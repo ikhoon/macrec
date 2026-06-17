@@ -747,7 +747,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         buildForm()
         load()
         w.contentView?.layoutSubtreeIfNeeded()
-        if let fit = w.contentView?.fittingSize { w.setContentSize(fit) }  // size to content + margins
+        let fit = w.contentView?.fittingSize ?? .zero
+        // grow to fit content, but never shrink below a roomy minimum (was shrinking too small)
+        w.setContentSize(NSSize(width: max(fit.width, 560), height: max(fit.height, 480)))
         w.center()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -896,10 +898,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Distinct audio-recorder identity: a waveform-with-mic while live, pause when not.
         let primary = recording ? "waveform.badge.mic" : "pause.circle"
         let fallback = recording ? "waveform" : "pause"
-        let img = NSImage(systemSymbolName: primary, accessibilityDescription: "Meeting Recorder")
-            ?? NSImage(systemSymbolName: fallback, accessibilityDescription: "Meeting Recorder")
+        // Fixed point size so the menu-bar icon never resizes (independent of which symbol).
+        let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+        let img = (NSImage(systemSymbolName: primary, accessibilityDescription: "Meeting Recorder")
+            ?? NSImage(systemSymbolName: fallback, accessibilityDescription: "Meeting Recorder"))?
+            .withSymbolConfiguration(cfg)
         img?.isTemplate = true
         statusItem.button?.image = img
+        statusItem.length = 30   // fixed width — our item won't reflow as system indicators come/go
     }
 
     private func item(_ title: String, _ sel: Selector, _ key: String = "") -> NSMenuItem {
