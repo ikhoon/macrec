@@ -476,6 +476,12 @@ final class CaptureSession {
         catch { return false }
     }
 
+    /// Stop the system-audio stream cleanly (on sleep) so we don't fight the display powering down.
+    func suspendStream() async {
+        if let s = stream { try? await s.stopCapture() }
+        stream = nil
+    }
+
     /// Snapshot the current writers into a CompletedSegment and (if `continueRecording`) swap in fresh
     /// writers for the next segment — all on the audio queue so no append races the swap.
     private func cut(continueRecording: Bool) -> CompletedSegment? {
@@ -551,6 +557,7 @@ final class RecordingEngine {
     private var timer: DispatchSourceTimer?
     private(set) var running = false
     private var recovering = false
+    private var suspended = false   // true while the display/system is asleep
     var onTranscriptSaved: ((String) -> Void)?   // (메시지) — UI 상태 갱신용
     var onSegmentResult: ((String) -> Void)?      // (메시지) — 발화 없어 버려도 알림
 
@@ -565,6 +572,22 @@ final class RecordingEngine {
         processQueue.async { self.process(seg) }
     }
 
+    /// On sleep: stop the system-audio stream so we don't hold the display/audio while it powers down.
+    private func suspendForSleep() {
+        guard running, !suspended else { return }
+        suspended = true
+        elog("engine: sleeping → suspending capture (won't fight the display)")
+        Task { await session.suspendStream() }
+    }
+
+    /// On wake: clear suspension and rebuild the stream.
+    private func wake() {
+        guard running else { return }
+        suspended = false
+        elog("engine: woke → resuming capture")
+        recover()
+    }
+
     /// Current per-source input level (0..1) for the live menu meter — is audio coming in right now?
     func liveLevels() -> (mic: Float, sys: Float) {
         guard running else { return (0, 0) }
@@ -574,7 +597,7 @@ final class RecordingEngine {
     /// Rebuild the capture stream after the display slept (it kills the SCStream with -3815).
     /// Retries every 2s until the display is back. Mic keeps running; only system audio is rebuilt.
     func recover() {
-        guard running, !recovering else { return }
+        guard running, !suspended, !recovering else { return }
         recovering = true
         Task { [weak self] in
             for attempt in 1...60 {
@@ -600,10 +623,14 @@ final class RecordingEngine {
         running = true
         elog("engine: recording (segment=\(Int(cfg.segmentSeconds))s, voiceMin=\(Int(cfg.voiceMinSeconds))s, exclude=\(cfg.excludeBundleIds.joined(separator: ",")))")
         processQueue.async { [weak self] in self?.cleanupRetention() }   // tidy old files on start
-        // Display sleep kills the SCStream (-3815); rebuild it on wake (and the stream-stopped event).
+        // Sleep/wake: stop capture cleanly on sleep (don't fight the display powering down) and
+        // resume on wake — avoids hammering ScreenCaptureKit while the display is off.
         let wc = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.screensDidWakeNotification, NSWorkspace.didWakeNotification] {
-            wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.recover() }
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification] {
+            wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.suspendForSleep() }
+        }
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
+            wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.wake() }
         }
         // 정시 정렬: 첫 회전을 시계 경계(정시, 또는 세그먼트 크기 배수)에 맞춘다.
         // 예: segment=3600이면 다음 :00, 900이면 다음 :00/:15/:30/:45.
