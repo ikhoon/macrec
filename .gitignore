@@ -1,0 +1,7 @@
+# build artifact — install.sh rebuilds & signs it
+MeetingCapture.app/
+
+# runtime / secrets / cruft
+*.log
+*.p12
+.DS_Store
