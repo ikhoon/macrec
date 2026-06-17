@@ -288,16 +288,18 @@ final class MicCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 
     func start(into rec: Recorder) throws {
         recorder = rec
-        guard let dev = AVCaptureDevice.default(for: .audio) else {
-            throw NSError(domain: "meeting-capture", code: 4, userInfo: [NSLocalizedDescriptionKey: "no default audio input device"])
+        if session.inputs.isEmpty {   // configure once; idempotent so suspend→resume just toggles running
+            guard let dev = AVCaptureDevice.default(for: .audio) else {
+                throw NSError(domain: "meeting-capture", code: 4, userInfo: [NSLocalizedDescriptionKey: "no default audio input device"])
+            }
+            let input = try AVCaptureDeviceInput(device: dev)
+            session.beginConfiguration()
+            if session.canAddInput(input) { session.addInput(input) }
+            output.setSampleBufferDelegate(self, queue: q)
+            if session.canAddOutput(output) { session.addOutput(output) }
+            session.commitConfiguration()
         }
-        let input = try AVCaptureDeviceInput(device: dev)
-        session.beginConfiguration()
-        if session.canAddInput(input) { session.addInput(input) }
-        output.setSampleBufferDelegate(self, queue: q)
-        if session.canAddOutput(output) { session.addOutput(output) }
-        session.commitConfiguration()
-        session.startRunning()
+        if !session.isRunning { session.startRunning() }
     }
 
     func stop() { if session.isRunning { session.stopRunning() } }
@@ -472,12 +474,13 @@ final class CaptureSession {
     func restartStream() async -> Bool {
         if let s = stream { try? await s.stopCapture() }
         stream = nil
-        do { try await buildStream(); return true }
+        do { try await buildStream(); try mic.start(into: rec); return true }   // resume mic too
         catch { return false }
     }
 
-    /// Stop the system-audio stream cleanly (on sleep) so we don't fight the display powering down.
+    /// Pause capture (mic + system audio) on lock/sleep — release the audio + display cleanly.
     func suspendStream() async {
+        mic.stop()
         if let s = stream { try? await s.stopCapture() }
         stream = nil
     }
@@ -576,15 +579,17 @@ final class RecordingEngine {
     private func suspendForSleep() {
         guard running, !suspended else { return }
         suspended = true
-        elog("engine: sleeping → suspending capture (won't fight the display)")
+        elog("engine: lock/sleep → suspending capture (mic + system)")
+        onSegmentResult?("Paused (locked/asleep)")
         Task { await session.suspendStream() }
     }
 
-    /// On wake: clear suspension and rebuild the stream.
+    /// On unlock/wake: clear suspension and rebuild the stream.
     private func wake() {
         guard running else { return }
         suspended = false
-        elog("engine: woke → resuming capture")
+        elog("engine: unlock/wake → resuming capture")
+        onSegmentResult?("Recording · mic + system audio")
         recover()
     }
 
@@ -632,6 +637,10 @@ final class RecordingEngine {
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
             wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.wake() }
         }
+        // Screen lock/unlock (distributed notifications) — pause while locked, too.
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in self?.suspendForSleep() }
+        dnc.addObserver(forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in self?.wake() }
         // 정시 정렬: 첫 회전을 시계 경계(정시, 또는 세그먼트 크기 배수)에 맞춘다.
         // 예: segment=3600이면 다음 :00, 900이면 다음 :00/:15/:30/:45.
         let cal = Calendar.current; let nowD = Date()
