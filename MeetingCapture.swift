@@ -90,6 +90,7 @@ final class SourceWriter {
     var framesOut: AVAudioFramePosition = 0
     var convErrors = 0
     var peak: Float = 0   // max abs sample seen — ~0 means this source recorded silence
+    var recentLevel: Float = 0   // peak of the most recent buffer — for the live menu meter
     var voicedFrames: AVAudioFramePosition = 0   // # samples above the voice threshold
     static let voiceThreshold: Float = 0.02      // ~-34 dBFS — speech-ish floor
 
@@ -140,11 +141,14 @@ final class SourceWriter {
         if let err = err { convErrors += 1; if convErrors <= 3 { elog("convert error: \(err)") }; return }
         guard outBuf.frameLength > 0 else { return }
         if let p = outBuf.floatChannelData?[0] {
+            var bufMax: Float = 0
             for i in 0..<Int(outBuf.frameLength) {
                 let a = abs(p[i])
-                if a > peak { peak = a }
+                if a > bufMax { bufMax = a }
                 if a > SourceWriter.voiceThreshold { voicedFrames += 1 }
             }
+            if bufMax > peak { peak = bufMax }
+            recentLevel = bufMax   // live meter
         }
         do { try file.write(from: outBuf); framesOut += AVAudioFramePosition(outBuf.frameLength) }
         catch { elog("write error: \(error)") }
@@ -561,6 +565,12 @@ final class RecordingEngine {
         processQueue.async { self.process(seg) }
     }
 
+    /// Current per-source input level (0..1) for the live menu meter — is audio coming in right now?
+    func liveLevels() -> (mic: Float, sys: Float) {
+        guard running else { return (0, 0) }
+        return (session.rec.micWriter?.recentLevel ?? 0, session.rec.sysWriter?.recentLevel ?? 0)
+    }
+
     /// Rebuild the capture stream after the display slept (it kills the SCStream with -3815).
     /// Retries every 2s until the display is back. Mic keeps running; only system audio is rebuilt.
     func recover() {
@@ -729,13 +739,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     init(onSave: @escaping () -> Void) {
         self.onSave = onSave
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 420),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 560),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "Meeting Recorder — Settings"
         super.init(window: w)
         w.delegate = self
         buildForm()
         load()
+        w.contentView?.layoutSubtreeIfNeeded()
+        if let fit = w.contentView?.fittingSize { w.setContentSize(fit) }  // size to content + margins
         w.center()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -771,15 +783,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [labeled("Save transcripts to:"), dirStack],
         ])
         grid.translatesAutoresizingMaskIntoConstraints = false
-        grid.rowSpacing = 12; grid.columnSpacing = 12
+        grid.rowSpacing = 16; grid.columnSpacing = 18
         grid.column(at: 0).xPlacement = .trailing
 
         let saveBtn = NSButton(title: "Save & Apply", target: self, action: #selector(saveAndClose)); saveBtn.keyEquivalent = "\r"
         let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(closeOnly)); cancelBtn.keyEquivalent = "\u{1b}"
         let btns = NSStackView(views: [cancelBtn, saveBtn]); btns.orientation = .horizontal; btns.spacing = 10
 
-        let root = NSStackView(views: [grid, btns]); root.orientation = .vertical; root.alignment = .trailing; root.spacing = 18
-        root.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        let root = NSStackView(views: [grid, btns]); root.orientation = .vertical; root.alignment = .trailing; root.spacing = 26
+        root.edgeInsets = NSEdgeInsets(top: 30, left: 34, bottom: 26, right: 34)
         root.translatesAutoresizingMaskIntoConstraints = false
         let content = NSView(); content.addSubview(root)
         NSLayoutConstraint.activate([
@@ -856,14 +868,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
 // MARK: - menu-bar app (tray icon)
 
-final class AppController: NSObject, NSApplicationDelegate {
+final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var engine: RecordingEngine?
     private var statusLine: NSMenuItem!
+    private var levelItem: NSMenuItem!
     private var lastSavedLine: NSMenuItem!
     private var toggleItem: NSMenuItem!
     private var paused = false
     private var settingsWC: SettingsWindowController?
+    private var levelTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
@@ -896,8 +910,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         setIcon(recording: false)
         let menu = NSMenu()
         statusLine = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: ""); statusLine.isEnabled = false
+        levelItem = NSMenuItem(title: "🎤 —   🔊 —", action: nil, keyEquivalent: ""); levelItem.isEnabled = false
         lastSavedLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); lastSavedLine.isEnabled = false; lastSavedLine.isHidden = true
-        menu.addItem(statusLine); menu.addItem(lastSavedLine)
+        menu.addItem(statusLine); menu.addItem(levelItem); menu.addItem(lastSavedLine)
         menu.addItem(.separator())
         menu.addItem(item("Transcribe now", #selector(flushNow), "s"))
         toggleItem = item("Pause", #selector(togglePause)); menu.addItem(toggleItem)
@@ -906,7 +921,28 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(item("Open transcripts folder", #selector(openTranscripts), "o"))
         menu.addItem(.separator())
         menu.addItem(item("Quit", #selector(quit), "q"))
+        menu.delegate = self
         statusItem.menu = menu
+    }
+
+    // Live input meter — only updates while the menu is open (cheap, and answers "is it working?").
+    func menuWillOpen(_ menu: NSMenu) {
+        updateLevels()
+        let t = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in self?.updateLevels() }
+        RunLoop.main.add(t, forMode: .eventTracking)   // fires while the menu is tracking
+        levelTimer = t
+    }
+    func menuDidClose(_ menu: NSMenu) { levelTimer?.invalidate(); levelTimer = nil }
+
+    private func meter(_ v: Float) -> String {
+        let n = min(8, max(0, Int(min(1, v * 4) * 8)))   // speech peaks ~0.1–0.5 → some gain
+        return String(repeating: "▰", count: n) + String(repeating: "▱", count: 8 - n)
+    }
+
+    private func updateLevels() {
+        guard let eng = engine, !paused else { levelItem.title = "🎤 —   🔊 —"; return }
+        let (mic, sys) = eng.liveLevels()
+        levelItem.title = "🎤 \(meter(mic))  🔊 \(meter(sys))"
     }
 
     private func refresh(_ status: String) {
