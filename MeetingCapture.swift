@@ -739,17 +739,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     init(onSave: @escaping () -> Void) {
         self.onSave = onSave
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 560),
-                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 580),
+                         styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         w.title = "Meeting Recorder — Settings"
         super.init(window: w)
         w.delegate = self
         buildForm()
         load()
-        w.contentView?.layoutSubtreeIfNeeded()
-        let fit = w.contentView?.fittingSize ?? .zero
-        // grow to fit content, but never shrink below a roomy minimum (was shrinking too small)
-        w.setContentSize(NSSize(width: max(fit.width, 560), height: max(fit.height, 480)))
+        w.setContentSize(NSSize(width: 600, height: 520))   // roomy fixed size; form top, buttons bottom
         w.center()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -791,16 +788,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let saveBtn = NSButton(title: "Save & Apply", target: self, action: #selector(saveAndClose)); saveBtn.keyEquivalent = "\r"
         let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(closeOnly)); cancelBtn.keyEquivalent = "\u{1b}"
         let btns = NSStackView(views: [cancelBtn, saveBtn]); btns.orientation = .horizontal; btns.spacing = 10
+        btns.translatesAutoresizingMaskIntoConstraints = false
 
-        let root = NSStackView(views: [grid, btns]); root.orientation = .vertical; root.alignment = .trailing; root.spacing = 26
-        root.edgeInsets = NSEdgeInsets(top: 30, left: 34, bottom: 26, right: 34)
-        root.translatesAutoresizingMaskIntoConstraints = false
-        let content = NSView(); content.addSubview(root)
+        // Form pinned to the TOP (natural row heights — no vertical stretch), buttons pinned to the
+        // BOTTOM-trailing. Extra window height becomes empty space between them, not stretched rows.
+        let content = NSView()
+        content.addSubview(grid); content.addSubview(btns)
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            root.topAnchor.constraint(equalTo: content.topAnchor),
-            root.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            grid.topAnchor.constraint(equalTo: content.topAnchor, constant: 28),
+            grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 34),
+            grid.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -34),
+            btns.topAnchor.constraint(greaterThanOrEqualTo: grid.bottomAnchor, constant: 24),
+            btns.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -34),
+            btns.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -22),
         ])
         window?.contentView = content
     }
@@ -906,6 +906,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         img?.isTemplate = true
         statusItem.button?.image = img
         statusItem.length = 30   // fixed width — our item won't reflow as system indicators come/go
+        elog("icon set (recording=\(recording)), statusItem.length=\(statusItem.length)")
     }
 
     private func item(_ title: String, _ sel: Selector, _ key: String = "") -> NSMenuItem {
@@ -920,7 +921,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastSavedLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); lastSavedLine.isEnabled = false; lastSavedLine.isHidden = true
         menu.addItem(statusLine); menu.addItem(levelItem); menu.addItem(lastSavedLine)
         menu.addItem(.separator())
-        menu.addItem(item("Transcribe now", #selector(flushNow), "s"))
+        // Custom-view button so clicking it does NOT dismiss the menu — you can watch the live
+        // meter + status update in place while it transcribes.
+        let tItem = NSMenuItem()
+        let tView = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
+        let tBtn = NSButton(title: "Transcribe now", target: self, action: #selector(flushNow))
+        tBtn.isBordered = false; tBtn.alignment = .left; tBtn.font = NSFont.menuFont(ofSize: 0)
+        tBtn.frame = NSRect(x: 14, y: 1, width: 220, height: 20)
+        tView.addSubview(tBtn); tItem.view = tView
+        menu.addItem(tItem)
         toggleItem = item("Pause", #selector(togglePause)); menu.addItem(toggleItem)
         menu.addItem(.separator())
         menu.addItem(item("Settings…", #selector(openSettings), ","))
@@ -942,7 +951,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func meter(_ v: Float) -> String {
         let n = min(8, max(0, Int(min(1, v * 4) * 8)))   // speech peaks ~0.1–0.5 → some gain
-        return String(repeating: "▰", count: n) + String(repeating: "▱", count: 8 - n)
+        // ●/○ are a same-width pair (▰/▱ rendered at different sizes in the menu font).
+        return String(repeating: "●", count: n) + String(repeating: "○", count: 8 - n)
     }
 
     private func updateLevels() {
