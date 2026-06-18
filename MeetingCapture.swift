@@ -17,6 +17,7 @@ import CoreMedia
 import CoreAudio
 import CoreGraphics
 import AppKit
+import EventKit
 
 // MARK: - helpers
 
@@ -324,6 +325,7 @@ enum Pref {
     static let segment = "segmentSeconds", voiceMin = "voiceMinSeconds", lang = "whisperLang"
     static let keepAudio = "keepAudio", audioRetention = "audioRetentionDays", txtRetention = "transcriptRetentionDays"
     static let exclude = "excludeApps", txtDir = "transcriptsDir", vad = "vadEnabled", autoStart = "autoStart"
+    static let cal = "useCalendarTitles"
 
     static func dbl(_ key: String, _ env: String, _ def: Double) -> Double {
         if d.object(forKey: key) != nil { return d.double(forKey: key) }
@@ -359,6 +361,7 @@ struct EngineConfig {
     var whisperModel: String
     var vadModel: String
     var vadEnabled: Bool
+    var useCalendarTitles: Bool         // title transcripts from the overlapping calendar event
     var whisperLang: String
     var keepAudio: Bool                 // false면 전사만 남기고 오디오 삭제
     var audioRetentionDays: Int         // 0 = 무제한
@@ -383,6 +386,7 @@ struct EngineConfig {
             vadModel: Pref.str("vadModel", "MR_VAD_MODEL",
                                home.appendingPathComponent("whisper-models/ggml-silero-v5.1.2.bin").path),
             vadEnabled: Pref.bool(Pref.vad, "MR_VAD", true),
+            useCalendarTitles: Pref.bool(Pref.cal, "MR_CALENDAR_TITLES", true),
             whisperLang: Pref.str(Pref.lang, "MR_WHISPER_LANG", "auto"),
             keepAudio: Pref.bool(Pref.keepAudio, "MR_KEEP_AUDIO", true),
             audioRetentionDays: Pref.int(Pref.audioRetention, "MR_AUDIO_RETENTION_DAYS", 30),
@@ -518,35 +522,146 @@ final class CaptureSession {
     }
 }
 
-// MARK: - transcriber (mixdown → whisper-cli)
+/// Filesystem-safe short slug from an event title (for the transcript filename). Keeps letters
+/// (incl. Hangul/CJK) and digits; turns spaces into '-'; drops punctuation/emoji; caps length.
+func slugify(_ s: String) -> String {
+    var out = ""
+    for ch in s {
+        if ch.isLetter || ch.isNumber { out.append(ch) }
+        else if ch == " " || ch == "-" || ch == "_" { out.append("-") }
+    }
+    while out.contains("--") { out = out.replacingOccurrences(of: "--", with: "-") }
+    out = out.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    if out.count > 40 { out = String(out.prefix(40)).trimmingCharacters(in: CharacterSet(charactersIn: "-")) }
+    return out.isEmpty ? "meeting" : out
+}
+
+// MARK: - calendar lookup (title a transcript from the overlapping event)
+
+enum CalendarLookup {
+    static let store = EKEventStore()
+
+    static var authorized: Bool { EKEventStore.authorizationStatus(for: .event) == .fullAccess }
+
+    /// Trigger the one-time Calendar permission prompt (no-op if already decided).
+    static func requestAccess() {
+        store.requestFullAccessToEvents { ok, err in
+            if let err = err { elog("calendar access: \(err)") } else { elog("calendar access granted=\(ok)") }
+        }
+    }
+
+    struct Match { let title: String; let link: String?; let attendees: [String] }
+
+    /// Best event overlapping [start, end] — prefers one with a Zoom/Meet/Teams link.
+    static func match(start: Date, end: Date) -> Match? {
+        guard authorized else { return nil }
+        let pred = store.predicateForEvents(withStart: start.addingTimeInterval(-300), end: end.addingTimeInterval(60), calendars: nil)
+        let events = store.events(matching: pred).filter { !$0.isAllDay && !($0.title ?? "").isEmpty }
+        guard !events.isEmpty else { return nil }
+
+        func link(_ e: EKEvent) -> String? {
+            let hay = [e.location, e.notes, e.url?.absoluteString].compactMap { $0 }.joined(separator: "\n")
+            let pats = ["zoom.us/j/", "zoom.us/my/", "zoom.us/s/", "meet.google.com/", "teams.microsoft.com/", "webex.com/"]
+            for tok in hay.split(whereSeparator: { " \n\t\r<>\"'(),".contains($0) }) {
+                let s = String(tok)
+                if pats.contains(where: { s.lowercased().contains($0) }) { return s }
+            }
+            return nil
+        }
+        func overlap(_ e: EKEvent) -> TimeInterval { max(0, min(e.endDate, end).timeIntervalSince(max(e.startDate, start))) }
+
+        let chosen = events.sorted { a, b in
+            let la = link(a) != nil, lb = link(b) != nil
+            if la != lb { return la }                 // events with a meeting link win
+            return overlap(a) > overlap(b)            // else the one overlapping most
+        }.first!
+        let names = (chosen.attendees ?? []).compactMap { $0.name }.filter { !$0.isEmpty }
+        return Match(title: chosen.title, link: link(chosen), attendees: names)
+    }
+}
+
+// MARK: - transcriber (per-track whisper-cli → speaker-labeled, time-merged transcript)
 
 enum Transcriber {
-    /// Mix mic+sys to a 16-bit WAV and run whisper-cli on it. Returns (mixedWav, transcript) or nil.
-    static func transcribe(_ seg: CompletedSegment, cfg: EngineConfig) -> (mixed: URL, text: String)? {
-        // seg-XXXX.sys.wav → seg-XXXX → seg-XXXX.wav
-        let stem = URL(fileURLWithPath: seg.sysURL.path).deletingPathExtension().deletingPathExtension()
-        let mixed = URL(fileURLWithPath: stem.path + ".wav")
-        do { try mixDown(sysURL: seg.sysURL, micURL: seg.micURL, outURL: mixed) }
-        catch { elog("mixdown: \(error)"); return nil }
-
+    /// Run whisper-cli (VAD + suppress-non-speech) on a 16kHz/16-bit WAV; return its timestamped stdout.
+    private static func runWhisper(_ wav16: URL, _ cfg: EngineConfig) -> String {
         guard FileManager.default.isExecutableFile(atPath: cfg.whisperCli),
               FileManager.default.fileExists(atPath: cfg.whisperModel) else {
-            elog("transcribe: whisper-cli or model missing (\(cfg.whisperCli), \(cfg.whisperModel))")
-            return (mixed, "")
+            elog("transcribe: whisper-cli or model missing (\(cfg.whisperCli))"); return ""
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cfg.whisperCli)
-        // -sns: 비음성 토큰 억제. --vad: 무음/잡음 구간을 통째로 건너뛰어 환각("Thank you" 등) 제거.
-        var args = ["-m", cfg.whisperModel, "-f", mixed.path, "-l", cfg.whisperLang, "-np", "-sns"]
+        var args = ["-m", cfg.whisperModel, "-f", wav16.path, "-l", cfg.whisperLang, "-np", "-sns"]
         if cfg.vadEnabled && FileManager.default.fileExists(atPath: cfg.vadModel) {
             args += ["--vad", "--vad-model", cfg.vadModel]
         }
         p.arguments = args
-        let outPipe = Pipe(); p.standardOutput = outPipe; p.standardError = Pipe()
-        do { try p.run() } catch { elog("whisper run: \(error)"); return (mixed, "") }
-        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
+        do { try p.run() } catch { elog("whisper run: \(error)"); return "" }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        return (mixed, String(data: data, encoding: .utf8) ?? "")
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Parse "[HH:MM:SS.mmm --> ...]  text" lines into (startSeconds, text).
+    private static func parse(_ output: String) -> [(Double, String)] {
+        var segs: [(Double, String)] = []
+        for raw in output.split(separator: "\n") {
+            let line = String(raw)
+            guard line.hasPrefix("["), let arrow = line.range(of: " --> "), let close = line.range(of: "]") else { continue }
+            let ts = line[line.index(after: line.startIndex)..<arrow.lowerBound].split(separator: ":")
+            guard ts.count == 3, let h = Double(ts[0]), let m = Double(ts[1]), let s = Double(ts[2]) else { continue }
+            let text = line[close.upperBound...].trimmingCharacters(in: .whitespaces)
+            if !text.isEmpty { segs.append((h * 3600 + m * 60 + s, text)) }
+        }
+        return segs
+    }
+
+    /// Convert a float32 WAV to 16kHz/16-bit (what whisper-cli expects). Returns the temp file URL.
+    private static func convert16(_ src: URL) -> URL? {
+        do {
+            let inFile = try AVAudioFile(forReading: src)
+            guard inFile.length > 0 else { return nil }
+            let outURL = URL(fileURLWithPath: src.deletingPathExtension().path + ".16.wav")
+            let settings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000.0,
+                AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false]
+            let outFile = try AVAudioFile(forWriting: outURL, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+            let block: AVAudioFrameCount = 16000
+            while inFile.framePosition < inFile.length {
+                guard let buf = AVAudioPCMBuffer(pcmFormat: canon, frameCapacity: block) else { break }
+                try inFile.read(into: buf, frameCount: block)
+                if buf.frameLength == 0 { break }
+                try outFile.write(from: buf)
+            }
+            return outURL
+        } catch { elog("convert16(\(src.lastPathComponent)): \(error)"); return nil }
+    }
+
+    /// Transcribe mic ("나") and system ("상대") SEPARATELY, then merge by time into a speaker-labeled
+    /// transcript. Mixes a kept WAV only when keepAudio. Returns (mixedWav?, text).
+    static func transcribe(_ seg: CompletedSegment, cfg: EngineConfig) -> (mixed: URL?, text: String)? {
+        var mixed: URL? = nil
+        if cfg.keepAudio {
+            let stem = URL(fileURLWithPath: seg.sysURL.path).deletingPathExtension().deletingPathExtension()
+            let m = URL(fileURLWithPath: stem.path + ".wav")
+            do { try mixDown(sysURL: seg.sysURL, micURL: seg.micURL, outURL: m); mixed = m }
+            catch { elog("mixdown: \(error)") }
+        }
+        var merged: [(start: Double, who: String, text: String)] = []
+        if let mic16 = convert16(seg.micURL) {
+            merged += parse(runWhisper(mic16, cfg)).map { (start: $0.0, who: "나", text: $0.1) }
+            try? FileManager.default.removeItem(at: mic16)
+        }
+        if let sys16 = convert16(seg.sysURL) {
+            merged += parse(runWhisper(sys16, cfg)).map { (start: $0.0, who: "상대", text: $0.1) }
+            try? FileManager.default.removeItem(at: sys16)
+        }
+        merged.sort { $0.start < $1.start }
+        let tf = DateFormatter(); tf.locale = Locale(identifier: "en_US_POSIX"); tf.dateFormat = "HH:mm:ss"
+        let text = merged.map { "[\(tf.string(from: seg.start.addingTimeInterval($0.start)))] \($0.who): \($0.text)" }
+            .joined(separator: "\n")
+        return (mixed, text)
     }
 }
 
@@ -707,7 +822,7 @@ final class RecordingEngine {
     }
 
     @discardableResult
-    private func writeTranscript(seg: CompletedSegment, text: String, mixed: URL) throws -> URL {
+    private func writeTranscript(seg: CompletedSegment, text: String, mixed: URL?) throws -> URL {
         let fm = FileManager.default
         try fm.createDirectory(at: cfg.transcriptsDir, withIntermediateDirectories: true)
         try fm.createDirectory(at: cfg.audioDir, withIntermediateDirectories: true)
@@ -715,31 +830,38 @@ final class RecordingEngine {
         let nameF = DateFormatter(); nameF.locale = Locale(identifier: "en_US_POSIX"); nameF.dateFormat = "yyyy-MM-dd-HHmm"
         let dayF = DateFormatter(); dayF.locale = Locale(identifier: "en_US_POSIX"); dayF.dateFormat = "yyyy-MM-dd"
         let hmF = DateFormatter(); hmF.locale = Locale(identifier: "en_US_POSIX"); hmF.dateFormat = "HH:mm"
-        let slug = nameF.string(from: seg.start)
         let end = seg.start.addingTimeInterval(seg.durationSeconds)
         let mins = Int((seg.durationSeconds + 30) / 60)
 
-        // keep (or drop) the mixed WAV per the keepAudio setting
+        // Title the transcript from the overlapping calendar event (prefers ones with a meeting link).
+        let event = cfg.useCalendarTitles ? CalendarLookup.match(start: seg.start, end: end) : nil
+        let title = event?.title ?? "자동 전사"
+        let base = nameF.string(from: seg.start)
+        let slug = event.map { "\(base)-\(slugify($0.title))" } ?? base
+
+        // keep the mixed WAV per the keepAudio setting (mixed is nil when keepAudio is off)
         var audioLine = "- 오디오: _(보관 안 함)_"
-        if cfg.keepAudio {
+        if cfg.keepAudio, let mixed = mixed {
             let keptAudio = cfg.audioDir.appendingPathComponent("\(slug).wav")
             try? fm.removeItem(at: keptAudio)
             try fm.moveItem(at: mixed, to: keptAudio)
             audioLine = "- 오디오: [audio/\(slug).wav](audio/\(slug).wav)"
-        } else {
-            try? fm.removeItem(at: mixed)
         }
+
+        var meta = ""
+        if let link = event?.link { meta += "\n- 회의 링크: \(link)" }
+        if let names = event?.attendees, !names.isEmpty { meta += "\n- 참석자: \(names.prefix(12).joined(separator: ", "))" }
 
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "_(전사 실패 — whisper-cli/모델 확인: \(cfg.whisperModel))_" : text
         let md = """
-        # \(dayF.string(from: seg.start)) \(hmF.string(from: seg.start))–\(hmF.string(from: end)) — 자동 전사
+        # \(dayF.string(from: seg.start)) \(hmF.string(from: seg.start))–\(hmF.string(from: end)) — \(title)
 
-        > [연속 녹음] whisper-cli 자동 전사. mic + system audio (\(cfg.excludeBundleIds.joined(separator: ", ")) 제외).
+        > [연속 녹음] whisper-cli 자동 전사 (화자: 나=마이크, 상대=시스템). \(cfg.excludeBundleIds.joined(separator: ", ")) 제외.
 
         - 시각: \(dayF.string(from: seg.start)) \(hmF.string(from: seg.start))–\(hmF.string(from: end)) (\(mins)분)
         - 발화: mic \(String(format: "%.1f", seg.micVoicedSeconds))s · sys \(String(format: "%.1f", seg.sysVoicedSeconds))s · 모델: `\(URL(fileURLWithPath: cfg.whisperModel).lastPathComponent)`
-        \(audioLine)
+        \(audioLine)\(meta)
         - 태그: #transcript #auto
 
         ## 전사 (transcript)
@@ -767,6 +889,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
     private let keepAudioBtn = NSButton(checkboxWithTitle: "Keep audio (WAV) too", target: nil, action: nil)
     private let vadBtn = NSButton(checkboxWithTitle: "Remove noise/silence (VAD)", target: nil, action: nil)
+    private let calBtn = NSButton(checkboxWithTitle: "Title transcripts from calendar events", target: nil, action: nil)
     private var runningAppIds: [String] = []
 
     private let segValues = [900, 1800, 3600, 7200], segTitles = ["15 min", "30 min", "1 hour", "2 hours"]
@@ -810,6 +933,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [labeled("Transcription language:"), langPopup],
             [labeled("Min. speech (sec):"), voiceField],
             [labeled(""), vadBtn],
+            [labeled(""), calBtn],
             [labeled(""), keepAudioBtn],
             [labeled("Keep audio for:"), audioRetPopup],
             [labeled("Keep transcripts for:"), txtRetPopup],
@@ -874,6 +998,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         langPopup.selectItem(at: idx(c.whisperLang, langValues))
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
+        calBtn.state = c.useCalendarTitles ? .on : .off
         keepAudioBtn.state = c.keepAudio ? .on : .off
         audioRetPopup.selectItem(at: idx(c.audioRetentionDays, retValues))
         txtRetPopup.selectItem(at: idx(c.transcriptRetentionDays, retValues))
@@ -892,6 +1017,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(langValues[max(0, langPopup.indexOfSelectedItem)], forKey: Pref.lang)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
+        d.set(calBtn.state == .on, forKey: Pref.cal)
         d.set(keepAudioBtn.state == .on, forKey: Pref.keepAudio)
         d.set(retValues[max(0, audioRetPopup.indexOfSelectedItem)], forKey: Pref.audioRetention)
         d.set(retValues[max(0, txtRetPopup.indexOfSelectedItem)], forKey: Pref.txtRetention)
@@ -918,7 +1044,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var levelTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Single instance: if a copy is already running (the LaunchAgent one), just tell it to open
+        // its menu and quit this launch — so clicking the app in /Applications opens the tray menu.
+        let bid = Bundle.main.bundleIdentifier ?? "com.ikhoon.meeting-capture"
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+            .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+        if !others.isEmpty {
+            DistributedNotificationCenter.default().postNotificationName(
+                .init("com.ikhoon.MeetingRecorder.openMenu"), object: nil, deliverImmediately: true)
+            NSApp.terminate(nil); return
+        }
         buildMenu()
+        DistributedNotificationCenter.default().addObserver(
+            forName: .init("com.ikhoon.MeetingRecorder.openMenu"), object: nil, queue: .main
+        ) { [weak self] _ in self?.openMenu() }
+        CalendarLookup.requestAccess()   // one-time Calendar prompt (for titling transcripts)
         startEngine()
         installStopHandler { [weak self] in
             if let eng = self?.engine {
@@ -1053,6 +1193,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let old = old { await old.stop() }
             await MainActor.run { self.startEngine() }
         }
+    }
+
+    /// Clicking the app icon in /Applications/Launchpad/Dock while it's running → open the tray menu.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        openMenu(); return true
+    }
+
+    /// Open the tray menu programmatically (when the app is clicked in /Applications).
+    @objc private func openMenu() {
+        NSApp.activate(ignoringOtherApps: true)
+        statusItem.button?.performClick(nil)
     }
 
     @objc private func openTranscripts() {
