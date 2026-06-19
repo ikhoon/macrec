@@ -18,6 +18,7 @@ import CoreAudio
 import CoreGraphics
 import AppKit
 import EventKit
+import ServiceManagement
 
 // MARK: - helpers
 
@@ -326,6 +327,7 @@ enum Pref {
     static let keepAudio = "keepAudio", audioRetention = "audioRetentionDays", txtRetention = "transcriptRetentionDays"
     static let exclude = "excludeApps", txtDir = "transcriptsDir", vad = "vadEnabled", autoStart = "autoStart"
     static let cal = "useCalendarTitles", model = "whisperModelName"
+    static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
 
     static func dbl(_ key: String, _ env: String, _ def: Double) -> Double {
         if d.object(forKey: key) != nil { return d.double(forKey: key) }
@@ -1047,6 +1049,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let keepAudioBtn = NSButton(checkboxWithTitle: "Keep audio (WAV) too", target: nil, action: nil)
     private let vadBtn = NSButton(checkboxWithTitle: "Remove noise/silence (VAD)", target: nil, action: nil)
     private let calBtn = NSButton(checkboxWithTitle: "Title transcripts from calendar events", target: nil, action: nil)
+    private let loginBtn = NSButton(checkboxWithTitle: "Start at login (24/7 recording)", target: nil, action: nil)
     private var runningAppIds: [String] = []
 
     private let segValues = [900, 1800, 3600, 7200], segTitles = ["15 min", "30 min", "1 hour", "2 hours"]
@@ -1094,6 +1097,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [labeled("Min. speech (sec):"), voiceField],
             [labeled(""), vadBtn],
             [labeled(""), calBtn],
+            [labeled(""), loginBtn],
             [labeled(""), keepAudioBtn],
             [labeled("Keep audio for:"), audioRetPopup],
             [labeled("Keep transcripts for:"), txtRetPopup],
@@ -1165,6 +1169,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         txtRetPopup.selectItem(at: idx(c.transcriptRetentionDays, retValues))
         excludeTokens.objectValue = c.excludeBundleIds
         dirField.stringValue = c.transcriptsDir.path
+        // Start at login — read the live SMAppService status (never cache); locked on the dev machine.
+        if #available(macOS 13, *) {
+            if LoginItem.managedByLaunchAgent {
+                loginBtn.state = .on; loginBtn.isEnabled = false
+                loginBtn.toolTip = "Managed by the LaunchAgent on this machine."
+            } else {
+                switch LoginItem.status {
+                case .enabled:          loginBtn.state = .on;  loginBtn.toolTip = nil
+                case .requiresApproval: loginBtn.state = .on;  loginBtn.toolTip = "Pending — enable in System Settings ▸ Login Items."
+                default:                loginBtn.state = .off; loginBtn.toolTip = nil   // .notRegistered / .notFound
+                }
+            }
+        } else { loginBtn.isEnabled = false }
     }
 
     @objc private func chooseDir() {
@@ -1186,10 +1203,65 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let ids = (excludeTokens.objectValue as? [String]) ?? []
         d.set(ids.joined(separator: " "), forKey: Pref.exclude)
         d.set(dirField.stringValue, forKey: Pref.txtDir)
+        // Apply "Start at login" (skip on the dev machine where the LaunchAgent owns autostart).
+        if #available(macOS 13, *), !LoginItem.managedByLaunchAgent {
+            if LoginItem.setEnabled(loginBtn.state == .on) == .requiresApproval { LoginItem.openSettings() }
+        }
         window?.close()
         onSave()
     }
     @objc private func closeOnly() { window?.close() }
+}
+
+// MARK: - login-item autostart (SMAppService)
+
+/// Auto-start at login via the modern Login Item API (macOS 13+). Works for our self-signed,
+/// /Applications-installed app because the signature is a stable cert-based DR. On the developer's
+/// machine the install.sh LaunchAgent owns autostart, so we detect it and stay out of the way.
+enum LoginItem {
+    /// The dev LaunchAgent (install.sh). When present, launchd owns autostart — not us.
+    static var managedByLaunchAgent: Bool {
+        let p = ("~/Library/LaunchAgents/com.ikhoon.meeting-recorder.plist" as NSString).expandingTildeInPath
+        return FileManager.default.fileExists(atPath: p)
+    }
+
+    @available(macOS 13, *)
+    static var status: SMAppService.Status { SMAppService.mainApp.status }
+
+    /// Apply desired on/off, registering/unregistering only on an actual change. Returns the
+    /// resulting status (may be .requiresApproval — caller can deep-link to System Settings).
+    /// macOS reports a user-disabled item as .notFound, so we key off the real status, never a cache.
+    @available(macOS 13, *)
+    @discardableResult
+    static func setEnabled(_ on: Bool) -> SMAppService.Status {
+        let svc = SMAppService.mainApp
+        let cur = svc.status
+        do {
+            if on {
+                if cur != .enabled && cur != .requiresApproval { try svc.register() }
+            } else {
+                if cur == .enabled || cur == .requiresApproval { try svc.unregister() }
+            }
+        } catch { elog("login item \(on ? "register" : "unregister") failed: \(error)") }
+        return svc.status
+    }
+
+    @available(macOS 13, *)
+    static func openSettings() { SMAppService.openSystemSettingsLoginItems() }
+
+    /// First-run only: enable autostart for the DISTRIBUTED app (no LaunchAgent, running from
+    /// /Applications, never registered before). A one-shot flag means a later user opt-out in
+    /// System Settings is never silently overridden.
+    static func autoEnableOnceIfDistributed() {
+        guard #available(macOS 13, *) else { return }
+        guard !managedByLaunchAgent else { return }                         // dev machine: launchd owns it
+        guard Bundle.main.bundleURL.path.hasPrefix("/Applications/") else { return }  // stable location only
+        guard !Pref.d.bool(forKey: Pref.autostartOffered) else { return }   // only ever auto-enable once
+        Pref.d.set(true, forKey: Pref.autostartOffered)
+        guard status == .notRegistered else { return }                      // never touch a prior user choice
+        _ = setEnabled(true)
+        elog("login item: auto-enabled on first run (status=\(status))")
+    }
 }
 
 // MARK: - menu-bar app (tray icon)
@@ -1223,6 +1295,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ) { [weak self] _ in self?.openMenu() }
         CalendarLookup.requestAccess()   // one-time Calendar prompt (for titling transcripts)
         setupModelDownload()             // first-run: fetch the large model, show progress in the menu
+        LoginItem.autoEnableOnceIfDistributed()   // distributed app: enable 24/7 autostart on first run
         startEngine()
         installStopHandler { [weak self] in
             if let eng = self?.engine {
@@ -1457,6 +1530,9 @@ struct Main {
             print("whisperCli=\(c.whisperCli)")
             print("whisperModel=\(c.whisperModel)")
             print("vadModel=\(c.vadModel)")
+            if #available(macOS 13, *) {
+                print("loginItem=\(LoginItem.managedByLaunchAgent ? "managed-by-launchagent" : "\(LoginItem.status)")")
+            }
             exit(0)
         }
 

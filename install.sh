@@ -26,7 +26,7 @@ echo "▸ building meeting-capture…"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 swiftc -swift-version 5 -parse-as-library -O \
   -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia -framework CoreAudio \
-  -framework CoreGraphics -framework AppKit -framework EventKit \
+  -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement \
   "$HERE/MeetingCapture.swift" -o "$STAGE_BIN"
 
 echo "▸ writing Info.plist + icon…"

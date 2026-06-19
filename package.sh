@@ -76,7 +76,7 @@ echo "▸ building meeting-capture…"
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 swiftc -swift-version 5 -parse-as-library -O \
   -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia -framework CoreAudio \
-  -framework CoreGraphics -framework AppKit -framework EventKit \
+  -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement \
   "$HERE/MeetingCapture.swift" -o "$APP/Contents/MacOS/meeting-capture"
 
 # ── 6) bundle whisper-cli + VAD + icon ──────────────────────────────────────────
