@@ -1,6 +1,10 @@
 # build artifact — install.sh rebuilds & signs it
 MeetingCapture.app/
 
+# package.sh outputs: distributable .app/zip + cached whisper.cpp checkout & build
+dist/
+.build/
+
 # runtime / secrets / cruft
 *.log
 *.p12

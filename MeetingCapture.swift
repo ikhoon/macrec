@@ -325,7 +325,7 @@ enum Pref {
     static let segment = "segmentSeconds", voiceMin = "voiceMinSeconds", lang = "whisperLang"
     static let keepAudio = "keepAudio", audioRetention = "audioRetentionDays", txtRetention = "transcriptRetentionDays"
     static let exclude = "excludeApps", txtDir = "transcriptsDir", vad = "vadEnabled", autoStart = "autoStart"
-    static let cal = "useCalendarTitles"
+    static let cal = "useCalendarTitles", model = "whisperModelName"
 
     static func dbl(_ key: String, _ env: String, _ def: Double) -> Double {
         if d.object(forKey: key) != nil { return d.double(forKey: key) }
@@ -346,6 +346,156 @@ enum Pref {
         if d.object(forKey: key) != nil { return d.bool(forKey: key) }
         if let e = ProcessInfo.processInfo.environment[env] { return (e as NSString).boolValue }
         return def
+    }
+}
+
+// MARK: - bundled tools + model store
+
+/// Resolves whisper-cli / VAD model shipped INSIDE the .app (self-contained distribution).
+/// Returns nil in dev (loose binary) so EngineConfig falls back to brew / ~/whisper-models.
+enum BundledTools {
+    /// The .app bundle URL when running as Contents/MacOS/meeting-capture; nil for a loose CLI binary.
+    static var appBundleURL: URL? {
+        let u = Bundle.main.bundleURL
+        return u.pathExtension == "app" ? u : nil
+    }
+    /// Contents/Helpers/whisper-cli inside the .app, if present + executable.
+    static var whisperCli: String? {
+        guard let app = appBundleURL else { return nil }
+        let p = app.appendingPathComponent("Contents/Helpers/whisper-cli").path
+        return FileManager.default.isExecutableFile(atPath: p) ? p : nil
+    }
+    /// Bundled silero VAD model (Contents/Resources), if present.
+    static var vadModel: String? {
+        Bundle.main.url(forResource: "ggml-silero-v5.1.2", withExtension: "bin")?.path
+    }
+}
+
+/// A downloadable whisper.cpp GGML model. Filenames + sizes verified against ggerganov/whisper.cpp.
+struct WhisperModelSpec {
+    let name: String        // stable id stored in prefs (e.g. "large-v3-turbo")
+    let filename: String    // ggml-<…>.bin on HuggingFace
+    let label: String       // shown in the Settings popup
+    let bytes: Int64        // verified size; download threshold = bytes/2 (rejects partials / HTML error pages)
+    var url: String { "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(filename)" }
+    var minBytes: Int64 { bytes / 2 }
+}
+
+/// Curated, verified set of selectable models (best multilingual ko/ja/en picks first).
+enum WhisperCatalog {
+    static let defaultName = "large-v3-turbo"
+    static let all: [WhisperModelSpec] = [
+        .init(name: "large-v3-turbo",      filename: "ggml-large-v3-turbo.bin",      label: "Large v3 Turbo — fast + accurate ★ (1.6 GB)",       bytes: 1_624_555_275),
+        .init(name: "large-v3-turbo-q5_0", filename: "ggml-large-v3-turbo-q5_0.bin", label: "Large v3 Turbo q5_0 — near-turbo, smaller (574 MB)", bytes:   574_041_195),
+        .init(name: "large-v3",            filename: "ggml-large-v3.bin",            label: "Large v3 — max accuracy, slow (3.1 GB)",            bytes: 3_095_033_483),
+        .init(name: "medium",              filename: "ggml-medium.bin",              label: "Medium — strong multilingual (1.5 GB)",             bytes: 1_533_763_059),
+        .init(name: "small",               filename: "ggml-small.bin",               label: "Small — lighter, faster (465 MB)",                  bytes:   487_601_967),
+        .init(name: "base",                filename: "ggml-base.bin",                label: "Base — fast, basic accuracy (141 MB)",              bytes:   147_951_465),
+        .init(name: "tiny",                filename: "ggml-tiny.bin",                label: "Tiny — fastest, lowest accuracy (74 MB)",           bytes:    77_691_713),
+    ]
+    static func spec(_ name: String) -> WhisperModelSpec {
+        all.first { $0.name == name } ?? all.first { $0.name == defaultName }!
+    }
+    /// Currently selected model (UserDefaults > env > default).
+    static var selected: WhisperModelSpec { spec(Pref.str(Pref.model, "MR_WHISPER_MODEL", defaultName)) }
+}
+
+/// Downloads the selected transcription model on first run / on change (too big to bundle).
+/// Stored under ~/Library/Application Support/MeetingRecorder/models/, keyed by filename so
+/// multiple models coexist and switching back never re-downloads.
+final class ModelStore: NSObject, URLSessionDownloadDelegate {
+    static let shared = ModelStore()
+
+    /// Download progress: 0...1 while running, 1.0 done, <0 failed. Delivered on the main queue.
+    var onProgress: ((Double) -> Void)?
+    private var session: URLSession?
+    private var downloadingName: String?      // name of the model currently downloading (nil = idle)
+
+    var dir: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MeetingRecorder/models", isDirectory: true)
+    }
+    func path(for s: WhisperModelSpec) -> URL { dir.appendingPathComponent(s.filename) }
+    func isReady(_ s: WhisperModelSpec) -> Bool { fileBytes(path(for: s)) >= s.minBytes }
+
+    /// The currently-selected model.
+    var spec: WhisperModelSpec { WhisperCatalog.selected }
+    var isReady: Bool { isReady(spec) }
+
+    /// Path EngineConfig should use for the current selection: App Support if present, else a dev
+    /// ~/whisper-models copy, else the (not-yet-filled) App Support path so the download lands there.
+    var resolvedModelPath: String {
+        let s = spec
+        if isReady(s) { return path(for: s).path }
+        let dev = devPath(s)
+        if fileBytes(dev) >= s.minBytes { return dev.path }
+        return path(for: s).path
+    }
+
+    private func devPath(_ s: WhisperModelSpec) -> URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("whisper-models/\(s.filename)")
+    }
+    private func fileBytes(_ u: URL) -> Int64 {
+        guard let a = try? FileManager.default.attributesOfItem(atPath: u.path) else { return 0 }
+        return (a[.size] as? NSNumber)?.int64Value ?? 0
+    }
+
+    /// Download the current selection if missing. Idempotent; re-targets if the selection changed.
+    func ensure() {
+        let s = spec
+        if isReady(s) || fileBytes(devPath(s)) >= s.minBytes {   // already available locally
+            if downloadingName != nil { cancelDownload() }
+            return
+        }
+        if downloadingName == s.name { return }                   // already fetching this one
+        if downloadingName != nil { cancelDownload() }            // switch download target
+
+        downloadingName = s.name
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let urlStr = ProcessInfo.processInfo.environment["MR_MODEL_URL"] ?? s.url
+        guard let url = URL(string: urlStr) else { downloadingName = nil; return }
+        let sess = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        session = sess
+        elog("model: downloading \(s.name) \(urlStr) → \(path(for: s).path)")
+        sess.downloadTask(with: url).resume()
+    }
+
+    private func cancelDownload() {
+        session?.invalidateAndCancel(); session = nil; downloadingName = nil
+    }
+
+    func urlSession(_ s: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData _: Int64, totalBytesWritten w: Int64, totalBytesExpectedToWrite t: Int64) {
+        guard s === session, t > 0 else { return }
+        let p = Double(w) / Double(t)
+        DispatchQueue.main.async { self.onProgress?(p) }
+    }
+
+    func urlSession(_ s: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo loc: URL) {
+        guard s === session, let name = downloadingName else { return }
+        let sp = WhisperCatalog.spec(name)
+        let size = fileBytes(loc)                       // temp file is deleted after we return — move now
+        guard size >= sp.minBytes else {
+            elog("model: \(name) downloaded too small (\(size) bytes) — discarding"); finish(ok: false); return
+        }
+        let dst = path(for: sp)
+        do {
+            try? FileManager.default.removeItem(at: dst)
+            try FileManager.default.moveItem(at: loc, to: dst)
+            elog("model: ready → \(dst.path) (\(size) bytes)")
+            finish(ok: true)
+        } catch { elog("model: move failed \(error)"); finish(ok: false) }
+    }
+
+    func urlSession(_ s: URLSession, task: URLSessionTask, didCompleteWithError err: Error?) {
+        guard s === session else { return }   // ignore callbacks from a cancelled (switched) session
+        if let err = err { elog("model: download failed \(err)"); finish(ok: false) }
+    }
+
+    private func finish(ok: Bool) {
+        downloadingName = nil
+        session?.finishTasksAndInvalidate(); session = nil
+        DispatchQueue.main.async { self.onProgress?(ok ? 1.0 : -1) }
     }
 }
 
@@ -380,11 +530,11 @@ struct EngineConfig {
             transcriptsDir: tdir,
             audioDir: tdir.appendingPathComponent("audio"),
             workDir: URL(fileURLWithPath: Pref.str("workDir", "MR_WORK_DIR", "/tmp/meeting-recorder-segments")),
-            whisperCli: Pref.str("whisperCli", "MR_WHISPER_CLI", "/opt/homebrew/bin/whisper-cli"),
-            whisperModel: Pref.str("whisperModel", "MR_WHISPER_GGML",
-                                   home.appendingPathComponent("whisper-models/ggml-large-v3-turbo.bin").path),
+            // Defaults prefer what's bundled in the .app (self-contained); env/UserDefaults still override.
+            whisperCli: Pref.str("whisperCli", "MR_WHISPER_CLI", BundledTools.whisperCli ?? "/opt/homebrew/bin/whisper-cli"),
+            whisperModel: Pref.str("whisperModel", "MR_WHISPER_GGML", ModelStore.shared.resolvedModelPath),
             vadModel: Pref.str("vadModel", "MR_VAD_MODEL",
-                               home.appendingPathComponent("whisper-models/ggml-silero-v5.1.2.bin").path),
+                               BundledTools.vadModel ?? home.appendingPathComponent("whisper-models/ggml-silero-v5.1.2.bin").path),
             vadEnabled: Pref.bool(Pref.vad, "MR_VAD", true),
             useCalendarTitles: Pref.bool(Pref.cal, "MR_CALENDAR_TITLES", true),
             whisperLang: Pref.str(Pref.lang, "MR_WHISPER_LANG", "auto"),
@@ -813,6 +963,12 @@ final class RecordingEngine {
             onSegmentResult?("No speech — skipped")
             return
         }
+        // Model not downloaded yet (first run) — defer rather than write a "전사 실패" file.
+        guard FileManager.default.fileExists(atPath: cfg.whisperModel) else {
+            elog("engine:   → model not ready (\(cfg.whisperModel)) — deferring transcription")
+            onSegmentResult?("Downloading model — transcription deferred")
+            return
+        }
         onSegmentResult?("Transcribing…")
         guard let (mixed, text) = Transcriber.transcribe(seg, cfg: cfg) else { return }
         do {
@@ -883,6 +1039,7 @@ final class RecordingEngine {
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let onSave: () -> Void
     private let segPopup = NSPopUpButton(), langPopup = NSPopUpButton()
+    private let modelPopup = NSPopUpButton()
     private let audioRetPopup = NSPopUpButton(), txtRetPopup = NSPopUpButton()
     private let addAppPopup = NSPopUpButton()
     private let voiceField = NSTextField(), dirField = NSTextField()
@@ -894,6 +1051,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private let segValues = [900, 1800, 3600, 7200], segTitles = ["15 min", "30 min", "1 hour", "2 hours"]
     private let langValues = ["auto", "ko", "ja", "en"], langTitles = ["Auto-detect", "Korean", "Japanese", "English"]
+    private let modelNames = WhisperCatalog.all.map { $0.name }   // popup order matches WhisperCatalog.all
     private let retValues = [7, 30, 90, 0], retTitles = ["7 days", "30 days", "90 days", "Unlimited"]
 
     init(onSave: @escaping () -> Void) {
@@ -914,6 +1072,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func buildForm() {
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
+        modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
         for f in [voiceField, dirField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
@@ -931,6 +1090,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let grid = NSGridView(views: [
             [labeled("Segment length (on the hour):"), segPopup],
             [labeled("Transcription language:"), langPopup],
+            [labeled("Transcription model:"), modelPopup],
             [labeled("Min. speech (sec):"), voiceField],
             [labeled(""), vadBtn],
             [labeled(""), calBtn],
@@ -996,6 +1156,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let c = EngineConfig.load()
         segPopup.selectItem(at: idx(Int(c.segmentSeconds), segValues))
         langPopup.selectItem(at: idx(c.whisperLang, langValues))
+        modelPopup.selectItem(at: idx(WhisperCatalog.selected.name, modelNames))
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
         calBtn.state = c.useCalendarTitles ? .on : .off
@@ -1015,6 +1176,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let d = Pref.d
         d.set(Double(segValues[max(0, segPopup.indexOfSelectedItem)]), forKey: Pref.segment)
         d.set(langValues[max(0, langPopup.indexOfSelectedItem)], forKey: Pref.lang)
+        d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(calBtn.state == .on, forKey: Pref.cal)
@@ -1038,6 +1200,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusLine: NSMenuItem!
     private var levelItem: NSMenuItem!
     private var lastSavedLine: NSMenuItem!
+    private var modelLine: NSMenuItem!
     private var toggleItem: NSMenuItem!
     private var paused = false
     private var settingsWC: SettingsWindowController?
@@ -1059,6 +1222,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             forName: .init("com.ikhoon.MeetingRecorder.openMenu"), object: nil, queue: .main
         ) { [weak self] _ in self?.openMenu() }
         CalendarLookup.requestAccess()   // one-time Calendar prompt (for titling transcripts)
+        setupModelDownload()             // first-run: fetch the large model, show progress in the menu
         startEngine()
         installStopHandler { [weak self] in
             if let eng = self?.engine {
@@ -1095,7 +1259,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusLine = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: ""); statusLine.isEnabled = false
         levelItem = NSMenuItem(title: "🎤 —   🔊 —", action: nil, keyEquivalent: ""); levelItem.isEnabled = false
         lastSavedLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); lastSavedLine.isEnabled = false; lastSavedLine.isHidden = true
-        menu.addItem(statusLine); menu.addItem(levelItem); menu.addItem(lastSavedLine)
+        modelLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); modelLine.isEnabled = false; modelLine.isHidden = true
+        menu.addItem(statusLine); menu.addItem(levelItem); menu.addItem(lastSavedLine); menu.addItem(modelLine)
         menu.addItem(.separator())
         // Custom-view button so clicking it does NOT dismiss the menu — you can watch the live
         // meter + status update in place while it transcribes.
@@ -1140,6 +1305,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refresh(_ status: String) {
         statusLine?.title = status
         toggleItem?.title = paused ? "Resume" : "Pause"
+    }
+
+    /// First-run model download (the large model is too big to bundle). Surfaces progress in the menu;
+    /// the engine transcribes automatically once the file lands (it re-checks per segment).
+    private func setupModelDownload() {
+        ModelStore.shared.onProgress = { [weak self] p in
+            guard let self = self else { return }
+            if p >= 1.0 {
+                self.modelLine.title = "✓ Model ready"; self.modelLine.isHidden = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.modelLine.isHidden = true }
+            } else if p < 0 {
+                self.modelLine.title = "⚠ Model download failed — retries on restart"; self.modelLine.isHidden = false
+            } else {
+                self.modelLine.title = String(format: "⤓ Downloading model… %.0f%%", p * 100); self.modelLine.isHidden = false
+            }
+        }
+        if ModelStore.shared.isReady {
+            modelLine.isHidden = true
+        } else {
+            modelLine.title = "⤓ Preparing model…"; modelLine.isHidden = false
+        }
+        ModelStore.shared.ensure()
     }
 
     private func startEngine() {
@@ -1188,6 +1375,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func restartEngine() {
         refresh("Applying settings…")
+        setupModelDownload()   // a newly-selected model starts downloading (if not already present)
         let old = engine; engine = nil; paused = false
         Task {
             if let old = old { await old.stop() }
@@ -1265,6 +1453,10 @@ struct Main {
             print("suite=\(Pref.suiteName)")
             print("segmentSeconds=\(Int(c.segmentSeconds)) voiceMin=\(Int(c.voiceMinSeconds)) lang=\(c.whisperLang) vad=\(c.vadEnabled) keepAudio=\(c.keepAudio) audioRetDays=\(c.audioRetentionDays) txtRetDays=\(c.transcriptRetentionDays)")
             print("exclude=\(c.excludeBundleIds) transcriptsDir=\(c.transcriptsDir.path)")
+            print("model=\(WhisperCatalog.selected.name) ready=\(ModelStore.shared.isReady)")
+            print("whisperCli=\(c.whisperCli)")
+            print("whisperModel=\(c.whisperModel)")
+            print("vadModel=\(c.vadModel)")
             exit(0)
         }
 
@@ -1307,6 +1499,7 @@ struct Main {
 
         // Subcommand: engine — continuous capture, hourly rotation, mic-gated transcription (headless).
         if args.first == "engine" {
+            ModelStore.shared.ensure()   // first-run model download (headless; progress goes to the log)
             let engine = RecordingEngine(cfg: EngineConfig.load())
             do { try await engine.start() } catch { elog("engine: \(error)"); exit(3) }
             installStopHandler {
