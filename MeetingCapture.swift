@@ -280,6 +280,48 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
+// MARK: - default-output guard
+//
+// Starting an AVCaptureSession with an audio input (and, on some macOS versions, (re)building the
+// ScreenCaptureKit audio stream) resets the system's DEFAULT OUTPUT device to the built-in speakers
+// as a side effect — so you suddenly "can't hear" your meeting. We never want to touch the output,
+// so we snapshot it before (re)starting capture and restore it right after (and a few more times
+// over the next ~2s, since the route change can land asynchronously after startRunning() returns).
+
+func defaultOutputDeviceID() -> AudioDeviceID {
+    var id = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
+    return id
+}
+
+func setDefaultOutputDeviceID(_ id: AudioDeviceID) {
+    guard id != 0 else { return }
+    var dev = id
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil,
+                               UInt32(MemoryLayout<AudioDeviceID>.size), &dev)
+}
+
+/// Restore `saved` as the default output if capture changed it — now and again over the next ~2s.
+func restoreOutputDevice(_ saved: AudioDeviceID) {
+    guard saved != 0 else { return }
+    func fix() {
+        let now = defaultOutputDeviceID()
+        if now != saved {
+            elog("audio: capture changed default output (\(now)) → restoring user device (\(saved))")
+            setDefaultOutputDeviceID(saved)
+        }
+    }
+    fix()
+    for d in [0.25, 0.75, 1.5, 2.5] { DispatchQueue.global().asyncAfter(deadline: .now() + d) { fix() } }
+}
+
 // MARK: - microphone capture (separate AVCaptureSession — does NOT touch the output device)
 
 final class MicCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
@@ -593,11 +635,13 @@ final class CaptureSession {
     }
 
     func start() async throws {
+        let savedOut = defaultOutputDeviceID()   // capture can hijack the default output — restore it after
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
         segStart = Date()
         try openWriters(segStart)
         try await buildStream()
         try mic.start(into: rec)   // separate mic path (AVCaptureSession) — does not touch output
+        restoreOutputDevice(savedOut)
     }
 
     /// Build & start the system-audio SCStream, re-acquiring the current display. Used by start()
@@ -628,9 +672,10 @@ final class CaptureSession {
     /// Rebuild the system-audio stream after it died (display sleep). Keeps the current writers + mic
     /// running, so the in-progress segment just resumes capturing system audio. Returns success.
     func restartStream() async -> Bool {
+        let savedOut = defaultOutputDeviceID()
         if let s = stream { try? await s.stopCapture() }
         stream = nil
-        do { try await buildStream(); try mic.start(into: rec); return true }   // resume mic too
+        do { try await buildStream(); try mic.start(into: rec); restoreOutputDevice(savedOut); return true }   // resume mic too
         catch { return false }
     }
 
