@@ -12,7 +12,7 @@ export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
 : ${OUTPUT_ROOT:="$HOME/src/LINE/work"}        # ← 회의록이 저장될 DB (분리된 출력 대상)
 
 # --- 캡처/전사 바이너리 ---
-: ${INSTALL_APP:="/Applications/Amanu.app"}   # 설치(실행) 위치 — Finder/Applications에 노출 (표시명 Amanu)
+: ${INSTALL_APP:="/Applications/macrec.app"}   # 설치(실행) 위치 — Finder/Applications에 노출 (표시명 macrec)
 : ${CAPTURE:="$INSTALL_APP/Contents/MacOS/meeting-capture"}  # 캡처 바이너리(.app 내부 = 안정적 TCC 정체)
 : ${BUNDLE_ID:="com.ikhoon.meeting-capture"}   # 고정 — 절대 바꾸지 말 것 (TCC DR의 identifier)
 : ${SIGN_ID:="MeetingCaptureSign"}             # 코드서명 인증서 이름 (make-signing-cert.sh가 생성)

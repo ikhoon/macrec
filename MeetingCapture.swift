@@ -1182,7 +1182,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         self.onSave = onSave
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 580),
                          styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        w.title = "Amanu — Settings"
+        w.title = "macrec — Settings"
         super.init(window: w)
         w.delegate = self
         buildForm()
@@ -1437,8 +1437,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let fallback = recording ? "waveform" : "pause"
         // Fixed point size so the menu-bar icon never resizes (independent of which symbol).
         let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
-        let img = (NSImage(systemSymbolName: primary, accessibilityDescription: "Amanu")
-            ?? NSImage(systemSymbolName: fallback, accessibilityDescription: "Amanu"))?
+        let img = (NSImage(systemSymbolName: primary, accessibilityDescription: "macrec")
+            ?? NSImage(systemSymbolName: fallback, accessibilityDescription: "macrec"))?
             .withSymbolConfiguration(cfg)
         img?.isTemplate = true
         statusItem.button?.image = img

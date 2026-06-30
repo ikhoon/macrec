@@ -1,12 +1,12 @@
-# Amanu
+# macrec
 
-> *amanuensis* — one who writes down what is dictated.
+> Always-on macOS meeting recorder — `mac` + `rec`, a sibling of `maccal` / `macmail`.
 
 An always-on macOS **menu-bar app** (with a CLI) that continuously records your **microphone + system audio**, splits the day into **hourly segments**, and **transcribes** the hours that actually contain speech using `whisper.cpp` with **Voice Activity Detection**. Transcripts land as timestamped Markdown in a folder you choose.
 
 Meeting boundaries are intentionally *not* detected — you get clean hourly transcripts and let an LLM segment/curate them later.
 
-> The repo/dir is still `meeting-recorder` and internal identifiers (bundle id `com.ikhoon.meeting-capture`, the executable `meeting-capture`) are unchanged — only the **product name** is Amanu.
+> The repo/dir is still `meeting-recorder` and internal identifiers (bundle id `com.ikhoon.meeting-capture`, the executable `meeting-capture`) are unchanged — only the **product name** is macrec.
 
 ## How it works
 
@@ -37,7 +37,7 @@ There are two paths — pick one.
 
 ### A) Download the app (self-contained, no Homebrew)
 
-Grab **`Amanu.zip`**, unzip, drag **`Amanu.app`** to `/Applications`, and launch it.
+Grab **`macrec.zip`**, unzip, drag **`macrec.app`** to `/Applications`, and launch it.
 
 - The app **bundles a self-contained `whisper-cli`** (built static, Metal embedded — no `/opt/homebrew` dependency) and the **silero VAD** model.
 - On first run it **downloads the transcription model** (default *Large v3 Turbo*, ~1.6 GB) to `~/Library/Application Support/MeetingRecorder/models/`; the menu shows `⤓ Downloading model… %`. You can change the model in Settings (see below).
@@ -53,7 +53,7 @@ cd ~/src/meeting-recorder
 
 `install.sh` will:
 1. create a **stable self-signed code-signing certificate** once (`make-signing-cert.sh`),
-2. build `MeetingCapture.swift` → `Amanu.app`,
+2. build `MeetingCapture.swift` → `macrec.app`,
 3. **sign it with that cert** (so TCC permissions survive every rebuild — see below),
 4. install a per-user **LaunchAgent** that launches the app at login (with `KeepAlive`).
 
@@ -62,17 +62,17 @@ cd ~/src/meeting-recorder
 ### Building a distributable
 
 ```bash
-./package.sh        # → dist/Amanu.zip
+./package.sh        # → dist/macrec.zip
 ```
 
-`package.sh` builds `whisper.cpp` from source **static** (`BUILD_SHARED_LIBS=OFF`, `GGML_BACKEND_DL=OFF`, Metal embedded) so the bundled `whisper-cli` has **zero `/opt/homebrew` dependencies**, bundles it + the VAD model into a self-signed `Amanu.app`, and zips it. Needs Xcode Command Line Tools (`swiftc`/`cmake`) on the build machine; the resulting app needs **neither Homebrew nor a pre-installed model** on the target.
+`package.sh` builds `whisper.cpp` from source **static** (`BUILD_SHARED_LIBS=OFF`, `GGML_BACKEND_DL=OFF`, Metal embedded) so the bundled `whisper-cli` has **zero `/opt/homebrew` dependencies**, bundles it + the VAD model into a self-signed `macrec.app`, and zips it. Needs Xcode Command Line Tools (`swiftc`/`cmake`) on the build machine; the resulting app needs **neither Homebrew nor a pre-installed model** on the target.
 
 ### One-time permissions
 
 Grant these once in **System Settings → Privacy & Security**:
 - **Screen & System Audio Recording** → enable `meeting-capture`
 - **Microphone** → enable `meeting-capture`
-- **Calendar** → enable `Amanu` (to title transcripts from meeting events)
+- **Calendar** → enable `macrec` (to title transcripts from meeting events)
 
 > Why Screen Recording for an audio tool? macOS only exposes **system-audio capture** through ScreenCaptureKit, which is gated by that permission. No screen content is recorded — the capture uses a throwaway 2×2-pixel video stream and writes audio only.
 
@@ -111,7 +111,7 @@ Power users / headless runs can override any setting via `MR_*` environment vari
 The same binary is a CLI:
 
 ```bash
-APP=/Applications/Amanu.app/Contents/MacOS/meeting-capture
+APP=/Applications/macrec.app/Contents/MacOS/meeting-capture
 $APP mic-status          # 1 if the default input device is in use
 $APP perm-status         # 1 if Screen Recording + Microphone are granted
 $APP config              # print resolved settings (model, paths, loginItem status)
@@ -125,8 +125,8 @@ $APP engine              # run the continuous engine headless (no menu bar)
 | File | Role |
 |---|---|
 | `MeetingCapture.swift` | the whole app: capture engine, model store, transcriber, menu-bar UI, settings, login item, CLI |
-| `install.sh` | build + sign + install to `/Applications/Amanu.app` + LaunchAgent (dev machine) |
-| `package.sh` | build static `whisper-cli` + bundle into a self-contained, self-signed `Amanu.app` → `dist/Amanu.zip` |
+| `install.sh` | build + sign + install to `/Applications/macrec.app` + LaunchAgent (dev machine) |
+| `package.sh` | build static `whisper-cli` + bundle into a self-contained, self-signed `macrec.app` → `dist/macrec.zip` |
 | `make-signing-cert.sh` | create the stable self-signed signing certificate (once) |
 | `config.sh` | defaults that seed the LaunchAgent's `MR_*` environment |
 | `make-icon.swift` | generate the colorful app icon |

@@ -37,8 +37,8 @@ cat > "$STAGE/Contents/Info.plist" <<EOF
 <plist version="1.0">
 <dict>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
-  <key>CFBundleName</key><string>Amanu</string>
-  <key>CFBundleDisplayName</key><string>Amanu</string>
+  <key>CFBundleName</key><string>macrec</string>
+  <key>CFBundleDisplayName</key><string>macrec</string>
   <key>CFBundleExecutable</key><string>meeting-capture</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
@@ -58,7 +58,7 @@ codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$STAGE_BIN"
 codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$STAGE"
 
 echo "▸ installing → $INSTALL_APP …"
-rm -rf /Applications/MeetingRecorder.app 2>/dev/null   # remove the pre-rename app if present
+rm -rf /Applications/MeetingRecorder.app /Applications/Amanu.app 2>/dev/null   # remove pre-rename apps
 rm -rf "$INSTALL_APP"
 cp -R "$STAGE" "$INSTALL_APP"
 codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$INSTALL_APP/Contents/MacOS/meeting-capture"
@@ -118,13 +118,13 @@ launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null \
   || { sleep 2; launchctl bootstrap "$DOMAIN" "$PLIST"; }
 
 echo
-echo "✅ installed → $INSTALL_APP  (Finder/Launchpad에 'Amanu'로 노출, 클릭하면 트레이 메뉴)"
+echo "✅ installed → $INSTALL_APP  (Finder/Launchpad에 'macrec'로 노출, 클릭하면 트레이 메뉴)"
 echo "   연속 녹음(${SEGMENT_SECONDS}s 회전) → 발화 있는 시간만 전사 (화자: 나/상대)."
 echo "   전사 출력: $TRANSCRIPTS_DIR"
 echo
 echo "👉 권한:"
 echo "   • Screen & System Audio Recording + Microphone → 'meeting-capture' 허용 (기존 유지)"
-echo "   • Calendar → 'Amanu' 허용 (신규 — 일정 제목으로 transcript 제목 붙이기)"
+echo "   • Calendar → 'macrec' 허용 (신규 — 일정 제목으로 transcript 제목 붙이기)"
 echo "   허용 뒤 재시작:   launchctl kickstart -k $DOMAIN/$LABEL"
 echo
 echo "📋 Live log:  tail -f \"$LOGFILE\""
