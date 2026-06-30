@@ -101,7 +101,8 @@ cat > "$PLIST" <<EOF
     <key>MR_CALENDAR_TITLES</key><string>true</string>
   </dict>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <!-- relaunch only on a crash (non-zero exit); a deliberate Quit from the menu stays quit -->
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>StandardOutPath</key><string>$LOGFILE</string>
   <key>StandardErrorPath</key><string>$LOGFILE</string>
 </dict>

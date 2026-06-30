@@ -284,9 +284,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 //
 // Starting an AVCaptureSession with an audio input (and, on some macOS versions, (re)building the
 // ScreenCaptureKit audio stream) resets the system's DEFAULT OUTPUT device to the built-in speakers
-// as a side effect — so you suddenly "can't hear" your meeting. We never want to touch the output,
-// so we snapshot it before (re)starting capture and restore it right after (and a few more times
-// over the next ~2s, since the route change can land asynchronously after startRunning() returns).
+// as a side effect — so you suddenly "can't hear" your meeting. OutputKeeper (below) remembers the
+// user's preferred output while it's known-good and re-pins it for a window after each capture
+// transition, so the chosen device sticks across sleep/wake and restarts.
 
 func defaultOutputDeviceID() -> AudioDeviceID {
     var id = AudioDeviceID(0)
@@ -308,18 +308,89 @@ func setDefaultOutputDeviceID(_ id: AudioDeviceID) {
                                UInt32(MemoryLayout<AudioDeviceID>.size), &dev)
 }
 
-/// Restore `saved` as the default output if capture changed it — now and again over the next ~2s.
-func restoreOutputDevice(_ saved: AudioDeviceID) {
-    guard saved != 0 else { return }
-    func fix() {
-        let now = defaultOutputDeviceID()
-        if now != saved {
-            elog("audio: capture changed default output (\(now)) → restoring user device (\(saved))")
-            setDefaultOutputDeviceID(saved)
+/// Device UID — stable across reboots/replug (unlike the volatile AudioDeviceID).
+func outputDeviceUID(_ id: AudioDeviceID) -> String? {
+    guard id != 0 else { return nil }
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    var cf = "" as CFString
+    var size = UInt32(MemoryLayout<CFString>.size)
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &cf) == noErr else { return nil }
+    let s = cf as String
+    return s.isEmpty ? nil : s
+}
+
+/// Find an output-capable device by its UID.
+func outputDevice(forUID uid: String) -> AudioDeviceID? {
+    var size = UInt32(0)
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size)
+    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids)
+    return ids.first { outputDeviceUID($0) == uid }
+}
+
+/// Keeps the user's preferred OUTPUT device pinned across capture (re)starts and sleep/wake.
+///
+/// macOS resets the default output to the built-in speakers around sleep/wake (and capture restart),
+/// so audio stops coming out of the chosen device. A "snapshot at restart" is too late — by then the
+/// output is already reset. Instead we REMEMBER the preferred device while it's known-good (before
+/// sleep, and during steady-state use) and ENFORCE it for a window after each capture transition via
+/// a CoreAudio listener — while still honoring a deliberate user switch made during normal use.
+final class OutputKeeper {
+    static let shared = OutputKeeper()
+    private let key = "preferredOutputUID"
+    private var enforceUntil = Date.distantPast
+    private var listening = false
+
+    private var preferredUID: String? {
+        get { Pref.d.string(forKey: key) }
+        set { if let v = newValue { Pref.d.set(v, forKey: key) } }
+    }
+
+    /// Record the current output as preferred — call when it's known-good (engine start w/o a stored
+    /// preference, before sleep, and on deliberate steady-state changes).
+    func rememberCurrentAsPreferred() {
+        if let u = outputDeviceUID(defaultOutputDeviceID()) {
+            if preferredUID != u { elog("audio: preferred output = \(u)") }
+            preferredUID = u
         }
     }
-    fix()
-    for d in [0.25, 0.75, 1.5, 2.5] { DispatchQueue.global().asyncAfter(deadline: .now() + d) { fix() } }
+
+    /// A capture (re)start / wake happened — enforce the preferred device for ~30s (the reset can land
+    /// several seconds late) and make sure the change listener is installed.
+    func onCaptureStarted() {
+        if preferredUID == nil { rememberCurrentAsPreferred() }   // bootstrap on first run
+        enforceUntil = Date().addingTimeInterval(30)
+        startListening()
+        let fix: () -> Void = { [weak self] in self?.enforce() }
+        fix()
+        for d in [0.3, 1, 2, 4, 8, 15] { DispatchQueue.global().asyncAfter(deadline: .now() + d, execute: fix) }
+    }
+
+    private func enforce() {
+        guard Date() < enforceUntil, let want = preferredUID else { return }
+        if outputDeviceUID(defaultOutputDeviceID()) != want, let dev = outputDevice(forUID: want) {
+            elog("audio: output hijacked → restoring preferred \(want)")
+            setDefaultOutputDeviceID(dev)
+        }
+    }
+
+    private func startListening() {
+        guard !listening else { return }
+        listening = true
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, DispatchQueue.global()) { [weak self] _, _ in
+            guard let self = self else { return }
+            if Date() < self.enforceUntil { self.enforce() }          // within a transition → undo hijack
+            else { self.rememberCurrentAsPreferred() }                // steady state → adopt user's choice
+        }
+    }
 }
 
 // MARK: - microphone capture (separate AVCaptureSession — does NOT touch the output device)
@@ -635,13 +706,12 @@ final class CaptureSession {
     }
 
     func start() async throws {
-        let savedOut = defaultOutputDeviceID()   // capture can hijack the default output — restore it after
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
         segStart = Date()
         try openWriters(segStart)
         try await buildStream()
         try mic.start(into: rec)   // separate mic path (AVCaptureSession) — does not touch output
-        restoreOutputDevice(savedOut)
+        OutputKeeper.shared.onCaptureStarted()   // re-pin the user's preferred output through the (re)start
     }
 
     /// Build & start the system-audio SCStream, re-acquiring the current display. Used by start()
@@ -672,15 +742,15 @@ final class CaptureSession {
     /// Rebuild the system-audio stream after it died (display sleep). Keeps the current writers + mic
     /// running, so the in-progress segment just resumes capturing system audio. Returns success.
     func restartStream() async -> Bool {
-        let savedOut = defaultOutputDeviceID()
         if let s = stream { try? await s.stopCapture() }
         stream = nil
-        do { try await buildStream(); try mic.start(into: rec); restoreOutputDevice(savedOut); return true }   // resume mic too
+        do { try await buildStream(); try mic.start(into: rec); OutputKeeper.shared.onCaptureStarted(); return true }   // resume mic too
         catch { return false }
     }
 
     /// Pause capture (mic + system audio) on lock/sleep — release the audio + display cleanly.
     func suspendStream() async {
+        OutputKeeper.shared.rememberCurrentAsPreferred()   // output is still good before we tear down for sleep
         mic.stop()
         if let s = stream { try? await s.stopCapture() }
         stream = nil
