@@ -441,6 +441,7 @@ enum Pref {
     static let exclude = "excludeApps", txtDir = "transcriptsDir", vad = "vadEnabled", autoStart = "autoStart"
     static let cal = "useCalendarTitles", model = "whisperModelName"
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
+    static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
 
     static func dbl(_ key: String, _ env: String, _ def: Double) -> Double {
         if d.object(forKey: key) != nil { return d.double(forKey: key) }
@@ -711,7 +712,6 @@ final class CaptureSession {
         try openWriters(segStart)
         try await buildStream()
         try mic.start(into: rec)   // separate mic path (AVCaptureSession) — does not touch output
-        OutputKeeper.shared.onCaptureStarted()   // re-pin the user's preferred output through the (re)start
     }
 
     /// Build & start the system-audio SCStream, re-acquiring the current display. Used by start()
@@ -719,6 +719,12 @@ final class CaptureSession {
     /// NB: no captureMicrophone / no forced sampleRate — capturing system audio AND mic through SCK
     /// (or forcing a device format) makes macOS build an aggregate device and hijack the output.
     private func buildStream() async throws {
+        // Mic-only fallback: skip system-audio (SCK) capture entirely so nothing competes with
+        // SoundSource / other audio tools for the system audio path.
+        guard Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) else {
+            elog("engine: system-audio capture OFF (mic-only) — coexists with SoundSource etc.")
+            return
+        }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         guard let display = content.displays.first else {
             throw NSError(domain: "meeting-capture", code: 1, userInfo: [NSLocalizedDescriptionKey: "no display for SCContentFilter"])
@@ -744,13 +750,12 @@ final class CaptureSession {
     func restartStream() async -> Bool {
         if let s = stream { try? await s.stopCapture() }
         stream = nil
-        do { try await buildStream(); try mic.start(into: rec); OutputKeeper.shared.onCaptureStarted(); return true }   // resume mic too
+        do { try await buildStream(); try mic.start(into: rec); return true }   // resume mic too
         catch { return false }
     }
 
     /// Pause capture (mic + system audio) on lock/sleep — release the audio + display cleanly.
     func suspendStream() async {
-        OutputKeeper.shared.rememberCurrentAsPreferred()   // output is still good before we tear down for sleep
         mic.stop()
         if let s = stream { try? await s.stopCapture() }
         stream = nil
@@ -1165,6 +1170,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let vadBtn = NSButton(checkboxWithTitle: "Remove noise/silence (VAD)", target: nil, action: nil)
     private let calBtn = NSButton(checkboxWithTitle: "Title transcripts from calendar events", target: nil, action: nil)
     private let loginBtn = NSButton(checkboxWithTitle: "Start at login (24/7 recording)", target: nil, action: nil)
+    private let systemAudioBtn = NSButton(checkboxWithTitle: "Capture system audio (other participants)", target: nil, action: nil)
     private var runningAppIds: [String] = []
 
     private let segValues = [900, 1800, 3600, 7200], segTitles = ["15 min", "30 min", "1 hour", "2 hours"]
@@ -1211,6 +1217,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [labeled("Transcription model:"), modelPopup],
             [labeled("Min. speech (sec):"), voiceField],
             [labeled(""), vadBtn],
+            [labeled(""), systemAudioBtn],
             [labeled(""), calBtn],
             [labeled(""), loginBtn],
             [labeled(""), keepAudioBtn],
@@ -1278,6 +1285,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         modelPopup.selectItem(at: idx(WhisperCatalog.selected.name, modelNames))
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
+        systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
         calBtn.state = c.useCalendarTitles ? .on : .off
         keepAudioBtn.state = c.keepAudio ? .on : .off
         audioRetPopup.selectItem(at: idx(c.audioRetentionDays, retValues))
@@ -1311,6 +1319,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
+        d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
         d.set(calBtn.state == .on, forKey: Pref.cal)
         d.set(keepAudioBtn.state == .on, forKey: Pref.keepAudio)
         d.set(retValues[max(0, audioRetPopup.indexOfSelectedItem)], forKey: Pref.audioRetention)
