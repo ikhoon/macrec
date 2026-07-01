@@ -33,7 +33,23 @@ Design notes (each one is a bug we actually hit):
 
 ## Install
 
-There are two paths — pick one.
+Three paths — pick one.
+
+### Homebrew (recommended)
+
+```bash
+brew install ikhoon/tap/macrec
+```
+
+Then launch it and grant permissions (see [One-time permissions](#one-time-permissions)):
+
+```bash
+open "$(brew --prefix)/opt/macrec/macrec.app"      # menu-bar app
+macrec config                                       # the CLI is on your PATH too
+```
+
+Apple Silicon only. Installing via brew **avoids the Gatekeeper "Open Anyway" step** (Homebrew's
+download isn't quarantined). `brew upgrade` pulls new releases. First run downloads the model.
 
 ### A) Download the app (self-contained, no Homebrew)
 
