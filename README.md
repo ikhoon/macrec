@@ -100,7 +100,7 @@ Design notes (each one is a bug we actually hit):
 
 ## Settings (menu-bar → Settings…)
 
-Stored in `UserDefaults` (suite `com.ikhoon.macrec`); saving restarts the engine immediately.
+Stored in `UserDefaults` (suite `com.ikhoon.macrec.prefs`); saving restarts the engine immediately.
 
 | Setting | Default |
 |---|---|
