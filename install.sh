@@ -4,6 +4,7 @@
 # 산출물(회의록·오디오)은 config의 OUTPUT_ROOT(work 노트 DB)로 간다.
 set -e
 HERE="${0:A:h}"
+[[ -f "$HERE/config.sh" ]] || cp "$HERE/config.sh.example" "$HERE/config.sh"   # first run: seed per-machine config
 source "$HERE/config.sh"
 
 LABEL="com.ikhoon.meeting-recorder"

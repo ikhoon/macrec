@@ -117,6 +117,7 @@ Stored in `UserDefaults` (suite `com.ikhoon.MeetingRecorder`); saving restarts t
 | Keep transcripts for | Unlimited |
 | Excluded apps | `com.spotify.client` (add more — incl. pick from running apps) |
 | Save transcripts to | `~/Documents/macrec/transcripts` |
+| Save audio to | `~/Documents/macrec/audio` |
 
 Changing the model downloads the new one on demand (models coexist by filename, so switching back never re-downloads). Menu actions: **Transcribe now**, **Pause / Resume**, **Open transcripts folder**, **Quit**.
 
