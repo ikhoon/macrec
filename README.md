@@ -107,6 +107,7 @@ Stored in `UserDefaults` (suite `com.ikhoon.MeetingRecorder`); saving restarts t
 | Segment length (on the hour) | 1 hour (15 m / 30 m / 1 h / 2 h) |
 | Transcription language | Auto-detect |
 | **Transcription model** | Large v3 Turbo (turbo-q5_0 / large-v3 / medium / small / base / tiny) |
+| …or custom model (URL / path) | empty — overrides the picker (see below) |
 | Min. speech to transcribe | 5 s |
 | Remove noise/silence (VAD) | on |
 | Capture system audio (other participants) | on |
@@ -119,7 +120,7 @@ Stored in `UserDefaults` (suite `com.ikhoon.MeetingRecorder`); saving restarts t
 | Save transcripts to | `~/Documents/macrec/transcripts` |
 | Save audio to | `~/Documents/macrec/audio` |
 
-Transcripts are organized into monthly folders (`transcripts/YYYY-MM/`), audio into a separate root (`audio/YYYY-MM/`). Changing the model downloads the new one on demand (models coexist by filename, so switching back never re-downloads). Menu actions: **Transcribe now**, **Pause / Resume**, **Open transcripts folder**, **Quit**.
+Transcripts are organized into monthly folders (`transcripts/YYYY-MM/`), audio into a separate root (`audio/YYYY-MM/`). Changing the model downloads the new one on demand (models coexist by filename, so switching back never re-downloads). To use a model outside the built-in list, put an `http(s)` URL to a GGML `.bin` (downloaded to App Support) **or** a local file path (used as-is) in **…or custom model** — it overrides the picker. Menu actions: **Transcribe now**, **Pause / Resume**, **Open transcripts folder**, **Quit**.
 
 Power users / headless runs can override any setting via `MR_*` environment variables (e.g. `MR_WHISPER_MODEL`, `MR_MODEL_URL`, `MR_AUDIO_DIR`; precedence: UserDefaults → env → default).
 

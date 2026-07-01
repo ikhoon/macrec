@@ -443,6 +443,7 @@ enum Pref {
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
     static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
     static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
+    static let customModel = "customModelURL"           // custom model source (URL or local path) — overrides the popup
 
     static func dbl(_ key: String, _ env: String, _ def: Double) -> Double {
         if d.object(forKey: key) != nil { return d.double(forKey: key) }
@@ -493,9 +494,16 @@ struct WhisperModelSpec {
     let name: String        // stable id stored in prefs (e.g. "large-v3-turbo")
     let filename: String    // ggml-<…>.bin on HuggingFace
     let label: String       // shown in the Settings popup
-    let bytes: Int64        // verified size; download threshold = bytes/2 (rejects partials / HTML error pages)
-    var url: String { "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(filename)" }
-    var minBytes: Int64 { bytes / 2 }
+    let url: String         // download URL — empty means `filename` is a local absolute path (no download)
+    let minBytes: Int64     // reject a download smaller than this (partials / HTML error pages)
+    // Catalog entries pass `bytes` (verified size → minBytes = bytes/2) and get the ggerganov URL;
+    // a custom model overrides `url`/`minBytes` explicitly.
+    init(name: String, filename: String, label: String, bytes: Int64,
+         url: String? = nil, minBytes: Int64? = nil) {
+        self.name = name; self.filename = filename; self.label = label
+        self.url = url ?? "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(filename)"
+        self.minBytes = minBytes ?? bytes / 2
+    }
 }
 
 /// Curated, verified set of selectable models (best multilingual ko/ja/en picks first).
@@ -513,8 +521,26 @@ enum WhisperCatalog {
     static func spec(_ name: String) -> WhisperModelSpec {
         all.first { $0.name == name } ?? all.first { $0.name == defaultName }!
     }
-    /// Currently selected model (UserDefaults > env > default).
-    static var selected: WhisperModelSpec { spec(Pref.str(Pref.model, "MR_WHISPER_MODEL", defaultName)) }
+    /// Currently selected model. A non-empty custom source (Settings field / MR_MODEL_URL) — a URL or
+    /// a local file path — overrides the catalog pick.
+    static var selected: WhisperModelSpec {
+        let custom = Pref.str(Pref.customModel, "MR_MODEL_URL", "").trimmingCharacters(in: .whitespaces)
+        if !custom.isEmpty { return customSpec(custom) }
+        return spec(Pref.str(Pref.model, "MR_WHISPER_MODEL", defaultName))
+    }
+
+    /// Build a spec from a custom source: an http(s) URL → download; anything else → local file path.
+    static func customSpec(_ src: String) -> WhisperModelSpec {
+        if src.hasPrefix("http://") || src.hasPrefix("https://") {
+            let base = URL(string: src)?.lastPathComponent ?? ""
+            let fname = base.isEmpty ? "custom-model.bin" : base
+            return WhisperModelSpec(name: "custom", filename: fname, label: "Custom", bytes: 0,
+                                    url: src, minBytes: 1_000_000)   // ≥1MB to reject HTML/404 pages
+        }
+        let abs = (src as NSString).expandingTildeInPath
+        return WhisperModelSpec(name: "custom", filename: abs, label: "Custom", bytes: 0,
+                                url: "", minBytes: 1)                // local file: exists (≥1 byte)
+    }
 }
 
 /// Downloads the selected transcription model on first run / on change (too big to bundle).
@@ -526,13 +552,16 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
     /// Download progress: 0...1 while running, 1.0 done, <0 failed. Delivered on the main queue.
     var onProgress: ((Double) -> Void)?
     private var session: URLSession?
-    private var downloadingName: String?      // name of the model currently downloading (nil = idle)
+    private var downloadingSpec: WhisperModelSpec?   // spec currently downloading (nil = idle)
 
     var dir: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MeetingRecorder/models", isDirectory: true)
     }
-    func path(for s: WhisperModelSpec) -> URL { dir.appendingPathComponent(s.filename) }
+    func path(for s: WhisperModelSpec) -> URL {
+        s.filename.hasPrefix("/") ? URL(fileURLWithPath: s.filename)   // custom local file (absolute path)
+                                  : dir.appendingPathComponent(s.filename)
+    }
     func isReady(_ s: WhisperModelSpec) -> Bool { fileBytes(path(for: s)) >= s.minBytes }
 
     /// The currently-selected model.
@@ -543,7 +572,7 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
     /// ~/whisper-models copy, else the (not-yet-filled) App Support path so the download lands there.
     var resolvedModelPath: String {
         let s = spec
-        if isReady(s) { return path(for: s).path }
+        if isReady(s) || s.url.isEmpty { return path(for: s).path }   // ready, or a local custom file
         let dev = devPath(s)
         if fileBytes(dev) >= s.minBytes { return dev.path }
         return path(for: s).path
@@ -560,25 +589,25 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
     /// Download the current selection if missing. Idempotent; re-targets if the selection changed.
     func ensure() {
         let s = spec
-        if isReady(s) || fileBytes(devPath(s)) >= s.minBytes {   // already available locally
-            if downloadingName != nil { cancelDownload() }
+        // Local custom file (empty url) or already-present model → nothing to download.
+        if s.url.isEmpty || isReady(s) || fileBytes(devPath(s)) >= s.minBytes {
+            if downloadingSpec != nil { cancelDownload() }
             return
         }
-        if downloadingName == s.name { return }                   // already fetching this one
-        if downloadingName != nil { cancelDownload() }            // switch download target
+        if downloadingSpec?.url == s.url { return }               // already fetching this exact source
+        if downloadingSpec != nil { cancelDownload() }            // switch download target
 
-        downloadingName = s.name
+        downloadingSpec = s
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let urlStr = ProcessInfo.processInfo.environment["MR_MODEL_URL"] ?? s.url
-        guard let url = URL(string: urlStr) else { downloadingName = nil; return }
+        guard let url = URL(string: s.url) else { downloadingSpec = nil; return }
         let sess = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         session = sess
-        elog("model: downloading \(s.name) \(urlStr) → \(path(for: s).path)")
+        elog("model: downloading \(s.name) \(s.url) → \(path(for: s).path)")
         sess.downloadTask(with: url).resume()
     }
 
     private func cancelDownload() {
-        session?.invalidateAndCancel(); session = nil; downloadingName = nil
+        session?.invalidateAndCancel(); session = nil; downloadingSpec = nil
     }
 
     func urlSession(_ s: URLSession, downloadTask: URLSessionDownloadTask,
@@ -589,11 +618,10 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
     }
 
     func urlSession(_ s: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo loc: URL) {
-        guard s === session, let name = downloadingName else { return }
-        let sp = WhisperCatalog.spec(name)
+        guard s === session, let sp = downloadingSpec else { return }
         let size = fileBytes(loc)                       // temp file is deleted after we return — move now
         guard size >= sp.minBytes else {
-            elog("model: \(name) downloaded too small (\(size) bytes) — discarding"); finish(ok: false); return
+            elog("model: \(sp.name) downloaded too small (\(size) bytes) — discarding"); finish(ok: false); return
         }
         let dst = path(for: sp)
         do {
@@ -610,7 +638,7 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
     }
 
     private func finish(ok: Bool) {
-        downloadingName = nil
+        downloadingSpec = nil
         session?.finishTasksAndInvalidate(); session = nil
         DispatchQueue.main.async { self.onProgress?(ok ? 1.0 : -1) }
     }
@@ -1187,6 +1215,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let audioRetPopup = NSPopUpButton(), txtRetPopup = NSPopUpButton()
     private let addAppPopup = NSPopUpButton()
     private let voiceField = NSTextField(), dirField = NSTextField(), audioDirField = NSTextField()
+    private let customModelField = NSTextField()   // custom model URL or local path (overrides the popup)
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
     private let keepAudioBtn = NSButton(checkboxWithTitle: "Keep audio (WAV) too", target: nil, action: nil)
     private let vadBtn = NSButton(checkboxWithTitle: "Remove noise/silence (VAD)", target: nil, action: nil)
@@ -1220,10 +1249,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
-        for f in [voiceField, dirField, audioDirField] { f.translatesAutoresizingMaskIntoConstraints = false }
+        for f in [voiceField, dirField, audioDirField, customModelField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
         dirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
         audioDirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
+        customModelField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        customModelField.placeholderString = "https://…/ggml-model.bin  or  /path/to/model.bin"
 
         excludeTokens.translatesAutoresizingMaskIntoConstraints = false
         excludeTokens.tokenizingCharacterSet = CharacterSet(charactersIn: ", ")
@@ -1240,6 +1271,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [labeled("Segment length (on the hour):"), segPopup],
             [labeled("Transcription language:"), langPopup],
             [labeled("Transcription model:"), modelPopup],
+            [labeled("…or custom model:"), customModelField],
             [labeled("Min. speech (sec):"), voiceField],
             [labeled(""), vadBtn],
             [labeled(""), systemAudioBtn],
@@ -1308,7 +1340,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let c = EngineConfig.load()
         segPopup.selectItem(at: idx(Int(c.segmentSeconds), segValues))
         langPopup.selectItem(at: idx(c.whisperLang, langValues))
-        modelPopup.selectItem(at: idx(WhisperCatalog.selected.name, modelNames))
+        modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
+        customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
         systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
@@ -1348,6 +1381,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(Double(segValues[max(0, segPopup.indexOfSelectedItem)]), forKey: Pref.segment)
         d.set(langValues[max(0, langPopup.indexOfSelectedItem)], forKey: Pref.lang)
         d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
+        d.set(customModelField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.customModel)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
