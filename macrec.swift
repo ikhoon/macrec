@@ -1,8 +1,8 @@
-// meeting-capture — record system audio (excluding self) + microphone, mix to 16kHz mono WAV.
+// macrec — record system audio (excluding self) + microphone, mix to 16kHz mono WAV.
 //
 // Usage:
-//   meeting-capture --out <path.wav> [--no-mic] [--duration <seconds>]
-//   meeting-capture mic-status        # prints "1" if the default input device is in use, else "0"
+//   macrec --out <path.wav> [--no-mic] [--duration <seconds>]
+//   macrec mic-status        # prints "1" if the default input device is in use, else "0"
 //
 // Stops on SIGINT/SIGTERM (or after --duration), mixes the two sources, prints the final
 // WAV path to stdout. All diagnostics go to stderr.
@@ -432,8 +432,8 @@ final class MicCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 enum Pref {
     // 전용 suite (bundle id와 '다른' 이름이어야 함 — suiteName==bundleID면 nil 반환).
     // launchd가 .app 내부 바이너리를 직접 exec할 때 .standard 도메인이 안 잡히는 문제를 우회.
-    // CLI에서 보려면: `defaults read com.ikhoon.MeetingRecorder`
-    static let suiteName = "com.ikhoon.MeetingRecorder"
+    // CLI에서 보려면: `defaults read com.ikhoon.macrec`
+    static let suiteName = "com.ikhoon.macrec"
     static let d = UserDefaults(suiteName: suiteName) ?? .standard
     // 키 상수 (설정 UI와 공유)
     static let segment = "segmentSeconds", voiceMin = "voiceMinSeconds", lang = "whisperLang"
@@ -544,7 +544,7 @@ enum WhisperCatalog {
 }
 
 /// Downloads the selected transcription model on first run / on change (too big to bundle).
-/// Stored under ~/Library/Application Support/MeetingRecorder/models/, keyed by filename so
+/// Stored under ~/Library/Application Support/macrec/models/, keyed by filename so
 /// multiple models coexist and switching back never re-downloads.
 final class ModelStore: NSObject, URLSessionDownloadDelegate {
     static let shared = ModelStore()
@@ -556,7 +556,7 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
 
     var dir: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("MeetingRecorder/models", isDirectory: true)
+            .appendingPathComponent("macrec/models", isDirectory: true)
     }
     func path(for s: WhisperModelSpec) -> URL {
         s.filename.hasPrefix("/") ? URL(fileURLWithPath: s.filename)   // custom local file (absolute path)
@@ -1411,7 +1411,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 enum LoginItem {
     /// The dev LaunchAgent (install.sh). When present, launchd owns autostart — not us.
     static var managedByLaunchAgent: Bool {
-        let p = ("~/Library/LaunchAgents/com.ikhoon.meeting-recorder.plist" as NSString).expandingTildeInPath
+        let p = ("~/Library/LaunchAgents/com.ikhoon.macrec.plist" as NSString).expandingTildeInPath
         return FileManager.default.fileExists(atPath: p)
     }
 
@@ -1471,17 +1471,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Single instance: if a copy is already running (the LaunchAgent one), just tell it to open
         // its menu and quit this launch — so clicking the app in /Applications opens the tray menu.
-        let bid = Bundle.main.bundleIdentifier ?? "com.ikhoon.meeting-capture"
+        let bid = Bundle.main.bundleIdentifier ?? "com.ikhoon.macrec"
         let others = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
             .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
         if !others.isEmpty {
             DistributedNotificationCenter.default().postNotificationName(
-                .init("com.ikhoon.MeetingRecorder.openMenu"), object: nil, deliverImmediately: true)
+                .init("com.ikhoon.macrec.openMenu"), object: nil, deliverImmediately: true)
             NSApp.terminate(nil); return
         }
         buildMenu()
         DistributedNotificationCenter.default().addObserver(
-            forName: .init("com.ikhoon.MeetingRecorder.openMenu"), object: nil, queue: .main
+            forName: .init("com.ikhoon.macrec.openMenu"), object: nil, queue: .main
         ) { [weak self] _ in self?.openMenu() }
         CalendarLookup.requestAccess()   // one-time Calendar prompt (for titling transcripts)
         setupModelDownload()             // first-run: fetch the large model, show progress in the menu

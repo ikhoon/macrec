@@ -73,12 +73,12 @@ if [[ ! -f "$HERE/AppIcon.icns" ]]; then
 fi
 
 # ── 5) build the Swift app into the .app ────────────────────────────────────────
-echo "▸ building meeting-capture…"
+echo "▸ building macrec…"
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 swiftc -swift-version 5 -parse-as-library -O \
   -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia -framework CoreAudio \
   -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement \
-  "$HERE/MeetingCapture.swift" -o "$APP/Contents/MacOS/meeting-capture"
+  "$HERE/macrec.swift" -o "$APP/Contents/MacOS/macrec"
 
 # ── 6) bundle whisper-cli + VAD + icon ──────────────────────────────────────────
 cp "$WCLI"    "$APP/Contents/Helpers/whisper-cli"
@@ -94,7 +94,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundleName</key><string>macrec</string>
   <key>CFBundleDisplayName</key><string>macrec</string>
-  <key>CFBundleExecutable</key><string>meeting-capture</string>
+  <key>CFBundleExecutable</key><string>macrec</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
@@ -111,7 +111,7 @@ EOF
 # ── 8) sign inside-out (nested code first, then seal the bundle) ─────────────────
 echo "▸ signing (self-signed cert: $SIGN_ID)…"
 codesign -f -s "$SIGN_ID" "$APP/Contents/Helpers/whisper-cli"
-codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$APP/Contents/MacOS/meeting-capture"
+codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$APP/Contents/MacOS/macrec"
 codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$APP"
 codesign --verify --deep --strict "$APP" && echo "  ✅ signature valid (nested whisper-cli sealed)"
 DR=$(codesign -d -r- "$APP" 2>&1)

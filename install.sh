@@ -1,5 +1,5 @@
 #!/bin/zsh
-# install.sh — build meeting-capture, STABLE-sign it (TCC 권한이 rebuild 후에도 유지),
+# install.sh — build macrec, STABLE-sign it (TCC 권한이 rebuild 후에도 유지),
 # install to /Applications (Finder/Launchpad 노출), load the LaunchAgent.
 # 산출물(회의록·오디오)은 config의 OUTPUT_ROOT(work 노트 DB)로 간다.
 set -e
@@ -7,11 +7,11 @@ HERE="${0:A:h}"
 [[ -f "$HERE/config.sh" ]] || cp "$HERE/config.sh.example" "$HERE/config.sh"   # first run: seed per-machine config
 source "$HERE/config.sh"
 
-LABEL="com.ikhoon.meeting-recorder"
+LABEL="com.ikhoon.macrec"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 STAGE="$HERE/MeetingCapture.app"                     # build staging (gitignored)
-STAGE_BIN="$STAGE/Contents/MacOS/meeting-capture"
+STAGE_BIN="$STAGE/Contents/MacOS/macrec"
 
 echo "▸ 안정적 코드서명 인증서 확인/생성…"
 "$HERE/make-signing-cert.sh"
@@ -23,12 +23,12 @@ if [[ ! -f "$HERE/AppIcon.icns" ]]; then
   rm -rf "$HERE/AppIcon.iconset"
 fi
 
-echo "▸ building meeting-capture…"
+echo "▸ building macrec…"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 swiftc -swift-version 5 -parse-as-library -O \
   -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia -framework CoreAudio \
   -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement \
-  "$HERE/MeetingCapture.swift" -o "$STAGE_BIN"
+  "$HERE/macrec.swift" -o "$STAGE_BIN"
 
 echo "▸ writing Info.plist + icon…"
 [[ -f "$HERE/AppIcon.icns" ]] && cp "$HERE/AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
@@ -40,7 +40,7 @@ cat > "$STAGE/Contents/Info.plist" <<EOF
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundleName</key><string>macrec</string>
   <key>CFBundleDisplayName</key><string>macrec</string>
-  <key>CFBundleExecutable</key><string>meeting-capture</string>
+  <key>CFBundleExecutable</key><string>macrec</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
@@ -62,7 +62,7 @@ echo "▸ installing → $INSTALL_APP …"
 rm -rf /Applications/MeetingRecorder.app /Applications/Amanu.app 2>/dev/null   # remove pre-rename apps
 rm -rf "$INSTALL_APP"
 cp -R "$STAGE" "$INSTALL_APP"
-codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$INSTALL_APP/Contents/MacOS/meeting-capture"
+codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$INSTALL_APP/Contents/MacOS/macrec"
 codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$INSTALL_APP"
 DR=$(codesign -d -r- "$INSTALL_APP" 2>&1)
 echo "  DR: ${DR##*designated => }"
@@ -111,6 +111,9 @@ cat > "$PLIST" <<EOF
 EOF
 
 echo "▸ (re)loading agent…"
+# migrate off the pre-macrec agent label (com.ikhoon.meeting-recorder), if present
+launchctl bootout "$DOMAIN/com.ikhoon.meeting-recorder" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/com.ikhoon.meeting-recorder.plist"
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 # bootout is async — wait until the old job is fully gone, else bootstrap races → EIO(5).
 for i in {1..12}; do launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break; sleep 0.5; done
@@ -124,7 +127,7 @@ echo "   연속 녹음(${SEGMENT_SECONDS}s 회전) → 발화 있는 시간만 �
 echo "   전사 출력: $TRANSCRIPTS_DIR"
 echo
 echo "👉 권한:"
-echo "   • Screen & System Audio Recording + Microphone → 'meeting-capture' 허용 (기존 유지)"
+echo "   • Screen & System Audio Recording + Microphone → 'macrec' 허용 (기존 유지)"
 echo "   • Calendar → 'macrec' 허용 (신규 — 일정 제목으로 transcript 제목 붙이기)"
 echo "   허용 뒤 재시작:   launchctl kickstart -k $DOMAIN/$LABEL"
 echo
