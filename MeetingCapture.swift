@@ -1060,19 +1060,22 @@ final class RecordingEngine {
     /// Delete audio/transcripts older than the retention window (0 = keep forever).
     private func cleanupRetention() {
         let fm = FileManager.default
-        func purge(_ dir: URL, days: Int, ext: String) {
-            guard days > 0, let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        // Recurse under transcriptsDir so retention still catches files inside the monthly subfolders
+        // (transcripts/YYYY-MM/*.md and transcripts/YYYY-MM/audio/*.wav) plus any legacy flat files.
+        func purge(days: Int, ext: String) {
+            guard days > 0,
+                  let en = fm.enumerator(at: cfg.transcriptsDir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
             let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
             var n = 0
-            for u in items where u.pathExtension.lowercased() == ext {
+            for case let u as URL in en where u.pathExtension.lowercased() == ext {
                 if let m = (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate, m < cutoff {
                     try? fm.removeItem(at: u); n += 1
                 }
             }
-            if n > 0 { elog("engine: retention — \(dir.lastPathComponent)에서 \(ext) \(n)개 삭제(>\(days)일)") }
+            if n > 0 { elog("engine: retention — \(ext) \(n)개 삭제(>\(days)일)") }
         }
-        purge(cfg.audioDir, days: cfg.audioRetentionDays, ext: "wav")
-        purge(cfg.transcriptsDir, days: cfg.transcriptRetentionDays, ext: "md")
+        purge(days: cfg.audioRetentionDays, ext: "wav")
+        purge(days: cfg.transcriptRetentionDays, ext: "md")
     }
 
     private func process(_ seg: CompletedSegment) {
@@ -1102,12 +1105,14 @@ final class RecordingEngine {
     @discardableResult
     private func writeTranscript(seg: CompletedSegment, text: String, mixed: URL?) throws -> URL {
         let fm = FileManager.default
-        try fm.createDirectory(at: cfg.transcriptsDir, withIntermediateDirectories: true)
-        try fm.createDirectory(at: cfg.audioDir, withIntermediateDirectories: true)
-
         let nameF = DateFormatter(); nameF.locale = Locale(identifier: "en_US_POSIX"); nameF.dateFormat = "yyyy-MM-dd-HHmm"
         let dayF = DateFormatter(); dayF.locale = Locale(identifier: "en_US_POSIX"); dayF.dateFormat = "yyyy-MM-dd"
         let hmF = DateFormatter(); hmF.locale = Locale(identifier: "en_US_POSIX"); hmF.dateFormat = "HH:mm"
+        let monthF = DateFormatter(); monthF.locale = Locale(identifier: "en_US_POSIX"); monthF.dateFormat = "yyyy-MM"
+
+        // Organize transcripts into monthly subfolders: transcripts/YYYY-MM/…  (audio under YYYY-MM/audio/).
+        let monthDir = cfg.transcriptsDir.appendingPathComponent(monthF.string(from: seg.start), isDirectory: true)
+        try fm.createDirectory(at: monthDir, withIntermediateDirectories: true)
         let end = seg.start.addingTimeInterval(seg.durationSeconds)
         let mins = Int((seg.durationSeconds + 30) / 60)
 
@@ -1120,10 +1125,12 @@ final class RecordingEngine {
         // keep the mixed WAV per the keepAudio setting (mixed is nil when keepAudio is off)
         var audioLine = "- 오디오: _(보관 안 함)_"
         if cfg.keepAudio, let mixed = mixed {
-            let keptAudio = cfg.audioDir.appendingPathComponent("\(slug).wav")
+            let audioDir = monthDir.appendingPathComponent("audio", isDirectory: true)
+            try fm.createDirectory(at: audioDir, withIntermediateDirectories: true)
+            let keptAudio = audioDir.appendingPathComponent("\(slug).wav")
             try? fm.removeItem(at: keptAudio)
             try fm.moveItem(at: mixed, to: keptAudio)
-            audioLine = "- 오디오: [audio/\(slug).wav](audio/\(slug).wav)"
+            audioLine = "- 오디오: [audio/\(slug).wav](audio/\(slug).wav)"   // relative to this .md inside the month folder
         }
 
         var meta = ""
@@ -1149,7 +1156,7 @@ final class RecordingEngine {
         ---
         _자동 생성. 재사용할 지식은 `topics/`로 정제하세요._
         """
-        let mdURL = cfg.transcriptsDir.appendingPathComponent("\(slug).md")
+        let mdURL = monthDir.appendingPathComponent("\(slug).md")
         try md.write(to: mdURL, atomically: true, encoding: .utf8)
         elog("engine:   → 전사 저장: \(mdURL.path)")
         return mdURL
