@@ -442,6 +442,7 @@ enum Pref {
     static let cal = "useCalendarTitles", model = "whisperModelName"
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
     static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
+    static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
 
     static func dbl(_ key: String, _ env: String, _ def: Double) -> Double {
         if d.object(forKey: key) != nil { return d.double(forKey: key) }
@@ -644,7 +645,10 @@ struct EngineConfig {
             segmentSeconds: Pref.dbl(Pref.segment, "MR_SEGMENT_SECONDS", 3600),
             voiceMinSeconds: Pref.dbl(Pref.voiceMin, "MR_VOICE_MIN_SECONDS", 5),
             transcriptsDir: tdir,
-            audioDir: tdir.appendingPathComponent("audio"),
+            // Audio lives in its OWN root (separate from transcripts) — default OUTPUT_ROOT/audio
+            // (sibling of transcripts), overridable via Settings / MR_AUDIO_DIR.
+            audioDir: URL(fileURLWithPath: Pref.str(Pref.audioDir, "MR_AUDIO_DIR",
+                                                    tdir.deletingLastPathComponent().appendingPathComponent("audio").path)),
             workDir: URL(fileURLWithPath: Pref.str("workDir", "MR_WORK_DIR", "/tmp/meeting-recorder-segments")),
             // Defaults prefer what's bundled in the .app (self-contained); env/UserDefaults still override.
             whisperCli: Pref.str("whisperCli", "MR_WHISPER_CLI", BundledTools.whisperCli ?? "/opt/homebrew/bin/whisper-cli"),
@@ -792,6 +796,17 @@ final class CaptureSession {
         stream = nil
         return done
     }
+}
+
+/// Filesystem-relative path from a directory to a file (e.g. transcripts/2026-07 → audio/2026-07/x.wav
+/// yields "../../audio/2026-07/x.wav"), so the audio link works from the .md wherever the roots sit.
+func relativePath(fromDir: URL, toFile: URL) -> String {
+    let a = fromDir.standardizedFileURL.pathComponents
+    let b = toFile.standardizedFileURL.pathComponents
+    var i = 0
+    while i < a.count, i < b.count, a[i] == b[i] { i += 1 }
+    let ups = Array(repeating: "..", count: max(0, a.count - i))
+    return (ups + b[i...]).joined(separator: "/")
 }
 
 /// Filesystem-safe short slug from an event title (for the transcript filename). Keeps letters
@@ -1060,11 +1075,11 @@ final class RecordingEngine {
     /// Delete audio/transcripts older than the retention window (0 = keep forever).
     private func cleanupRetention() {
         let fm = FileManager.default
-        // Recurse under transcriptsDir so retention still catches files inside the monthly subfolders
-        // (transcripts/YYYY-MM/*.md and transcripts/YYYY-MM/audio/*.wav) plus any legacy flat files.
-        func purge(days: Int, ext: String) {
+        // Recurse under each root so retention prunes the monthly subfolders too:
+        // transcripts/YYYY-MM/*.md and audioDir/YYYY-MM/*.wav (plus any legacy layout).
+        func purge(_ root: URL, days: Int, ext: String) {
             guard days > 0,
-                  let en = fm.enumerator(at: cfg.transcriptsDir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+                  let en = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
             let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
             var n = 0
             for case let u as URL in en where u.pathExtension.lowercased() == ext {
@@ -1074,8 +1089,8 @@ final class RecordingEngine {
             }
             if n > 0 { elog("engine: retention — \(ext) \(n)개 삭제(>\(days)일)") }
         }
-        purge(days: cfg.audioRetentionDays, ext: "wav")
-        purge(days: cfg.transcriptRetentionDays, ext: "md")
+        purge(cfg.audioDir, days: cfg.audioRetentionDays, ext: "wav")
+        purge(cfg.transcriptsDir, days: cfg.transcriptRetentionDays, ext: "md")
     }
 
     private func process(_ seg: CompletedSegment) {
@@ -1125,12 +1140,12 @@ final class RecordingEngine {
         // keep the mixed WAV per the keepAudio setting (mixed is nil when keepAudio is off)
         var audioLine = "- 오디오: _(보관 안 함)_"
         if cfg.keepAudio, let mixed = mixed {
-            let audioDir = monthDir.appendingPathComponent("audio", isDirectory: true)
-            try fm.createDirectory(at: audioDir, withIntermediateDirectories: true)
-            let keptAudio = audioDir.appendingPathComponent("\(slug).wav")
+            let audioMonthDir = cfg.audioDir.appendingPathComponent(monthF.string(from: seg.start), isDirectory: true)
+            try fm.createDirectory(at: audioMonthDir, withIntermediateDirectories: true)
+            let keptAudio = audioMonthDir.appendingPathComponent("\(slug).wav")
             try? fm.removeItem(at: keptAudio)
             try fm.moveItem(at: mixed, to: keptAudio)
-            audioLine = "- 오디오: [audio/\(slug).wav](audio/\(slug).wav)"   // relative to this .md inside the month folder
+            audioLine = "- 오디오: [\(slug).wav](\(relativePath(fromDir: monthDir, toFile: keptAudio)))"
         }
 
         var meta = ""
@@ -1171,7 +1186,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let modelPopup = NSPopUpButton()
     private let audioRetPopup = NSPopUpButton(), txtRetPopup = NSPopUpButton()
     private let addAppPopup = NSPopUpButton()
-    private let voiceField = NSTextField(), dirField = NSTextField()
+    private let voiceField = NSTextField(), dirField = NSTextField(), audioDirField = NSTextField()
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
     private let keepAudioBtn = NSButton(checkboxWithTitle: "Keep audio (WAV) too", target: nil, action: nil)
     private let vadBtn = NSButton(checkboxWithTitle: "Remove noise/silence (VAD)", target: nil, action: nil)
@@ -1205,9 +1220,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
-        for f in [voiceField, dirField] { f.translatesAutoresizingMaskIntoConstraints = false }
+        for f in [voiceField, dirField, audioDirField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
         dirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
+        audioDirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
 
         excludeTokens.translatesAutoresizingMaskIntoConstraints = false
         excludeTokens.tokenizingCharacterSet = CharacterSet(charactersIn: ", ")
@@ -1217,6 +1233,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         let chooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseDir))
         let dirStack = NSStackView(views: [dirField, chooseBtn]); dirStack.orientation = .horizontal; dirStack.spacing = 6
+        let audioChooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseAudioDir))
+        let audioStack = NSStackView(views: [audioDirField, audioChooseBtn]); audioStack.orientation = .horizontal; audioStack.spacing = 6
 
         let grid = NSGridView(views: [
             [labeled("Segment length (on the hour):"), segPopup],
@@ -1233,6 +1251,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [labeled("Excluded apps:"), excludeTokens],
             [labeled("Add a running app:"), addAppPopup],
             [labeled("Save transcripts to:"), dirStack],
+            [labeled("Save audio to:"), audioStack],
         ])
         grid.translatesAutoresizingMaskIntoConstraints = false
         grid.rowSpacing = 16; grid.columnSpacing = 18
@@ -1299,6 +1318,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         txtRetPopup.selectItem(at: idx(c.transcriptRetentionDays, retValues))
         excludeTokens.objectValue = c.excludeBundleIds
         dirField.stringValue = c.transcriptsDir.path
+        audioDirField.stringValue = c.audioDir.path
         // Start at login — read the live SMAppService status (never cache); locked on the dev machine.
         if #available(macOS 13, *) {
             if LoginItem.managedByLaunchAgent {
@@ -1318,6 +1338,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let p = NSOpenPanel(); p.canChooseDirectories = true; p.canChooseFiles = false; p.allowsMultipleSelection = false
         if p.runModal() == .OK, let u = p.url { dirField.stringValue = u.path }
     }
+    @objc private func chooseAudioDir() {
+        let p = NSOpenPanel(); p.canChooseDirectories = true; p.canChooseFiles = false; p.allowsMultipleSelection = false
+        if p.runModal() == .OK, let u = p.url { audioDirField.stringValue = u.path }
+    }
 
     @objc private func saveAndClose() {
         let d = Pref.d
@@ -1334,6 +1358,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let ids = (excludeTokens.objectValue as? [String]) ?? []
         d.set(ids.joined(separator: " "), forKey: Pref.exclude)
         d.set(dirField.stringValue, forKey: Pref.txtDir)
+        d.set(audioDirField.stringValue, forKey: Pref.audioDir)
         // Apply "Start at login" (skip on the dev machine where the LaunchAgent owns autostart).
         if #available(macOS 13, *), !LoginItem.managedByLaunchAgent {
             if LoginItem.setEnabled(loginBtn.state == .on) == .requiresApproval { LoginItem.openSettings() }
