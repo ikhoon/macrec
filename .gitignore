@@ -5,7 +5,11 @@ MeetingCapture.app/
 dist/
 .build/
 
-# runtime / secrets / cruft
+# per-machine config (copy from config.sh.example) — keeps personal paths out of the repo
+config.sh
+
+# editor / runtime / secrets / cruft
+.idea/
 *.log
 *.p12
 .DS_Store

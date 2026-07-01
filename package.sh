@@ -9,6 +9,7 @@
 # Output: dist/macrec.zip  — unzip, drag to /Applications, launch.
 set -e
 HERE="${0:A:h}"
+[[ -f "$HERE/config.sh" ]] || cp "$HERE/config.sh.example" "$HERE/config.sh"   # first run: seed per-machine config
 source "$HERE/config.sh"
 
 DIST="$HERE/dist"

@@ -638,7 +638,7 @@ struct EngineConfig {
     static func load() -> EngineConfig {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let tdir = URL(fileURLWithPath: Pref.str(Pref.txtDir, "MR_TRANSCRIPTS_DIR",
-                                                 home.appendingPathComponent("src/LINE/work/transcripts").path))
+                                                 home.appendingPathComponent("Documents/macrec/transcripts").path))
         let excl = Pref.str(Pref.exclude, "MR_EXCLUDE_APPS", "com.spotify.client")
             .split(whereSeparator: { $0 == " " || $0 == "," }).map(String.init)
         return EngineConfig(

@@ -1,0 +1,48 @@
+# config.sh.example — copy to config.sh and customize (config.sh is gitignored / per-machine).
+#   cp config.sh.example config.sh
+# install.sh copies this automatically if config.sh is missing.
+#
+# The tool lives on its own (~/src/meeting-recorder); its outputs (transcripts/audio) land under
+# OUTPUT_ROOT — point that at wherever you keep notes.
+
+# directory these scripts live in (= install location)
+TOOLS="${${(%):-%x}:A:h}"
+
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
+
+# --- where outputs (transcripts/audio) go (override with the OUTPUT_ROOT env var) ---
+: ${OUTPUT_ROOT:="$HOME/Documents/macrec"}     # e.g. an Obsidian vault or any notes folder
+
+# --- capture/transcribe binaries ---
+: ${INSTALL_APP:="/Applications/macrec.app"}   # install (run) location — shown in Finder/Applications
+: ${CAPTURE:="$INSTALL_APP/Contents/MacOS/meeting-capture"}  # capture binary (inside .app = stable TCC identity)
+: ${BUNDLE_ID:="com.ikhoon.meeting-capture"}   # fixed — never change (TCC DR identifier)
+: ${SIGN_ID:="MeetingCaptureSign"}             # code-signing cert name (created by make-signing-cert.sh)
+
+# transcription: whisper.cpp's whisper-cli + GGML models directly
+: ${WHISPER_CLI:="/opt/homebrew/bin/whisper-cli"}
+: ${WHISPER_GGML:="$HOME/whisper-models/ggml-large-v3-turbo.bin"}   # fast turbo
+: ${VAD_MODEL:="$HOME/whisper-models/ggml-silero-v5.1.2.bin"}       # silero VAD — drops silence/noise (anti-hallucination)
+: ${WHISPER_LANG:="auto"}                      # ko|ja|en|auto
+
+# --- output paths (relative to OUTPUT_ROOT) ---
+: ${MEETINGS:="$OUTPUT_ROOT/meetings"}
+: ${AUDIO_DIR:="$OUTPUT_ROOT/audio"}
+: ${INDEX:="$OUTPUT_ROOT/INDEX.md"}
+: ${LOGFILE:="$TOOLS/meeting-recorder.log"}    # log lives with the tool (runtime state)
+
+# --- detection/behavior knobs (override with env) ---
+: ${STRICT_MEETING:=1}   # 1: record only when Zoom/Meet detected; 0: whenever the mic is on
+: ${POLL:=3}             # mic-state poll interval (s)
+: ${MIN_ON:=6}           # mic must be on this long before recording starts (ignore blips)
+: ${MIN_OFF:=8}          # mic must be off this long before recording stops
+: ${KEEP_AUDIO:=1}       # 1: keep the mixed WAV; 0: delete after transcription
+
+# --- apps whose audio is excluded from the recording (space-separated bundle ids) ---
+: ${EXCLUDE_APPS:="com.spotify.client"}        # keep music out of the meeting recording
+
+# --- continuous record/transcribe engine (app mode; the Swift app reads these as MR_* env) ---
+: ${SEGMENT_SECONDS:=3600}                        # hourly rotation (s)
+: ${VOICE_MIN_SECONDS:=5}                         # min voiced seconds to transcribe/keep a segment
+: ${TRANSCRIPTS_DIR:="$OUTPUT_ROOT/transcripts"}  # where hourly transcripts land
+: ${WORK_DIR:="/tmp/meeting-recorder-segments"}   # temp segments during rotation (cleaned after)
