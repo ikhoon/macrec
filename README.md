@@ -30,7 +30,7 @@ Apple Silicon only. Installing via brew **avoids the Gatekeeper "Open Anyway" st
 Grab **`macrec.zip`**, unzip, drag **`macrec.app`** to `/Applications`, and launch it.
 
 - The app **bundles a self-contained `whisper-cli`** (built static, Metal embedded) and the **silero VAD** model.
-- On first run it **downloads the transcription model** (default *Large v3 Turbo*, ~1.6 GB) from **Hugging Face** to `~/Library/Application Support/MeetingRecorder/models/`; the menu shows `⤓ Downloading model… %`. Change the model in Settings.
+- On first run it **downloads the transcription model** (default *Large v3 Turbo*, ~1.6 GB) from **Hugging Face** to `~/Library/Application Support/macrec/models/`; the menu shows `⤓ Downloading model… %`. Change the model in Settings.
 - First launch is blocked by Gatekeeper (self-signed): **System Settings → Privacy & Security → "Open Anyway"** once.
 - It registers itself as a **Login Item** on first run (24/7 autostart); toggle in Settings.
 
@@ -66,11 +66,11 @@ Grant these once in **System Settings → Privacy & Security** (the app is liste
 
 > Why Screen Recording for an audio tool? macOS only exposes **system-audio capture** through ScreenCaptureKit, which is gated by that permission. No screen content is recorded — the capture uses a throwaway 2×2-pixel video stream and writes audio only.
 
-The code-signing **designated requirement** references the certificate + bundle id, so **rebuilds keep the grant** (and the Login Item stays registered). Don't delete/regenerate the cert (back up `~/.config/meeting-recorder/MeetingCaptureSign.p12`). If switching from an old ad-hoc build, reset stale grants once (the bundle id is `com.ikhoon.meeting-capture`):
+The code-signing **designated requirement** references the certificate + bundle id, so **rebuilds keep the grant** (and the Login Item stays registered). Don't delete/regenerate the cert (back up `~/.config/meeting-recorder/MeetingCaptureSign.p12`). If switching from an old ad-hoc build, reset stale grants once (the bundle id is `com.ikhoon.macrec`):
 ```bash
-tccutil reset ScreenCapture com.ikhoon.meeting-capture
-tccutil reset Microphone    com.ikhoon.meeting-capture
-launchctl kickstart -k gui/$(id -u)/com.ikhoon.meeting-recorder
+tccutil reset ScreenCapture com.ikhoon.macrec
+tccutil reset Microphone    com.ikhoon.macrec
+launchctl kickstart -k gui/$(id -u)/com.ikhoon.macrec
 ```
 
 ## How it works
@@ -100,7 +100,7 @@ Design notes (each one is a bug we actually hit):
 
 ## Settings (menu-bar → Settings…)
 
-Stored in `UserDefaults` (suite `com.ikhoon.MeetingRecorder`); saving restarts the engine immediately.
+Stored in `UserDefaults` (suite `com.ikhoon.macrec`); saving restarts the engine immediately.
 
 | Setting | Default |
 |---|---|
@@ -126,7 +126,7 @@ Power users / headless runs can override any setting via `MR_*` environment vari
 
 ## CLI
 
-The `macrec` command is installed by Homebrew (otherwise the binary lives inside the app at `macrec.app/Contents/MacOS/meeting-capture`):
+The `macrec` command is installed by Homebrew (otherwise the binary lives inside the app at `macrec.app/Contents/MacOS/macrec`):
 
 ```bash
 macrec mic-status          # 1 if the default input device is in use
@@ -141,7 +141,7 @@ macrec --out out.wav --duration 20 [--exclude-app <bundleid>] [--no-mic]   # one
 
 | File | Role |
 |---|---|
-| `MeetingCapture.swift` | the whole app: capture engine, model store, transcriber, menu-bar UI, settings, login item, CLI |
+| `macrec.swift` | the whole app: capture engine, model store, transcriber, menu-bar UI, settings, login item, CLI |
 | `install.sh` | build + sign + install to `/Applications/macrec.app` + LaunchAgent (dev machine) |
 | `package.sh` | build static `whisper-cli` + bundle into a self-contained, self-signed `macrec.app` → `dist/macrec.zip` |
 | `make-signing-cert.sh` | create the stable self-signed signing certificate (once) |

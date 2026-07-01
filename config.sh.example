@@ -15,8 +15,8 @@ export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
 
 # --- capture/transcribe binaries ---
 : ${INSTALL_APP:="/Applications/macrec.app"}   # install (run) location — shown in Finder/Applications
-: ${CAPTURE:="$INSTALL_APP/Contents/MacOS/meeting-capture"}  # capture binary (inside .app = stable TCC identity)
-: ${BUNDLE_ID:="com.ikhoon.meeting-capture"}   # fixed — never change (TCC DR identifier)
+: ${CAPTURE:="$INSTALL_APP/Contents/MacOS/macrec"}  # capture binary (inside .app = stable TCC identity)
+: ${BUNDLE_ID:="com.ikhoon.macrec"}   # fixed — never change (TCC DR identifier)
 : ${SIGN_ID:="MeetingCaptureSign"}             # code-signing cert name (created by make-signing-cert.sh)
 
 # transcription: whisper.cpp's whisper-cli + GGML models directly
