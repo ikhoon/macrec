@@ -430,10 +430,10 @@ final class MicCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 // 우선순위: UserDefaults(키가 있으면) > env > 기본값.
 
 enum Pref {
-    // 전용 suite (bundle id와 '다른' 이름이어야 함 — suiteName==bundleID면 nil 반환).
+    // 전용 suite (bundle id와 '달라야' 함 — suiteName==bundleID면 nil 반환/동작 안 함).
     // launchd가 .app 내부 바이너리를 직접 exec할 때 .standard 도메인이 안 잡히는 문제를 우회.
-    // CLI에서 보려면: `defaults read com.ikhoon.macrec`
-    static let suiteName = "com.ikhoon.macrec"
+    // CLI에서 보려면: `defaults read com.ikhoon.macrec.prefs`
+    static let suiteName = "com.ikhoon.macrec.prefs"
     static let d = UserDefaults(suiteName: suiteName) ?? .standard
     // 키 상수 (설정 UI와 공유)
     static let segment = "segmentSeconds", voiceMin = "voiceMinSeconds", lang = "whisperLang"
@@ -1465,6 +1465,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var modelLine: NSMenuItem!
     private var toggleItem: NSMenuItem!
     private var paused = false
+    private var didAutoPrompt = false   // only auto-open the permission prompts/Settings once per launch
     private var settingsWC: SettingsWindowController?
     private var levelTimer: Timer?
 
@@ -1536,6 +1537,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(tItem)
         toggleItem = item("Pause", #selector(togglePause)); menu.addItem(toggleItem)
         menu.addItem(.separator())
+        menu.addItem(item("Grant permissions…", #selector(grantPermissions)))
         menu.addItem(item("Settings…", #selector(openSettings), ","))
         menu.addItem(item("Open transcripts folder", #selector(openTranscripts), "o"))
         menu.addItem(.separator())
@@ -1609,7 +1611,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 try await eng.start()
                 await MainActor.run { self.paused = false; self.setIcon(recording: true); self.refresh("● Recording · mic + system audio") }
             } catch {
-                await MainActor.run { self.engine = nil; self.setIcon(recording: false); self.refresh("⚠ Permission needed — enable 'meeting-capture' in System Settings") }
+                await MainActor.run {
+                    self.engine = nil; self.setIcon(recording: false)
+                    self.refresh("⚠ Grant Screen Recording + Microphone to macrec")
+                    if !self.didAutoPrompt { self.didAutoPrompt = true; self.grantPermissions() }  // fire prompts + open Settings once
+                }
             }
         }
     }
@@ -1626,6 +1632,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             paused = true; setIcon(recording: false); refresh("⏸ Paused")
             if let eng = engine { engine = nil; Task { await eng.stop() } }
+        }
+    }
+
+    /// Fire the permission prompts and jump straight to the Screen Recording pane. Microphone and
+    /// Calendar can be granted inline via the popups; Screen Recording is Settings-only on macOS
+    /// (no inline "Allow"), so we deep-link to its pane — toggle macrec there, then it restarts.
+    @objc private func grantPermissions() {
+        NSApp.activate(ignoringOtherApps: true)
+        _ = requestPermissions()          // Screen Recording prompt + Microphone popup
+        CalendarLookup.requestAccess()    // Calendar popup
+        if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(u)     // open the Screen & System Audio Recording pane directly
         }
     }
 
