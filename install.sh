@@ -26,7 +26,7 @@ fi
 echo "▸ building macrec…"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 swiftc -swift-version 5 -parse-as-library -O \
-  -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia -framework CoreAudio \
+  -framework AVFoundation -framework CoreMedia -framework CoreAudio \
   -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement \
   "$HERE/macrec.swift" -o "$STAGE_BIN"
 
@@ -44,11 +44,12 @@ cat > "$STAGE/Contents/Info.plist" <<EOF
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>NSMicrophoneUsageDescription</key><string>Records meeting audio (your mic + system audio) for local transcription.</string>
+  <key>NSAudioCaptureUsageDescription</key><string>Records other participants' audio (the system audio mix) for local transcription.</string>
   <key>NSCalendarsUsageDescription</key><string>Reads current calendar events to title transcripts with the meeting name.</string>
 </dict>
 </plist>
@@ -126,9 +127,9 @@ echo "✅ installed → $INSTALL_APP  (Finder/Launchpad에 'macrec'로 노출, �
 echo "   연속 녹음(${SEGMENT_SECONDS}s 회전) → 발화 있는 시간만 전사 (화자: 나/상대)."
 echo "   전사 출력: $TRANSCRIPTS_DIR"
 echo
-echo "👉 권한:"
-echo "   • Screen & System Audio Recording + Microphone → 'macrec' 허용 (기존 유지)"
-echo "   • Calendar → 'macrec' 허용 (신규 — 일정 제목으로 transcript 제목 붙이기)"
+echo "👉 권한 (최초 실행 시 인라인 팝업으로 요청됨):"
+echo "   • System Audio Recording Only + Microphone → 'macrec' 허용"
+echo "   • Calendar → 'macrec' 허용 (일정 제목으로 transcript 제목 붙이기)"
 echo "   허용 뒤 재시작:   launchctl kickstart -k $DOMAIN/$LABEL"
 echo
 echo "📋 Live log:  tail -f \"$LOGFILE\""
