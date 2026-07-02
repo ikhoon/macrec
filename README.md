@@ -124,7 +124,7 @@ Stored in `UserDefaults` (suite `com.ikhoon.macrec.prefs`); saving restarts the 
 | Save transcripts to | `~/Documents/macrec/transcripts` |
 | Save audio to | `~/Documents/macrec/audio` |
 
-Transcripts are organized into monthly folders (`transcripts/YYYY-MM/`), audio into a separate root (`audio/YYYY-MM/`). Changing the model downloads the new one on demand (models coexist by filename, so switching back never re-downloads). To use a model outside the built-in list, put an `http(s)` URL to a GGML `.bin` (downloaded to App Support) **or** a local file path (used as-is) in **…or custom model** — it overrides the picker. Menu actions: **Transcribe now**, **Pause / Resume**, **Open transcripts folder**, **Quit**.
+Transcripts are organized into monthly folders (`transcripts/YYYY-MM/`), audio into a separate root (`audio/YYYY-MM/`). Changing the model downloads the new one on demand (models coexist by filename, so switching back never re-downloads). To use a model outside the built-in list, put an `http(s)` URL to a GGML `.bin` (downloaded to App Support) **or** a local file path (used as-is) in **…or custom model** — it overrides the picker. Menu actions: **Transcribe now**, **Pause / Resume**, **Open transcripts folder**, **About macrec** (shows the version), **Quit**.
 
 Power users / headless runs can override any setting via `MR_*` environment variables (e.g. `MR_WHISPER_MODEL`, `MR_MODEL_URL`, `MR_AUDIO_DIR`; precedence: UserDefaults → env → default).
 
@@ -133,6 +133,8 @@ Power users / headless runs can override any setting via `MR_*` environment vari
 The `macrec` command is installed by Homebrew (otherwise the binary lives inside the app at `macrec.app/Contents/MacOS/macrec`):
 
 ```bash
+macrec help                # usage + all commands (also --help, -h)
+macrec version             # print the version (also --version, -v)
 macrec mic-status          # 1 if the default input device is in use
 macrec perm-status         # 1 if System Audio Recording + Microphone are granted
 macrec config              # print resolved settings (model, paths, loginItem status)
