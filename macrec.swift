@@ -1642,11 +1642,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // live meter + status update in place). Its leading icon aligns with the imaged items below.
         let tItem = NSMenuItem()
         let tView = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
-        let tBtn = NSButton(title: " Transcribe now", target: self, action: #selector(flushNow))
+        let tBtn = NSButton(title: "Transcribe now", target: self, action: #selector(flushNow))
         tBtn.isBordered = false; tBtn.alignment = .left; tBtn.font = NSFont.menuFont(ofSize: 0)
         tBtn.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Transcribe now")
-        tBtn.imagePosition = .imageLeading; tBtn.imageHugsTitle = true
-        tBtn.frame = NSRect(x: 13, y: 1, width: 222, height: 20)
+        tBtn.imagePosition = .imageLeading
+        // AppKit's default image↔title gap matches the standard imaged items; a small left inset
+        // lines the icon up with them. (No leading space in the title — that would leak into the
+        // accessibility label and render inconsistently across fonts.)
+        tBtn.frame = NSRect(x: 14, y: 1, width: 221, height: 20)
         tView.addSubview(tBtn); tItem.view = tView
         menu.addItem(tItem)
         toggleItem = item("Pause", #selector(togglePause), symbol: "pause.circle"); menu.addItem(toggleItem)
