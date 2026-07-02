@@ -443,6 +443,7 @@ enum Pref {
     static let keepAudio = "keepAudio", audioRetention = "audioRetentionDays", txtRetention = "transcriptRetentionDays"
     static let exclude = "excludeApps", txtDir = "transcriptsDir", vad = "vadEnabled", autoStart = "autoStart"
     static let cal = "useCalendarTitles", model = "whisperModelName"
+    static let calendars = "calendarNames"              // calendar titles to source event titles from (empty = all)
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
     static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
     static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
@@ -949,10 +950,27 @@ enum CalendarLookup {
 
     struct Match { let title: String; let link: String?; let attendees: [String] }
 
+    /// The event calendars the user chose to source titles from (by title). Empty selection — or a
+    /// selection that matches nothing (e.g. a renamed calendar) — means "all calendars" (nil).
+    static var selectedCalendars: [EKCalendar]? {
+        let names = (Pref.d.stringArray(forKey: Pref.calendars) ?? [])
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard !names.isEmpty else { return nil }
+        let want = Set(names)
+        let cals = store.calendars(for: .event).filter { want.contains($0.title) }
+        return cals.isEmpty ? nil : cals
+    }
+
+    /// Titles of all available event calendars (deduped, sorted) — for the Settings picker.
+    static func availableCalendarNames() -> [String] {
+        guard authorized else { return [] }
+        return Array(Set(store.calendars(for: .event).map { $0.title })).sorted()
+    }
+
     /// Best event overlapping [start, end] — prefers one with a Zoom/Meet/Teams link.
     static func match(start: Date, end: Date) -> Match? {
         guard authorized else { return nil }
-        let pred = store.predicateForEvents(withStart: start.addingTimeInterval(-300), end: end.addingTimeInterval(60), calendars: nil)
+        let pred = store.predicateForEvents(withStart: start.addingTimeInterval(-300), end: end.addingTimeInterval(60), calendars: selectedCalendars)
         let events = store.events(matching: pred).filter { !$0.isAllDay && !($0.title ?? "").isEmpty }
         guard !events.isEmpty else { return nil }
 
@@ -1318,15 +1336,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let modelPopup = NSPopUpButton()
     private let audioRetPopup = NSPopUpButton(), txtRetPopup = NSPopUpButton()
     private let addAppPopup = NSPopUpButton()
+    private let addCalPopup = NSPopUpButton()       // pick a calendar to source titles from
     private let voiceField = NSTextField(), dirField = NSTextField(), audioDirField = NSTextField()
     private let customModelField = NSTextField()   // custom model URL or local path (overrides the popup)
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
+    private let calTokens = NSTokenField()       // calendar titles for event titling (empty = all)
     private let keepAudioBtn = NSButton(checkboxWithTitle: "Keep audio (WAV) too", target: nil, action: nil)
     private let vadBtn = NSButton(checkboxWithTitle: "Remove noise/silence (VAD)", target: nil, action: nil)
     private let calBtn = NSButton(checkboxWithTitle: "Title transcripts from calendar events", target: nil, action: nil)
     private let loginBtn = NSButton(checkboxWithTitle: "Start at login (24/7 recording)", target: nil, action: nil)
     private let systemAudioBtn = NSButton(checkboxWithTitle: "Capture system audio (other participants)", target: nil, action: nil)
     private var runningAppIds: [String] = []
+    private var calendarNames: [String] = []
 
     private let segValues = [900, 1800, 3600, 7200], segTitles = ["15 min", "30 min", "1 hour", "2 hours"]
     private let langValues = ["auto", "ko", "ja", "en"], langTitles = ["Auto-detect", "Korean", "Japanese", "English"]
@@ -1342,7 +1363,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         w.delegate = self
         buildForm()
         load()
-        w.setContentSize(NSSize(width: 600, height: 520))   // roomy fixed size; form top, buttons bottom
+        w.setContentSize(NSSize(width: 600, height: 600))   // roomy fixed size; form top, buttons bottom
         w.center()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -1366,6 +1387,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         excludeTokens.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
         populateRunningApps()
 
+        calTokens.translatesAutoresizingMaskIntoConstraints = false
+        calTokens.tokenizingCharacterSet = CharacterSet(charactersIn: ",")   // titles can contain spaces
+        calTokens.placeholderString = "All calendars (leave empty)"
+        calTokens.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
+        populateCalendars()
+
         let chooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseDir))
         let dirStack = NSStackView(views: [dirField, chooseBtn]); dirStack.orientation = .horizontal; dirStack.spacing = 6
         let audioChooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseAudioDir))
@@ -1380,6 +1407,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [labeled(""), vadBtn],
             [labeled(""), systemAudioBtn],
             [labeled(""), calBtn],
+            [labeled("Calendars for titles:"), calTokens],
+            [labeled("Add a calendar:"), addCalPopup],
             [labeled(""), loginBtn],
             [labeled(""), keepAudioBtn],
             [labeled("Keep audio for:"), audioRetPopup],
@@ -1438,6 +1467,28 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         addAppPopup.selectItem(at: 0)
     }
 
+    /// Fill the "add a calendar" popup with the user's event calendars (by title). Picking one
+    /// appends it to the token field; an empty token field means "use all calendars".
+    private func populateCalendars() {
+        addCalPopup.removeAllItems()
+        addCalPopup.addItem(withTitle: "＋ Choose a calendar…")
+        calendarNames = [""]
+        for name in CalendarLookup.availableCalendarNames() {
+            addCalPopup.addItem(withTitle: name); calendarNames.append(name)
+        }
+        addCalPopup.target = self
+        addCalPopup.action = #selector(addCal)
+    }
+
+    @objc private func addCal() {
+        let i = addCalPopup.indexOfSelectedItem
+        guard i > 0, i < calendarNames.count else { return }
+        let name = calendarNames[i]
+        var cur = (calTokens.objectValue as? [String]) ?? []
+        if !cur.contains(name) { cur.append(name); calTokens.objectValue = cur }
+        addCalPopup.selectItem(at: 0)
+    }
+
     private func idx<T: Equatable>(_ v: T, _ arr: [T]) -> Int { arr.firstIndex(of: v) ?? 0 }
 
     private func load() {
@@ -1454,6 +1505,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         audioRetPopup.selectItem(at: idx(c.audioRetentionDays, retValues))
         txtRetPopup.selectItem(at: idx(c.transcriptRetentionDays, retValues))
         excludeTokens.objectValue = c.excludeBundleIds
+        calTokens.objectValue = Pref.d.stringArray(forKey: Pref.calendars) ?? []
         dirField.stringValue = c.transcriptsDir.path
         audioDirField.stringValue = c.audioDir.path
         // Start at login — read the live SMAppService status (never cache); locked on the dev machine.
@@ -1495,6 +1547,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(retValues[max(0, txtRetPopup.indexOfSelectedItem)], forKey: Pref.txtRetention)
         let ids = (excludeTokens.objectValue as? [String]) ?? []
         d.set(ids.joined(separator: " "), forKey: Pref.exclude)
+        let calNames = ((calTokens.objectValue as? [String]) ?? [])
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        d.set(calNames, forKey: Pref.calendars)
         d.set(dirField.stringValue, forKey: Pref.txtDir)
         d.set(audioDirField.stringValue, forKey: Pref.audioDir)
         // Apply "Start at login" (skip on the dev machine where the LaunchAgent owns autostart).
@@ -1856,7 +1911,7 @@ func installStopHandler(_ handler: @escaping () -> Void) {
 /// correctly even when run via the Homebrew `bin/macrec` symlink (where Bundle.main resolves to
 /// /opt/homebrew/bin, not the .app, so the Info.plist can't be read). install.sh / package.sh
 /// stamp CFBundleShortVersionString from THIS value, so the binary and the bundle never drift.
-let macrecVersion = "0.2.3"
+let macrecVersion = "0.3.0"
 
 func printMacrecHelp() {
     print("""
