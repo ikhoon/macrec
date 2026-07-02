@@ -1645,6 +1645,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item("Settings…", #selector(openSettings), ","))
         menu.addItem(item("Open transcripts folder", #selector(openTranscripts), "o"))
         menu.addItem(.separator())
+        menu.addItem(item("About macrec", #selector(showAbout)))
         menu.addItem(item("Quit", #selector(quit), "q"))
         menu.delegate = self
         statusItem.menu = menu
@@ -1789,6 +1790,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(dir)
     }
 
+    @objc private func showAbout() {
+        NSApp.activate(ignoringOtherApps: true)
+        let credits = NSAttributedString(
+            string: "Always-on meeting recorder — mic + system audio → local whisper.cpp transcripts.\nSystem audio via a Core Audio tap (System Audio Recording Only — no Screen Recording).\nhttps://github.com/ikhoon/macrec",
+            attributes: [.font: NSFont.systemFont(ofSize: 11)])
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationName: "macrec",
+            .applicationVersion: macrecVersion(),
+            .credits: credits,
+        ])
+    }
+
     @objc private func quit() {
         if let eng = engine {
             let s = DispatchSemaphore(value: 0)
@@ -1825,10 +1838,53 @@ func installStopHandler(_ handler: @escaping () -> Void) {
 
 // MARK: - main
 
+/// App version, read from the bundle Info.plist (authoritative when running as macrec.app inside
+/// the .app — which is also where the brew `bin/macrec` symlink points); falls back for an
+/// unbundled dev/CI build.
+func macrecVersion() -> String {
+    (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.0.0-dev"
+}
+
+func printMacrecHelp() {
+    print("""
+    macrec \(macrecVersion()) — always-on macOS meeting recorder
+      Continuously records your microphone + system audio, rotates hourly, and
+      transcribes the hours that contain speech locally via whisper.cpp.
+
+    USAGE
+      macrec                 launch the menu-bar app (default; continuous recording)
+      macrec <command>
+      macrec --out FILE.wav [options]        one-shot capture → mixed WAV
+
+    COMMANDS
+      engine                 run the continuous engine headless (no menu bar)
+      config                 print resolved settings (paths, model, login item)
+      perm-status            exit 0 if System Audio Recording + Microphone are granted
+      request-permission     trigger the macOS permission prompts
+      mic-status             exit 0 if the default input device is in use right now
+      version, --version     print the version and exit
+      help,    --help        show this help
+
+    ONE-SHOT OPTIONS (with --out)
+      --duration N           stop after N seconds
+      --no-mic               capture system audio only (skip the microphone)
+      --exclude-app ID       exclude an app's audio by bundle id (repeatable), e.g. com.spotify.client
+      --keep-temp            keep the intermediate per-source .sys/.mic WAVs
+
+    Transcripts + audio go to the folders set in Settings (menu-bar → Settings…).
+    Permissions: System Audio Recording Only + Microphone (+ Calendar for titles) — no Screen Recording.
+    Docs: https://github.com/ikhoon/macrec
+    """)
+}
+
 @main
 struct Main {
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
+
+        // Subcommands: help / version (accept the common flag spellings too).
+        if let a = args.first, ["help", "--help", "-h"].contains(a) { printMacrecHelp(); exit(0) }
+        if let a = args.first, ["version", "--version", "-v"].contains(a) { print("macrec \(macrecVersion())"); exit(0) }
 
         // Subcommand: mic-status — is the default input device currently in use?
         if args.first == "mic-status" {
