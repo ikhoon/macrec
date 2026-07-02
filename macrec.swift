@@ -1805,9 +1805,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func showAbout() {
         NSApp.activate(ignoringOtherApps: true)
+        let para = NSMutableParagraphStyle(); para.alignment = .center
         let credits = NSAttributedString(
-            string: "Always-on meeting recorder — mic + system audio → local whisper.cpp transcripts.\nSystem audio via a Core Audio tap (System Audio Recording Only — no Screen Recording).\nhttps://github.com/ikhoon/macrec",
-            attributes: [.font: NSFont.systemFont(ofSize: 11)])
+            string: "Always-on meeting recorder",
+            attributes: [.font: NSFont.systemFont(ofSize: 13), .paragraphStyle: para])
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "macrec",
             .applicationVersion: macrecVersion,
@@ -1855,7 +1856,7 @@ func installStopHandler(_ handler: @escaping () -> Void) {
 /// correctly even when run via the Homebrew `bin/macrec` symlink (where Bundle.main resolves to
 /// /opt/homebrew/bin, not the .app, so the Info.plist can't be read). install.sh / package.sh
 /// stamp CFBundleShortVersionString from THIS value, so the binary and the bundle never drift.
-let macrecVersion = "0.2.2"
+let macrecVersion = "0.2.3"
 
 func printMacrecHelp() {
     print("""
