@@ -100,7 +100,7 @@ Design notes (each one is a bug we actually hit):
 - **The app never sets the default output device** — that's left to macOS / tools like SoundSource, so it can't hijack what you're listening to.
 - **VAD (silero) + `--suppress-nst`** skip silence/noise, so transcripts don't fill up with whisper's silence hallucinations ("Thank you", subtitle credits, etc.).
 - **System audio is the digital mix before your DAC**, so transcription quality is unaffected by analog/output-device noise.
-- **Speaker labels**: mic → `나`, system audio → `상대`, merged by timestamp. Transcripts are auto-titled from the overlapping **calendar** event (prefers ones with a Zoom/Meet/Teams link).
+- **Speaker labels**: mic → `나`, system audio → `상대`, merged by timestamp. Transcripts are auto-titled from the overlapping **calendar** event (prefers ones with a Zoom/Meet/Teams link) — across all calendars, or only the ones you pick in Settings.
 
 ## Settings (menu-bar → Settings…)
 
@@ -116,6 +116,7 @@ Stored in `UserDefaults` (suite `com.ikhoon.macrec.prefs`); saving restarts the 
 | Remove noise/silence (VAD) | on |
 | Capture system audio (other participants) | on |
 | Title transcripts from calendar | on |
+| Calendars for titles | all (pick specific ones — empty = all) |
 | **Start at login (24/7)** | on (distributed app; managed by LaunchAgent on dev machines) |
 | Keep audio (WAV) too | on |
 | Keep audio for | 30 days |
