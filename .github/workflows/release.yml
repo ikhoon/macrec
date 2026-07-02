@@ -1,0 +1,123 @@
+name: Release
+
+# Push a tag `vX.Y.Z` → build the self-contained, self-signed macrec.app, attach it to a GitHub
+# release, and bump the Homebrew tap formula. Just `git tag v0.2.0 && git push --tags`.
+#
+# Required repository secrets:
+#   MACREC_SIGNING_P12_BASE64    base64 of ~/.config/meeting-recorder/MeetingCaptureSign.p12
+#                                  (`base64 -i .../MeetingCaptureSign.p12 | pbcopy`)
+#   MACREC_SIGNING_P12_PASSWORD  the p12 export password (default from make-signing-cert.sh: meeting-capture)
+#   HOMEBREW_TAP_TOKEN           a PAT with contents:write on ikhoon/homebrew-tap (to push the formula bump)
+#
+# ⚠ CI MUST reuse the SAME cert the local builds use. The code-signing designated requirement is
+#   `identifier "com.ikhoon.macrec" and certificate root = <that cert>`, so a different cert would
+#   change the DR and break every user's TCC grant on `brew upgrade`. The guard step below fails the
+#   build if the expected identity is missing rather than letting package.sh mint a new one.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build a release for, e.g. v0.2.0"
+        required: true
+
+env:
+  SIGN_ID: MeetingCaptureSign
+
+jobs:
+  release:
+    runs-on: macos-15
+    permissions:
+      contents: write        # gh release create on THIS repo
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Install cmake (for the whisper.cpp static build)
+        run: brew install cmake
+
+      - name: Import signing certificate into a temporary keychain
+        env:
+          P12_BASE64: ${{ secrets.MACREC_SIGNING_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACREC_SIGNING_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$P12_BASE64" ] || { echo "::error::MACREC_SIGNING_P12_BASE64 secret is empty"; exit 1; }
+          KEYCHAIN="$RUNNER_TEMP/macrec.keychain-db"
+          KPASS="$(uuidgen)"
+          security create-keychain -p "$KPASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KPASS" "$KEYCHAIN"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -A -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KPASS" "$KEYCHAIN" >/dev/null
+          # put our keychain first in the search list so find-identity + codesign see the cert
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Verify the expected signing identity is present (DR safety)
+        run: |
+          if ! security find-identity -p codesigning | grep -q "$SIGN_ID"; then
+            echo "::error::signing identity '$SIGN_ID' not found — refusing to build (package.sh would mint a NEW cert and change the designated requirement, breaking users' permission grants on upgrade)"
+            security find-identity -p codesigning || true
+            exit 1
+          fi
+          echo "✅ '$SIGN_ID' present — package.sh will reuse it (make-signing-cert.sh is a no-op)"
+
+      - name: Build distributable (package.sh → dist/macrec.zip)
+        run: ./package.sh
+
+      - name: Sanity-check the bundle
+        run: |
+          set -e
+          otool -L dist/macrec.app/Contents/MacOS/macrec | grep -qi ScreenCaptureKit \
+            && { echo "::error::bundle links ScreenCaptureKit"; exit 1; } || true
+          /usr/libexec/PlistBuddy -c "Print :NSAudioCaptureUsageDescription" dist/macrec.app/Contents/Info.plist
+          codesign --verify --deep --strict dist/macrec.app && echo "✅ signature valid"
+
+      - name: Stage release asset
+        id: asset
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          ASSET="macrec-$VERSION-macos-arm64.zip"
+          cp dist/macrec.zip "dist/$ASSET"
+          echo "name=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "path=dist/$ASSET" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(shasum -a 256 "dist/$ASSET" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"; ASSET="${{ steps.asset.outputs.path }}"
+          gh release create "$TAG" --title "macrec $TAG" --generate-notes "$ASSET" \
+            || gh release upload "$TAG" "$ASSET" --clobber
+
+      - name: Bump Homebrew tap formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::HOMEBREW_TAP_TOKEN secret is empty"; exit 1; }
+          VERSION="${{ steps.tag.outputs.version }}"
+          SHA="${{ steps.asset.outputs.sha256 }}"
+          git clone "https://x-access-token:$GH_TOKEN@github.com/ikhoon/homebrew-tap.git" tap
+          f=tap/Formula/macrec.rb
+          sed -i '' -E "s|releases/download/v[0-9.]+/macrec-[0-9.]+-macos-arm64\.zip|releases/download/v$VERSION/macrec-$VERSION-macos-arm64.zip|" "$f"
+          sed -i '' -E "s|version \"[0-9.]+\"|version \"$VERSION\"|" "$f"
+          sed -i '' -E "s|sha256 \"[0-9a-f]+\"|sha256 \"$SHA\"|" "$f"
+          cd tap
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "macrec $VERSION (automated release)"
+          git push

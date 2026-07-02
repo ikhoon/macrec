@@ -1,0 +1,41 @@
+name: CI
+
+# Build the Swift app and smoke-test the CLI on every push / PR that touches code.
+# (No signing here — that only happens in release.yml on a tag.)
+
+on:
+  push:
+    branches: [main]
+    paths: ["macrec.swift", "**/*.sh", ".github/workflows/ci.yml"]
+  pull_request:
+    paths: ["macrec.swift", "**/*.sh", ".github/workflows/ci.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: swift --version && sw_vers
+
+      - name: Build (swiftc — same frameworks as install.sh, unsigned)
+        run: |
+          swiftc -swift-version 5 -parse-as-library -O \
+            -framework AVFoundation -framework CoreMedia -framework CoreAudio \
+            -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement \
+            macrec.swift -o "$RUNNER_TEMP/macrec"
+
+      - name: Guard against ScreenCaptureKit creeping back in
+        run: |
+          if otool -L "$RUNNER_TEMP/macrec" | grep -qi ScreenCaptureKit; then
+            echo "::error::binary links ScreenCaptureKit — system audio must use the Core Audio tap"
+            exit 1
+          fi
+          echo "✅ no ScreenCaptureKit dependency"
+
+      - name: Smoke-test CLI (headless, no GUI / permissions)
+        run: |
+          "$RUNNER_TEMP/macrec" config          # must print resolved settings + exit 0
+          "$RUNNER_TEMP/macrec" perm-status || true   # exits non-zero when ungranted (expected on CI)
