@@ -953,7 +953,8 @@ enum CalendarLookup {
     /// The event calendars the user chose to source titles from (by title). Empty selection — or a
     /// selection that matches nothing (e.g. a renamed calendar) — means "all calendars" (nil).
     static var selectedCalendars: [EKCalendar]? {
-        let names = Pref.d.stringArray(forKey: Pref.calendars) ?? []
+        let names = (Pref.d.stringArray(forKey: Pref.calendars) ?? [])
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         guard !names.isEmpty else { return nil }
         let want = Set(names)
         let cals = store.calendars(for: .event).filter { want.contains($0.title) }
@@ -1546,7 +1547,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(retValues[max(0, txtRetPopup.indexOfSelectedItem)], forKey: Pref.txtRetention)
         let ids = (excludeTokens.objectValue as? [String]) ?? []
         d.set(ids.joined(separator: " "), forKey: Pref.exclude)
-        d.set((calTokens.objectValue as? [String]) ?? [], forKey: Pref.calendars)
+        let calNames = ((calTokens.objectValue as? [String]) ?? [])
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        d.set(calNames, forKey: Pref.calendars)
         d.set(dirField.stringValue, forKey: Pref.txtDir)
         d.set(audioDirField.stringValue, forKey: Pref.audioDir)
         // Apply "Start at login" (skip on the dev machine where the LaunchAgent owns autostart).
