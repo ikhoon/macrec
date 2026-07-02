@@ -13,6 +13,7 @@
 import Foundation
 import AVFoundation
 import CoreMedia
+import Speech   // macOS 26 SpeechAnalyzer — real-time captions (whisper-cli stays the saved transcript)
 import CoreAudio
 import CoreGraphics
 import AppKit
@@ -106,6 +107,7 @@ final class SourceWriter {
     var recentLevel: Float = 0   // peak of the most recent buffer — for the live menu meter
     var voicedFrames: AVAudioFramePosition = 0   // # samples above the voice threshold
     static let voiceThreshold: Float = 0.02      // ~-34 dBFS — speech-ish floor
+    var onCanon: ((AVAudioPCMBuffer) -> Void)?   // tee of the canon (16k mono) buffer → live captions
 
     /// Seconds of "voiced" (above-threshold) audio — used to decide if a segment is worth transcribing.
     var voicedSeconds: Double { Double(voicedFrames) / canon.sampleRate }
@@ -171,6 +173,7 @@ final class SourceWriter {
         }
         do { try file.write(from: outBuf); framesOut += AVAudioFramePosition(outBuf.frameLength) }
         catch { elog("write error: \(error)") }
+        onCanon?(outBuf)   // feed live captions (no-op unless live is active)
     }
 
     /// Copy a CMSampleBuffer's PCM data into an AVAudioPCMBuffer in the buffer's own format.
@@ -843,6 +846,11 @@ final class CaptureSession {
     private func openWriters(_ start: Date) throws {
         rec.sysWriter = try SourceWriter(url: URL(fileURLWithPath: base(start) + ".sys.wav"))
         rec.micWriter = try SourceWriter(url: URL(fileURLWithPath: base(start) + ".mic.wav"))
+        // Tee canon audio to live captions (no-op unless the overlay is on). macOS 26+ only.
+        if #available(macOS 26, *) {
+            rec.sysWriter?.onCanon = { LiveCaptions.shared.feedSystem($0) }
+            rec.micWriter?.onCanon = { LiveCaptions.shared.feedMic($0) }
+        }
     }
 
     func start() async throws {
@@ -1625,6 +1633,180 @@ enum LoginItem {
     }
 }
 
+// MARK: - live transcription (macOS 26 SpeechAnalyzer → real-time caption overlay)
+//
+// Tees the same canon (16 kHz mono) audio the recorder writes into an on-device SpeechAnalyzer per
+// source (mic → 나, system → 상대) for low-latency live captions in a floating panel. whisper-cli on
+// segment rotation stays the authoritative, saved transcript — this overlay is an ephemeral view.
+
+@available(macOS 26, *)
+final class LiveTranscriber {
+    private let locale: Locale
+    private let onUpdate: (String, Bool) -> Void   // (text, isFinal)
+    private let lock = NSLock()
+    private var cont: AsyncStream<AnalyzerInput>.Continuation?
+    private var inputFormat: AVAudioFormat?
+    private var converter: AVAudioConverter?
+    private var task: Task<Void, Never>?
+
+    init(locale: Locale, onUpdate: @escaping (String, Bool) -> Void) {
+        self.locale = locale; self.onUpdate = onUpdate
+    }
+
+    func start() { task = Task { [weak self] in
+        do { try await self?.run() } catch { elog("live: transcriber failed: \(error)") } } }
+
+    private func run() async throws {
+        let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [],
+                                            reportingOptions: [.volatileResults], attributeOptions: [])
+        if let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+            elog("live: installing speech model (\(locale.identifier))…")
+            try await req.downloadAndInstall()
+        }
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        let fmt = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
+        let (stream, c) = AsyncStream<AnalyzerInput>.makeStream()
+        lock.lock(); inputFormat = fmt; cont = c; lock.unlock()
+        try await analyzer.start(inputSequence: stream)
+        for try await result in transcriber.results {
+            let text = String(result.text.characters)
+            if !text.isEmpty { onUpdate(text, result.isFinal) }
+        }
+    }
+
+    /// Feed a canon (16k mono float32) buffer — convert to the analyzer's format and yield it.
+    /// Called on the audio queue; the lock guards the converter + continuation.
+    func feed(_ buf: AVAudioPCMBuffer) {
+        lock.lock(); defer { lock.unlock() }
+        guard let cont, let target = inputFormat else { return }
+        if buf.format == target { cont.yield(AnalyzerInput(buffer: buf)); return }
+        if converter == nil || converter?.inputFormat != buf.format {
+            converter = AVAudioConverter(from: buf.format, to: target)
+        }
+        guard let conv = converter else { return }
+        let ratio = target.sampleRate / buf.format.sampleRate
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: cap) else { return }
+        var fed = false; var err: NSError?
+        conv.convert(to: out, error: &err) { _, status in
+            if fed { status.pointee = .noDataNow; return nil }
+            fed = true; status.pointee = .haveData; return buf
+        }
+        if err == nil, out.frameLength > 0 { cont.yield(AnalyzerInput(buffer: out)) }
+    }
+
+    func stop() {
+        lock.lock(); cont?.finish(); cont = nil; lock.unlock()
+        task?.cancel(); task = nil
+    }
+}
+
+/// Owns the two per-source transcribers + the floating caption window. Menu toggles it on/off.
+@available(macOS 26, *)
+final class LiveCaptions {
+    static let shared = LiveCaptions()
+    private var mic: LiveTranscriber?
+    private var sys: LiveTranscriber?
+    private var window: LiveCaptionWindow?
+    private var lines: [(speaker: String, text: String, final: Bool)] = []
+    private let maxLines = 12
+    private(set) var active = false
+
+    /// Menu toggle (main thread).
+    func toggle() { active ? stop() : start() }
+
+    func start() {
+        guard !active else { return }
+        active = true; lines = []
+        let win = LiveCaptionWindow(onClose: { [weak self] in self?.stop() })
+        window = win; win.show()
+        let locale = Locale.current
+        mic = LiveTranscriber(locale: locale) { [weak self] t, f in self?.post("나", t, f) }
+        sys = LiveTranscriber(locale: locale) { [weak self] t, f in self?.post("상대", t, f) }
+        mic?.start(); sys?.start()
+        elog("live: captions ON")
+    }
+
+    func stop() {
+        guard active else { return }
+        active = false
+        mic?.stop(); sys?.stop(); mic = nil; sys = nil
+        let w = window; window = nil; w?.close()
+        elog("live: captions OFF")
+    }
+
+    // Audio-queue feeds (no-op when inactive — the transcribers are nil).
+    func feedMic(_ b: AVAudioPCMBuffer) { mic?.feed(b) }
+    func feedSystem(_ b: AVAudioPCMBuffer) { sys?.feed(b) }
+
+    private func post(_ speaker: String, _ text: String, _ final: Bool) {
+        DispatchQueue.main.async { [weak self] in self?.apply(speaker, text, final) }
+    }
+    private func apply(_ speaker: String, _ text: String, _ final: Bool) {
+        guard active else { return }
+        // Update this speaker's in-progress (non-final) line, or start a new one.
+        if let i = lines.lastIndex(where: { $0.speaker == speaker && !$0.final }) {
+            lines[i].text = text; lines[i].final = final
+        } else {
+            lines.append((speaker, text, final))
+        }
+        if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
+        window?.render(lines.map { ($0.speaker, $0.text) })
+    }
+}
+
+/// Borderless-ish always-on-top panel that shows the merged live captions.
+@available(macOS 26, *)
+final class LiveCaptionWindow: NSObject, NSWindowDelegate {
+    private let panel: NSPanel
+    private let textView = NSTextView()
+    private let onClose: () -> Void
+    private var suppressCloseCallback = false
+
+    init(onClose: @escaping () -> Void) {
+        self.onClose = onClose
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 170),
+                        styleMask: [.titled, .closable, .resizable, .utilityWindow, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        super.init()
+        panel.title = "macrec live"
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.isMovableByWindowBackground = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.delegate = self
+        let scroll = NSScrollView(frame: panel.contentView!.bounds)
+        scroll.autoresizingMask = [.width, .height]
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        textView.frame = scroll.bounds
+        textView.autoresizingMask = [.width]
+        textView.isEditable = false; textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.font = NSFont.systemFont(ofSize: 14)
+        textView.textContainerInset = NSSize(width: 10, height: 8)
+        scroll.documentView = textView
+        panel.contentView?.addSubview(scroll)
+    }
+
+    func show() {
+        if let f = NSScreen.main?.visibleFrame {
+            panel.setFrameOrigin(NSPoint(x: f.maxX - panel.frame.width - 24, y: f.minY + 24))
+        }
+        panel.orderFrontRegardless()
+    }
+    func close() { suppressCloseCallback = true; panel.close() }
+
+    func render(_ lines: [(String, String)]) {
+        textView.string = lines.map { "\($0.0)  \($0.1)" }.joined(separator: "\n")
+        textView.scrollToEndOfDocument(nil)
+    }
+
+    // User clicked the panel's close button → tear the session down (unless we closed it ourselves).
+    func windowWillClose(_ notification: Notification) { if !suppressCloseCallback { onClose() } }
+}
+
 // MARK: - menu-bar app (tray icon)
 
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -1635,6 +1817,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastSavedLine: NSMenuItem!
     private var modelLine: NSMenuItem!
     private var toggleItem: NSMenuItem!
+    private var liveItem: NSMenuItem?   // "Live captions" toggle (macOS 26+)
     private var paused = false
     private var didAutoPrompt = false   // only auto-open the permission prompts/Settings once per launch
     private var settingsWC: SettingsWindowController?
@@ -1718,6 +1901,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tView.addSubview(tBtn); tItem.view = tView
         menu.addItem(tItem)
         toggleItem = item("Pause", #selector(togglePause), symbol: "pause.circle"); menu.addItem(toggleItem)
+        if #available(macOS 26, *) {   // real-time caption overlay (on-device SpeechAnalyzer)
+            let li = item("Live captions", #selector(toggleLive), symbol: "captions.bubble")
+            li.state = LiveCaptions.shared.active ? .on : .off
+            liveItem = li; menu.addItem(li)
+        }
         menu.addItem(.separator())
         menu.addItem(item("Grant permissions…", #selector(grantPermissions), symbol: "hand.raised"))
         menu.addItem(item("Settings…", #selector(openSettings), ",", symbol: "gearshape"))
@@ -1816,6 +2004,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             paused = true; setIcon(recording: false); refresh("⏸ Paused")
             if let eng = engine { engine = nil; Task { await eng.stop() } }
         }
+    }
+
+    /// Toggle the real-time caption overlay (macOS 26+ SpeechAnalyzer). The saved whisper transcript
+    /// is unaffected — this is a live view only.
+    @available(macOS 26, *)
+    @objc private func toggleLive() {
+        LiveCaptions.shared.toggle()
+        liveItem?.state = LiveCaptions.shared.active ? .on : .off
     }
 
     /// Fire the permission prompts inline. System Audio Recording, Microphone and Calendar all show
@@ -1921,7 +2117,7 @@ func installStopHandler(_ handler: @escaping () -> Void) {
 /// correctly even when run via the Homebrew `bin/macrec` symlink (where Bundle.main resolves to
 /// /opt/homebrew/bin, not the .app, so the Info.plist can't be read). install.sh / package.sh
 /// stamp CFBundleShortVersionString from THIS value, so the binary and the bundle never drift.
-let macrecVersion = "0.3.1"
+let macrecVersion = "0.4.0"
 
 func printMacrecHelp() {
     print("""

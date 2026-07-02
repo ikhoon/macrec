@@ -77,7 +77,7 @@ echo "▸ building macrec…"
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 swiftc -swift-version 5 -parse-as-library -O \
   -framework AVFoundation -framework CoreMedia -framework CoreAudio \
-  -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement \
+  -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech \
   "$HERE/macrec.swift" -o "$APP/Contents/MacOS/macrec"
 
 # ── 6) bundle whisper-cli + VAD + icon ──────────────────────────────────────────
@@ -106,6 +106,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>NSMicrophoneUsageDescription</key><string>Records meeting audio (your mic + system audio) for local transcription.</string>
   <key>NSAudioCaptureUsageDescription</key><string>Records other participants' audio (the system audio mix) for local transcription.</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>Transcribes meeting audio on-device for real-time captions.</string>
   <key>NSCalendarsUsageDescription</key><string>Reads current calendar events to title transcripts with the meeting name.</string>
 </dict>
 </plist>
