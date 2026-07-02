@@ -1710,6 +1710,9 @@ final class LiveTranscriber {
 @available(macOS 26, *)
 final class LiveCaptions {
     static let shared = LiveCaptions()
+    // mic/sys are written on the main thread (start/stop) and read on the audio queue (feed*), so a
+    // lock guards the reference swap. LiveTranscriber.feed is itself thread-safe.
+    private let srcLock = NSLock()
     private var mic: LiveTranscriber?
     private var sys: LiveTranscriber?
     private var window: LiveCaptionWindow?
@@ -1726,23 +1729,25 @@ final class LiveCaptions {
         let win = LiveCaptionWindow(onClose: { [weak self] in self?.stop() })
         window = win; win.show()
         let locale = Locale.current
-        mic = LiveTranscriber(locale: locale) { [weak self] t, f in self?.post("나", t, f) }
-        sys = LiveTranscriber(locale: locale) { [weak self] t, f in self?.post("상대", t, f) }
-        mic?.start(); sys?.start()
+        let m = LiveTranscriber(locale: locale) { [weak self] t, f in self?.post("나", t, f) }
+        let s = LiveTranscriber(locale: locale) { [weak self] t, f in self?.post("상대", t, f) }
+        srcLock.lock(); mic = m; sys = s; srcLock.unlock()
+        m.start(); s.start()
         elog("live: captions ON")
     }
 
     func stop() {
         guard active else { return }
         active = false
-        mic?.stop(); sys?.stop(); mic = nil; sys = nil
+        srcLock.lock(); let m = mic, s = sys; mic = nil; sys = nil; srcLock.unlock()
+        m?.stop(); s?.stop()
         let w = window; window = nil; w?.close()
         elog("live: captions OFF")
     }
 
-    // Audio-queue feeds (no-op when inactive — the transcribers are nil).
-    func feedMic(_ b: AVAudioPCMBuffer) { mic?.feed(b) }
-    func feedSystem(_ b: AVAudioPCMBuffer) { sys?.feed(b) }
+    // Audio-queue feeds (no-op when inactive). Snapshot the ref under the lock, then feed outside it.
+    func feedMic(_ b: AVAudioPCMBuffer) { srcLock.lock(); let m = mic; srcLock.unlock(); m?.feed(b) }
+    func feedSystem(_ b: AVAudioPCMBuffer) { srcLock.lock(); let s = sys; srcLock.unlock(); s?.feed(b) }
 
     private func post(_ speaker: String, _ text: String, _ final: Bool) {
         DispatchQueue.main.async { [weak self] in self?.apply(speaker, text, final) }
@@ -1785,8 +1790,16 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         scroll.autoresizingMask = [.width, .height]
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
-        textView.frame = scroll.bounds
+        // Canonical scrollable NSTextView setup so vertical resizing + scrolling behave correctly.
+        let size = scroll.contentSize
+        textView.frame = NSRect(origin: .zero, size: size)
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
+        textView.textContainer?.containerSize = NSSize(width: size.width, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = true
         textView.isEditable = false; textView.isSelectable = true
         textView.drawsBackground = false
         textView.font = NSFont.systemFont(ofSize: 14)
@@ -1924,6 +1937,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Live input meter — only updates while the menu is open (cheap, and answers "is it working?").
     func menuWillOpen(_ menu: NSMenu) {
         updateLevels()
+        // Reflect the live-captions state in case it was turned off by closing the floating panel.
+        if #available(macOS 26, *) { liveItem?.state = LiveCaptions.shared.active ? .on : .off }
         let t = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in self?.updateLevels() }
         RunLoop.main.add(t, forMode: .eventTracking)   // fires while the menu is tracking
         levelTimer = t
