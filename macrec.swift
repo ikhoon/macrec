@@ -1543,16 +1543,18 @@ enum LoginItem {
     @available(macOS 13, *)
     static func openSettings() { SMAppService.openSystemSettingsLoginItems() }
 
-    /// First-run only: enable autostart for the DISTRIBUTED app (no LaunchAgent, running from
-    /// /Applications, never registered before). A one-shot flag means a later user opt-out in
-    /// System Settings is never silently overridden.
+    /// First-run only: enable autostart for the DISTRIBUTED app (no LaunchAgent, running from a
+    /// stable location — /Applications for the .zip download, or the Homebrew Cellar for `brew
+    /// install` — never registered before). A one-shot flag means a later user opt-out in System
+    /// Settings is never silently overridden.
     static func autoEnableOnceIfDistributed() {
         guard #available(macOS 13, *) else { return }
         guard !managedByLaunchAgent else { return }                         // dev machine: launchd owns it
-        guard Bundle.main.bundleURL.path.hasPrefix("/Applications/") else { return }  // stable location only
+        let loc = Bundle.main.bundleURL.resolvingSymlinksInPath().path      // resolve the brew opt→Cellar symlink
+        guard loc.hasPrefix("/Applications/") || loc.contains("/Cellar/macrec/") else { return }  // stable location only
         guard !Pref.d.bool(forKey: Pref.autostartOffered) else { return }   // only ever auto-enable once
         Pref.d.set(true, forKey: Pref.autostartOffered)
-        guard status == .notRegistered else { return }                      // never touch a prior user choice
+        guard status != .enabled, status != .requiresApproval else { return }  // don't touch an already-on item
         _ = setEnabled(true)
         elog("login item: auto-enabled on first run (status=\(status))")
     }
@@ -1842,7 +1844,7 @@ func installStopHandler(_ handler: @escaping () -> Void) {
 /// correctly even when run via the Homebrew `bin/macrec` symlink (where Bundle.main resolves to
 /// /opt/homebrew/bin, not the .app, so the Info.plist can't be read). install.sh / package.sh
 /// stamp CFBundleShortVersionString from THIS value, so the binary and the bundle never drift.
-let macrecVersion = "0.2.0"
+let macrecVersion = "0.2.1"
 
 func printMacrecHelp() {
     print("""
