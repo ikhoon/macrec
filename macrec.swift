@@ -1797,7 +1797,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             attributes: [.font: NSFont.systemFont(ofSize: 11)])
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "macrec",
-            .applicationVersion: macrecVersion(),
+            .applicationVersion: macrecVersion,
             .credits: credits,
         ])
     }
@@ -1838,16 +1838,15 @@ func installStopHandler(_ handler: @escaping () -> Void) {
 
 // MARK: - main
 
-/// App version, read from the bundle Info.plist (authoritative when running as macrec.app inside
-/// the .app — which is also where the brew `bin/macrec` symlink points); falls back for an
-/// unbundled dev/CI build.
-func macrecVersion() -> String {
-    (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.0.0-dev"
-}
+/// Single source of truth for the version — a compile-time constant so `macrec version` reports
+/// correctly even when run via the Homebrew `bin/macrec` symlink (where Bundle.main resolves to
+/// /opt/homebrew/bin, not the .app, so the Info.plist can't be read). install.sh / package.sh
+/// stamp CFBundleShortVersionString from THIS value, so the binary and the bundle never drift.
+let macrecVersion = "0.2.0"
 
 func printMacrecHelp() {
     print("""
-    macrec \(macrecVersion()) — always-on macOS meeting recorder
+    macrec \(macrecVersion) — always-on macOS meeting recorder
       Continuously records your microphone + system audio, rotates hourly, and
       transcribes the hours that contain speech locally via whisper.cpp.
 
@@ -1884,7 +1883,7 @@ struct Main {
 
         // Subcommands: help / version (accept the common flag spellings too).
         if let a = args.first, ["help", "--help", "-h"].contains(a) { printMacrecHelp(); exit(0) }
-        if let a = args.first, ["version", "--version", "-v"].contains(a) { print("macrec \(macrecVersion())"); exit(0) }
+        if let a = args.first, ["version", "--version", "-v"].contains(a) { print("macrec \(macrecVersion)"); exit(0) }
 
         // Subcommand: mic-status — is the default input device currently in use?
         if args.first == "mic-status" {
