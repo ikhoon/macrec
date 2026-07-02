@@ -1619,36 +1619,43 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         elog("icon set (recording=\(recording)), statusItem.length=\(statusItem.length)")
     }
 
-    private func item(_ title: String, _ sel: Selector, _ key: String = "") -> NSMenuItem {
-        let i = NSMenuItem(title: title, action: sel, keyEquivalent: key); i.target = self; return i
+    private func item(_ title: String, _ sel: Selector, _ key: String = "", symbol: String = "") -> NSMenuItem {
+        let i = NSMenuItem(title: title, action: sel, keyEquivalent: key); i.target = self
+        if !symbol.isEmpty { i.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title) }
+        return i
     }
 
     private func buildMenu() {
         setIcon(recording: false)
         let menu = NSMenu()
+        // About on top (macOS convention), then a divider.
+        menu.addItem(item("About macrec", #selector(showAbout), symbol: "info.circle"))
+        menu.addItem(.separator())
+        // Live status rows (disabled — informational; they carry their own inline status glyphs).
         statusLine = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: ""); statusLine.isEnabled = false
         levelItem = NSMenuItem(title: "🎤 —   🔊 —", action: nil, keyEquivalent: ""); levelItem.isEnabled = false
         lastSavedLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); lastSavedLine.isEnabled = false; lastSavedLine.isHidden = true
         modelLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); modelLine.isEnabled = false; modelLine.isHidden = true
         menu.addItem(statusLine); menu.addItem(levelItem); menu.addItem(lastSavedLine); menu.addItem(modelLine)
         menu.addItem(.separator())
-        // Custom-view button so clicking it does NOT dismiss the menu — you can watch the live
-        // meter + status update in place while it transcribes.
+        // Transcribe now — custom-view button so clicking it does NOT dismiss the menu (watch the
+        // live meter + status update in place). Its leading icon aligns with the imaged items below.
         let tItem = NSMenuItem()
         let tView = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
-        let tBtn = NSButton(title: "Transcribe now", target: self, action: #selector(flushNow))
+        let tBtn = NSButton(title: " Transcribe now", target: self, action: #selector(flushNow))
         tBtn.isBordered = false; tBtn.alignment = .left; tBtn.font = NSFont.menuFont(ofSize: 0)
-        tBtn.frame = NSRect(x: 14, y: 1, width: 220, height: 20)
+        tBtn.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Transcribe now")
+        tBtn.imagePosition = .imageLeading; tBtn.imageHugsTitle = true
+        tBtn.frame = NSRect(x: 13, y: 1, width: 222, height: 20)
         tView.addSubview(tBtn); tItem.view = tView
         menu.addItem(tItem)
-        toggleItem = item("Pause", #selector(togglePause)); menu.addItem(toggleItem)
+        toggleItem = item("Pause", #selector(togglePause), symbol: "pause.circle"); menu.addItem(toggleItem)
         menu.addItem(.separator())
-        menu.addItem(item("Grant permissions…", #selector(grantPermissions)))
-        menu.addItem(item("Settings…", #selector(openSettings), ","))
-        menu.addItem(item("Open transcripts folder", #selector(openTranscripts), "o"))
+        menu.addItem(item("Grant permissions…", #selector(grantPermissions), symbol: "hand.raised"))
+        menu.addItem(item("Settings…", #selector(openSettings), ",", symbol: "gearshape"))
+        menu.addItem(item("Open transcripts folder", #selector(openTranscripts), "o", symbol: "folder"))
         menu.addItem(.separator())
-        menu.addItem(item("About macrec", #selector(showAbout)))
-        menu.addItem(item("Quit", #selector(quit), "q"))
+        menu.addItem(item("Quit", #selector(quit), "q", symbol: "power"))
         menu.delegate = self
         statusItem.menu = menu
     }
@@ -1677,6 +1684,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refresh(_ status: String) {
         statusLine?.title = status
         toggleItem?.title = paused ? "Resume" : "Pause"
+        toggleItem?.image = NSImage(systemSymbolName: paused ? "play.circle" : "pause.circle", accessibilityDescription: nil)
     }
 
     /// First-run model download (the large model is too big to bundle). Surfaces progress in the menu;
@@ -1844,7 +1852,7 @@ func installStopHandler(_ handler: @escaping () -> Void) {
 /// correctly even when run via the Homebrew `bin/macrec` symlink (where Bundle.main resolves to
 /// /opt/homebrew/bin, not the .app, so the Info.plist can't be read). install.sh / package.sh
 /// stamp CFBundleShortVersionString from THIS value, so the binary and the bundle never drift.
-let macrecVersion = "0.2.1"
+let macrecVersion = "0.2.2"
 
 func printMacrecHelp() {
     print("""
