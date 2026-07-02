@@ -59,17 +59,19 @@ cd ~/src/meeting-recorder
 
 ### One-time permissions
 
-Grant these once in **System Settings → Privacy & Security** (the app is listed as **macrec**):
-- **Screen & System Audio Recording** → enable **macrec**
-- **Microphone** → enable **macrec**
-- **Calendar** → enable **macrec** (to title transcripts from meeting events)
+On first launch macrec **requests these inline** (normal consent popups — click *Allow*; no Settings trip needed):
+- **System Audio Recording Only** → the least-privilege macOS 15+ permission for capturing the system audio mix (records other participants). **Not** Screen Recording.
+- **Microphone** → records your voice.
+- **Calendar** → titles transcripts from the overlapping meeting event.
 
-> Why Screen Recording for an audio tool? macOS only exposes **system-audio capture** through ScreenCaptureKit, which is gated by that permission. No screen content is recorded — the capture uses a throwaway 2×2-pixel video stream and writes audio only.
+They also appear in **System Settings → Privacy & Security** (listed as **macrec**) if you want to toggle them later.
 
-The code-signing **designated requirement** references the certificate + bundle id, so **rebuilds keep the grant** (and the Login Item stays registered). Don't delete/regenerate the cert (back up `~/.config/meeting-recorder/MeetingCaptureSign.p12`). If switching from an old ad-hoc build, reset stale grants once (the bundle id is `com.ikhoon.macrec`):
+> Why not Screen Recording? System audio is captured with a **Core Audio process tap** (macOS 14.4+), gated by the dedicated **System Audio Recording Only** permission (`kTCCServiceAudioCapture`) — so macrec never requests Screen Recording and no screen content is ever accessed.
+
+The code-signing **designated requirement** references the certificate + bundle id, so **rebuilds keep the grant** (and the Login Item stays registered). Don't delete/regenerate the cert (back up `~/.config/meeting-recorder/MeetingCaptureSign.p12`). If a grant gets into a bad state, reset it once (bundle id `com.ikhoon.macrec`) and relaunch to re-prompt:
 ```bash
-tccutil reset ScreenCapture com.ikhoon.macrec
-tccutil reset Microphone    com.ikhoon.macrec
+tccutil reset AudioCapture com.ikhoon.macrec
+tccutil reset Microphone   com.ikhoon.macrec
 launchctl kickstart -k gui/$(id -u)/com.ikhoon.macrec
 ```
 
@@ -77,24 +79,26 @@ launchctl kickstart -k gui/$(id -u)/com.ikhoon.macrec
 
 ```
 menu-bar app (login item / launchd) ──► continuous capture
-   • system audio : ScreenCaptureKit (excludes chosen apps, e.g. Spotify)
-   • microphone   : a SEPARATE AVCaptureSession  ← key: capturing both via SCK
-                                                    hijacks the default output
+   • system audio : Core Audio process tap (private aggregate device;
+                    excludes our own PID + chosen apps, e.g. Spotify)
+   • microphone   : a SEPARATE AVCaptureSession
    └─ every hour, on the hour ──► rotate segment
         speech this hour (mic OR system ≥ N s)?
           yes → whisper-cli (VAD + suppress non-speech)
                   → transcripts/YYYY-MM/….md  (+ audio/YYYY-MM/….wav)
           no  → discard
-   └─ display sleeps / screen locks → suspend capture; wake/unlock → rebuild
+   └─ screen locks / sleeps → suspend capture; wake/unlock → rebuild tap
    └─ daily ──► delete audio/transcripts past their retention window
 ```
 
 Design notes (each one is a bug we actually hit):
 
-- **Mic is captured via a separate `AVCaptureSession`, not ScreenCaptureKit.** Capturing system audio *and* mic through SCK (or forcing a device sample rate) makes macOS build an aggregate device that steals the default output — you stop hearing anything. Keeping mic on its own path leaves the output untouched.
+- **System audio uses a Core Audio process tap**, not ScreenCaptureKit — so it needs only the least-privilege *System Audio Recording Only* permission, never Screen Recording, and shows no orange recording dot. The tap sits on a **private aggregate device pinned to the current default output**, so it captures the mix without changing what device you're listening on.
+- **The tap excludes our own process** (and any apps you list, e.g. Spotify), so macrec never records itself and excluded apps stay out of the transcript.
+- **A tap created before the permission is granted delivers silence.** So the engine starts the tap anyway, then watches for the grant and **rebuilds the tap the moment you click Allow** — capture just begins, no manual restart.
+- **Mic is captured via a separate `AVCaptureSession`** on its own path, independent of the system-audio tap.
 - **The app never sets the default output device** — that's left to macOS / tools like SoundSource, so it can't hijack what you're listening to.
 - **VAD (silero) + `--suppress-nst`** skip silence/noise, so transcripts don't fill up with whisper's silence hallucinations ("Thank you", subtitle credits, etc.).
-- **Display sleep kills the SCStream** (`-3815 Failed to find any displays`). The engine suspends on sleep/lock and rebuilds the stream automatically on wake/unlock.
 - **System audio is the digital mix before your DAC**, so transcription quality is unaffected by analog/output-device noise.
 - **Speaker labels**: mic → `나`, system audio → `상대`, merged by timestamp. Transcripts are auto-titled from the overlapping **calendar** event (prefers ones with a Zoom/Meet/Teams link).
 
@@ -130,7 +134,7 @@ The `macrec` command is installed by Homebrew (otherwise the binary lives inside
 
 ```bash
 macrec mic-status          # 1 if the default input device is in use
-macrec perm-status         # 1 if Screen Recording + Microphone are granted
+macrec perm-status         # 1 if System Audio Recording + Microphone are granted
 macrec config              # print resolved settings (model, paths, loginItem status)
 macrec request-permission  # trigger/register the TCC prompts
 macrec engine              # run the continuous engine headless (no menu bar)

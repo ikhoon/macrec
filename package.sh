@@ -76,7 +76,7 @@ fi
 echo "▸ building macrec…"
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 swiftc -swift-version 5 -parse-as-library -O \
-  -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia -framework CoreAudio \
+  -framework AVFoundation -framework CoreMedia -framework CoreAudio \
   -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement \
   "$HERE/macrec.swift" -o "$APP/Contents/MacOS/macrec"
 
@@ -98,11 +98,12 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>NSMicrophoneUsageDescription</key><string>Records meeting audio (your mic + system audio) for local transcription.</string>
+  <key>NSAudioCaptureUsageDescription</key><string>Records other participants' audio (the system audio mix) for local transcription.</string>
   <key>NSCalendarsUsageDescription</key><string>Reads current calendar events to title transcripts with the meeting name.</string>
 </dict>
 </plist>
@@ -131,5 +132,5 @@ echo
 echo "👉 유저 설치:"
 echo "   1) zip 풀고 macrec.app 을 /Applications 로 드래그"
 echo "   2) 첫 실행: 차단되면 System Settings → Privacy & Security → 'Open Anyway' (1회)"
-echo "   3) 권한 허용: Screen & System Audio Recording · Microphone · Calendar"
+echo "   3) 권한 허용 (인라인 팝업): System Audio Recording Only · Microphone · Calendar"
 echo "   4) 트레이 메뉴에 '⤓ Downloading model… %' → 완료되면 자동 전사 시작"

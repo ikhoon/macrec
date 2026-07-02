@@ -7,12 +7,11 @@
 // Stops on SIGINT/SIGTERM (or after --duration), mixes the two sources, prints the final
 // WAV path to stdout. All diagnostics go to stderr.
 //
-// Requires (macOS 15+): Screen Recording permission (system audio via ScreenCaptureKit) and
-// Microphone permission. Built for macOS 26.
+// Requires (macOS 15+): "System Audio Recording Only" permission (system audio via a Core Audio
+// process tap, kTCCServiceAudioCapture) and Microphone permission. Built for macOS 26.
 
 import Foundation
 import AVFoundation
-import ScreenCaptureKit
 import CoreMedia
 import CoreAudio
 import CoreGraphics
@@ -28,21 +27,33 @@ func elog(_ s: String) {
 
 // MARK: - permissions (preflighting these prevents startCapture() from hanging under launchd)
 
-func hasScreenPermission() -> Bool { CGPreflightScreenCaptureAccess() }
+// System-audio capture uses Core Audio process taps, gated by kTCCServiceAudioCapture
+// ("System Audio Recording Only") — NOT Screen Recording. No public API checks/requests it, so we
+// use the private TCC SPI (as insidegui/AudioCap does); fine for a self-signed, non-App-Store tool.
+private let tccHandle = dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_NOW)
+private let kAudioCaptureTCC = "kTCCServiceAudioCapture" as CFString
+
+func audioCaptureAuthorized() -> Bool {
+    guard let h = tccHandle, let sym = dlsym(h, "TCCAccessPreflight") else { return true }  // can't check → assume ok
+    typealias Preflight = @convention(c) (CFString, CFDictionary?) -> Int
+    return unsafeBitCast(sym, to: Preflight.self)(kAudioCaptureTCC, nil) == 0   // 0 authorized, 1 denied, 2 undetermined
+}
 
 func micAuthorized() -> Bool { AVCaptureDevice.authorizationStatus(for: .audio) == .authorized }
 
-/// Triggers the Screen Recording + Microphone prompts and registers this binary in the TCC
-/// lists (so it can be enabled in System Settings even when no prompt can be shown). Never hangs.
-func requestPermissions() -> (screen: Bool, mic: Bool) {
-    let screen = CGRequestScreenCaptureAccess()
-    let sem = DispatchSemaphore(value: 0)
+/// Fire the System-Audio-Recording + Microphone prompts (registers macrec in the TCC lists). Non-blocking-ish.
+func requestPermissions() -> (audio: Bool, mic: Bool) {
+    if let h = tccHandle, let sym = dlsym(h, "TCCAccessRequest") {
+        typealias Request = @convention(c) (CFString, CFDictionary?, @convention(block) (Bool) -> Void) -> Void
+        unsafeBitCast(sym, to: Request.self)(kAudioCaptureTCC, nil) { _ in }
+    }
     var mic = micAuthorized()
     if !mic {
+        let sem = DispatchSemaphore(value: 0)
         AVCaptureDevice.requestAccess(for: .audio) { granted in mic = granted; sem.signal() }
         _ = sem.wait(timeout: .now() + 3)  // don't block forever if no prompt can show
     }
-    return (screen, mic)
+    return (audioCaptureAuthorized(), mic)
 }
 
 /// Canonical processing format used everywhere: 16 kHz, mono, float32 (what Whisper wants).
@@ -122,6 +133,12 @@ final class SourceWriter {
 
     func append(_ sampleBuffer: CMSampleBuffer) {
         guard let inBuf = SourceWriter.pcm(from: sampleBuffer) else { return }
+        append(inBuf)
+    }
+
+    /// Convert an arbitrary-format PCM buffer to canonical 16 kHz mono float32 and write it.
+    /// (System audio arrives here from the Core Audio tap; mic from AVCaptureSession via a CMSampleBuffer.)
+    func append(_ inBuf: AVAudioPCMBuffer) {
         buffersIn += 1
         framesIn += AVAudioFramePosition(inBuf.frameLength)
         if converter == nil || srcFormat != inBuf.format {
@@ -227,41 +244,27 @@ func mixDown(sysURL: URL, micURL: URL?, outURL: URL) throws {
     }
 }
 
-// MARK: - recorder (ScreenCaptureKit)
+// MARK: - recorder (holds the per-source writers)
 
-final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
+final class Recorder {
     var sysWriter: SourceWriter?
     var micWriter: SourceWriter?
-    let queue = DispatchQueue(label: "meeting-capture.audio")
-    var stream: SCStream?
+    let queue = DispatchQueue(label: "macrec.audio")
 
     init(sysWriter: SourceWriter?, micWriter: SourceWriter?) {
         self.sysWriter = sysWriter
         self.micWriter = micWriter
     }
 
-    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard CMSampleBufferDataIsReady(sb) else { return }
-        switch type {
-        case .audio: sysWriter?.append(sb)
-        case .microphone: micWriter?.append(sb)  // (unused now — mic comes via appendMic)
-        default: break  // .screen frames are ignored
-        }
-    }
+    /// System audio arrives from the Core Audio tap (an owned copy — safe to hand to the queue).
+    func appendSys(_ buf: AVAudioPCMBuffer) { queue.async { self.sysWriter?.append(buf) } }
 
-    /// Mic samples arrive from a SEPARATE AVCaptureSession (not ScreenCaptureKit). Capturing
-    /// system audio + mic *both* through SCK makes macOS build an aggregate device that hijacks
-    /// the default output (silences the user). Routing mic through its own path avoids that.
-    /// Appended on `queue` so it shares synchronization with sys writes and rotation swaps.
+    /// Mic samples arrive from a SEPARATE AVCaptureSession (independent of the system-audio tap), so
+    /// the two capture paths don't interact. Appended on `queue` so it shares synchronization with
+    /// sys writes and rotation swaps.
     func appendMic(_ sb: CMSampleBuffer) {
         guard CMSampleBufferDataIsReady(sb) else { return }
         queue.async { self.micWriter?.append(sb) }
-    }
-
-    var onStopped: (() -> Void)?
-    func stream(_ stream: SCStream, didStopWithError error: Error) {
-        elog("stream stopped with error: \(error)")
-        onStopped?()   // display slept / stream died → let the engine rebuild it
     }
 
     /// Drain in-flight callbacks, then release the AVAudioFiles so they flush their WAV headers
@@ -271,7 +274,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         if let s = sysWriter {
             elog("stats sys " + s.stats)
             if s.framesOut > 16000 && s.peak < 0.001 {
-                elog("⚠ system audio was SILENT (peak≈0) — other participants won't be transcribed. Check: (1) meeting-capture has 'Screen & System Audio Recording' permission, (2) audio output routing (USB DAC / SoundSource).")
+                elog("⚠ system audio was SILENT (peak≈0) — other participants won't be transcribed. Check: (1) macrec has 'System Audio Recording Only' permission, (2) audio output routing (USB DAC / SoundSource).")
             }
         }
         if let m = micWriter { elog("stats mic " + m.stats) }
@@ -282,11 +285,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
 // MARK: - default-output guard
 //
-// Starting an AVCaptureSession with an audio input (and, on some macOS versions, (re)building the
-// ScreenCaptureKit audio stream) resets the system's DEFAULT OUTPUT device to the built-in speakers
-// as a side effect — so you suddenly "can't hear" your meeting. OutputKeeper (below) remembers the
-// user's preferred output while it's known-good and re-pins it for a window after each capture
-// transition, so the chosen device sticks across sleep/wake and restarts.
+// Starting an AVCaptureSession with an audio input can, on some macOS versions, reset the system's
+// DEFAULT OUTPUT device to the built-in speakers as a side effect — so you suddenly "can't hear"
+// your meeting. (The system-audio tap itself uses a PRIVATE aggregate device pinned to the current
+// output, so it does not change the default.) OutputKeeper (below) can re-pin the user's preferred
+// output, but is DORMANT — we leave output routing entirely to macOS / SoundSource.
 
 func defaultOutputDeviceID() -> AudioDeviceID {
     var id = AudioDeviceID(0)
@@ -712,22 +715,125 @@ func segFormatter() -> DateFormatter {
     let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd-HHmmss"; return f
 }
 
-/// One always-on SCStream whose per-source writers are swapped on a timer (hourly rotation),
-/// so capture never stops and there are no gaps between segments.
+// MARK: - system-audio capture (Core Audio process tap — "System Audio Recording Only")
+
+/// Captures the system audio mix via a Core Audio process tap + private aggregate device (macOS
+/// 14.4+). Needs only kTCCServiceAudioCapture — no Screen Recording, no orange dot. Excludes our
+/// own process (and any excluded apps, e.g. Spotify) so we don't record ourselves / that app.
+final class SystemAudioTap {
+    private var tapID = AudioObjectID(kAudioObjectUnknown)
+    private var aggID = AudioObjectID(kAudioObjectUnknown)
+    private var procID: AudioDeviceIOProcID?
+    private var format: AVAudioFormat?
+    private let ioQueue = DispatchQueue(label: "macrec.systap")
+    private let excludeBundleIds: [String]
+    private let onBuffer: (AVAudioPCMBuffer) -> Void
+
+    init(excludeBundleIds: [String], onBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
+        self.excludeBundleIds = excludeBundleIds
+        self.onBuffer = onBuffer
+    }
+
+    func start() throws {
+        stop()   // idempotent
+        var exclude: [AudioObjectID] = []
+        if let me = Self.processObject(pid: getpid()) { exclude.append(me) }
+        for bid in excludeBundleIds {
+            for app in NSRunningApplication.runningApplications(withBundleIdentifier: bid) {
+                if let o = Self.processObject(pid: app.processIdentifier) { exclude.append(o) }
+            }
+        }
+        // stereoGlobalTapButExcludeProcesses = the whole system mix minus these processes; a global
+        // tap is unmuted by default (audio stays audible), which is exactly what we want.
+        let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: exclude)
+        desc.uuid = UUID(); desc.isPrivate = true
+
+        var tap = AudioObjectID(kAudioObjectUnknown)
+        var st = AudioHardwareCreateProcessTap(desc, &tap)
+        guard st == noErr, tap != kAudioObjectUnknown else { throw Self.err("create tap", st) }
+        tapID = tap
+        guard let fmt = Self.tapFormat(tap) else { stop(); throw Self.err("tap format", -1) }
+        format = fmt
+
+        let outUID = outputDeviceUID(defaultOutputDeviceID())
+        let dict: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "macrec-tap",
+            kAudioAggregateDeviceUIDKey: UUID().uuidString,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceMainSubDeviceKey: outUID as Any,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outUID as Any]],
+            kAudioAggregateDeviceTapListKey: [[kAudioSubTapUIDKey: desc.uuid.uuidString,
+                                               kAudioSubTapDriftCompensationKey: true]],
+            kAudioAggregateDeviceTapAutoStartKey: true,
+        ]
+        var agg = AudioObjectID(kAudioObjectUnknown)
+        st = AudioHardwareCreateAggregateDevice(dict as CFDictionary, &agg)
+        guard st == noErr, agg != kAudioObjectUnknown else { stop(); throw Self.err("create aggregate", st) }
+        aggID = agg
+
+        st = AudioDeviceCreateIOProcIDWithBlock(&procID, agg, ioQueue) { [weak self] _, inData, _, _, _ in
+            guard let self = self, let fmt = self.format,
+                  let src = AVAudioPCMBuffer(pcmFormat: fmt, bufferListNoCopy: inData, deallocator: nil),
+                  src.frameLength > 0,
+                  let copy = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: src.frameLength) else { return }
+            copy.frameLength = src.frameLength   // no-copy buffer is only valid in this callback → copy it
+            let s = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: src.audioBufferList))
+            let d = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
+            for i in 0..<min(s.count, d.count) where s[i].mData != nil && d[i].mData != nil {
+                memcpy(d[i].mData, s[i].mData, Int(min(s[i].mDataByteSize, d[i].mDataByteSize)))
+            }
+            self.onBuffer(copy)
+        }
+        guard st == noErr, let p = procID else { stop(); throw Self.err("create IOProc", st) }
+        st = AudioDeviceStart(aggID, p)
+        guard st == noErr else { stop(); throw Self.err("device start", st) }
+        elog("engine: system-audio tap started (\(Int(fmt.sampleRate))Hz \(fmt.channelCount)ch, excluding \(exclude.count) procs)")
+    }
+
+    func stop() {
+        if aggID != kAudioObjectUnknown, let p = procID { AudioDeviceStop(aggID, p); AudioDeviceDestroyIOProcID(aggID, p) }
+        procID = nil
+        if aggID != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(aggID); aggID = kAudioObjectUnknown }
+        if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID); tapID = kAudioObjectUnknown }
+    }
+
+    private static func processObject(pid: pid_t) -> AudioObjectID? {
+        var pidVar = pid
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+                                              mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var obj = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let st = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr,
+                                            UInt32(MemoryLayout<pid_t>.size), &pidVar, &size, &obj)
+        return (st == noErr && obj != kAudioObjectUnknown) ? obj : nil
+    }
+    private static func tapFormat(_ tap: AudioObjectID) -> AVAudioFormat? {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioTapPropertyFormat,
+                                              mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var asbd = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        guard AudioObjectGetPropertyData(tap, &addr, 0, nil, &size, &asbd) == noErr else { return nil }
+        return AVAudioFormat(streamDescription: &asbd)
+    }
+    private static func err(_ what: String, _ st: OSStatus) -> NSError {
+        NSError(domain: "macrec.systap", code: Int(st), userInfo: [NSLocalizedDescriptionKey: "\(what) failed (\(st))"])
+    }
+}
+
+/// Continuous capture whose per-source writers are swapped on a timer (hourly rotation), so capture
+/// never stops and there are no gaps. System audio via a Core Audio tap ("System Audio Recording
+/// Only" permission); mic via a separate AVCaptureSession.
 final class CaptureSession {
-    private var stream: SCStream?
+    private var tap: SystemAudioTap?
     private let mic = MicCapture()
     let rec = Recorder(sysWriter: nil, micWriter: nil)
     private let excludeBundleIds: [String]
     private let workDir: URL
     private var segStart = Date()
 
-    var onStreamStopped: (() -> Void)?   // engine sets this to trigger recovery
-
     init(excludeBundleIds: [String], workDir: URL) {
         self.excludeBundleIds = excludeBundleIds
         self.workDir = workDir
-        rec.onStopped = { [weak self] in self?.onStreamStopped?() }
     }
 
     private func base(_ start: Date) -> String {
@@ -742,55 +848,32 @@ final class CaptureSession {
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
         segStart = Date()
         try openWriters(segStart)
-        try await buildStream()
-        try mic.start(into: rec)   // separate mic path (AVCaptureSession) — does not touch output
+        try startTap()
+        try mic.start(into: rec)   // separate mic path (AVCaptureSession)
     }
 
-    /// Build & start the system-audio SCStream, re-acquiring the current display. Used by start()
-    /// and by restartStream() to recover after the display slept and killed the stream (-3815).
-    /// NB: no captureMicrophone / no forced sampleRate — capturing system audio AND mic through SCK
-    /// (or forcing a device format) makes macOS build an aggregate device and hijack the output.
-    private func buildStream() async throws {
-        // Mic-only fallback: skip system-audio (SCK) capture entirely so nothing competes with
-        // SoundSource / other audio tools for the system audio path.
+    /// Start the system-audio Core Audio tap, unless system-audio capture is disabled (mic-only).
+    private func startTap() throws {
         guard Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) else {
-            elog("engine: system-audio capture OFF (mic-only) — coexists with SoundSource etc.")
+            elog("engine: system-audio capture OFF (mic-only)")
             return
         }
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let display = content.displays.first else {
-            throw NSError(domain: "meeting-capture", code: 1, userInfo: [NSLocalizedDescriptionKey: "no display for SCContentFilter"])
-        }
-        let excluded = content.applications.filter { excludeBundleIds.contains($0.bundleIdentifier) }
-        if !excluded.isEmpty { elog("engine: excluding audio from \(excluded.map { $0.bundleIdentifier }.joined(separator: ", "))") }
-        let filter = SCContentFilter(display: display, excludingApplications: excluded, exceptingWindows: [])
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true
-        config.width = 2; config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 4)
-        let s = SCStream(filter: filter, configuration: config, delegate: rec)
-        rec.stream = s
-        try s.addStreamOutput(rec, type: .screen, sampleHandlerQueue: rec.queue)
-        try s.addStreamOutput(rec, type: .audio, sampleHandlerQueue: rec.queue)
-        try await s.startCapture()
-        stream = s
+        let t = SystemAudioTap(excludeBundleIds: excludeBundleIds) { [weak self] buf in self?.rec.appendSys(buf) }
+        try t.start()
+        tap = t
     }
 
-    /// Rebuild the system-audio stream after it died (display sleep). Keeps the current writers + mic
-    /// running, so the in-progress segment just resumes capturing system audio. Returns success.
+    /// Rebuild the tap + mic (e.g. resuming after sleep/wake). Keeps the current writers running.
     func restartStream() async -> Bool {
-        if let s = stream { try? await s.stopCapture() }
-        stream = nil
-        do { try await buildStream(); try mic.start(into: rec); return true }   // resume mic too
-        catch { return false }
+        tap?.stop(); tap = nil
+        do { try startTap(); try mic.start(into: rec); return true }
+        catch { elog("engine: tap restart failed: \(error)"); return false }
     }
 
-    /// Pause capture (mic + system audio) on lock/sleep — release the audio + display cleanly.
+    /// Pause capture (mic + system tap) on lock/sleep.
     func suspendStream() async {
         mic.stop()
-        if let s = stream { try? await s.stopCapture() }
-        stream = nil
+        tap?.stop(); tap = nil
     }
 
     /// Snapshot the current writers into a CompletedSegment and (if `continueRecording`) swap in fresh
@@ -820,8 +903,7 @@ final class CaptureSession {
     func stop() async -> CompletedSegment? {
         mic.stop()
         let done = cut(continueRecording: false)
-        if let s = stream { try? await s.stopCapture() }
-        stream = nil
+        tap?.stop(); tap = nil
         return done
     }
 }
@@ -1029,8 +1111,25 @@ final class RecordingEngine {
         return (session.rec.micWriter?.recentLevel ?? 0, session.rec.sysWriter?.recentLevel ?? 0)
     }
 
-    /// Rebuild the capture stream after the display slept (it kills the SCStream with -3815).
-    /// Retries every 2s until the display is back. Mic keeps running; only system audio is rebuilt.
+    /// A tap created before "System Audio Recording Only" was granted delivers muted (zero) buffers.
+    /// Poll the grant for a few minutes; the moment it flips to authorized, rebuild the tap so real
+    /// system audio starts flowing — no manual Resume needed after the user clicks Allow.
+    func waitForAudioGrantThenRestart() {
+        Task { [weak self] in
+            for _ in 0..<90 {   // ~3 min
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self, self.running, !self.suspended else { return }
+                if audioCaptureAuthorized() {
+                    elog("engine: System Audio Recording granted — rebuilding tap to capture audio")
+                    _ = await self.session.restartStream()
+                    return
+                }
+            }
+        }
+    }
+
+    /// Rebuild the capture (tap + mic) if it stopped delivering — e.g. the default output device
+    /// changed under the aggregate device. Retries every 2s. Called on wake/unlock.
     func recover() {
         guard running, !suspended, !recovering else { return }
         recovering = true
@@ -1048,18 +1147,23 @@ final class RecordingEngine {
     }
 
     func start() async throws {
-        guard hasScreenPermission(), micAuthorized() else {
-            elog("engine: Screen Recording / Microphone permission not granted — requesting.")
+        let audioOK = audioCaptureAuthorized()   // preflight == granted
+        let micOK = micAuthorized()
+        // Fire the consent prompts if anything is missing. From the .app bundle (which carries the
+        // NSAudioCaptureUsageDescription), TCCAccessRequest surfaces the "System Audio Recording
+        // Only" dialog; AVCaptureDevice surfaces the Microphone one. We do NOT hard-block on an
+        // undetermined system-audio grant — we start the tap anyway (silent until granted) and
+        // rebuild it the moment the user allows, so capture just begins with no manual restart.
+        if !audioOK || !micOK {
+            elog("engine: requesting permissions (system-audio granted=\(audioOK), mic=\(micOK))")
             _ = requestPermissions()
-            throw NSError(domain: "meeting-capture", code: 3, userInfo: [NSLocalizedDescriptionKey: "permissions not granted"])
         }
-        session.onStreamStopped = { [weak self] in self?.recover() }
         try await session.start()
         running = true
         elog("engine: recording (segment=\(Int(cfg.segmentSeconds))s, voiceMin=\(Int(cfg.voiceMinSeconds))s, exclude=\(cfg.excludeBundleIds.joined(separator: ",")))")
+        if !audioOK { waitForAudioGrantThenRestart() }   // rebuild the muted tap once the user allows
         processQueue.async { [weak self] in self?.cleanupRetention() }   // tidy old files on start
-        // Sleep/wake: stop capture cleanly on sleep (don't fight the display powering down) and
-        // resume on wake — avoids hammering ScreenCaptureKit while the display is off.
+        // Sleep/wake: stop capture cleanly on sleep and resume on wake.
         let wc = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification] {
             wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.suspendForSleep() }
@@ -1613,7 +1717,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } catch {
                 await MainActor.run {
                     self.engine = nil; self.setIcon(recording: false)
-                    self.refresh("⚠ Grant Screen Recording + Microphone to macrec")
+                    self.refresh("⚠ Grant System Audio Recording + Microphone to macrec")
                     if !self.didAutoPrompt { self.didAutoPrompt = true; self.grantPermissions() }  // fire prompts + open Settings once
                 }
             }
@@ -1635,15 +1739,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Fire the permission prompts and jump straight to the Screen Recording pane. Microphone and
-    /// Calendar can be granted inline via the popups; Screen Recording is Settings-only on macOS
-    /// (no inline "Allow"), so we deep-link to its pane — toggle macrec there, then it restarts.
+    /// Fire the permission prompts inline. System Audio Recording, Microphone and Calendar all show
+    /// a normal consent popup on macOS 15+ (kTCCServiceAudioCapture prompts like the mic does), so no
+    /// Settings trip is needed for a first grant. If audio is still denied afterwards (user clicked
+    /// Deny earlier → no re-prompt), deep-link to the Privacy pane so they can toggle it.
     @objc private func grantPermissions() {
         NSApp.activate(ignoringOtherApps: true)
-        _ = requestPermissions()          // Screen Recording prompt + Microphone popup
+        _ = requestPermissions()          // System Audio Recording prompt + Microphone popup
         CalendarLookup.requestAccess()    // Calendar popup
-        if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
-            NSWorkspace.shared.open(u)     // open the Screen & System Audio Recording pane directly
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard !audioCaptureAuthorized() else { return }
+            if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture") {
+                NSWorkspace.shared.open(u)   // "System Audio Recording Only" pane
+            }
         }
     }
 
@@ -1744,9 +1852,9 @@ struct Main {
             exit(0)
         }
 
-        // Subcommand: perm-status — are both Screen Recording and Microphone granted? (no prompt)
+        // Subcommand: perm-status — are System Audio Recording + Microphone granted? (no prompt)
         if args.first == "perm-status" {
-            let ok = hasScreenPermission() && micAuthorized()
+            let ok = audioCaptureAuthorized() && micAuthorized()
             print(ok ? "1" : "0")
             exit(ok ? 0 : 1)
         }
@@ -1754,30 +1862,20 @@ struct Main {
         // Subcommand: request-permission — prompt for / register both permissions. Never hangs.
         if args.first == "request-permission" {
             let p = requestPermissions()
-            elog("screen-recording=\(p.screen) microphone=\(p.mic)")
-            print(p.screen && p.mic ? "1" : "0")
-            exit(p.screen && p.mic ? 0 : 3)
+            elog("system-audio=\(p.audio) microphone=\(p.mic)")
+            print(p.audio && p.mic ? "1" : "0")
+            exit(p.audio && p.mic ? 0 : 3)
         }
 
-        // Subcommand: register — force this binary into the TCC lists by actually attempting an
-        // SCStream capture (the reliable way to get listed under Screen Recording). A 3s watchdog
-        // exits the process so a not-yet-granted startCapture() can't hang forever.
+        // Subcommand: register — force this binary into the TCC lists by actually creating a Core
+        // Audio process tap (first tap creation triggers the "System Audio Recording Only" prompt)
+        // + firing the mic prompt. A watchdog exits so a not-yet-granted create can't hang forever.
         if args.first == "register" {
-            _ = CGRequestScreenCaptureAccess()
-            AVCaptureDevice.requestAccess(for: .audio) { _ in }
+            _ = requestPermissions()   // TCCAccessRequest(kTCCServiceAudioCapture) + mic prompt
             DispatchQueue.global().asyncAfter(deadline: .now() + 25) { exit(0) }  // watchdog (keep prompt alive)
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-                if let d = content.displays.first {
-                    let f = SCContentFilter(display: d, excludingApplications: [], exceptingWindows: [])
-                    let c = SCStreamConfiguration()
-                    c.capturesAudio = true
-                    c.width = 2; c.height = 2
-                    let s = SCStream(filter: f, configuration: c, delegate: nil)
-                    try await s.startCapture()
-                    try? await s.stopCapture()
-                }
-            } catch { elog("register attempt: \(error)") }
+            let probe = SystemAudioTap(excludeBundleIds: []) { _ in }
+            do { try probe.start(); try? await Task.sleep(nanoseconds: 2_000_000_000); probe.stop() }
+            catch { elog("register attempt: \(error)") }
             exit(0)
         }
 
@@ -1830,15 +1928,15 @@ struct Main {
         let sysURL = URL(fileURLWithPath: base + ".sys.wav")
         let micURL = URL(fileURLWithPath: base + ".mic.wav")
 
-        // Preflight permissions. Calling startCapture() without Screen Recording permission
-        // hangs forever under a background launchd agent (it blocks on a prompt that never shows).
-        guard hasScreenPermission() else {
-            elog("error: Screen Recording permission not granted. Run `meeting-capture request-permission`, then enable meeting-capture in System Settings → Screen & System Audio Recording.")
+        // Preflight permissions. Creating the tap without System Audio Recording permission would
+        // fail; under a background launchd agent no prompt can show, so bail out early.
+        guard audioCaptureAuthorized() else {
+            elog("error: System Audio Recording permission not granted. Run `macrec request-permission`, then enable macrec in System Settings → Privacy & Security → System Audio Recording Only.")
             _ = requestPermissions()
             exit(3)
         }
         guard noMic || micAuthorized() else {
-            elog("error: Microphone permission not granted. Run `meeting-capture request-permission`, then enable meeting-capture in System Settings → Microphone.")
+            elog("error: Microphone permission not granted. Run `macrec request-permission`, then enable macrec in System Settings → Microphone.")
             _ = requestPermissions()
             exit(3)
         }
@@ -1847,32 +1945,9 @@ struct Main {
             let rec = Recorder(sysWriter: try SourceWriter(url: sysURL),
                                micWriter: noMic ? nil : try SourceWriter(url: micURL))
 
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let display = content.displays.first else {
-                elog("error: no display available for SCContentFilter")
-                exit(1)
-            }
-            // 지정된 bundle id의 앱(들)을 오디오 캡처에서 제외한다. 한 bundle id가
-            // 여러 헬퍼 프로세스를 가질 수 있으므로(예: Spotify) .filter 로 전부 모은다.
-            // SCK는 앱 단위로 오디오를 거르므로 제외 앱의 소리는 sys 트랙에 안 섞인다.
-            let excludedApps = content.applications.filter { excludeBundleIds.contains($0.bundleIdentifier) }
-            if !excludedApps.isEmpty {
-                elog("meeting-capture: excluding audio from \(excludedApps.map { $0.bundleIdentifier }.joined(separator: ", "))")
-            }
-            let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
-
-            let config = SCStreamConfiguration()
-            config.capturesAudio = true
-            config.excludesCurrentProcessAudio = true
-            config.width = 2
-            config.height = 2
-            config.minimumFrameInterval = CMTime(value: 1, timescale: 4)  // ~4fps dummy video
-            // No captureMicrophone / forced sampleRate — see CaptureSession note. Mic via MicCapture.
-
-            let stream = SCStream(filter: filter, configuration: config, delegate: rec)
-            rec.stream = stream
-            try stream.addStreamOutput(rec, type: .screen, sampleHandlerQueue: rec.queue)
-            try stream.addStreamOutput(rec, type: .audio, sampleHandlerQueue: rec.queue)
+            // System audio via a Core Audio process tap (excludes our own PID + the given bundle ids,
+            // e.g. Spotify). Mic on a separate AVCaptureSession, as in the continuous engine.
+            let tap = SystemAudioTap(excludeBundleIds: excludeBundleIds) { [rec] buf in rec.appendSys(buf) }
             let micCap = MicCapture()
 
             // Stop coordination via semaphore + signal sources.
@@ -1886,12 +1961,12 @@ struct Main {
                 signalSources.append(src)
             }
 
-            try await stream.startCapture()
+            try tap.start()
             if !noMic {
                 do { try micCap.start(into: rec) }
-                catch { elog("meeting-capture: mic capture failed: \(error)") }
+                catch { elog("macrec: mic capture failed: \(error)") }
             }
-            elog("meeting-capture: recording → \(outPath)  (mic=\(!noMic))")
+            elog("macrec: recording → \(outPath)  (mic=\(!noMic))")
             if let duration = duration {
                 sigQ.asyncAfter(deadline: .now() + duration) { sem.signal() }
             }
@@ -1903,9 +1978,9 @@ struct Main {
                 }
             }
 
-            elog("meeting-capture: stopping…")
+            elog("macrec: stopping…")
             micCap.stop()
-            try? await stream.stopCapture()
+            tap.stop()
             rec.finalizeWriters()  // flush WAV headers before we read them back
 
             try mixDown(sysURL: sysURL, micURL: noMic ? nil : micURL, outURL: outURL)
