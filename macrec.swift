@@ -1471,8 +1471,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     /// Fill the "add a calendar" popup with the user's event calendars (by title). Picking one
     /// appends it to the token field; an empty token field means "use all calendars".
-    /// A scrollable checkbox list of the user's event calendars. None checked = all calendars.
-    /// (Replaces the old token field so many/long calendar names all stay visible.)
+    /// A scrollable checkbox list of the user's event calendars (none checked = all). Keeps every
+    /// calendar visible even with many entries or long names.
     private func buildCalendarList() -> NSView {
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 4
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -1523,7 +1523,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         audioRetPopup.selectItem(at: idx(c.audioRetentionDays, retValues))
         txtRetPopup.selectItem(at: idx(c.transcriptRetentionDays, retValues))
         excludeTokens.objectValue = c.excludeBundleIds
-        let selectedCals = Set(Pref.d.stringArray(forKey: Pref.calendars) ?? [])
+        // Trim stored titles (older builds stored via a token field that could carry stray spaces).
+        let selectedCals = Set((Pref.d.stringArray(forKey: Pref.calendars) ?? [])
+            .map { $0.trimmingCharacters(in: .whitespaces) })
         for (name, box) in calChecks { box.state = selectedCals.contains(name) ? .on : .off }
         dirField.stringValue = c.transcriptsDir.path
         audioDirField.stringValue = c.audioDir.path
@@ -1566,8 +1568,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(retValues[max(0, txtRetPopup.indexOfSelectedItem)], forKey: Pref.txtRetention)
         let ids = (excludeTokens.objectValue as? [String]) ?? []
         d.set(ids.joined(separator: " "), forKey: Pref.exclude)
-        let calNames = calChecks.filter { $0.box.state == .on }.map { $0.name }
-        d.set(calNames, forKey: Pref.calendars)
+        // Only persist if we actually listed calendars — otherwise (no Calendar access → empty list)
+        // we'd silently wipe a previously-saved selection.
+        if !calChecks.isEmpty {
+            d.set(calChecks.filter { $0.box.state == .on }.map { $0.name }, forKey: Pref.calendars)
+        }
         d.set(dirField.stringValue, forKey: Pref.txtDir)
         d.set(audioDirField.stringValue, forKey: Pref.audioDir)
         // Apply "Start at login" (skip on the dev machine where the LaunchAgent owns autostart).
