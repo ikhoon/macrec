@@ -1411,73 +1411,66 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let audioChooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseAudioDir))
         let audioStack = NSStackView(views: [audioDirField, audioChooseBtn]); audioStack.orientation = .horizontal; audioStack.spacing = 6
 
-        func sectionHeader(_ s: String) -> NSTextField {
-            let l = NSTextField(labelWithString: s.uppercased())
-            l.font = .systemFont(ofSize: 11, weight: .semibold); l.textColor = .secondaryLabelColor
-            return l
+        // Grouped into tabs (each pane stays short) instead of one long scrolling form.
+        func row(_ label: String, _ control: NSView) -> [NSView] { [labeled(label), control] }
+        func tab(_ title: String, _ rows: [[NSView]]) -> NSTabViewItem {
+            let grid = NSGridView(views: rows)
+            grid.translatesAutoresizingMaskIntoConstraints = false
+            grid.rowSpacing = 9; grid.columnSpacing = 18
+            grid.column(at: 0).xPlacement = .trailing
+            let pane = NSView(); pane.addSubview(grid)
+            NSLayoutConstraint.activate([
+                grid.topAnchor.constraint(equalTo: pane.topAnchor, constant: 20),
+                grid.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 24),
+                grid.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -24),
+            ])
+            let item = NSTabViewItem(); item.label = title; item.view = pane
+            return item
         }
-        var rows: [[NSView]] = []; var headerRows: [Int] = []
-        func sec(_ t: String) { headerRows.append(rows.count); rows.append([sectionHeader(t), NSGridCell.emptyContentView]) }
-        func row(_ label: String, _ control: NSView) { rows.append([labeled(label), control]) }
 
-        sec("Recording")
-        row("Segment length (on the hour):", segPopup)
-        row("", systemAudioBtn)
-        row("Min. speech (sec):", voiceField)
-        row("", vadBtn)
-        row("Excluded apps:", excludeTokens)
-        row("Add a running app:", addAppPopup)
-        sec("Transcription (whisper)")
-        row("Model:", modelPopup)
-        row("…or custom model:", customModelField)
-        row("Language:", langPopup)
-        sec("Titling")
-        row("", calBtn)
-        row("Calendars:", calListCell)
-        sec("Storage")
-        row("", keepAudioBtn)
-        row("Keep audio for:", audioRetPopup)
-        row("Keep transcripts for:", txtRetPopup)
-        row("Save transcripts to:", dirStack)
-        row("Save audio to:", audioStack)
-        sec("General")
-        row("", loginBtn)
-
-        let grid = NSGridView(views: rows)
-        grid.translatesAutoresizingMaskIntoConstraints = false
-        grid.rowSpacing = 9; grid.columnSpacing = 18
-        grid.column(at: 0).xPlacement = .trailing
-        for r in headerRows {
-            grid.mergeCells(inHorizontalRange: NSRange(location: 0, length: 2), verticalRange: NSRange(location: r, length: 1))
-            grid.cell(atColumnIndex: 0, rowIndex: r).xPlacement = .leading
-            if r > 0 { grid.row(at: r).topPadding = 14 }
-        }
+        let tabs = NSTabView(); tabs.translatesAutoresizingMaskIntoConstraints = false
+        tabs.addTabViewItem(tab("Recording", [
+            row("Segment length (on the hour):", segPopup),
+            row("", systemAudioBtn),
+            row("Min. speech (sec):", voiceField),
+            row("", vadBtn),
+            row("Excluded apps:", excludeTokens),
+            row("Add a running app:", addAppPopup),
+        ]))
+        tabs.addTabViewItem(tab("Transcription", [
+            row("Model:", modelPopup),
+            row("…or custom model:", customModelField),
+            row("Language:", langPopup),
+        ]))
+        tabs.addTabViewItem(tab("Titling", [
+            row("", calBtn),
+            row("Calendars:", calListCell),
+        ]))
+        tabs.addTabViewItem(tab("Storage", [
+            row("", keepAudioBtn),
+            row("Keep audio for:", audioRetPopup),
+            row("Keep transcripts for:", txtRetPopup),
+            row("Save transcripts to:", dirStack),
+            row("Save audio to:", audioStack),
+        ]))
+        tabs.addTabViewItem(tab("General", [
+            row("", loginBtn),
+        ]))
 
         let saveBtn = NSButton(title: "Save & Apply", target: self, action: #selector(saveAndClose)); saveBtn.keyEquivalent = "\r"
         let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(closeOnly)); cancelBtn.keyEquivalent = "\u{1b}"
         let btns = NSStackView(views: [cancelBtn, saveBtn]); btns.orientation = .horizontal; btns.spacing = 10
         btns.translatesAutoresizingMaskIntoConstraints = false
 
-        // Scrollable form (many grouped rows) with the buttons pinned below it.
-        let doc = NSView(); doc.translatesAutoresizingMaskIntoConstraints = false
-        doc.addSubview(grid)
-        let scroll = NSScrollView(); scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.hasVerticalScroller = true; scroll.scrollerStyle = .overlay; scroll.drawsBackground = false
-        scroll.documentView = doc
         let content = NSView()
-        content.addSubview(scroll); content.addSubview(btns)
+        content.addSubview(tabs); content.addSubview(btns)
         NSLayoutConstraint.activate([
-            grid.topAnchor.constraint(equalTo: doc.topAnchor, constant: 20),
-            grid.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 34),
-            grid.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -34),
-            grid.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -20),
-            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-            scroll.topAnchor.constraint(equalTo: content.topAnchor),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: btns.topAnchor, constant: -12),
-            btns.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -34),
-            btns.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -22),
+            tabs.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            tabs.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            tabs.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            tabs.bottomAnchor.constraint(equalTo: btns.topAnchor, constant: -12),
+            btns.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            btns.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
         window?.contentView = content
     }
@@ -2139,7 +2132,7 @@ final class LiveCaptions {
             let showTS = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true)
             let fontSize = CGFloat(Pref.dbl(Pref.liveFontSize, "MR_LIVE_FONT_SIZE", 14))
             self.window?.render(self.lines.map { (speaker: $0.speaker, text: $0.text, translated: $0.translated,
-                                        time: $0.time, mine: $0.speaker == self.mineLabel) },
+                                        time: $0.time, mine: $0.speaker == self.mineLabel, inProgress: !$0.final) },
                                 showTimestamps: showTS, fontSize: fontSize, showLabels: self.showLabels)
         }
     }
@@ -2158,7 +2151,6 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     private var suppressCloseCallback = false
     private let langPopup = NSPopUpButton(), sourcePopup = NSPopUpButton(), translatePopup = NSPopUpButton()
     private let tsToggle = NSButton(checkboxWithTitle: "Time", target: nil, action: nil)
-    private let spinner = NSProgressIndicator()   // spins while the session is live (reassures it's working)
     private static let titleIcon = "🎙️"           // beautifies the "macrec live" title
 
     init(onClose: @escaping () -> Void, onReconfigure: @escaping () -> Void, onRestyle: @escaping () -> Void) {
@@ -2252,9 +2244,6 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         tsToggle.controlSize = .small; tsToggle.font = .systemFont(ofSize: 11); tsToggle.toolTip = "Show timestamps"
         tsToggle.state = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true) ? .on : .off
         tsToggle.target = self; tsToggle.action = #selector(tsToggled(_:))
-        spinner.style = .spinning; spinner.controlSize = .small; spinner.isDisplayedWhenStopped = false
-        spinner.setContentHuggingPriority(.required, for: .horizontal)
-        spinner.toolTip = "Live — transcribing"
         // Gear pull-down for less-frequent / future options (engine, …) — keeps the bar uncluttered.
         let gear = NSPopUpButton(frame: .zero, pullsDown: true)
         gear.controlSize = .small; gear.bezelStyle = .texturedRounded; gear.imagePosition = .imageOnly
@@ -2271,7 +2260,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         }
         gear.menu = gmenu
         let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        let bar = NSStackView(views: [spinner, langPopup, sourcePopup, translatePopup, spacer, aMinus, aPlus, tsToggle, gear])
+        let bar = NSStackView(views: [langPopup, sourcePopup, translatePopup, spacer, aMinus, aPlus, tsToggle, gear])
         bar.orientation = .horizontal; bar.alignment = .centerY; bar.spacing = 6; bar.distribution = .fill
         return bar
     }
@@ -2311,7 +2300,6 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             panel.setFrameOrigin(NSPoint(x: f.maxX - panel.frame.width - 24, y: f.minY + 24))
         }
         panel.orderFrontRegardless()
-        spinner.startAnimation(nil)   // live activity indicator (spins for the session's lifetime)
     }
     func close() { suppressCloseCallback = true; panel.close() }
 
@@ -2326,7 +2314,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     /// them) on a bold label; with a single speaker the label is dropped and the text uses the primary
     /// color (one voice → nothing to disambiguate). A hanging indent keeps wrapped lines aligned under
     /// the text rather than sliding under the timestamp/label.
-    func render(_ lines: [(speaker: String, text: String, translated: String?, time: Date, mine: Bool)],
+    func render(_ lines: [(speaker: String, text: String, translated: String?, time: Date, mine: Bool, inProgress: Bool)],
                 showTimestamps: Bool, fontSize: CGFloat, showLabels: Bool) {
         let tsFont = NSFont.monospacedDigitSystemFont(ofSize: max(9, fontSize - 3), weight: .regular)
         let labelFont = NSFont.boldSystemFont(ofSize: fontSize)
@@ -2356,6 +2344,10 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             }
             out.append(NSAttributedString(string: l.text, attributes: [
                 .font: textFont, .foregroundColor: color, .paragraphStyle: para]))
+            if l.inProgress {   // still transcribing this line → typing indicator inside the text
+                out.append(NSAttributedString(string: (l.text.isEmpty ? "…" : " …"), attributes: [
+                    .font: textFont, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
+            }
             if let t = l.translated, !t.isEmpty {
                 // Translation on its own line, first char aligned under the text, wraps under the ↳ text.
                 let tp = NSMutableParagraphStyle()
