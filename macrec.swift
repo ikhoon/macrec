@@ -1922,9 +1922,9 @@ final class WhisperLiveTranscriber: LiveTranscribing {
         timer?.cancel(); timer = nil
         lock.lock(); let p = proc; proc = nil; lock.unlock()
         p?.terminate()   // kill any in-flight whisper-cli so it doesn't keep burning CPU / leak
-        q.sync {   // serialize after any in-flight transcribeIfReady() so the wav isn't recreated post-delete
-            lock.lock(); seg.removeAll(); running = false; lock.unlock()
-            try? FileManager.default.removeItem(at: wavURL)
+        q.async {   // runs after any in-flight transcribeIfReady() (serial queue) so the wav isn't recreated post-delete
+            self.lock.lock(); self.seg.removeAll(); self.running = false; self.lock.unlock()
+            try? FileManager.default.removeItem(at: self.wavURL)
         }
     }
 
