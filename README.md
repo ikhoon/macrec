@@ -1,10 +1,41 @@
-# macrec
+# 🎙️ macrec
+
+![platform](https://img.shields.io/badge/macOS-15%2B-000000?logo=apple&logoColor=white)
+![arch](https://img.shields.io/badge/Apple%20Silicon-arm64-333333)
+![privacy](https://img.shields.io/badge/100%25-on--device-2ea44f)
+![install](https://img.shields.io/badge/install-brew-FBB040?logo=homebrew&logoColor=white)
+![transcription](https://img.shields.io/badge/transcription-whisper.cpp-4b8bbe)
 
 > Always-on macOS meeting recorder — `mac` + `rec`, a sibling of `maccal` / `macmail`.
 
 An always-on macOS **menu-bar app** (with a CLI) that continuously records your **microphone + system audio**, splits the day into **hourly segments**, and **transcribes** the hours that actually contain speech using `whisper.cpp` with **Voice Activity Detection**. Transcripts land as timestamped Markdown in a folder you choose.
 
 Meeting boundaries are intentionally *not* detected — you get clean hourly transcripts and let an LLM segment/curate them later.
+
+### ✨ Highlights
+
+- 🎙️ **Mic + system audio, 24/7** — hourly segments, only speech-containing hours get transcribed
+- 🔒 **100% on-device** — audio, transcripts, and the model stay local; the only network use is the one-time model download
+- 🪶 **Least-privilege capture** — system audio via a Core Audio tap ⇒ *System Audio Recording Only*, **never** Screen Recording (no orange dot)
+- 💬 **Live captions** (macOS 26) — a floating overlay transcribes in real time (`Me`/`Them`, speaker-labeled) with **optional live translation**, while `whisper.cpp` still writes the authoritative transcript
+- 🗓️ **Auto-titled** from the overlapping calendar event · monthly folders · self-contained (bundled `whisper-cli` + VAD)
+
+### What it looks like
+
+```text
+  ▎ menu bar ▾                         ┌─ macrec live · en-US ───────────┐
+  ────────────────────────            │ 10:32:41  Me:   그 부분은 다음…   │
+  ⓘ  About macrec                     │ 10:32:45  Them: 네, 리뷰는 목요일 │
+  ● Recording · mic + system          │           ↳ Yes, review on Thu ▍ │
+  🎤 ●●●●○○○○   🔊 ●●●○○○○○           └──────────────────────────────────┘
+  ────────────────────────              floating · translucent · draggable
+  〰️ Transcribe now                     (Me = blue · Them = green · ↳ = translation)
+  ⏸  Pause
+  ────────────────────────
+  🖐 Grant permissions…
+  ⚙️  Settings…      📂 Open transcripts
+  ⏻  Quit
+```
 
 ## Install
 
@@ -117,6 +148,7 @@ Stored in `UserDefaults` (suite `com.ikhoon.macrec.prefs`); saving restarts the 
 | Capture system audio (other participants) | on |
 | Title transcripts from calendar | on |
 | Calendars for titles | all (pick specific ones — empty = all) |
+| Timestamps in live captions (macOS 26) | on |
 | **Start at login (24/7)** | on (distributed app; managed by LaunchAgent on dev machines) |
 | Keep audio (WAV) too | on |
 | Keep audio for | 30 days |
