@@ -458,6 +458,7 @@ enum Pref {
     static let liveFontSize = "liveFontSize"            // live-caption overlay font size (pt)
     static let liveOpacity = "liveOpacity"              // live-caption overlay opacity (0.3–1.0)
     static let liveSource = "liveSource"                // which speakers to transcribe live: both|other|me
+    static let liveEngine = "liveEngine"                // live transcription engine: apple|whisper (extensible)
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
     static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
     static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
@@ -1706,7 +1707,7 @@ func pickSpeechLocale(requested: Locale, from pool: [Locale]) -> Locale? {
 // segment rotation stays the authoritative, saved transcript — this overlay is an ephemeral view.
 
 @available(macOS 26, *)
-final class LiveTranscriber {
+final class LiveTranscriber: LiveTranscribing {
     private let label: String
     private let locale: Locale
     private let onUpdate: (String, Bool) -> Void   // (text, isFinal)
@@ -1812,6 +1813,165 @@ final class LiveTranslator {
     }
 }
 
+// MARK: - live transcription engines (pluggable)
+//
+// A live engine consumes fed PCM and calls back with caption text. Two implementations today —
+// Apple SpeechAnalyzer (LiveTranscriber, low latency) and whisper.cpp (WhisperLiveTranscriber, higher
+// accuracy esp. non-English). Add another (e.g. sherpa-onnx, Vosk) by conforming + a LiveEngine case.
+
+/// One caption source's transcription engine. `feed` is called off the audio thread; `onUpdate(text,
+/// isFinal)` reports a (possibly volatile) line; `onLocale` surfaces the active language for the UI.
+protocol LiveTranscribing: AnyObject {
+    func start()
+    func feed(_ buffer: AVAudioPCMBuffer)
+    func stop()
+}
+
+/// Selectable live engine. Extensible: add a case, a title, and a branch in `makeTranscriber`.
+enum LiveEngine: String, CaseIterable {
+    case apple, whisper
+    static var current: LiveEngine { LiveEngine(rawValue: Pref.d.string(forKey: Pref.liveEngine) ?? "") ?? .apple }
+    var title: String {
+        switch self {
+        case .apple:   return "Apple (fast)"
+        case .whisper: return "Whisper (accurate)"
+        }
+    }
+}
+
+/// whisper.cpp live engine: accumulates fed audio into a 16 kHz mono segment, and every ~2 s re-runs
+/// `whisper-cli` on the current segment for a volatile caption line. A lightweight energy gate finalizes
+/// the line after ~1 s of silence (or a 12 s cap). Reuses the same whisper-cli + model as the saved
+/// transcript. Not on the real-time path — runs on its own queue. Tunables are named constants below.
+final class WhisperLiveTranscriber: LiveTranscribing {
+    private let label: String
+    private let locale: Locale
+    private let lang: String                    // whisper -l code (e.g. "ko"; "auto" if unknown)
+    private let onUpdate: (String, Bool) -> Void
+    private let onLocale: ((Locale) -> Void)?
+    private let cfg = EngineConfig.load()
+    private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+    private let wavURL = FileManager.default.temporaryDirectory.appendingPathComponent("macrec-live-\(UUID().uuidString).wav")
+    private let q = DispatchQueue(label: "macrec.whisperlive", qos: .userInitiated)
+    private let lock = NSLock()
+    private var converter: AVAudioConverter?
+    private var seg: [Float] = []               // current segment samples (16 kHz mono)
+    private var startedAt = 0.0                 // systemUptime when the segment began
+    private var lastVoiceAt = 0.0               // systemUptime of the last non-silent buffer
+    private var timer: DispatchSourceTimer?
+    private var running = false                 // a whisper-cli run is in flight
+
+    // Tunables (kept named for future exposure as options).
+    private let tick = 2.0, minDur = 0.8, silenceGap = 1.0, maxDur = 12.0, maxWindow = 30.0
+    private let voiceRMS: Float = 0.01          // ~ -40 dBFS speech gate
+
+    init(label: String, locale: Locale, onLocale: ((Locale) -> Void)? = nil,
+         onUpdate: @escaping (String, Bool) -> Void) {
+        self.label = label; self.locale = locale; self.onLocale = onLocale; self.onUpdate = onUpdate
+        self.lang = locale.language.languageCode?.identifier ?? "auto"
+    }
+
+    func start() {
+        onLocale?(locale)   // whisper uses the requested language directly; surface it in the title
+        let t = DispatchSource.makeTimerSource(queue: q)
+        t.schedule(deadline: .now() + tick, repeating: tick)
+        t.setEventHandler { [weak self] in self?.transcribeIfReady() }
+        t.resume(); timer = t
+        elog("whisperlive[\(label)]: started (lang=\(lang), model=\((cfg.whisperModel as NSString).lastPathComponent))")
+    }
+
+    func feed(_ buffer: AVAudioPCMBuffer) {
+        guard let conv = to16kMono(buffer), let ch = conv.floatChannelData?[0] else { return }
+        let n = Int(conv.frameLength); guard n > 0 else { return }
+        var sum: Float = 0; for i in 0..<n { sum += ch[i] * ch[i] }
+        let rms = (sum / Float(n)).squareRoot()
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        if seg.isEmpty { startedAt = now }
+        seg.append(contentsOf: UnsafeBufferPointer(start: ch, count: n))
+        if rms > voiceRMS { lastVoiceAt = now }
+        let cap = Int(fmt.sampleRate * maxWindow)
+        if seg.count > cap { seg.removeFirst(seg.count - cap) }
+        lock.unlock()
+    }
+
+    func stop() {
+        timer?.cancel(); timer = nil
+        lock.lock(); seg.removeAll(); running = false; lock.unlock()
+        try? FileManager.default.removeItem(at: wavURL)
+    }
+
+    /// Convert an incoming buffer (mic native / 48 kHz tap) to 16 kHz mono float.
+    private func to16kMono(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        if buffer.format == fmt { return buffer }
+        lock.lock()
+        if converter == nil || converter?.inputFormat != buffer.format { converter = AVAudioConverter(from: buffer.format, to: fmt) }
+        let c = converter; lock.unlock()
+        guard let c else { return nil }
+        let ratio = fmt.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: capacity) else { return nil }
+        var fed = false; var err: NSError?
+        c.convert(to: out, error: &err) { _, status in
+            if fed { status.pointee = .noDataNow; return nil }
+            fed = true; status.pointee = .haveData; return buffer
+        }
+        return (err == nil && out.frameLength > 0) ? out : nil
+    }
+
+    /// Timer handler (on `q`). Snapshots the segment, decides finalize vs volatile, runs whisper-cli.
+    private func transcribeIfReady() {
+        lock.lock()
+        if running { lock.unlock(); return }
+        let samples = seg, started = startedAt, lastVoice = lastVoiceAt
+        lock.unlock()
+        let now = ProcessInfo.processInfo.systemUptime
+        let dur = Double(samples.count) / fmt.sampleRate
+        guard dur >= minDur else { return }
+        let finalize = (now - lastVoice > silenceGap) || (now - started > maxDur)
+        lock.lock(); running = true; lock.unlock()
+        let text = runWhisper(samples)
+        if !text.isEmpty { onUpdate(text, finalize) }
+        lock.lock()
+        if finalize && !text.isEmpty { seg.removeAll(keepingCapacity: true); startedAt = 0 }
+        running = false
+        lock.unlock()
+    }
+
+    private func runWhisper(_ samples: [Float]) -> String {
+        guard FileManager.default.isExecutableFile(atPath: cfg.whisperCli),
+              FileManager.default.fileExists(atPath: cfg.whisperModel) else {
+            elog("whisperlive[\(label)]: whisper-cli or model missing (\(cfg.whisperCli))"); return ""
+        }
+        guard writeWav(samples) else { return "" }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: cfg.whisperCli)
+        // -nt: plain text (no timestamps); -bs 1: greedy for latency; half the cores to spare the engine.
+        p.arguments = ["-m", cfg.whisperModel, "-f", wavURL.path, "-l", lang, "-nt", "-np", "-sns",
+                       "-bs", "1", "-t", String(max(2, ProcessInfo.processInfo.activeProcessorCount / 2))]
+        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
+        do { try p.run() } catch { elog("whisperlive run: \(error)"); return "" }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let raw = String(data: data, encoding: .utf8) ?? ""
+        return raw.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("[") }.joined(separator: " ")
+    }
+
+    private func writeWav(_ samples: [Float]) -> Bool {
+        guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(samples.count)) else { return false }
+        buf.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { buf.floatChannelData![0].update(from: $0.baseAddress!, count: samples.count) }
+        let settings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000.0,
+            AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false]
+        do {
+            let file = try AVAudioFile(forWriting: wavURL, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+            try file.write(from: buf); return true
+        } catch { elog("whisperlive writeWav: \(error)"); return false }
+    }
+}
+
 /// Which speakers to transcribe for the live overlay. Each source runs its own on-device analyzer,
 /// so transcribing one instead of two roughly halves inference load → lower latency. Default is
 /// `.other` (the remote party / system audio): you already know what you said, and it's the cheaper
@@ -1841,8 +2001,8 @@ final class LiveCaptions {
     // lock guards the reference swap. LiveTranscriber.feed is itself thread-safe.
     private let srcLock = NSLock()
     private let feedQueue = DispatchQueue(label: "macrec.live.feed", qos: .userInitiated)
-    private var mic: LiveTranscriber?
-    private var sys: LiveTranscriber?
+    private var mic: (any LiveTranscribing)?
+    private var sys: (any LiveTranscribing)?
     private var translator: LiveTranslator?   // nil = no live translation
     private var window: LiveCaptionWindow?
     private var lines: [(speaker: String, text: String, translated: String?, final: Bool, time: Date)] = []
@@ -1888,17 +2048,26 @@ final class LiveCaptions {
                 ?? loc.identifier(.bcp47)
             DispatchQueue.main.async { self?.window?.setLanguage(name) }
         }
-        var m: LiveTranscriber?, s: LiveTranscriber?
+        var m: (any LiveTranscribing)?, s: (any LiveTranscribing)?
         if mode == .both || mode == .me {
-            m = LiveTranscriber(label: mine, locale: locale, onLocale: onLocale) { [weak self] t, f in self?.post(mine, t, f) }
+            m = makeTranscriber(label: mine, locale: locale, onLocale: onLocale) { [weak self] t, f in self?.post(mine, t, f) }
         }
         if mode == .both || mode == .other {
             // Let whichever transcriber the mic isn't already covering report the resolved language.
-            s = LiveTranscriber(label: theirs, locale: locale, onLocale: m == nil ? onLocale : nil) { [weak self] t, f in self?.post(theirs, t, f) }
+            s = makeTranscriber(label: theirs, locale: locale, onLocale: m == nil ? onLocale : nil) { [weak self] t, f in self?.post(theirs, t, f) }
         }
         srcLock.lock(); mic = m; sys = s; srcLock.unlock()
         m?.start(); s?.start()
-        elog("live: engine ready (locale=\(locale.identifier), source=\(mode.rawValue), translate=\(toId.isEmpty ? "off" : toId))")
+        elog("live: engine ready (engine=\(LiveEngine.current.rawValue), locale=\(locale.identifier), source=\(mode.rawValue), translate=\(toId.isEmpty ? "off" : toId))")
+    }
+
+    /// Build the configured engine for one source. Extensible: add a LiveEngine case + a branch here.
+    private func makeTranscriber(label: String, locale: Locale, onLocale: ((Locale) -> Void)?,
+                                 onUpdate: @escaping (String, Bool) -> Void) -> any LiveTranscribing {
+        switch LiveEngine.current {
+        case .whisper: return WhisperLiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
+        case .apple:   return LiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
+        }
     }
 
     /// Apply an overlay control-bar change (language / source / translation) live: stop the current
@@ -2086,8 +2255,23 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         spinner.style = .spinning; spinner.controlSize = .small; spinner.isDisplayedWhenStopped = false
         spinner.setContentHuggingPriority(.required, for: .horizontal)
         spinner.toolTip = "Live — transcribing"
+        // Gear pull-down for less-frequent / future options (engine, …) — keeps the bar uncluttered.
+        let gear = NSPopUpButton(frame: .zero, pullsDown: true)
+        gear.controlSize = .small; gear.bezelStyle = .texturedRounded; gear.imagePosition = .imageOnly
+        gear.setContentHuggingPriority(.required, for: .horizontal); gear.toolTip = "Engine & options"
+        let gmenu = NSMenu()
+        let face = NSMenuItem(); face.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Options")
+        gmenu.addItem(face)   // pull-down: item 0 is the button face (the gear icon)
+        let engHeader = NSMenuItem(title: "Engine", action: nil, keyEquivalent: ""); engHeader.isEnabled = false
+        gmenu.addItem(engHeader)
+        for e in LiveEngine.allCases {
+            let mi = NSMenuItem(title: e.title, action: #selector(enginePicked(_:)), keyEquivalent: "")
+            mi.target = self; mi.representedObject = e.rawValue; mi.state = (e == LiveEngine.current) ? .on : .off
+            gmenu.addItem(mi)
+        }
+        gear.menu = gmenu
         let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        let bar = NSStackView(views: [spinner, langPopup, sourcePopup, translatePopup, spacer, aMinus, aPlus, tsToggle])
+        let bar = NSStackView(views: [spinner, langPopup, sourcePopup, translatePopup, spacer, aMinus, aPlus, tsToggle, gear])
         bar.orientation = .horizontal; bar.alignment = .centerY; bar.spacing = 6; bar.distribution = .fill
         return bar
     }
@@ -2110,6 +2294,12 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         Pref.d.set(Double(next), forKey: Pref.liveFontSize); onRestyle()
     }
     @objc private func tsToggled(_ s: NSButton) { Pref.d.set(s.state == .on, forKey: Pref.liveTimestamps); onRestyle() }
+    @objc private func enginePicked(_ item: NSMenuItem) {
+        guard let raw = item.representedObject as? String else { return }
+        Pref.d.set(raw, forKey: Pref.liveEngine)
+        item.menu?.items.forEach { if $0.representedObject is String { $0.state = ($0 === item) ? .on : .off } }
+        onReconfigure()
+    }
 
     @objc private func opacityChanged(_ s: NSSlider) {
         panel.alphaValue = CGFloat(s.doubleValue)
