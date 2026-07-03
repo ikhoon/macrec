@@ -2595,11 +2595,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         LoginItem.autoEnableOnceIfDistributed()   // distributed app: enable 24/7 autostart on first run
         startEngine()
         installStopHandler { [weak self] in
-            if let eng = self?.engine {
-                let s = DispatchSemaphore(value: 0)
-                Task { await eng.stop(); s.signal() }
-                _ = s.wait(timeout: .now() + 15)
-            }
+            self?.stopEngineSync()
             DispatchQueue.main.async { NSApp.terminate(nil) }
         }
     }
@@ -2834,14 +2830,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ])
     }
 
-    @objc private func quit() {
-        if let eng = engine {
-            let s = DispatchSemaphore(value: 0)
-            Task { await eng.stop(); s.signal() }
-            _ = s.wait(timeout: .now() + 15)
-        }
-        NSApp.terminate(nil)
+    /// Stop the engine (→ destroys the Core Audio process tap + aggregate device) synchronously, once.
+    /// A leaked tap can wedge coreaudiod ("no sound until killall coreaudiod"), so run it on EVERY
+    /// termination path: menu Quit, SIGTERM/kickstart, and logout/shutdown (applicationWillTerminate).
+    private func stopEngineSync() {
+        guard let eng = engine else { return }
+        engine = nil   // idempotent — later callers see nil and skip (no double-stop)
+        let s = DispatchSemaphore(value: 0)
+        Task { await eng.stop(); s.signal() }
+        _ = s.wait(timeout: .now() + 15)
     }
+
+    func applicationWillTerminate(_ notification: Notification) { stopEngineSync() }
+
+    @objc private func quit() { stopEngineSync(); NSApp.terminate(nil) }
 }
 
 var appController: AppController?   // retained for process lifetime
