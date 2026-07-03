@@ -455,6 +455,8 @@ enum Pref {
     static let liveTimestamps = "liveTimestamps"        // show timestamps in the live-caption overlay
     static let captionLang = "liveCaptionLang"          // live-caption transcription locale ("" = system)
     static let translateTo = "liveTranslateTo"          // live-caption translation target ("" = off)
+    static let liveFontSize = "liveFontSize"            // live-caption overlay font size (pt)
+    static let liveOpacity = "liveOpacity"              // live-caption overlay opacity (0.3–1.0)
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
     static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
     static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
@@ -1348,6 +1350,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let onSave: () -> Void
     private let segPopup = NSPopUpButton(), langPopup = NSPopUpButton()
     private let captionLangPopup = NSPopUpButton(), translateToPopup = NSPopUpButton()   // live captions (macOS 26)
+    private let liveFontPopup = NSPopUpButton(), liveOpacityPopup = NSPopUpButton()      // live overlay appearance
     private let modelPopup = NSPopUpButton()
     private let audioRetPopup = NSPopUpButton(), txtRetPopup = NSPopUpButton()
     private let addAppPopup = NSPopUpButton()
@@ -1367,6 +1370,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let segValues = [900, 1800, 3600, 7200], segTitles = ["15 min", "30 min", "1 hour", "2 hours"]
     private let langValues = ["auto", "ko", "ja", "en"], langTitles = ["Auto-detect", "Korean", "Japanese", "English"]
     // Live-caption languages (macOS 26 SpeechAnalyzer + Translation). "" = System (caption) / Off (translate).
+    private let fontValues: [Double] = [12, 14, 16, 18, 22], fontTitles = ["Small", "Medium", "Large", "X-Large", "XX-Large"]
+    private let opacityValues: [Double] = [1.0, 0.9, 0.8, 0.7, 0.6], opacityTitles = ["100%", "90%", "80%", "70%", "60%"]
     private let capLangValues = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
     private let capLangTitles  = ["System", "Korean", "Japanese", "English", "Chinese", "Spanish", "French", "German"]
     private let transToValues  = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
@@ -1393,6 +1398,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func buildForm() {
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
         captionLangPopup.addItems(withTitles: capLangTitles); translateToPopup.addItems(withTitles: transToTitles)
+        liveFontPopup.addItems(withTitles: fontTitles); liveOpacityPopup.addItems(withTitles: opacityTitles)
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
         for f in [voiceField, dirField, audioDirField, customModelField] { f.translatesAutoresizingMaskIntoConstraints = false }
@@ -1420,6 +1426,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [labeled("Transcription language:"), langPopup],
             [labeled("Live caption language:"), captionLangPopup],
             [labeled("Live translate to:"), translateToPopup],
+            [labeled("Live font size:"), liveFontPopup],
+            [labeled("Live overlay opacity:"), liveOpacityPopup],
             [labeled("Transcription model:"), modelPopup],
             [labeled("…or custom model:"), customModelField],
             [labeled("Min. speech (sec):"), voiceField],
@@ -1530,6 +1538,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let c = EngineConfig.load()
         segPopup.selectItem(at: idx(Int(c.segmentSeconds), segValues))
         langPopup.selectItem(at: idx(c.whisperLang, langValues))
+        liveFontPopup.selectItem(at: idx(Pref.dbl(Pref.liveFontSize, "MR_LIVE_FONT_SIZE", 14), fontValues))
+        liveOpacityPopup.selectItem(at: idx(Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 0.9), opacityValues))
         captionLangPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.captionLang) ?? "", capLangValues))
         translateToPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.translateTo) ?? "", transToValues))
         modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
@@ -1577,6 +1587,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let d = Pref.d
         d.set(Double(segValues[max(0, segPopup.indexOfSelectedItem)]), forKey: Pref.segment)
         d.set(langValues[max(0, langPopup.indexOfSelectedItem)], forKey: Pref.lang)
+        d.set(fontValues[max(0, liveFontPopup.indexOfSelectedItem)], forKey: Pref.liveFontSize)
+        d.set(opacityValues[max(0, liveOpacityPopup.indexOfSelectedItem)], forKey: Pref.liveOpacity)
         d.set(capLangValues[max(0, captionLangPopup.indexOfSelectedItem)], forKey: Pref.captionLang)
         d.set(transToValues[max(0, translateToPopup.indexOfSelectedItem)], forKey: Pref.translateTo)
         d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
@@ -1805,6 +1817,7 @@ final class LiveCaptions {
     // mic/sys are written on the main thread (start/stop) and read on the audio queue (feed*), so a
     // lock guards the reference swap. LiveTranscriber.feed is itself thread-safe.
     private let srcLock = NSLock()
+    private let feedQueue = DispatchQueue(label: "macrec.live.feed", qos: .userInitiated)
     private var mic: LiveTranscriber?
     private var sys: LiveTranscriber?
     private var translator: LiveTranslator?   // nil = no live translation
@@ -1824,9 +1837,7 @@ final class LiveCaptions {
         // (Pref.str treats "" as unset and would fall back to the default).
         let capId = Pref.d.string(forKey: Pref.captionLang) ?? ""
         let locale = capId.isEmpty ? Locale.current : Locale(identifier: capId)
-        let win = LiveCaptionWindow(currentLang: capId,
-                                    onPickLanguage: { [weak self] code in self?.changeLanguage(code) },
-                                    onClose: { [weak self] in self?.stop() })
+        let win = LiveCaptionWindow(onClose: { [weak self] in self?.stop() })
         window = win; win.show()
         let (mine, theirs) = speakerLabels(forLanguage: locale.language.languageCode?.identifier)
         mineLabel = mine
@@ -1855,8 +1866,10 @@ final class LiveCaptions {
     }
 
     // Audio-queue feeds (no-op when inactive). Snapshot the ref under the lock, then feed outside it.
-    func feedMic(_ b: AVAudioPCMBuffer) { srcLock.lock(); let m = mic; srcLock.unlock(); m?.feed(b) }
-    func feedSystem(_ b: AVAudioPCMBuffer) { srcLock.lock(); let s = sys; srcLock.unlock(); s?.feed(b) }
+    // Feeds arrive on the capture threads (the tap's real-time IOProc for system audio!). Hop onto a
+    // normal queue so the format conversion never runs on the real-time audio thread (avoids glitches).
+    func feedMic(_ b: AVAudioPCMBuffer) { srcLock.lock(); let m = mic; srcLock.unlock(); if let m { feedQueue.async { m.feed(b) } } }
+    func feedSystem(_ b: AVAudioPCMBuffer) { srcLock.lock(); let s = sys; srcLock.unlock(); if let s { feedQueue.async { s.feed(b) } } }
 
     private func post(_ speaker: String, _ text: String, _ final: Bool) {
         DispatchQueue.main.async { [weak self] in self?.apply(speaker, text, final) }
@@ -1896,42 +1909,31 @@ final class LiveCaptions {
             self.renderScheduled = false
             guard self.active else { return }
             let showTS = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true)
+            let fontSize = CGFloat(Pref.dbl(Pref.liveFontSize, "MR_LIVE_FONT_SIZE", 14))
             self.window?.render(self.lines.map { (speaker: $0.speaker, text: $0.text, translated: $0.translated,
-                                        time: $0.time, mine: $0.speaker == self.mineLabel) }, showTimestamps: showTS)
+                                        time: $0.time, mine: $0.speaker == self.mineLabel) },
+                                showTimestamps: showTS, fontSize: fontSize)
         }
-    }
-
-    /// Switch caption language live (from the overlay popup): persist + restart the session.
-    func changeLanguage(_ code: String) {
-        Pref.d.set(code, forKey: Pref.captionLang)
-        guard active else { return }
-        stop(); start()
     }
 }
 
-/// Quick language choices offered right on the overlay (full list lives in Settings).
-let liveOverlayLanguages: [(title: String, code: String)] =
-    [("System", ""), ("한국어", "ko"), ("English", "en"), ("日本語", "ja"), ("中文", "zh-Hans")]
-
-/// Borderless-ish always-on-top panel that shows the merged live captions.
+/// Floating always-on-top panel showing the live captions — captions only; every control (language,
+/// translate, font size, opacity, timestamps) lives in Settings, so the overlay stays clean.
 @available(macOS 26, *)
 final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     private let panel: NSPanel
     private let textView = NSTextView()
-    private let langPopup = NSPopUpButton()
-    private let onPickLanguage: (String) -> Void
     private let onClose: () -> Void
     private var suppressCloseCallback = false
 
-    init(currentLang: String, onPickLanguage: @escaping (String) -> Void, onClose: @escaping () -> Void) {
-        self.onPickLanguage = onPickLanguage
+    init(onClose: @escaping () -> Void) {
         self.onClose = onClose
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 150),
                         styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         super.init()
         panel.title = "macrec live"
-        panel.alphaValue = 0.92   // slightly see-through so it's less obtrusive over a call
+        panel.alphaValue = CGFloat(min(1.0, max(0.3, Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 0.92))))
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.hidesOnDeactivate = false
@@ -1939,8 +1941,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.delegate = self
         let content = panel.contentView!
-        let barH: CGFloat = 26   // bottom strip holds the opacity slider
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: barH, width: content.bounds.width, height: content.bounds.height - barH))
+        let scroll = NSScrollView(frame: content.bounds)
         scroll.autoresizingMask = [.width, .height]
         scroll.hasVerticalScroller = true
         scroll.scrollerStyle = .overlay        // auto-hiding overlay scroller (no permanent bar)
@@ -1958,33 +1959,9 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         textView.textContainer?.widthTracksTextView = true
         textView.isEditable = false; textView.isSelectable = true
         textView.drawsBackground = false
-        textView.font = NSFont.systemFont(ofSize: 14)
         textView.textContainerInset = NSSize(width: 10, height: 8)
         scroll.documentView = textView
         content.addSubview(scroll)
-        // Bottom bar: a language quick-picker (left) + an opacity slider (right).
-        for l in liveOverlayLanguages { langPopup.addItem(withTitle: l.title) }
-        langPopup.selectItem(at: max(0, liveOverlayLanguages.firstIndex { $0.code == currentLang } ?? 0))
-        langPopup.controlSize = .mini
-        langPopup.font = NSFont.menuFont(ofSize: NSFont.smallSystemFontSize)
-        langPopup.target = self; langPopup.action = #selector(languagePicked(_:))
-        langPopup.frame = NSRect(x: 8, y: 2, width: 118, height: 20)
-        langPopup.autoresizingMask = [.maxXMargin, .maxYMargin]
-        langPopup.toolTip = "Caption language"
-        content.addSubview(langPopup)
-        let slider = NSSlider(value: Double(panel.alphaValue), minValue: 0.3, maxValue: 1.0,
-                              target: self, action: #selector(opacityChanged(_:)))
-        slider.frame = NSRect(x: 134, y: 4, width: content.bounds.width - 144, height: 16)
-        slider.autoresizingMask = [.width, .maxYMargin]
-        slider.controlSize = .mini
-        slider.toolTip = "Overlay opacity"
-        content.addSubview(slider)
-    }
-
-    @objc private func languagePicked(_ sender: NSPopUpButton) {
-        let i = sender.indexOfSelectedItem
-        guard i >= 0, i < liveOverlayLanguages.count else { return }
-        onPickLanguage(liveOverlayLanguages[i].code)
     }
 
     func show() {
@@ -2005,30 +1982,28 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     /// Render the caption lines as attributed text — neutral (label color) text with a bold speaker
     /// label + separator (speakers are told apart by the label, no loud tint); a subtle timestamp
     /// prefix (optional) and a dim "↳ translation" line below.
-    func render(_ lines: [(speaker: String, text: String, translated: String?, time: Date, mine: Bool)], showTimestamps: Bool) {
+    func render(_ lines: [(speaker: String, text: String, translated: String?, time: Date, mine: Bool)],
+                showTimestamps: Bool, fontSize: CGFloat) {
         let out = NSMutableAttributedString()
         for (i, l) in lines.enumerated() {
             if i > 0 { out.append(NSAttributedString(string: "\n")) }
             if showTimestamps {
                 out.append(NSAttributedString(string: "\(tsFormatter.string(from: l.time)) ", attributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: max(9, fontSize - 4), weight: .regular),
                     .foregroundColor: NSColor.tertiaryLabelColor]))
             }
             out.append(NSAttributedString(string: "\(l.speaker): ", attributes: [
-                .font: NSFont.boldSystemFont(ofSize: 14), .foregroundColor: NSColor.labelColor]))
+                .font: NSFont.boldSystemFont(ofSize: fontSize), .foregroundColor: NSColor.labelColor]))
             out.append(NSAttributedString(string: l.text, attributes: [
-                .font: NSFont.systemFont(ofSize: 14), .foregroundColor: NSColor.labelColor]))
+                .font: NSFont.systemFont(ofSize: fontSize), .foregroundColor: NSColor.labelColor]))
             if let t = l.translated, !t.isEmpty {
                 out.append(NSAttributedString(string: "\n    ↳ \(t)", attributes: [
-                    .font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.secondaryLabelColor]))
+                    .font: NSFont.systemFont(ofSize: max(10, fontSize - 1)), .foregroundColor: NSColor.secondaryLabelColor]))
             }
         }
         textView.textStorage?.setAttributedString(out)
         textView.scrollToEndOfDocument(nil)
     }
-
-    /// Opacity slider callback (live-adjusts the panel translucency).
-    @objc func opacityChanged(_ sender: NSSlider) { panel.alphaValue = CGFloat(sender.doubleValue) }
 
     // User clicked the panel's close button → tear the session down (unless we closed it ourselves).
     func windowWillClose(_ notification: Notification) { if !suppressCloseCallback { onClose() } }
