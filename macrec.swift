@@ -268,9 +268,10 @@ final class Recorder {
     /// the two capture paths don't interact. Appended on `queue` so it shares synchronization with
     /// sys writes and rotation swaps; live captions are fed directly (converted once) for low latency.
     func appendMic(_ sb: CMSampleBuffer) {
-        guard CMSampleBufferDataIsReady(sb) else { return }
-        if #available(macOS 26, *), let pcm = SourceWriter.pcm(from: sb) { LiveCaptions.shared.feedMic(pcm) }
-        queue.async { self.micWriter?.append(sb) }
+        guard CMSampleBufferDataIsReady(sb), let pcm = SourceWriter.pcm(from: sb) else { return }
+        // Convert once: feed live captions immediately, then hand the same PCM to the writer.
+        if #available(macOS 26, *) { LiveCaptions.shared.feedMic(pcm) }
+        queue.async { self.micWriter?.append(pcm) }
     }
 
     /// Drain in-flight callbacks, then release the AVAudioFiles so they flush their WAV headers
@@ -1712,8 +1713,8 @@ final class LiveTranscriber {
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         let fmt = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
         let (stream, c) = AsyncStream<AnalyzerInput>.makeStream()
+        try await analyzer.start(inputSequence: stream)   // only accept feeds once the analyzer is up
         lock.lock(); inputFormat = fmt; cont = c; lock.unlock()
-        try await analyzer.start(inputSequence: stream)
         elog("live[\(label)]: analyzer ready (\(loc.identifier(.bcp47)))")
         for try await result in transcriber.results {
             let text = String(result.text.characters)
@@ -1730,8 +1731,8 @@ final class LiveTranscriber {
             ?? pickSpeechLocale(requested: requested, from: supported)
     }
 
-    /// Feed a canon (16k mono float32) buffer — convert to the analyzer's format and yield it.
-    /// Called on the audio queue; the lock guards the converter + continuation.
+    /// Feed a captured PCM buffer (tap: 48 kHz stereo · mic: its native format) — convert to the
+    /// analyzer's format and yield it. Called off the capture thread; the lock guards converter + cont.
     func feed(_ buf: AVAudioPCMBuffer) {
         lock.lock(); defer { lock.unlock() }
         guard let cont, let target = inputFormat else { return }   // analyzer not ready yet → drop
@@ -1883,7 +1884,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     }()
 
     /// Render the caption lines as attributed text: optional dim timestamp, a bold color-coded
-    /// speaker label + separator, then the text. (나/mic = blue, 상대/system = green.)
+    /// speaker label + separator, then the text. (mic speaker = blue, system speaker = green.)
     func render(_ lines: [(speaker: String, text: String, time: Date, mine: Bool)], showTimestamps: Bool) {
         let out = NSMutableAttributedString()
         let body = NSFont.systemFont(ofSize: 14)
