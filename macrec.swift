@@ -1380,7 +1380,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         w.delegate = self
         buildForm()
         load()
-        w.setContentSize(NSSize(width: 600, height: 600))   // roomy fixed size; form top, buttons bottom
+        w.setContentSize(NSSize(width: 560, height: 440))   // sized to the tabbed panes; buttons pinned bottom
         w.center()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -1421,8 +1421,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             let pane = NSView(); pane.addSubview(grid)
             NSLayoutConstraint.activate([
                 grid.topAnchor.constraint(equalTo: pane.topAnchor, constant: 20),
-                grid.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 24),
-                grid.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -24),
+                grid.centerXAnchor.constraint(equalTo: pane.centerXAnchor),
+                grid.leadingAnchor.constraint(greaterThanOrEqualTo: pane.leadingAnchor, constant: 24),
             ])
             let item = NSTabViewItem(); item.label = title; item.view = pane
             return item
@@ -1524,7 +1524,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = stack
         scroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
-        scroll.heightAnchor.constraint(equalToConstant: 108).isActive = true
+        // Grow to fit all calendars up to a cap, then scroll (instead of a fixed short box).
+        let naturalH = CGFloat(max(1, names.count)) * 21 + 14
+        scroll.heightAnchor.constraint(equalToConstant: min(naturalH, 220)).isActive = true
         let clip = scroll.contentView
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: clip.topAnchor),
@@ -1792,6 +1794,12 @@ final class LiveTranslator {
 
     init(source: Locale.Language, target: Locale.Language) {
         session = TranslationSession(installedSource: source, target: target)
+        // Pre-warm the pair now — the first translate can otherwise stall on the model download.
+        Task { [weak self] in
+            guard let self else { return }
+            do { try await session.prepareTranslation(); lock.lock(); prepared = true; lock.unlock(); elog("live: translator ready") }
+            catch { elog("live: translate prewarm failed: \(error)") }
+        }
     }
 
     func translate(_ text: String) async -> String? {
@@ -1810,7 +1818,9 @@ final class LiveTranslator {
 //
 // A live engine consumes fed PCM and calls back with caption text. Two implementations today —
 // Apple SpeechAnalyzer (LiveTranscriber, low latency) and whisper.cpp (WhisperLiveTranscriber, higher
-// accuracy esp. non-English). Add another (e.g. sherpa-onnx, Vosk) by conforming + a LiveEngine case.
+// accuracy esp. non-English). Add another — on-device (sherpa-onnx, Vosk) or a paid streaming CLOUD
+// API (Deepgram, OpenAI realtime, …) for low-latency + high quality — by conforming to LiveTranscribing
+// (feed audio, emit text) + a LiveEngine case; its API key/endpoint would come from Prefs in init.
 
 /// One caption source's transcription engine. `feed` is called off the audio thread; `onUpdate(text,
 /// isFinal)` reports a (possibly volatile) line; `onLocale` surfaces the active language for the UI.
@@ -1826,8 +1836,8 @@ enum LiveEngine: String, CaseIterable {
     static var current: LiveEngine { LiveEngine(rawValue: Pref.d.string(forKey: Pref.liveEngine) ?? "") ?? .apple }
     var title: String {
         switch self {
-        case .apple:   return "Apple (fast)"
-        case .whisper: return "Whisper (accurate)"
+        case .apple:   return "Apple"
+        case .whisper: return "Whisper"
         }
     }
 }
@@ -1855,7 +1865,7 @@ final class WhisperLiveTranscriber: LiveTranscribing {
     private var running = false                 // a whisper-cli run is in flight
 
     // Tunables (kept named for future exposure as options).
-    private let tick = 2.0, minDur = 0.8, silenceGap = 1.0, maxDur = 12.0, maxWindow = 30.0
+    private let tick = 1.0, minDur = 0.6, silenceGap = 0.8, maxDur = 8.0, maxWindow = 30.0
     private let voiceRMS: Float = 0.01          // ~ -40 dBFS speech gate
 
     init(label: String, locale: Locale, onLocale: ((Locale) -> Void)? = nil,
@@ -1941,7 +1951,7 @@ final class WhisperLiveTranscriber: LiveTranscribing {
         p.executableURL = URL(fileURLWithPath: cfg.whisperCli)
         // -nt: plain text (no timestamps); -bs 1: greedy for latency; half the cores to spare the engine.
         p.arguments = ["-m", cfg.whisperModel, "-f", wavURL.path, "-l", lang, "-nt", "-np", "-sns",
-                       "-bs", "1", "-t", String(max(2, ProcessInfo.processInfo.activeProcessorCount / 2))]
+                       "-bs", "1", "-t", String(max(4, ProcessInfo.processInfo.activeProcessorCount - 2))]
         let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
         do { try p.run() } catch { elog("whisperlive run: \(error)"); return "" }
         let data = out.fileHandleForReading.readDataToEndOfFile()
@@ -1981,9 +1991,9 @@ enum LiveCaptionOptions {
     static let langValues   = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
     static let langTitles   = ["System", "한국어", "日本語", "English", "中文", "Español", "Français", "Deutsch"]
     static let sourceValues = ["other", "both", "me"]
-    static let sourceTitles = ["Them only", "Both", "Me only"]
+    static let sourceTitles = ["Them", "Both", "Me"]
     static let transValues  = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
-    static let transTitles  = ["No translate", "→한국어", "→日本語", "→English", "→中文", "→Español", "→Français", "→Deutsch"]
+    static let transTitles  = ["Off", "→한국어", "→日本語", "→English", "→中文", "→Español", "→Français", "→Deutsch"]
 }
 
 /// Owns the two per-source transcribers + optional translator + the floating caption window.
@@ -2001,6 +2011,8 @@ final class LiveCaptions {
     private var lines: [(speaker: String, text: String, translated: String?, final: Bool, time: Date)] = []
     private var mineLabel = ""   // label used for the mic track (for speaker coloring)
     private var showLabels = true   // false in single-speaker modes (one voice → the label is redundant)
+    private var lastTranslateAt: [String: Double] = [:]   // per-speaker throttle for live translation
+    private let translateThrottle = 0.5
     private let maxLines = 12
     private(set) var active = false
 
@@ -2105,17 +2117,24 @@ final class LiveCaptions {
         }
         if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
         render()
-        // Translate finalized lines only (bounded rate); fill it in when it returns.
-        if final, let translator, !text.isEmpty {
-            Task { [weak self] in
-                guard let out = await translator.translate(text) else { return }
-                await MainActor.run { self?.setTranslation(speaker, text, out) }
+        // Translate the live text too (not just finals), throttled per speaker so it streams along.
+        if let translator, !text.isEmpty {
+            let now = ProcessInfo.processInfo.systemUptime
+            if final || now - (lastTranslateAt[speaker] ?? 0) >= translateThrottle {
+                lastTranslateAt[speaker] = now
+                Task { [weak self] in
+                    guard let out = await translator.translate(text) else { return }
+                    await MainActor.run { self?.setTranslation(speaker, text, out) }
+                }
             }
         }
     }
     private func setTranslation(_ speaker: String, _ original: String, _ translated: String) {
-        // Update the most recent line matching this speaker + original text.
-        guard active, let i = lines.lastIndex(where: { $0.speaker == speaker && $0.text == original }) else { return }
+        guard active else { return }
+        // Prefer the exact source line; else the speaker's current line (volatile text has since moved on).
+        let i = lines.lastIndex(where: { $0.speaker == speaker && $0.text == original })
+            ?? lines.lastIndex(where: { $0.speaker == speaker })
+        guard let i else { return }
         lines[i].translated = translated
         render()
     }
@@ -2155,7 +2174,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
 
     init(onClose: @escaping () -> Void, onReconfigure: @escaping () -> Void, onRestyle: @escaping () -> Void) {
         self.onClose = onClose; self.onReconfigure = onReconfigure; self.onRestyle = onRestyle
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 560, height: 160),
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: 150),
                         styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         super.init()
@@ -2172,7 +2191,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         // window chrome, not content — the caption area stays clean. Each control applies immediately.
         let accessory = NSTitlebarAccessoryViewController()
         accessory.layoutAttribute = .bottom
-        let host = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 32))
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 680, height: 32))
         host.autoresizingMask = [.width]
         let bar = buildControlBar()
         bar.translatesAutoresizingMaskIntoConstraints = false
@@ -2186,10 +2205,9 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         accessory.view = host
         panel.addTitlebarAccessoryViewController(accessory)
 
-        // --- captions (scrollable text), above the opacity strip ---
+        // --- captions (scrollable text) fill the whole content (opacity moved up to the control bar) ---
         let content = panel.contentView!
-        let barH: CGFloat = 22   // slim bottom strip for the opacity drag slider
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: barH, width: content.bounds.width, height: content.bounds.height - barH))
+        let scroll = NSScrollView(frame: content.bounds)
         scroll.autoresizingMask = [.width, .height]
         scroll.hasVerticalScroller = true
         scroll.scrollerStyle = .overlay        // auto-hiding overlay scroller (no permanent bar)
@@ -2210,15 +2228,6 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         textView.textContainerInset = NSSize(width: 10, height: 8)
         scroll.documentView = textView
         content.addSubview(scroll)
-
-        // --- opacity drag slider (bottom) ---
-        let slider = NSSlider(value: Double(panel.alphaValue), minValue: 0.3, maxValue: 1.0,
-                              target: self, action: #selector(opacityChanged(_:)))
-        slider.frame = NSRect(x: 10, y: 2, width: content.bounds.width - 20, height: 16)
-        slider.autoresizingMask = [.width, .maxYMargin]
-        slider.controlSize = .mini
-        slider.toolTip = "Overlay opacity"
-        content.addSubview(slider)
     }
 
     /// Build the top control bar. Each control writes its Pref and fires the matching callback so the
@@ -2244,23 +2253,18 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         tsToggle.controlSize = .small; tsToggle.font = .systemFont(ofSize: 11); tsToggle.toolTip = "Show timestamps"
         tsToggle.state = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true) ? .on : .off
         tsToggle.target = self; tsToggle.action = #selector(tsToggled(_:))
-        // Gear pull-down for less-frequent / future options (engine, …) — keeps the bar uncluttered.
-        let gear = NSPopUpButton(frame: .zero, pullsDown: true)
-        gear.controlSize = .small; gear.bezelStyle = .texturedRounded; gear.imagePosition = .imageOnly
-        gear.setContentHuggingPriority(.required, for: .horizontal); gear.toolTip = "Engine & options"
-        let gmenu = NSMenu()
-        let face = NSMenuItem(); face.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Options")
-        gmenu.addItem(face)   // pull-down: item 0 is the button face (the gear icon)
-        let engHeader = NSMenuItem(title: "Engine", action: nil, keyEquivalent: ""); engHeader.isEnabled = false
-        gmenu.addItem(engHeader)
-        for e in LiveEngine.allCases {
-            let mi = NSMenuItem(title: e.title, action: #selector(enginePicked(_:)), keyEquivalent: "")
-            mi.target = self; mi.representedObject = e.rawValue; mi.state = (e == LiveEngine.current) ? .on : .off
-            gmenu.addItem(mi)
-        }
-        gear.menu = gmenu
+        // Engine select box — Apple (fast) vs Whisper (accurate / better Korean).
+        let enginePopup = NSPopUpButton()
+        fill(enginePopup, LiveEngine.allCases.map { $0.title }, LiveEngine.allCases.firstIndex(of: .current) ?? 0,
+             "Engine — Apple: fast · Whisper: accurate (better Korean)", #selector(engineChanged(_:)))
+        // Opacity drag slider, now on the top bar (was a bottom strip).
+        let opacity = NSSlider(value: Double(panel.alphaValue), minValue: 0.3, maxValue: 1.0,
+                               target: self, action: #selector(opacityChanged(_:)))
+        opacity.controlSize = .mini; opacity.toolTip = "Overlay opacity"
+        opacity.translatesAutoresizingMaskIntoConstraints = false
+        opacity.widthAnchor.constraint(equalToConstant: 72).isActive = true
         let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        let bar = NSStackView(views: [langPopup, sourcePopup, translatePopup, spacer, aMinus, aPlus, tsToggle, gear])
+        let bar = NSStackView(views: [enginePopup, langPopup, sourcePopup, translatePopup, spacer, aMinus, aPlus, tsToggle, opacity])
         bar.orientation = .horizontal; bar.alignment = .centerY; bar.spacing = 6; bar.distribution = .fill
         return bar
     }
@@ -2283,11 +2287,10 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         Pref.d.set(Double(next), forKey: Pref.liveFontSize); onRestyle()
     }
     @objc private func tsToggled(_ s: NSButton) { Pref.d.set(s.state == .on, forKey: Pref.liveTimestamps); onRestyle() }
-    @objc private func enginePicked(_ item: NSMenuItem) {
-        guard let raw = item.representedObject as? String else { return }
-        Pref.d.set(raw, forKey: Pref.liveEngine)
-        item.menu?.items.forEach { if $0.representedObject is String { $0.state = ($0 === item) ? .on : .off } }
-        onReconfigure()
+    @objc private func engineChanged(_ s: NSPopUpButton) {
+        let engines = LiveEngine.allCases
+        let e = engines[min(max(0, s.indexOfSelectedItem), engines.count - 1)]
+        Pref.d.set(e.rawValue, forKey: Pref.liveEngine); onReconfigure()
     }
 
     @objc private func opacityChanged(_ s: NSSlider) {
@@ -2416,14 +2419,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let primary = recording ? "waveform.badge.mic" : "pause.circle"
         let fallback = recording ? "waveform" : "pause"
         // Fixed point size so the menu-bar icon never resizes (independent of which symbol).
-        let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+        let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
         let img = (NSImage(systemSymbolName: primary, accessibilityDescription: "macrec")
             ?? NSImage(systemSymbolName: fallback, accessibilityDescription: "macrec"))?
             .withSymbolConfiguration(cfg)
         img?.isTemplate = true
         statusItem.button?.image = img
         statusItem.button?.imagePosition = .imageOnly   // no title padding around the glyph
-        statusItem.length = 26   // fixed width, tighter L/R padding (won't reflow as indicators come/go)
+        statusItem.length = 22   // fixed width, tight L/R padding (won't reflow as indicators come/go)
         elog("icon set (recording=\(recording)), statusItem.length=\(statusItem.length)")
     }
 
