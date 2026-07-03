@@ -1820,12 +1820,14 @@ final class LiveCaptions {
     func start() {
         guard !active else { return }
         active = true; lines = []
-        let win = LiveCaptionWindow(onClose: { [weak self] in self?.stop() })
-        window = win; win.show()
         // Caption language: the picker value ("" = system). Read directly so "" is respected
         // (Pref.str treats "" as unset and would fall back to the default).
         let capId = Pref.d.string(forKey: Pref.captionLang) ?? ""
         let locale = capId.isEmpty ? Locale.current : Locale(identifier: capId)
+        let win = LiveCaptionWindow(currentLang: capId,
+                                    onPickLanguage: { [weak self] code in self?.changeLanguage(code) },
+                                    onClose: { [weak self] in self?.stop() })
+        window = win; win.show()
         let (mine, theirs) = speakerLabels(forLanguage: locale.language.languageCode?.identifier)
         mineLabel = mine
         // Optional translation of finalized lines — skip if the target language == caption language.
@@ -1883,24 +1885,48 @@ final class LiveCaptions {
         lines[i].translated = translated
         render()
     }
+    // Volatile results arrive many times/sec from BOTH transcribers; rebuilding the whole overlay
+    // each time churns the UI thread. Coalesce to ~10 fps (negligible vs the engine's own latency).
+    private var renderScheduled = false
     private func render() {
-        let showTS = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true)
-        window?.render(lines.map { (speaker: $0.speaker, text: $0.text, translated: $0.translated,
-                                    time: $0.time, mine: $0.speaker == mineLabel) }, showTimestamps: showTS)
+        guard !renderScheduled else { return }
+        renderScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self else { return }
+            self.renderScheduled = false
+            guard self.active else { return }
+            let showTS = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true)
+            self.window?.render(self.lines.map { (speaker: $0.speaker, text: $0.text, translated: $0.translated,
+                                        time: $0.time, mine: $0.speaker == self.mineLabel) }, showTimestamps: showTS)
+        }
+    }
+
+    /// Switch caption language live (from the overlay popup): persist + restart the session.
+    func changeLanguage(_ code: String) {
+        Pref.d.set(code, forKey: Pref.captionLang)
+        guard active else { return }
+        stop(); start()
     }
 }
+
+/// Quick language choices offered right on the overlay (full list lives in Settings).
+let liveOverlayLanguages: [(title: String, code: String)] =
+    [("System", ""), ("한국어", "ko"), ("English", "en"), ("日本語", "ja"), ("中文", "zh-Hans")]
 
 /// Borderless-ish always-on-top panel that shows the merged live captions.
 @available(macOS 26, *)
 final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     private let panel: NSPanel
     private let textView = NSTextView()
+    private let langPopup = NSPopUpButton()
+    private let onPickLanguage: (String) -> Void
     private let onClose: () -> Void
     private var suppressCloseCallback = false
 
-    init(onClose: @escaping () -> Void) {
+    init(currentLang: String, onPickLanguage: @escaping (String) -> Void, onClose: @escaping () -> Void) {
+        self.onPickLanguage = onPickLanguage
         self.onClose = onClose
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 190),
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 150),
                         styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         super.init()
@@ -1917,6 +1943,8 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         let scroll = NSScrollView(frame: NSRect(x: 0, y: barH, width: content.bounds.width, height: content.bounds.height - barH))
         scroll.autoresizingMask = [.width, .height]
         scroll.hasVerticalScroller = true
+        scroll.scrollerStyle = .overlay        // auto-hiding overlay scroller (no permanent bar)
+        scroll.autohidesScrollers = true
         scroll.drawsBackground = false
         // Canonical scrollable NSTextView setup so vertical resizing + scrolling behave correctly.
         let size = scroll.contentSize
@@ -1934,14 +1962,29 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         textView.textContainerInset = NSSize(width: 10, height: 8)
         scroll.documentView = textView
         content.addSubview(scroll)
-        // Opacity slider along the bottom — adjust the overlay translucency right here (0.3–1.0).
+        // Bottom bar: a language quick-picker (left) + an opacity slider (right).
+        for l in liveOverlayLanguages { langPopup.addItem(withTitle: l.title) }
+        langPopup.selectItem(at: max(0, liveOverlayLanguages.firstIndex { $0.code == currentLang } ?? 0))
+        langPopup.controlSize = .mini
+        langPopup.font = NSFont.menuFont(ofSize: NSFont.smallSystemFontSize)
+        langPopup.target = self; langPopup.action = #selector(languagePicked(_:))
+        langPopup.frame = NSRect(x: 8, y: 2, width: 118, height: 20)
+        langPopup.autoresizingMask = [.maxXMargin, .maxYMargin]
+        langPopup.toolTip = "Caption language"
+        content.addSubview(langPopup)
         let slider = NSSlider(value: Double(panel.alphaValue), minValue: 0.3, maxValue: 1.0,
                               target: self, action: #selector(opacityChanged(_:)))
-        slider.frame = NSRect(x: 10, y: 3, width: content.bounds.width - 20, height: 19)
+        slider.frame = NSRect(x: 134, y: 4, width: content.bounds.width - 144, height: 16)
         slider.autoresizingMask = [.width, .maxYMargin]
         slider.controlSize = .mini
         slider.toolTip = "Overlay opacity"
         content.addSubview(slider)
+    }
+
+    @objc private func languagePicked(_ sender: NSPopUpButton) {
+        let i = sender.indexOfSelectedItem
+        guard i >= 0, i < liveOverlayLanguages.count else { return }
+        onPickLanguage(liveOverlayLanguages[i].code)
     }
 
     func show() {
@@ -1959,23 +2002,22 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "HH:mm:ss"; return f
     }()
 
-    /// Render the caption lines as attributed text. Each line is tinted by speaker (mic = blue,
-    /// system = green): bold label + ":" separator, then the text in the same hue so the whole line
-    /// reads as one; a subtle timestamp prefix (optional) and a dim "↳ translation" line below.
+    /// Render the caption lines as attributed text — neutral (label color) text with a bold speaker
+    /// label + separator (speakers are told apart by the label, no loud tint); a subtle timestamp
+    /// prefix (optional) and a dim "↳ translation" line below.
     func render(_ lines: [(speaker: String, text: String, translated: String?, time: Date, mine: Bool)], showTimestamps: Bool) {
         let out = NSMutableAttributedString()
         for (i, l) in lines.enumerated() {
             if i > 0 { out.append(NSAttributedString(string: "\n")) }
-            let color: NSColor = l.mine ? .systemBlue : .systemGreen
             if showTimestamps {
                 out.append(NSAttributedString(string: "\(tsFormatter.string(from: l.time)) ", attributes: [
                     .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
                     .foregroundColor: NSColor.tertiaryLabelColor]))
             }
             out.append(NSAttributedString(string: "\(l.speaker): ", attributes: [
-                .font: NSFont.boldSystemFont(ofSize: 14), .foregroundColor: color]))
+                .font: NSFont.boldSystemFont(ofSize: 14), .foregroundColor: NSColor.labelColor]))
             out.append(NSAttributedString(string: l.text, attributes: [
-                .font: NSFont.systemFont(ofSize: 14), .foregroundColor: color]))   // whole line tinted
+                .font: NSFont.systemFont(ofSize: 14), .foregroundColor: NSColor.labelColor]))
             if let t = l.translated, !t.isEmpty {
                 out.append(NSAttributedString(string: "\n    ↳ \(t)", attributes: [
                     .font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.secondaryLabelColor]))
