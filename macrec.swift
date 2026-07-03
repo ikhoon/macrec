@@ -1880,9 +1880,9 @@ final class WhisperLiveTranscriber: LiveTranscribing {
 
     // Tunables (kept named for future exposure as options).
     private let tick = 1.0, minDur = 0.6, silenceGap = 0.8, maxDur = 8.0, maxWindow = 30.0
-    private let voiceRMS: Float = 0.02          // ~ -34 dBFS speech gate (above room noise)
+    private let voiceRMS: Float = 0.006         // ~ -44 dBFS gate — permissive; only drops true silence
     private var voicedSamples = 0               // above-threshold samples in the current segment
-    private let minVoicedSec = 0.25             // require this much real speech before running whisper
+    private let minVoicedSec = 0.2              // require this much real speech before running whisper
 
     init(label: String, locale: Locale, onLocale: ((Locale) -> Void)? = nil,
          onUpdate: @escaping (String, Bool) -> Void) {
@@ -2242,13 +2242,13 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         // window chrome, not content — the caption area stays clean. Each control applies immediately.
         let accessory = NSTitlebarAccessoryViewController()
         accessory.layoutAttribute = .bottom
-        let host = NSView(frame: NSRect(x: 0, y: 0, width: 680, height: 58))
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 680, height: 32))
         host.autoresizingMask = [.width]
         let bar = buildControlBar()
         bar.translatesAutoresizingMaskIntoConstraints = false
         host.addSubview(bar)
         NSLayoutConstraint.activate([
-            host.heightAnchor.constraint(equalToConstant: 58),
+            host.heightAnchor.constraint(equalToConstant: 32),
             bar.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 8),
             bar.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -8),
             bar.centerYAnchor.constraint(equalTo: host.centerYAnchor),
@@ -2314,16 +2314,21 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         opacity.controlSize = .mini; opacity.toolTip = "Overlay opacity"
         opacity.translatesAutoresizingMaskIntoConstraints = false
         opacity.widthAnchor.constraint(equalToConstant: 72).isActive = true
-        func lbl(_ s: String) -> NSTextField {
-            let l = NSTextField(labelWithString: s); l.font = .systemFont(ofSize: 11); l.textColor = .secondaryLabelColor
-            l.setContentHuggingPriority(.required, for: .horizontal); return l
+        // A small leading icon per select box says what it controls, without text-label clutter.
+        func icon(_ name: String, _ tip: String) -> NSImageView {
+            let iv = NSImageView(image: NSImage(systemSymbolName: name, accessibilityDescription: tip) ?? NSImage())
+            iv.symbolConfiguration = .init(pointSize: 12, weight: .regular)
+            iv.contentTintColor = .secondaryLabelColor; iv.toolTip = tip
+            iv.setContentHuggingPriority(.required, for: .horizontal); return iv
         }
-        // Two rows: labeled select boxes on top (so it's clear what each controls), display controls below.
-        let row1 = NSStackView(views: [lbl("Engine"), enginePopup, lbl("Language"), langPopup, lbl("Speaker"), sourcePopup, lbl("Translate"), translatePopup])
-        let row2 = NSStackView(views: [lbl("Text"), aMinus, aPlus, tsToggle, lbl("Opacity"), opacity])
-        for r in [row1, row2] { r.orientation = .horizontal; r.alignment = .centerY; r.spacing = 5 }
-        let bar = NSStackView(views: [row1, row2])
-        bar.orientation = .vertical; bar.alignment = .leading; bar.spacing = 3
+        let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        let bar = NSStackView(views: [
+            icon("cpu", "Engine"), enginePopup,
+            icon("globe", "Caption language"), langPopup,
+            icon("person.2", "Who to transcribe"), sourcePopup,
+            icon("character.bubble", "Translate to"), translatePopup,
+            spacer, aMinus, aPlus, tsToggle, opacity])
+        bar.orientation = .horizontal; bar.alignment = .centerY; bar.spacing = 5; bar.distribution = .fill
         return bar
     }
 
@@ -2380,7 +2385,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         let tsFont = NSFont.monospacedDigitSystemFont(ofSize: max(9, fontSize - 3), weight: .regular)
         let labelFont = NSFont.boldSystemFont(ofSize: fontSize)
         let textFont = NSFont.systemFont(ofSize: fontSize)
-        let transFont = NSFont.systemFont(ofSize: max(11, fontSize - 1))
+        let transFont = NSFont.systemFont(ofSize: fontSize)   // same size as the caption — translation is the point
         func w(_ s: String, _ f: NSFont) -> CGFloat { (s as NSString).size(withAttributes: [.font: f]).width }
         // Shared text column = timestamp width (constant, monospaced) + widest speaker label + a gap.
         let tsW = showTimestamps ? w("00:00:00  ", tsFont) : 0
@@ -2414,8 +2419,10 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
                     .font: textFont, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
             }
             if let t = l.translated, !t.isEmpty {
-                out.append(NSAttributedString(string: "\n↳ \(t)", attributes: [
-                    .font: transFont, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: trans]))
+                out.append(NSAttributedString(string: "\n↳ ", attributes: [
+                    .font: transFont, .foregroundColor: NSColor.tertiaryLabelColor, .paragraphStyle: trans]))
+                out.append(NSAttributedString(string: t, attributes: [   // translation is the point → bright
+                    .font: transFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: trans]))
             }
         }
         textView.textStorage?.setAttributedString(out)
