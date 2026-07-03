@@ -246,6 +246,79 @@ func mixDown(sysURL: URL, micURL: URL?, outURL: URL) throws {
     }
 }
 
+// MARK: - echo ducker (opt-in speaker→mic echo reduction, no external AEC lib)
+//
+// When the far-end plays through SPEAKERS it leaks into the mic and gets transcribed a second time under
+// the mic speaker. We can't use Apple's voice-processing AEC (it only cancels audio THIS process renders;
+// the far-end is another app's output). Instead we use the process-tap system audio as a REFERENCE: when
+// the (delayed) far-end is active and the mic isn't dominated by near-end speech, we duck that mic block.
+// Coarse energy-gating — enough to kill the double-transcription — not a full adaptive AEC. Opt-in.
+final class EchoDucker {
+    static let shared = EchoDucker()
+    private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+    private let lock = NSLock()
+    private var ref: [Float] = []                 // recent reference (system) samples, 16k mono
+    private var refConv: AVAudioConverter?        // used only on the tap thread (pushReference)
+    private var micConv: AVAudioConverter?        // used only on the capture thread (duckMic)
+    private var lastGain: Float = 1               // for click-free gain ramping (capture thread only)
+    // Tunables (kept named for future exposure / testing).
+    private let maxRefSec = 3.0
+    private let delaySec = 0.15                   // speaker→mic acoustic + capture latency
+    private let refActive: Float = 0.02           // far-end considered "playing" above this RMS
+    private let duckRatio: Float = 0.6            // duck only if micRMS < refRMS*ratio (else it's near-end speech)
+    private let duckGain: Float = 0.08            // attenuation applied to echo-dominated mic blocks
+
+    var enabled: Bool { Pref.bool(Pref.echoReduce, "MR_ECHO_REDUCE", false) }
+    func reset() { lock.lock(); ref.removeAll(keepingCapacity: true); lastGain = 1; lock.unlock() }
+
+    /// Feed a system-audio (reference) buffer — converted to 16k mono, appended to the ring.
+    func pushReference(_ buf: AVAudioPCMBuffer) {
+        guard let out = toCanon(buf, &refConv), let ch = out.floatChannelData?[0] else { return }
+        let n = Int(out.frameLength); guard n > 0 else { return }
+        lock.lock()
+        ref.append(contentsOf: UnsafeBufferPointer(start: ch, count: n))
+        let cap = Int(fmt.sampleRate * maxRefSec)
+        if ref.count > cap { ref.removeFirst(ref.count - cap) }
+        lock.unlock()
+    }
+
+    /// Return the mic buffer as 16k mono, ducked where it's dominated by the delayed far-end reference.
+    func duckMic(_ pcm: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let out = toCanon(pcm, &micConv), let mp = out.floatChannelData?[0] else { return nil }
+        let n = Int(out.frameLength); guard n > 0 else { return out }
+        var ms: Float = 0; for i in 0..<n { ms += mp[i] * mp[i] }
+        let micRMS = (ms / Float(n)).squareRoot()
+        let delay = Int(fmt.sampleRate * delaySec)
+        lock.lock()
+        var rs: Float = 0; var have = false
+        if ref.count >= delay + n {
+            let start = ref.count - delay - n
+            for i in 0..<n { let v = ref[start + i]; rs += v * v }; have = true
+        }
+        lock.unlock()
+        let refRMS = have ? (rs / Float(n)).squareRoot() : 0
+        let target: Float = (refRMS > refActive && micRMS < refRMS * duckRatio) ? duckGain : 1
+        if lastGain != 1 || target != 1 {   // ramp across the block so gain changes don't click
+            let g0 = lastGain, g1 = target, d = Float(max(1, n - 1))
+            for i in 0..<n { mp[i] *= g0 + (g1 - g0) * (Float(i) / d) }
+        }
+        lastGain = target
+        return out
+    }
+
+    private func toCanon(_ buf: AVAudioPCMBuffer, _ conv: inout AVAudioConverter?) -> AVAudioPCMBuffer? {
+        if buf.format == fmt { return buf }
+        if conv == nil || conv?.inputFormat != buf.format { conv = AVAudioConverter(from: buf.format, to: fmt) }
+        guard let c = conv else { return nil }
+        let ratio = fmt.sampleRate / buf.format.sampleRate
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return nil }
+        var fed = false; var err: NSError?
+        c.convert(to: out, error: &err) { _, s in if fed { s.pointee = .noDataNow; return nil }; fed = true; s.pointee = .haveData; return buf }
+        return (err == nil && out.frameLength > 0) ? out : nil
+    }
+}
+
 // MARK: - recorder (holds the per-source writers)
 
 final class Recorder {
@@ -261,6 +334,7 @@ final class Recorder {
     /// System audio arrives from the Core Audio tap (an owned copy — safe to hand to the queue).
     /// Live captions are fed straight from here (lowest latency — no WAV-write/canon-convert/queue hop).
     func appendSys(_ buf: AVAudioPCMBuffer) {
+        if EchoDucker.shared.enabled { EchoDucker.shared.pushReference(buf) }   // reference for mic echo ducking
         if #available(macOS 26, *) { LiveCaptions.shared.feedSystem(buf) }
         queue.async { self.sysWriter?.append(buf) }
     }
@@ -270,9 +344,10 @@ final class Recorder {
     /// sys writes and rotation swaps; live captions are fed directly (converted once) for low latency.
     func appendMic(_ sb: CMSampleBuffer) {
         guard CMSampleBufferDataIsReady(sb), let pcm = SourceWriter.pcm(from: sb) else { return }
-        // Convert once: feed live captions immediately, then hand the same PCM to the writer.
-        if #available(macOS 26, *) { LiveCaptions.shared.feedMic(pcm) }
-        queue.async { self.micWriter?.append(pcm) }
+        // Opt-in: duck speaker→mic echo (returns 16k-mono). Off = original raw PCM, zero overhead.
+        let out = EchoDucker.shared.enabled ? (EchoDucker.shared.duckMic(pcm) ?? pcm) : pcm
+        if #available(macOS 26, *) { LiveCaptions.shared.feedMic(out) }
+        queue.async { self.micWriter?.append(out) }
     }
 
     /// Drain in-flight callbacks, then release the AVAudioFiles so they flush their WAV headers
@@ -461,6 +536,7 @@ enum Pref {
     static let liveEngine = "liveEngine"                // live transcription engine: apple|whisper (extensible)
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
     static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
+    static let echoReduce = "echoReduce"                // opt-in: duck speaker→mic echo using the tap as reference
     static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
     static let customModel = "customModelURL"           // custom model source (URL or local path) — overrides the popup
 
@@ -1364,6 +1440,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let calBtn = NSButton(checkboxWithTitle: "Title transcripts from calendar events", target: nil, action: nil)
     private let loginBtn = NSButton(checkboxWithTitle: "Start at login (24/7 recording)", target: nil, action: nil)
     private let systemAudioBtn = NSButton(checkboxWithTitle: "Capture system audio (other participants)", target: nil, action: nil)
+    private let echoBtn = NSButton(checkboxWithTitle: "Reduce mic echo on speakers (experimental)", target: nil, action: nil)
     private var runningAppIds: [String] = []
 
     private let segValues = [900, 1800, 3600, 7200], segTitles = ["15 min", "30 min", "1 hour", "2 hours"]
@@ -1432,6 +1509,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         tabs.addTabViewItem(tab("Recording", [
             row("Segment length (on the hour):", segPopup),
             row("", systemAudioBtn),
+            row("", echoBtn),
             row("Min. speech (sec):", voiceField),
             row("", vadBtn),
             row("Excluded apps:", excludeTokens),
@@ -1551,6 +1629,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
         systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
+        echoBtn.state = Pref.bool(Pref.echoReduce, "MR_ECHO_REDUCE", false) ? .on : .off
         calBtn.state = c.useCalendarTitles ? .on : .off
         keepAudioBtn.state = c.keepAudio ? .on : .off
         audioRetPopup.selectItem(at: idx(c.audioRetentionDays, retValues))
@@ -1595,6 +1674,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
+        d.set(echoBtn.state == .on, forKey: Pref.echoReduce)
         d.set(calBtn.state == .on, forKey: Pref.cal)
         d.set(keepAudioBtn.state == .on, forKey: Pref.keepAudio)
         d.set(retValues[max(0, audioRetPopup.indexOfSelectedItem)], forKey: Pref.audioRetention)
