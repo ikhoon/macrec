@@ -1336,18 +1336,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let modelPopup = NSPopUpButton()
     private let audioRetPopup = NSPopUpButton(), txtRetPopup = NSPopUpButton()
     private let addAppPopup = NSPopUpButton()
-    private let addCalPopup = NSPopUpButton()       // pick a calendar to source titles from
     private let voiceField = NSTextField(), dirField = NSTextField(), audioDirField = NSTextField()
     private let customModelField = NSTextField()   // custom model URL or local path (overrides the popup)
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
-    private let calTokens = NSTokenField()       // calendar titles for event titling (empty = all)
+    // Calendar titling: a scrollable checkbox list of the user's calendars (none checked = all).
+    private var calChecks: [(name: String, box: NSButton)] = []
     private let keepAudioBtn = NSButton(checkboxWithTitle: "Keep audio (WAV) too", target: nil, action: nil)
     private let vadBtn = NSButton(checkboxWithTitle: "Remove noise/silence (VAD)", target: nil, action: nil)
     private let calBtn = NSButton(checkboxWithTitle: "Title transcripts from calendar events", target: nil, action: nil)
     private let loginBtn = NSButton(checkboxWithTitle: "Start at login (24/7 recording)", target: nil, action: nil)
     private let systemAudioBtn = NSButton(checkboxWithTitle: "Capture system audio (other participants)", target: nil, action: nil)
     private var runningAppIds: [String] = []
-    private var calendarNames: [String] = []
 
     private let segValues = [900, 1800, 3600, 7200], segTitles = ["15 min", "30 min", "1 hour", "2 hours"]
     private let langValues = ["auto", "ko", "ja", "en"], langTitles = ["Auto-detect", "Korean", "Japanese", "English"]
@@ -1387,11 +1386,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         excludeTokens.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
         populateRunningApps()
 
-        calTokens.translatesAutoresizingMaskIntoConstraints = false
-        calTokens.tokenizingCharacterSet = CharacterSet(charactersIn: ",")   // titles can contain spaces
-        calTokens.placeholderString = "All calendars (leave empty)"
-        calTokens.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
-        populateCalendars()
+        let calListCell = buildCalendarList()
 
         let chooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseDir))
         let dirStack = NSStackView(views: [dirField, chooseBtn]); dirStack.orientation = .horizontal; dirStack.spacing = 6
@@ -1407,8 +1402,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [labeled(""), vadBtn],
             [labeled(""), systemAudioBtn],
             [labeled(""), calBtn],
-            [labeled("Calendars for titles:"), calTokens],
-            [labeled("Add a calendar:"), addCalPopup],
+            [labeled("Calendars for titles:"), calListCell],
             [labeled(""), loginBtn],
             [labeled(""), keepAudioBtn],
             [labeled("Keep audio for:"), audioRetPopup],
@@ -1469,24 +1463,40 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     /// Fill the "add a calendar" popup with the user's event calendars (by title). Picking one
     /// appends it to the token field; an empty token field means "use all calendars".
-    private func populateCalendars() {
-        addCalPopup.removeAllItems()
-        addCalPopup.addItem(withTitle: "＋ Choose a calendar…")
-        calendarNames = [""]
-        for name in CalendarLookup.availableCalendarNames() {
-            addCalPopup.addItem(withTitle: name); calendarNames.append(name)
+    /// A scrollable checkbox list of the user's event calendars (none checked = all). Keeps every
+    /// calendar visible even with many entries or long names.
+    private func buildCalendarList() -> NSView {
+        let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.edgeInsets = NSEdgeInsets(top: 6, left: 8, bottom: 6, right: 8)
+        calChecks = []
+        let names = CalendarLookup.availableCalendarNames()
+        if names.isEmpty {
+            let l = NSTextField(labelWithString: "No calendars available (grant Calendar access, then reopen).")
+            l.textColor = .secondaryLabelColor; l.font = .systemFont(ofSize: 11)
+            stack.addArrangedSubview(l)
         }
-        addCalPopup.target = self
-        addCalPopup.action = #selector(addCal)
-    }
-
-    @objc private func addCal() {
-        let i = addCalPopup.indexOfSelectedItem
-        guard i > 0, i < calendarNames.count else { return }
-        let name = calendarNames[i]
-        var cur = (calTokens.objectValue as? [String]) ?? []
-        if !cur.contains(name) { cur.append(name); calTokens.objectValue = cur }
-        addCalPopup.selectItem(at: 0)
+        for name in names {
+            let box = NSButton(checkboxWithTitle: name, target: nil, action: nil)
+            stack.addArrangedSubview(box); calChecks.append((name, box))
+        }
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = stack
+        scroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        scroll.heightAnchor.constraint(equalToConstant: 108).isActive = true
+        let clip = scroll.contentView
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: clip.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: clip.trailingAnchor),
+        ])
+        let hint = NSTextField(labelWithString: "None checked = all calendars")
+        hint.font = .systemFont(ofSize: 10); hint.textColor = .secondaryLabelColor
+        let cell = NSStackView(views: [scroll, hint]); cell.orientation = .vertical
+        cell.alignment = .leading; cell.spacing = 3
+        return cell
     }
 
     private func idx<T: Equatable>(_ v: T, _ arr: [T]) -> Int { arr.firstIndex(of: v) ?? 0 }
@@ -1505,7 +1515,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         audioRetPopup.selectItem(at: idx(c.audioRetentionDays, retValues))
         txtRetPopup.selectItem(at: idx(c.transcriptRetentionDays, retValues))
         excludeTokens.objectValue = c.excludeBundleIds
-        calTokens.objectValue = Pref.d.stringArray(forKey: Pref.calendars) ?? []
+        // Trim stored titles (older builds stored via a token field that could carry stray spaces).
+        let selectedCals = Set((Pref.d.stringArray(forKey: Pref.calendars) ?? [])
+            .map { $0.trimmingCharacters(in: .whitespaces) })
+        for (name, box) in calChecks { box.state = selectedCals.contains(name) ? .on : .off }
         dirField.stringValue = c.transcriptsDir.path
         audioDirField.stringValue = c.audioDir.path
         // Start at login — read the live SMAppService status (never cache); locked on the dev machine.
@@ -1547,9 +1560,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(retValues[max(0, txtRetPopup.indexOfSelectedItem)], forKey: Pref.txtRetention)
         let ids = (excludeTokens.objectValue as? [String]) ?? []
         d.set(ids.joined(separator: " "), forKey: Pref.exclude)
-        let calNames = ((calTokens.objectValue as? [String]) ?? [])
-            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        d.set(calNames, forKey: Pref.calendars)
+        // Only persist if we actually listed calendars — otherwise (no Calendar access → empty list)
+        // we'd silently wipe a previously-saved selection.
+        if !calChecks.isEmpty {
+            d.set(calChecks.filter { $0.box.state == .on }.map { $0.name }, forKey: Pref.calendars)
+        }
         d.set(dirField.stringValue, forKey: Pref.txtDir)
         d.set(audioDirField.stringValue, forKey: Pref.audioDir)
         // Apply "Start at login" (skip on the dev machine where the LaunchAgent owns autostart).
@@ -1911,7 +1926,7 @@ func installStopHandler(_ handler: @escaping () -> Void) {
 /// correctly even when run via the Homebrew `bin/macrec` symlink (where Bundle.main resolves to
 /// /opt/homebrew/bin, not the .app, so the Info.plist can't be read). install.sh / package.sh
 /// stamp CFBundleShortVersionString from THIS value, so the binary and the bundle never drift.
-let macrecVersion = "0.3.0"
+let macrecVersion = "0.3.1"
 
 func printMacrecHelp() {
     print("""
