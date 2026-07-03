@@ -2524,8 +2524,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .withSymbolConfiguration(cfg)
         img?.isTemplate = true
         statusItem.button?.image = img
-        statusItem.length = 30   // fixed width — our item won't reflow as system indicators come/go
-        elog("icon set (recording=\(recording)), statusItem.length=\(statusItem.length)")
+        // Hug the glyph's real width (+ a hair) so there's no wide L/R slack — WITHOUT touching pointSize
+        // or imagePosition (fixed length keeps the vertical centering that variableLength/imageOnly broke).
+        let glyphW = img?.size.width ?? 22
+        statusItem.length = ceil(glyphW) + 4
+        elog("icon set (recording=\(recording)), glyphW=\(glyphW), length=\(statusItem.length)")
     }
 
     private func item(_ title: String, _ sel: Selector, _ key: String = "", symbol: String = "") -> NSMenuItem {
