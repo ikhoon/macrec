@@ -2139,19 +2139,16 @@ final class LiveCaptions {
         let sameSources = cfg.locale.identifier == curLocaleId && cfg.engine.rawValue == curEngine && cfg.source.rawValue == curSource
         let sameTranslate = cfg.translateId == curTranslateId
         if sameSources && sameTranslate { return }   // nothing changed (e.g. re-picked the active language)
-        if cfg.source.rawValue != curSource {
-            lines = []   // speaker set changed → start fresh (don't carry mixed-speaker history)
-        } else {
-            // Keep the history; just finalize in-progress lines.
-            for i in lines.indices where !lines[i].final { lines[i].final = true }
-            // Caption language changed → remap kept lines' speaker labels so their label/color stay correct.
-            let (oldMine, oldTheirs) = speakerLabels(forLanguage: Locale(identifier: curLocaleId).language.languageCode?.identifier)
-            let (newMine, newTheirs) = speakerLabels(forLanguage: cfg.locale.language.languageCode?.identifier)
-            if oldMine != newMine || oldTheirs != newTheirs {
-                for i in lines.indices {
-                    if lines[i].speaker == oldMine { lines[i].speaker = newMine }
-                    else if lines[i].speaker == oldTheirs { lines[i].speaker = newTheirs }
-                }
+        // Keep the transcript history on every change — the overlay filters what it SHOWS by source
+        // (Both→Me hides the other party's lines; switching back to Both reveals them again).
+        for i in lines.indices where !lines[i].final { lines[i].final = true }
+        // Caption language changed → remap kept lines' speaker labels so their label/color stay correct.
+        let (oldMine, oldTheirs) = speakerLabels(forLanguage: Locale(identifier: curLocaleId).language.languageCode?.identifier)
+        let (newMine, newTheirs) = speakerLabels(forLanguage: cfg.locale.language.languageCode?.identifier)
+        if oldMine != newMine || oldTheirs != newTheirs {
+            for i in lines.indices {
+                if lines[i].speaker == oldMine { lines[i].speaker = newMine }
+                else if lines[i].speaker == oldTheirs { lines[i].speaker = newTheirs }
             }
         }
         if !sameSources {
@@ -2228,7 +2225,16 @@ final class LiveCaptions {
             guard self.active else { return }
             let showTS = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true)
             let fontSize = CGFloat(Pref.dbl(Pref.liveFontSize, "MR_LIVE_FONT_SIZE", 14))
-            self.window?.render(self.lines.map { (speaker: $0.speaker, text: $0.text, translated: $0.translated,
+            // Show only the lines matching the current source (Both = all; Me = mine; Them = the rest).
+            let mode = LiveSource(rawValue: self.curSource) ?? .both
+            let visible = self.lines.filter { l in
+                switch mode {
+                case .both:  return true
+                case .me:    return l.speaker == self.mineLabel
+                case .other: return l.speaker != self.mineLabel
+                }
+            }
+            self.window?.render(visible.map { (speaker: $0.speaker, text: $0.text, translated: $0.translated,
                                         time: $0.time, mine: $0.speaker == self.mineLabel, inProgress: !$0.final) },
                                 showTimestamps: showTS, fontSize: fontSize, showLabels: self.showLabels)
         }
@@ -2508,19 +2514,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func setIcon(recording: Bool) {
-        // Distinct audio-recorder identity: a waveform-with-mic while live, pause when not.
-        let primary = recording ? "waveform.badge.mic" : "pause.circle"
-        let fallback = recording ? "waveform" : "pause"
-        // Fixed point size so the menu-bar icon never resizes (independent of which symbol).
-        let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        // Narrow mic glyph keeps the menu-bar footprint tight — filled = live, slashed = paused.
+        let primary = recording ? "mic.fill" : "mic.slash.fill"
+        let fallback = recording ? "mic" : "mic.slash"
+        let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
         let img = (NSImage(systemSymbolName: primary, accessibilityDescription: "macrec")
             ?? NSImage(systemSymbolName: fallback, accessibilityDescription: "macrec"))?
             .withSymbolConfiguration(cfg)
         img?.isTemplate = true
         statusItem.button?.image = img
-        statusItem.button?.imagePosition = .imageOnly   // no title padding around the glyph
-        statusItem.length = 22   // fixed width, tight L/R padding (won't reflow as indicators come/go)
-        elog("icon set (recording=\(recording)), statusItem.length=\(statusItem.length)")
+        statusItem.button?.imagePosition = .imageOnly
+        statusItem.length = NSStatusItem.variableLength   // hug the glyph — no fixed L/R slack
+        elog("icon set (recording=\(recording))")
     }
 
     private func item(_ title: String, _ sel: Selector, _ key: String = "", symbol: String = "") -> NSMenuItem {
