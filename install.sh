@@ -27,7 +27,7 @@ echo "▸ building macrec…"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 swiftc -swift-version 5 -parse-as-library -O \
   -framework AVFoundation -framework CoreMedia -framework CoreAudio \
-  -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech \
+  -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech -framework Translation \
   "$HERE/macrec.swift" -o "$STAGE_BIN"
 
 echo "▸ writing Info.plist + icon…"

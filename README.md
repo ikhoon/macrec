@@ -148,6 +148,8 @@ Stored in `UserDefaults` (suite `com.ikhoon.macrec.prefs`); saving restarts the 
 | Capture system audio (other participants) | on |
 | Title transcripts from calendar | on |
 | Calendars for titles | all (pick specific ones — empty = all) |
+| **Live caption language** (macOS 26) | System |
+| **Live translate to** (macOS 26) | Off |
 | Timestamps in live captions (macOS 26) | on |
 | **Start at login (24/7)** | on (distributed app; managed by LaunchAgent on dev machines) |
 | Keep audio (WAV) too | on |
@@ -160,6 +162,10 @@ Stored in `UserDefaults` (suite `com.ikhoon.macrec.prefs`); saving restarts the 
 Transcripts are organized into monthly folders (`transcripts/YYYY-MM/`), audio into a separate root (`audio/YYYY-MM/`). Changing the model downloads the new one on demand (models coexist by filename, so switching back never re-downloads). To use a model outside the built-in list, put an `http(s)` URL to a GGML `.bin` (downloaded to App Support) **or** a local file path (used as-is) in **…or custom model** — it overrides the picker. Menu actions: **Transcribe now**, **Pause / Resume**, **Open transcripts folder**, **About macrec** (shows the version), **Quit**.
 
 Power users / headless runs can override any setting via `MR_*` environment variables (e.g. `MR_WHISPER_MODEL`, `MR_MODEL_URL`, `MR_AUDIO_DIR`; precedence: UserDefaults → env → default).
+
+### Live captions & translation (macOS 26)
+
+The menu's **Live captions** toggle opens a floating, always-on-top overlay that transcribes **on-device** (`SpeechAnalyzer`) in real time — each line tinted by speaker (mic = blue, system = green), with an optional timestamp and an **opacity slider** built into the window. Pick the spoken language in **Live caption language** (the title bar shows the active one, e.g. `macrec live · en-US`); set **Live translate to** and each finalized line gets an on-device translation shown beneath it (`↳ …`). It's a live view only — `whisper.cpp` still writes the saved transcript on rotation. macOS 15 and earlier are unaffected (no overlay).
 
 ## CLI
 
