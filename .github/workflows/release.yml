@@ -28,7 +28,7 @@ env:
 
 jobs:
   release:
-    runs-on: macos-15
+    runs-on: macos-26   # needs the macOS 26 SDK to compile the SpeechAnalyzer (live-captions) code
     permissions:
       contents: write        # gh release create on THIS repo
     steps:
