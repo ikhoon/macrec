@@ -1744,11 +1744,13 @@ final class LiveTranscriber: LiveTranscribing {
         let fmt = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
         let (stream, c) = AsyncStream<AnalyzerInput>.makeStream()
         try await analyzer.start(inputSequence: stream)
+        if Task.isCancelled { c.finish(); return }   // stopped mid-setup → EOF the input, don't publish
         // SpeechAnalyzer defers its model/ANE warm-up to the first audio buffer (~10s of dead air before
         // the first caption). Force it NOW, before exposing `cont`, so the warm-up runs during setup and
         // audio fed meanwhile is dropped (not queued) — the first real buffer then transcribes immediately.
         let tp = ProcessInfo.processInfo.systemUptime
         try await analyzer.prepareToAnalyze(in: fmt)
+        if Task.isCancelled { c.finish(); return }   // stopped during warm-up → don't publish cont / clobber title
         lock.lock(); inputFormat = fmt; cont = c; lock.unlock()
         onLocale?(loc)   // now warm — surface the active language (replaces the "preparing" title)
         let t3 = ProcessInfo.processInfo.systemUptime
@@ -1775,7 +1777,8 @@ final class LiveTranscriber: LiveTranscribing {
     /// analyzer's format and yield it. Called off the capture thread; the lock guards converter + cont.
     func feed(_ buf: AVAudioPCMBuffer) {
         lock.lock(); defer { lock.unlock() }
-        guard let cont, let target = inputFormat else { return }   // analyzer not ready yet → drop
+        guard let cont else { return }   // analyzer not ready yet → drop
+        guard let target = inputFormat else { cont.yield(AnalyzerInput(buffer: buf)); return }   // no negotiated format → pass through
         if buf.format == target { cont.yield(AnalyzerInput(buffer: buf)); return }
         if converter == nil || converter?.inputFormat != buf.format {
             converter = AVAudioConverter(from: buf.format, to: target)
@@ -1877,6 +1880,7 @@ final class WhisperLiveTranscriber: LiveTranscribing {
     private var lastVoiceAt = 0.0               // systemUptime of the last non-silent buffer
     private var timer: DispatchSourceTimer?
     private var running = false                 // a whisper-cli run is in flight
+    private var proc: Process?                  // the in-flight whisper-cli, so stop() can terminate it
 
     // Tunables (kept named for future exposure as options).
     private let tick = 1.0, minDur = 0.6, silenceGap = 0.8, maxDur = 8.0, maxWindow = 30.0
@@ -1916,8 +1920,12 @@ final class WhisperLiveTranscriber: LiveTranscribing {
 
     func stop() {
         timer?.cancel(); timer = nil
-        lock.lock(); seg.removeAll(); running = false; lock.unlock()
-        try? FileManager.default.removeItem(at: wavURL)
+        lock.lock(); let p = proc; proc = nil; lock.unlock()
+        p?.terminate()   // kill any in-flight whisper-cli so it doesn't keep burning CPU / leak
+        q.sync {   // serialize after any in-flight transcribeIfReady() so the wav isn't recreated post-delete
+            lock.lock(); seg.removeAll(); running = false; lock.unlock()
+            try? FileManager.default.removeItem(at: wavURL)
+        }
     }
 
     /// Convert an incoming buffer (mic native / 48 kHz tap) to 16 kHz mono float.
@@ -1974,13 +1982,18 @@ final class WhisperLiveTranscriber: LiveTranscribing {
         // -nt: plain text (no timestamps); -bs 1: greedy for latency; half the cores to spare the engine.
         p.arguments = ["-m", cfg.whisperModel, "-f", wavURL.path, "-l", lang, "-nt", "-np", "-sns",
                        "-bs", "1", "-t", String(max(4, ProcessInfo.processInfo.activeProcessorCount - 2))]
-        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
-        do { try p.run() } catch { elog("whisperlive run: \(error)"); return "" }
+        let out = Pipe(); p.standardOutput = out
+        p.standardError = FileHandle.nullDevice   // discard stderr — draining a Pipe we never read can deadlock waitUntilExit()
+        lock.lock(); proc = p; lock.unlock()
+        do { try p.run() } catch { elog("whisperlive run: \(error)"); lock.lock(); proc = nil; lock.unlock(); return "" }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
+        lock.lock(); proc = nil; lock.unlock()
         let raw = String(data: data, encoding: .utf8) ?? ""
-        return raw.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        let text = raw.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && !$0.hasPrefix("[") }.joined(separator: " ")
+        if text.isEmpty || p.terminationStatus != 0 { elog("whisperlive[\(label)]: whisper exit \(p.terminationStatus), raw \(raw.count) chars → empty") }
+        return text
     }
 
     private func writeWav(_ samples: [Float]) -> Bool {
@@ -2126,8 +2139,21 @@ final class LiveCaptions {
         let sameSources = cfg.locale.identifier == curLocaleId && cfg.engine.rawValue == curEngine && cfg.source.rawValue == curSource
         let sameTranslate = cfg.translateId == curTranslateId
         if sameSources && sameTranslate { return }   // nothing changed (e.g. re-picked the active language)
-        // Finalize in-progress lines but KEEP the history — a settings change shouldn't wipe the captions.
-        for i in lines.indices where !lines[i].final { lines[i].final = true }
+        if cfg.source.rawValue != curSource {
+            lines = []   // speaker set changed → start fresh (don't carry mixed-speaker history)
+        } else {
+            // Keep the history; just finalize in-progress lines.
+            for i in lines.indices where !lines[i].final { lines[i].final = true }
+            // Caption language changed → remap kept lines' speaker labels so their label/color stay correct.
+            let (oldMine, oldTheirs) = speakerLabels(forLanguage: Locale(identifier: curLocaleId).language.languageCode?.identifier)
+            let (newMine, newTheirs) = speakerLabels(forLanguage: cfg.locale.language.languageCode?.identifier)
+            if oldMine != newMine || oldTheirs != newTheirs {
+                for i in lines.indices {
+                    if lines[i].speaker == oldMine { lines[i].speaker = newMine }
+                    else if lines[i].speaker == oldTheirs { lines[i].speaker = newTheirs }
+                }
+            }
+        }
         if !sameSources {
             srcLock.lock(); let m = mic, s = sys; mic = nil; sys = nil; srcLock.unlock()
             m?.stop(); s?.stop()
@@ -2185,7 +2211,7 @@ final class LiveCaptions {
         guard active else { return }
         // Prefer the exact source line; else the speaker's current line (volatile text has since moved on).
         let i = lines.lastIndex(where: { $0.speaker == speaker && $0.text == original })
-            ?? lines.lastIndex(where: { $0.speaker == speaker })
+            ?? lines.lastIndex(where: { $0.speaker == speaker && !$0.final })   // else the current in-progress line
         guard let i else { return }
         lines[i].translated = translated
         render()
@@ -2405,18 +2431,18 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         let out = NSMutableAttributedString()
         for (i, l) in lines.enumerated() {
             if i > 0 { out.append(NSAttributedString(string: "\n")) }
-            let color: NSColor = showLabels ? (l.mine ? .systemTeal : .systemOrange) : .labelColor
+            let tint: NSColor = l.mine ? .systemTeal : .systemOrange   // colors the LABEL only (both-speaker mode)
             if showTimestamps {
                 out.append(NSAttributedString(string: "\(tsFormatter.string(from: l.time))  ", attributes: [
                     .font: tsFont, .foregroundColor: NSColor.secondaryLabelColor, .baselineOffset: tsBaseline, .paragraphStyle: para]))
             }
             if showLabels {
                 out.append(NSAttributedString(string: "\(l.speaker)  ", attributes: [
-                    .font: labelFont, .foregroundColor: color, .paragraphStyle: para]))
+                    .font: labelFont, .foregroundColor: tint, .paragraphStyle: para]))
             }
             if hasPrefix { out.append(NSAttributedString(string: "\t", attributes: [.font: textFont, .paragraphStyle: para])) }
-            out.append(NSAttributedString(string: l.text, attributes: [
-                .font: textFont, .foregroundColor: color, .paragraphStyle: para]))
+            out.append(NSAttributedString(string: l.text, attributes: [   // text stays neutral like single-speaker mode
+                .font: textFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: para]))
             if l.inProgress {   // still transcribing this line → typing indicator inside the text
                 out.append(NSAttributedString(string: (l.text.isEmpty ? "…" : " …"), attributes: [
                     .font: textFont, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
