@@ -1989,36 +1989,46 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     private var suppressCloseCallback = false
     private let langPopup = NSPopUpButton(), sourcePopup = NSPopUpButton(), translatePopup = NSPopUpButton()
     private let tsToggle = NSButton(checkboxWithTitle: "Time", target: nil, action: nil)
+    private let spinner = NSProgressIndicator()   // spins while the session is live (reassures it's working)
+    private static let titleIcon = "🎙️"           // beautifies the "macrec live" title
 
     init(onClose: @escaping () -> Void, onReconfigure: @escaping () -> Void, onRestyle: @escaping () -> Void) {
         self.onClose = onClose; self.onReconfigure = onReconfigure; self.onRestyle = onRestyle
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 560, height: 190),
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 560, height: 160),
                         styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         super.init()
-        panel.title = "macrec live"
-        panel.alphaValue = CGFloat(min(1.0, max(0.3, Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 0.92))))
+        panel.title = "\(Self.titleIcon) macrec live"
+        panel.alphaValue = CGFloat(min(1.0, max(0.3, Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 1.0))))
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.delegate = self
-        let content = panel.contentView!
-        let topH: CGFloat = 30   // control bar along the top (live settings)
-        let barH: CGFloat = 22   // slim bottom strip for the opacity drag slider
 
-        // --- top control bar: live settings (each control applies immediately) ---
+        // Controls live in the titlebar (a full-width accessory strip just below it) so they read as
+        // window chrome, not content — the caption area stays clean. Each control applies immediately.
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.layoutAttribute = .bottom
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 32))
+        host.autoresizingMask = [.width]
         let bar = buildControlBar()
-        bar.frame = NSRect(x: 8, y: content.bounds.height - topH, width: content.bounds.width - 16, height: topH)
-        bar.autoresizingMask = [.width, .minYMargin]
-        content.addSubview(bar)
-        let sep = NSBox(frame: NSRect(x: 0, y: content.bounds.height - topH - 1, width: content.bounds.width, height: 1))
-        sep.boxType = .separator; sep.autoresizingMask = [.width, .minYMargin]
-        content.addSubview(sep)
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(bar)
+        NSLayoutConstraint.activate([
+            host.heightAnchor.constraint(equalToConstant: 32),
+            bar.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 8),
+            bar.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -8),
+            bar.centerYAnchor.constraint(equalTo: host.centerYAnchor),
+        ])
+        accessory.view = host
+        panel.addTitlebarAccessoryViewController(accessory)
 
-        // --- captions (scrollable text) ---
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: barH, width: content.bounds.width, height: content.bounds.height - barH - topH))
+        // --- captions (scrollable text), above the opacity strip ---
+        let content = panel.contentView!
+        let barH: CGFloat = 22   // slim bottom strip for the opacity drag slider
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: barH, width: content.bounds.width, height: content.bounds.height - barH))
         scroll.autoresizingMask = [.width, .height]
         scroll.hasVerticalScroller = true
         scroll.scrollerStyle = .overlay        // auto-hiding overlay scroller (no permanent bar)
@@ -2073,8 +2083,11 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         tsToggle.controlSize = .small; tsToggle.font = .systemFont(ofSize: 11); tsToggle.toolTip = "Show timestamps"
         tsToggle.state = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true) ? .on : .off
         tsToggle.target = self; tsToggle.action = #selector(tsToggled(_:))
+        spinner.style = .spinning; spinner.controlSize = .small; spinner.isDisplayedWhenStopped = false
+        spinner.setContentHuggingPriority(.required, for: .horizontal)
+        spinner.toolTip = "Live — transcribing"
         let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        let bar = NSStackView(views: [langPopup, sourcePopup, translatePopup, spacer, aMinus, aPlus, tsToggle])
+        let bar = NSStackView(views: [spinner, langPopup, sourcePopup, translatePopup, spacer, aMinus, aPlus, tsToggle])
         bar.orientation = .horizontal; bar.alignment = .centerY; bar.spacing = 6; bar.distribution = .fill
         return bar
     }
@@ -2108,11 +2121,12 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             panel.setFrameOrigin(NSPoint(x: f.maxX - panel.frame.width - 24, y: f.minY + 24))
         }
         panel.orderFrontRegardless()
+        spinner.startAnimation(nil)   // live activity indicator (spins for the session's lifetime)
     }
     func close() { suppressCloseCallback = true; panel.close() }
 
-    /// Show the active transcription language in the title bar (human name, e.g. "macrec live · Korean").
-    func setLanguage(_ name: String) { panel.title = "macrec live · \(name)" }
+    /// Show the active transcription language in the title bar (human name, e.g. "🎙️ macrec live · Korean").
+    func setLanguage(_ name: String) { panel.title = "\(Self.titleIcon) macrec live · \(name)" }
 
     private let tsFormatter: DateFormatter = {
         let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "HH:mm:ss"; return f
@@ -2124,30 +2138,42 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     /// the text rather than sliding under the timestamp/label.
     func render(_ lines: [(speaker: String, text: String, translated: String?, time: Date, mine: Bool)],
                 showTimestamps: Bool, fontSize: CGFloat, showLabels: Bool) {
-        let para = NSMutableParagraphStyle()
-        // Hang-indent wrapped lines to sit under the text, past whichever prefixes are shown.
-        para.headIndent = (showTimestamps ? fontSize * 4.5 : 0) + (showLabels ? fontSize * 2.4 : 0)
-        para.lineHeightMultiple = 1.1
-        para.paragraphSpacing = 4
+        let tsFont = NSFont.monospacedDigitSystemFont(ofSize: max(9, fontSize - 3), weight: .regular)
+        let labelFont = NSFont.boldSystemFont(ofSize: fontSize)
+        let textFont = NSFont.systemFont(ofSize: fontSize)
+        let transFont = NSFont.systemFont(ofSize: max(11, fontSize - 1))
+        func w(_ s: String, _ f: NSFont) -> CGFloat { (s as NSString).size(withAttributes: [.font: f]).width }
         let out = NSMutableAttributedString()
         for (i, l) in lines.enumerated() {
             if i > 0 { out.append(NSAttributedString(string: "\n")) }
             let color: NSColor = showLabels ? (l.mine ? .systemTeal : .systemOrange) : .labelColor
+            let tsStr = "\(tsFormatter.string(from: l.time))  ", labelStr = "\(l.speaker)  "
+            // Measure the actual prefix width so wrapped lines hang-indent flush under the text start.
+            var indent: CGFloat = 0
+            if showTimestamps { indent += w(tsStr, tsFont) }
+            if showLabels     { indent += w(labelStr, labelFont) }
+            let para = NSMutableParagraphStyle()
+            para.headIndent = indent               // wrapped lines align under the text
+            para.lineHeightMultiple = 1.1
+            para.paragraphSpacing = 4
             if showTimestamps {
-                out.append(NSAttributedString(string: "\(tsFormatter.string(from: l.time))  ", attributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: max(9, fontSize - 3), weight: .regular),
-                    .foregroundColor: NSColor.tertiaryLabelColor, .paragraphStyle: para]))
+                out.append(NSAttributedString(string: tsStr, attributes: [
+                    .font: tsFont, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
             }
             if showLabels {
-                out.append(NSAttributedString(string: "\(l.speaker)  ", attributes: [
-                    .font: NSFont.boldSystemFont(ofSize: fontSize), .foregroundColor: color, .paragraphStyle: para]))
+                out.append(NSAttributedString(string: labelStr, attributes: [
+                    .font: labelFont, .foregroundColor: color, .paragraphStyle: para]))
             }
             out.append(NSAttributedString(string: l.text, attributes: [
-                .font: NSFont.systemFont(ofSize: fontSize), .foregroundColor: color, .paragraphStyle: para]))
+                .font: textFont, .foregroundColor: color, .paragraphStyle: para]))
             if let t = l.translated, !t.isEmpty {
-                out.append(NSAttributedString(string: "\n     ↳ \(t)", attributes: [
-                    .font: NSFont.systemFont(ofSize: max(11, fontSize - 1)),
-                    .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
+                // Translation on its own line, first char aligned under the text, wraps under the ↳ text.
+                let tp = NSMutableParagraphStyle()
+                tp.firstLineHeadIndent = indent
+                tp.headIndent = indent + w("↳ ", transFont)
+                tp.lineHeightMultiple = 1.1
+                out.append(NSAttributedString(string: "\n↳ \(t)", attributes: [
+                    .font: transFont, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: tp]))
             }
         }
         textView.textStorage?.setAttributedString(out)
@@ -2208,13 +2234,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let primary = recording ? "waveform.badge.mic" : "pause.circle"
         let fallback = recording ? "waveform" : "pause"
         // Fixed point size so the menu-bar icon never resizes (independent of which symbol).
-        let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+        let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
         let img = (NSImage(systemSymbolName: primary, accessibilityDescription: "macrec")
             ?? NSImage(systemSymbolName: fallback, accessibilityDescription: "macrec"))?
             .withSymbolConfiguration(cfg)
         img?.isTemplate = true
         statusItem.button?.image = img
-        statusItem.length = 30   // fixed width — our item won't reflow as system indicators come/go
+        statusItem.button?.imagePosition = .imageOnly   // no title padding around the glyph
+        statusItem.length = 26   // fixed width, tighter L/R padding (won't reflow as indicators come/go)
         elog("icon set (recording=\(recording)), statusItem.length=\(statusItem.length)")
     }
 
