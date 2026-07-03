@@ -39,3 +39,7 @@ jobs:
         run: |
           "$RUNNER_TEMP/macrec" config          # must print resolved settings + exit 0
           "$RUNNER_TEMP/macrec" perm-status || true   # exits non-zero when ungranted (expected on CI)
+
+      - name: Unit self-tests (pure logic — locale mapping, speaker labels)
+        run: |
+          "$RUNNER_TEMP/macrec" selftest
