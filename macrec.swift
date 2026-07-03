@@ -1350,7 +1350,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let onSave: () -> Void
     private let segPopup = NSPopUpButton(), langPopup = NSPopUpButton()
     private let captionLangPopup = NSPopUpButton(), translateToPopup = NSPopUpButton()   // live captions (macOS 26)
-    private let liveFontPopup = NSPopUpButton(), liveOpacityPopup = NSPopUpButton()      // live overlay appearance
+    private let liveFontPopup = NSPopUpButton()      // live overlay font size (opacity is on the overlay itself)
     private let modelPopup = NSPopUpButton()
     private let audioRetPopup = NSPopUpButton(), txtRetPopup = NSPopUpButton()
     private let addAppPopup = NSPopUpButton()
@@ -1362,7 +1362,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let keepAudioBtn = NSButton(checkboxWithTitle: "Keep audio (WAV) too", target: nil, action: nil)
     private let vadBtn = NSButton(checkboxWithTitle: "Remove noise/silence (VAD)", target: nil, action: nil)
     private let calBtn = NSButton(checkboxWithTitle: "Title transcripts from calendar events", target: nil, action: nil)
-    private let liveTimestampsBtn = NSButton(checkboxWithTitle: "Timestamps in live captions (macOS 26)", target: nil, action: nil)
+    private let liveTimestampsBtn = NSButton(checkboxWithTitle: "Show timestamps", target: nil, action: nil)
     private let loginBtn = NSButton(checkboxWithTitle: "Start at login (24/7 recording)", target: nil, action: nil)
     private let systemAudioBtn = NSButton(checkboxWithTitle: "Capture system audio (other participants)", target: nil, action: nil)
     private var runningAppIds: [String] = []
@@ -1371,7 +1371,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let langValues = ["auto", "ko", "ja", "en"], langTitles = ["Auto-detect", "Korean", "Japanese", "English"]
     // Live-caption languages (macOS 26 SpeechAnalyzer + Translation). "" = System (caption) / Off (translate).
     private let fontValues: [Double] = [12, 14, 16, 18, 22], fontTitles = ["Small", "Medium", "Large", "X-Large", "XX-Large"]
-    private let opacityValues: [Double] = [1.0, 0.9, 0.8, 0.7, 0.6], opacityTitles = ["100%", "90%", "80%", "70%", "60%"]
     private let capLangValues = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
     private let capLangTitles  = ["System", "Korean", "Japanese", "English", "Chinese", "Spanish", "French", "German"]
     private let transToValues  = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
@@ -1398,7 +1397,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func buildForm() {
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
         captionLangPopup.addItems(withTitles: capLangTitles); translateToPopup.addItems(withTitles: transToTitles)
-        liveFontPopup.addItems(withTitles: fontTitles); liveOpacityPopup.addItems(withTitles: opacityTitles)
+        liveFontPopup.addItems(withTitles: fontTitles)
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
         for f in [voiceField, dirField, audioDirField, customModelField] { f.translatesAutoresizingMaskIntoConstraints = false }
@@ -1421,48 +1420,76 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let audioChooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseAudioDir))
         let audioStack = NSStackView(views: [audioDirField, audioChooseBtn]); audioStack.orientation = .horizontal; audioStack.spacing = 6
 
-        let grid = NSGridView(views: [
-            [labeled("Segment length (on the hour):"), segPopup],
-            [labeled("Transcription language:"), langPopup],
-            [labeled("Live caption language:"), captionLangPopup],
-            [labeled("Live translate to:"), translateToPopup],
-            [labeled("Live font size:"), liveFontPopup],
-            [labeled("Live overlay opacity:"), liveOpacityPopup],
-            [labeled("Transcription model:"), modelPopup],
-            [labeled("…or custom model:"), customModelField],
-            [labeled("Min. speech (sec):"), voiceField],
-            [labeled(""), vadBtn],
-            [labeled(""), systemAudioBtn],
-            [labeled(""), calBtn],
-            [labeled(""), liveTimestampsBtn],
-            [labeled("Calendars for titles:"), calListCell],
-            [labeled(""), loginBtn],
-            [labeled(""), keepAudioBtn],
-            [labeled("Keep audio for:"), audioRetPopup],
-            [labeled("Keep transcripts for:"), txtRetPopup],
-            [labeled("Excluded apps:"), excludeTokens],
-            [labeled("Add a running app:"), addAppPopup],
-            [labeled("Save transcripts to:"), dirStack],
-            [labeled("Save audio to:"), audioStack],
-        ])
+        func sectionHeader(_ s: String) -> NSTextField {
+            let l = NSTextField(labelWithString: s.uppercased())
+            l.font = .systemFont(ofSize: 11, weight: .semibold); l.textColor = .secondaryLabelColor
+            return l
+        }
+        var rows: [[NSView]] = []; var headerRows: [Int] = []
+        func sec(_ t: String) { headerRows.append(rows.count); rows.append([sectionHeader(t), NSGridCell.emptyContentView]) }
+        func row(_ label: String, _ control: NSView) { rows.append([labeled(label), control]) }
+
+        sec("Recording")
+        row("Segment length (on the hour):", segPopup)
+        row("", systemAudioBtn)
+        row("Min. speech (sec):", voiceField)
+        row("", vadBtn)
+        row("Excluded apps:", excludeTokens)
+        row("Add a running app:", addAppPopup)
+        sec("Transcription (whisper)")
+        row("Model:", modelPopup)
+        row("…or custom model:", customModelField)
+        row("Language:", langPopup)
+        sec("Live captions (macOS 26)")
+        row("Caption language:", captionLangPopup)
+        row("Translate to:", translateToPopup)
+        row("Font size:", liveFontPopup)
+        row("", liveTimestampsBtn)
+        sec("Titling")
+        row("", calBtn)
+        row("Calendars:", calListCell)
+        sec("Storage")
+        row("", keepAudioBtn)
+        row("Keep audio for:", audioRetPopup)
+        row("Keep transcripts for:", txtRetPopup)
+        row("Save transcripts to:", dirStack)
+        row("Save audio to:", audioStack)
+        sec("General")
+        row("", loginBtn)
+
+        let grid = NSGridView(views: rows)
         grid.translatesAutoresizingMaskIntoConstraints = false
-        grid.rowSpacing = 16; grid.columnSpacing = 18
+        grid.rowSpacing = 9; grid.columnSpacing = 18
         grid.column(at: 0).xPlacement = .trailing
+        for r in headerRows {
+            grid.mergeCells(inHorizontalRange: NSRange(location: 0, length: 2), verticalRange: NSRange(location: r, length: 1))
+            grid.cell(atColumnIndex: 0, rowIndex: r).xPlacement = .leading
+            if r > 0 { grid.row(at: r).topPadding = 14 }
+        }
 
         let saveBtn = NSButton(title: "Save & Apply", target: self, action: #selector(saveAndClose)); saveBtn.keyEquivalent = "\r"
         let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(closeOnly)); cancelBtn.keyEquivalent = "\u{1b}"
         let btns = NSStackView(views: [cancelBtn, saveBtn]); btns.orientation = .horizontal; btns.spacing = 10
         btns.translatesAutoresizingMaskIntoConstraints = false
 
-        // Form pinned to the TOP (natural row heights — no vertical stretch), buttons pinned to the
-        // BOTTOM-trailing. Extra window height becomes empty space between them, not stretched rows.
+        // Scrollable form (many grouped rows) with the buttons pinned below it.
+        let doc = NSView(); doc.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(grid)
+        let scroll = NSScrollView(); scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true; scroll.scrollerStyle = .overlay; scroll.drawsBackground = false
+        scroll.documentView = doc
         let content = NSView()
-        content.addSubview(grid); content.addSubview(btns)
+        content.addSubview(scroll); content.addSubview(btns)
         NSLayoutConstraint.activate([
-            grid.topAnchor.constraint(equalTo: content.topAnchor, constant: 28),
-            grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 34),
-            grid.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -34),
-            btns.topAnchor.constraint(greaterThanOrEqualTo: grid.bottomAnchor, constant: 24),
+            grid.topAnchor.constraint(equalTo: doc.topAnchor, constant: 20),
+            grid.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 34),
+            grid.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -34),
+            grid.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -20),
+            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            scroll.topAnchor.constraint(equalTo: content.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: btns.topAnchor, constant: -12),
             btns.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -34),
             btns.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -22),
         ])
@@ -1539,7 +1566,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         segPopup.selectItem(at: idx(Int(c.segmentSeconds), segValues))
         langPopup.selectItem(at: idx(c.whisperLang, langValues))
         liveFontPopup.selectItem(at: idx(Pref.dbl(Pref.liveFontSize, "MR_LIVE_FONT_SIZE", 14), fontValues))
-        liveOpacityPopup.selectItem(at: idx(Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 0.9), opacityValues))
         captionLangPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.captionLang) ?? "", capLangValues))
         translateToPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.translateTo) ?? "", transToValues))
         modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
@@ -1588,7 +1614,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(Double(segValues[max(0, segPopup.indexOfSelectedItem)]), forKey: Pref.segment)
         d.set(langValues[max(0, langPopup.indexOfSelectedItem)], forKey: Pref.lang)
         d.set(fontValues[max(0, liveFontPopup.indexOfSelectedItem)], forKey: Pref.liveFontSize)
-        d.set(opacityValues[max(0, liveOpacityPopup.indexOfSelectedItem)], forKey: Pref.liveOpacity)
         d.set(capLangValues[max(0, captionLangPopup.indexOfSelectedItem)], forKey: Pref.captionLang)
         d.set(transToValues[max(0, translateToPopup.indexOfSelectedItem)], forKey: Pref.translateTo)
         d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
@@ -1847,7 +1872,10 @@ final class LiveCaptions {
             translator = LiveTranslator(source: locale.language, target: Locale.Language(identifier: toId))
         }
         let m = LiveTranscriber(label: mine, locale: locale,
-            onLocale: { [weak self] loc in DispatchQueue.main.async { self?.window?.setLanguage(loc.identifier(.bcp47)) } }
+            onLocale: { [weak self] loc in
+                let name = Locale.current.localizedString(forLanguageCode: loc.language.languageCode?.identifier ?? "")
+                    ?? loc.identifier(.bcp47)
+                DispatchQueue.main.async { self?.window?.setLanguage(name) } }
         ) { [weak self] t, f in self?.post(mine, t, f) }
         let s = LiveTranscriber(label: theirs, locale: locale) { [weak self] t, f in self?.post(theirs, t, f) }
         srcLock.lock(); mic = m; sys = s; srcLock.unlock()
@@ -1928,7 +1956,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
 
     init(onClose: @escaping () -> Void) {
         self.onClose = onClose
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 150),
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 150),
                         styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         super.init()
@@ -1941,7 +1969,8 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.delegate = self
         let content = panel.contentView!
-        let scroll = NSScrollView(frame: content.bounds)
+        let barH: CGFloat = 22   // slim bottom strip for the opacity drag slider
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: barH, width: content.bounds.width, height: content.bounds.height - barH))
         scroll.autoresizingMask = [.width, .height]
         scroll.hasVerticalScroller = true
         scroll.scrollerStyle = .overlay        // auto-hiding overlay scroller (no permanent bar)
@@ -1962,6 +1991,19 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         textView.textContainerInset = NSSize(width: 10, height: 8)
         scroll.documentView = textView
         content.addSubview(scroll)
+        // Opacity: a drag slider along the bottom (live translucency; persists to Prefs).
+        let slider = NSSlider(value: Double(panel.alphaValue), minValue: 0.3, maxValue: 1.0,
+                              target: self, action: #selector(opacityChanged(_:)))
+        slider.frame = NSRect(x: 10, y: 2, width: content.bounds.width - 20, height: 16)
+        slider.autoresizingMask = [.width, .maxYMargin]
+        slider.controlSize = .mini
+        slider.toolTip = "Overlay opacity"
+        content.addSubview(slider)
+    }
+
+    @objc private func opacityChanged(_ s: NSSlider) {
+        panel.alphaValue = CGFloat(s.doubleValue)
+        Pref.d.set(s.doubleValue, forKey: Pref.liveOpacity)
     }
 
     func show() {
@@ -1972,33 +2014,39 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     }
     func close() { suppressCloseCallback = true; panel.close() }
 
-    /// Show the active transcription language in the title bar (e.g. "macrec live · en-US").
-    func setLanguage(_ bcp47: String) { panel.title = "macrec live · \(bcp47)" }
+    /// Show the active transcription language in the title bar (human name, e.g. "macrec live · Korean").
+    func setLanguage(_ name: String) { panel.title = "macrec live · \(name)" }
 
     private let tsFormatter: DateFormatter = {
         let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "HH:mm:ss"; return f
     }()
 
-    /// Render the caption lines as attributed text — neutral (label color) text with a bold speaker
-    /// label + separator (speakers are told apart by the label, no loud tint); a subtle timestamp
-    /// prefix (optional) and a dim "↳ translation" line below.
+    /// Render for glanceable reading: each speaker gets a distinct tint (mic = teal, system = orange —
+    /// deliberately not blue) on a bold label + the text, a subtle timestamp, and a hanging indent so
+    /// wrapped lines align under the text instead of sliding under the timestamp/label.
     func render(_ lines: [(speaker: String, text: String, translated: String?, time: Date, mine: Bool)],
                 showTimestamps: Bool, fontSize: CGFloat) {
+        let para = NSMutableParagraphStyle()
+        para.headIndent = fontSize * 2.4       // wrapped lines hang-indent (don't run under the prefix)
+        para.lineHeightMultiple = 1.1
+        para.paragraphSpacing = 4
         let out = NSMutableAttributedString()
         for (i, l) in lines.enumerated() {
             if i > 0 { out.append(NSAttributedString(string: "\n")) }
+            let color: NSColor = l.mine ? .systemTeal : .systemOrange
             if showTimestamps {
-                out.append(NSAttributedString(string: "\(tsFormatter.string(from: l.time)) ", attributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: max(9, fontSize - 4), weight: .regular),
-                    .foregroundColor: NSColor.tertiaryLabelColor]))
+                out.append(NSAttributedString(string: "\(tsFormatter.string(from: l.time))  ", attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: max(9, fontSize - 3), weight: .regular),
+                    .foregroundColor: NSColor.tertiaryLabelColor, .paragraphStyle: para]))
             }
-            out.append(NSAttributedString(string: "\(l.speaker): ", attributes: [
-                .font: NSFont.boldSystemFont(ofSize: fontSize), .foregroundColor: NSColor.labelColor]))
+            out.append(NSAttributedString(string: "\(l.speaker)  ", attributes: [
+                .font: NSFont.boldSystemFont(ofSize: fontSize), .foregroundColor: color, .paragraphStyle: para]))
             out.append(NSAttributedString(string: l.text, attributes: [
-                .font: NSFont.systemFont(ofSize: fontSize), .foregroundColor: NSColor.labelColor]))
+                .font: NSFont.systemFont(ofSize: fontSize), .foregroundColor: color, .paragraphStyle: para]))
             if let t = l.translated, !t.isEmpty {
-                out.append(NSAttributedString(string: "\n    ↳ \(t)", attributes: [
-                    .font: NSFont.systemFont(ofSize: max(10, fontSize - 1)), .foregroundColor: NSColor.secondaryLabelColor]))
+                out.append(NSAttributedString(string: "\n     ↳ \(t)", attributes: [
+                    .font: NSFont.systemFont(ofSize: max(11, fontSize - 1)),
+                    .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
             }
         }
         textView.textStorage?.setAttributedString(out)
