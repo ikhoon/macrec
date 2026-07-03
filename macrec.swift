@@ -2424,8 +2424,8 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             if let t = l.translated, !t.isEmpty {
                 out.append(NSAttributedString(string: "\n↳ ", attributes: [
                     .font: transFont, .foregroundColor: NSColor.tertiaryLabelColor, .paragraphStyle: trans]))
-                out.append(NSAttributedString(string: t, attributes: [   // translation is the point → bright
-                    .font: transFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: trans]))
+                out.append(NSAttributedString(string: t, attributes: [   // readable, but a touch dimmer than the original → clear hierarchy
+                    .font: transFont, .foregroundColor: NSColor.labelColor.withAlphaComponent(0.8), .paragraphStyle: trans]))
             }
         }
         textView.textStorage?.setAttributedString(out)
