@@ -107,7 +107,6 @@ final class SourceWriter {
     var recentLevel: Float = 0   // peak of the most recent buffer — for the live menu meter
     var voicedFrames: AVAudioFramePosition = 0   // # samples above the voice threshold
     static let voiceThreshold: Float = 0.02      // ~-34 dBFS — speech-ish floor
-    var onCanon: ((AVAudioPCMBuffer) -> Void)?   // tee of the canon (16k mono) buffer → live captions
 
     /// Seconds of "voiced" (above-threshold) audio — used to decide if a segment is worth transcribing.
     var voicedSeconds: Double { Double(voicedFrames) / canon.sampleRate }
@@ -173,7 +172,6 @@ final class SourceWriter {
         }
         do { try file.write(from: outBuf); framesOut += AVAudioFramePosition(outBuf.frameLength) }
         catch { elog("write error: \(error)") }
-        onCanon?(outBuf)   // feed live captions (no-op unless live is active)
     }
 
     /// Copy a CMSampleBuffer's PCM data into an AVAudioPCMBuffer in the buffer's own format.
@@ -260,14 +258,20 @@ final class Recorder {
     }
 
     /// System audio arrives from the Core Audio tap (an owned copy — safe to hand to the queue).
-    func appendSys(_ buf: AVAudioPCMBuffer) { queue.async { self.sysWriter?.append(buf) } }
+    /// Live captions are fed straight from here (lowest latency — no WAV-write/canon-convert/queue hop).
+    func appendSys(_ buf: AVAudioPCMBuffer) {
+        if #available(macOS 26, *) { LiveCaptions.shared.feedSystem(buf) }
+        queue.async { self.sysWriter?.append(buf) }
+    }
 
     /// Mic samples arrive from a SEPARATE AVCaptureSession (independent of the system-audio tap), so
     /// the two capture paths don't interact. Appended on `queue` so it shares synchronization with
-    /// sys writes and rotation swaps.
+    /// sys writes and rotation swaps; live captions are fed directly (converted once) for low latency.
     func appendMic(_ sb: CMSampleBuffer) {
-        guard CMSampleBufferDataIsReady(sb) else { return }
-        queue.async { self.micWriter?.append(sb) }
+        guard CMSampleBufferDataIsReady(sb), let pcm = SourceWriter.pcm(from: sb) else { return }
+        // Convert once: feed live captions immediately, then hand the same PCM to the writer.
+        if #available(macOS 26, *) { LiveCaptions.shared.feedMic(pcm) }
+        queue.async { self.micWriter?.append(pcm) }
     }
 
     /// Drain in-flight callbacks, then release the AVAudioFiles so they flush their WAV headers
@@ -447,6 +451,7 @@ enum Pref {
     static let exclude = "excludeApps", txtDir = "transcriptsDir", vad = "vadEnabled", autoStart = "autoStart"
     static let cal = "useCalendarTitles", model = "whisperModelName"
     static let calendars = "calendarNames"              // calendar titles to source event titles from (empty = all)
+    static let liveTimestamps = "liveTimestamps"        // show timestamps in the live-caption overlay
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
     static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
     static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
@@ -846,11 +851,6 @@ final class CaptureSession {
     private func openWriters(_ start: Date) throws {
         rec.sysWriter = try SourceWriter(url: URL(fileURLWithPath: base(start) + ".sys.wav"))
         rec.micWriter = try SourceWriter(url: URL(fileURLWithPath: base(start) + ".mic.wav"))
-        // Tee canon audio to live captions (no-op unless the overlay is on). macOS 26+ only.
-        if #available(macOS 26, *) {
-            rec.sysWriter?.onCanon = { LiveCaptions.shared.feedSystem($0) }
-            rec.micWriter?.onCanon = { LiveCaptions.shared.feedMic($0) }
-        }
     }
 
     func start() async throws {
@@ -1071,13 +1071,16 @@ enum Transcriber {
             do { try mixDown(sysURL: seg.sysURL, micURL: seg.micURL, outURL: m); mixed = m }
             catch { elog("mixdown: \(error)") }
         }
+        // Speaker labels follow the transcription language (auto → the system language).
+        let lang = cfg.whisperLang == "auto" ? Locale.current.language.languageCode?.identifier : cfg.whisperLang
+        let (mine, theirs) = speakerLabels(forLanguage: lang)
         var merged: [(start: Double, who: String, text: String)] = []
         if let mic16 = convert16(seg.micURL) {
-            merged += parse(runWhisper(mic16, cfg)).map { (start: $0.0, who: "나", text: $0.1) }
+            merged += parse(runWhisper(mic16, cfg)).map { (start: $0.0, who: mine, text: $0.1) }
             try? FileManager.default.removeItem(at: mic16)
         }
         if let sys16 = convert16(seg.sysURL) {
-            merged += parse(runWhisper(sys16, cfg)).map { (start: $0.0, who: "상대", text: $0.1) }
+            merged += parse(runWhisper(sys16, cfg)).map { (start: $0.0, who: theirs, text: $0.1) }
             try? FileManager.default.removeItem(at: sys16)
         }
         merged.sort { $0.start < $1.start }
@@ -1352,6 +1355,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let keepAudioBtn = NSButton(checkboxWithTitle: "Keep audio (WAV) too", target: nil, action: nil)
     private let vadBtn = NSButton(checkboxWithTitle: "Remove noise/silence (VAD)", target: nil, action: nil)
     private let calBtn = NSButton(checkboxWithTitle: "Title transcripts from calendar events", target: nil, action: nil)
+    private let liveTimestampsBtn = NSButton(checkboxWithTitle: "Timestamps in live captions (macOS 26)", target: nil, action: nil)
     private let loginBtn = NSButton(checkboxWithTitle: "Start at login (24/7 recording)", target: nil, action: nil)
     private let systemAudioBtn = NSButton(checkboxWithTitle: "Capture system audio (other participants)", target: nil, action: nil)
     private var runningAppIds: [String] = []
@@ -1410,6 +1414,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [labeled(""), vadBtn],
             [labeled(""), systemAudioBtn],
             [labeled(""), calBtn],
+            [labeled(""), liveTimestampsBtn],
             [labeled("Calendars for titles:"), calListCell],
             [labeled(""), loginBtn],
             [labeled(""), keepAudioBtn],
@@ -1519,6 +1524,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         vadBtn.state = c.vadEnabled ? .on : .off
         systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
         calBtn.state = c.useCalendarTitles ? .on : .off
+        liveTimestampsBtn.state = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true) ? .on : .off
         keepAudioBtn.state = c.keepAudio ? .on : .off
         audioRetPopup.selectItem(at: idx(c.audioRetentionDays, retValues))
         txtRetPopup.selectItem(at: idx(c.transcriptRetentionDays, retValues))
@@ -1563,6 +1569,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
         d.set(calBtn.state == .on, forKey: Pref.cal)
+        d.set(liveTimestampsBtn.state == .on, forKey: Pref.liveTimestamps)
         d.set(keepAudioBtn.state == .on, forKey: Pref.keepAudio)
         d.set(retValues[max(0, audioRetPopup.indexOfSelectedItem)], forKey: Pref.audioRetention)
         d.set(retValues[max(0, txtRetPopup.indexOfSelectedItem)], forKey: Pref.txtRetention)
@@ -1638,6 +1645,30 @@ enum LoginItem {
     }
 }
 
+/// Localized speaker labels — (mine = the microphone / you, theirs = the other party / system audio)
+/// — for a language code. Falls back to English so non-Korean users don't see 나/상대.
+func speakerLabels(forLanguage lang: String?) -> (mine: String, theirs: String) {
+    switch lang {
+    case "ko": return ("나", "상대")
+    case "ja": return ("私", "相手")
+    case "zh": return ("我", "对方")
+    default:   return ("Me", "Them")
+    }
+}
+
+/// Pick the best BCP-47 locale from `pool` for `requested` — exact match → same-language+same-region
+/// → same-language (preferring -US then -GB) → nil. Pure + testable (see `macrec selftest`); used to
+/// map `Locale.current` (which can be an unsupported region like en_KR) to a supported speech locale.
+func pickSpeechLocale(requested: Locale, from pool: [Locale]) -> Locale? {
+    let reqBCP = requested.identifier(.bcp47)
+    if let exact = pool.first(where: { $0.identifier(.bcp47) == reqBCP }) { return exact }
+    let lang = requested.language.languageCode?.identifier
+    let same = pool.filter { $0.language.languageCode?.identifier == lang }
+    if let r = requested.region?.identifier, let m = same.first(where: { $0.region?.identifier == r }) { return m }
+    return same.first(where: { $0.identifier(.bcp47).hasSuffix("-US") })
+        ?? same.first(where: { $0.identifier(.bcp47).hasSuffix("-GB") }) ?? same.first
+}
+
 // MARK: - live transcription (macOS 26 SpeechAnalyzer → real-time caption overlay)
 //
 // Tees the same canon (16 kHz mono) audio the recorder writes into an on-device SpeechAnalyzer per
@@ -1646,44 +1677,65 @@ enum LoginItem {
 
 @available(macOS 26, *)
 final class LiveTranscriber {
+    private let label: String
     private let locale: Locale
     private let onUpdate: (String, Bool) -> Void   // (text, isFinal)
+    private let onLocale: ((Locale) -> Void)?      // reports the resolved speech locale once ready
     private let lock = NSLock()
     private var cont: AsyncStream<AnalyzerInput>.Continuation?
     private var inputFormat: AVAudioFormat?
     private var converter: AVAudioConverter?
     private var task: Task<Void, Never>?
 
-    init(locale: Locale, onUpdate: @escaping (String, Bool) -> Void) {
-        self.locale = locale; self.onUpdate = onUpdate
+    init(label: String, locale: Locale, onLocale: ((Locale) -> Void)? = nil,
+         onUpdate: @escaping (String, Bool) -> Void) {
+        self.label = label; self.locale = locale; self.onLocale = onLocale; self.onUpdate = onUpdate
     }
 
     func start() { task = Task { [weak self] in
-        do { try await self?.run() } catch { elog("live: transcriber failed: \(error)") } } }
+        do { try await self?.run() } catch { elog("live[\(self?.label ?? "?")]: transcriber failed: \(error)") } } }
 
     private func run() async throws {
-        let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [],
+        // Locale.current can be a region SpeechTranscriber doesn't support (e.g. en_KR → error 15
+        // "unsupported locale"). Map it to a supported (ideally already-installed) locale.
+        guard let loc = await Self.resolvedLocale(locale) else {
+            elog("live[\(label)]: no supported speech locale for \(locale.identifier)"); return
+        }
+        if loc.identifier(.bcp47) != locale.identifier(.bcp47) {
+            elog("live[\(label)]: locale \(locale.identifier) → \(loc.identifier(.bcp47))")
+        }
+        onLocale?(loc)   // surface the active language (e.g. in the overlay title)
+        let transcriber = SpeechTranscriber(locale: loc, transcriptionOptions: [],
                                             reportingOptions: [.volatileResults], attributeOptions: [])
         if let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-            elog("live: installing speech model (\(locale.identifier))…")
-            try await req.downloadAndInstall()
+            elog("live[\(label)]: downloading speech model (\(loc.identifier(.bcp47)))…"); try await req.downloadAndInstall()
         }
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         let fmt = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
         let (stream, c) = AsyncStream<AnalyzerInput>.makeStream()
+        try await analyzer.start(inputSequence: stream)   // only accept feeds once the analyzer is up
         lock.lock(); inputFormat = fmt; cont = c; lock.unlock()
-        try await analyzer.start(inputSequence: stream)
+        elog("live[\(label)]: analyzer ready (\(loc.identifier(.bcp47)))")
         for try await result in transcriber.results {
             let text = String(result.text.characters)
             if !text.isEmpty { onUpdate(text, result.isFinal) }
         }
     }
 
-    /// Feed a canon (16k mono float32) buffer — convert to the analyzer's format and yield it.
-    /// Called on the audio queue; the lock guards the converter + continuation.
+    /// Map a requested locale to one SpeechTranscriber supports (exact → same-language same-region →
+    /// same-language preferring en-US/GB → any same-language), preferring an already-installed one.
+    private static func resolvedLocale(_ requested: Locale) async -> Locale? {
+        let supported = await SpeechTranscriber.supportedLocales
+        let installed = await SpeechTranscriber.installedLocales
+        return pickSpeechLocale(requested: requested, from: installed)   // prefer already-installed
+            ?? pickSpeechLocale(requested: requested, from: supported)
+    }
+
+    /// Feed a captured PCM buffer (tap: 48 kHz stereo · mic: its native format) — convert to the
+    /// analyzer's format and yield it. Called off the capture thread; the lock guards converter + cont.
     func feed(_ buf: AVAudioPCMBuffer) {
         lock.lock(); defer { lock.unlock() }
-        guard let cont, let target = inputFormat else { return }
+        guard let cont, let target = inputFormat else { return }   // analyzer not ready yet → drop
         if buf.format == target { cont.yield(AnalyzerInput(buffer: buf)); return }
         if converter == nil || converter?.inputFormat != buf.format {
             converter = AVAudioConverter(from: buf.format, to: target)
@@ -1716,7 +1768,8 @@ final class LiveCaptions {
     private var mic: LiveTranscriber?
     private var sys: LiveTranscriber?
     private var window: LiveCaptionWindow?
-    private var lines: [(speaker: String, text: String, final: Bool)] = []
+    private var lines: [(speaker: String, text: String, final: Bool, time: Date)] = []
+    private var mineLabel = ""   // label used for the mic track (for speaker coloring)
     private let maxLines = 12
     private(set) var active = false
 
@@ -1729,11 +1782,15 @@ final class LiveCaptions {
         let win = LiveCaptionWindow(onClose: { [weak self] in self?.stop() })
         window = win; win.show()
         let locale = Locale.current
-        let m = LiveTranscriber(locale: locale) { [weak self] t, f in self?.post("나", t, f) }
-        let s = LiveTranscriber(locale: locale) { [weak self] t, f in self?.post("상대", t, f) }
+        let (mine, theirs) = speakerLabels(forLanguage: locale.language.languageCode?.identifier)
+        mineLabel = mine
+        let m = LiveTranscriber(label: mine, locale: locale,
+            onLocale: { [weak self] loc in DispatchQueue.main.async { self?.window?.setLanguage(loc.identifier(.bcp47)) } }
+        ) { [weak self] t, f in self?.post(mine, t, f) }
+        let s = LiveTranscriber(label: theirs, locale: locale) { [weak self] t, f in self?.post(theirs, t, f) }
         srcLock.lock(); mic = m; sys = s; srcLock.unlock()
         m.start(); s.start()
-        elog("live: captions ON")
+        elog("live: captions ON (locale=\(locale.identifier))")
     }
 
     func stop() {
@@ -1758,10 +1815,12 @@ final class LiveCaptions {
         if let i = lines.lastIndex(where: { $0.speaker == speaker && !$0.final }) {
             lines[i].text = text; lines[i].final = final
         } else {
-            lines.append((speaker, text, final))
+            lines.append((speaker, text, final, Date()))
         }
         if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
-        window?.render(lines.map { ($0.speaker, $0.text) })
+        let showTS = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true)
+        window?.render(lines.map { (speaker: $0.speaker, text: $0.text, time: $0.time, mine: $0.speaker == mineLabel) },
+                       showTimestamps: showTS)
     }
 }
 
@@ -1775,11 +1834,12 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
 
     init(onClose: @escaping () -> Void) {
         self.onClose = onClose
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 170),
-                        styleMask: [.titled, .closable, .resizable, .utilityWindow, .nonactivatingPanel],
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 190),
+                        styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         super.init()
         panel.title = "macrec live"
+        panel.alphaValue = 0.92   // slightly see-through so it's less obtrusive over a call
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.hidesOnDeactivate = false
@@ -1816,8 +1876,31 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     }
     func close() { suppressCloseCallback = true; panel.close() }
 
-    func render(_ lines: [(String, String)]) {
-        textView.string = lines.map { "\($0.0)  \($0.1)" }.joined(separator: "\n")
+    /// Show the active transcription language in the title bar (e.g. "macrec live · en-US").
+    func setLanguage(_ bcp47: String) { panel.title = "macrec live · \(bcp47)" }
+
+    private let tsFormatter: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "HH:mm:ss"; return f
+    }()
+
+    /// Render the caption lines as attributed text: optional dim timestamp, a bold color-coded
+    /// speaker label + separator, then the text. (mic speaker = blue, system speaker = green.)
+    func render(_ lines: [(speaker: String, text: String, time: Date, mine: Bool)], showTimestamps: Bool) {
+        let out = NSMutableAttributedString()
+        let body = NSFont.systemFont(ofSize: 14)
+        for (i, l) in lines.enumerated() {
+            if i > 0 { out.append(NSAttributedString(string: "\n")) }
+            if showTimestamps {
+                out.append(NSAttributedString(string: "\(tsFormatter.string(from: l.time))  ", attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+                    .foregroundColor: NSColor.secondaryLabelColor]))
+            }
+            out.append(NSAttributedString(string: "\(l.speaker):", attributes: [
+                .font: NSFont.boldSystemFont(ofSize: 14),
+                .foregroundColor: l.mine ? NSColor.systemBlue : NSColor.systemGreen]))
+            out.append(NSAttributedString(string: "  \(l.text)", attributes: [.font: body, .foregroundColor: NSColor.labelColor]))
+        }
+        textView.textStorage?.setAttributedString(out)
         textView.scrollToEndOfDocument(nil)
     }
 
@@ -2137,7 +2220,7 @@ func installStopHandler(_ handler: @escaping () -> Void) {
 /// correctly even when run via the Homebrew `bin/macrec` symlink (where Bundle.main resolves to
 /// /opt/homebrew/bin, not the .app, so the Info.plist can't be read). install.sh / package.sh
 /// stamp CFBundleShortVersionString from THIS value, so the binary and the bundle never drift.
-let macrecVersion = "0.4.0"
+let macrecVersion = "0.4.1"
 
 func printMacrecHelp() {
     print("""
@@ -2179,6 +2262,27 @@ struct Main {
         // Subcommands: help / version (accept the common flag spellings too).
         if let a = args.first, ["help", "--help", "-h"].contains(a) { printMacrecHelp(); exit(0) }
         if let a = args.first, ["version", "--version", "-v"].contains(a) { print("macrec \(macrecVersion)"); exit(0) }
+
+        // Subcommand: selftest — assertions on pure logic (run in CI). No GUI/permissions needed.
+        if args.first == "selftest" {
+            var fails = 0
+            func check(_ name: String, _ ok: Bool) { print("\(ok ? "ok  " : "FAIL") \(name)"); if !ok { fails += 1 } }
+            // Live-caption locale mapping (regression: Locale.current can be en_KR, which SpeechTranscriber
+            // rejects with "unsupported locale" — must map to a supported one).
+            let pool = ["fr-FR", "ko-KR", "zh-CN", "es-ES", "es-US", "en-GB", "en-AU", "en-US", "ja-JP"].map { Locale(identifier: $0) }
+            func pick(_ id: String) -> String? { pickSpeechLocale(requested: Locale(identifier: id), from: pool)?.identifier(.bcp47) }
+            check("en_KR → en-US (prefer -US)", pick("en_KR") == "en-US")
+            check("ko_KR → ko-KR (exact-ish)",  pick("ko_KR") == "ko-KR")
+            check("ja_JP → ja-JP",              pick("ja_JP") == "ja-JP")
+            check("en-GB → en-GB (exact)",      pick("en-GB") == "en-GB")
+            check("es_MX → same-language es",   pick("es_MX") == "es-US" || pick("es_MX") == "es-ES")
+            check("unsupported lang → nil",     pick("sw_TZ") == nil)
+            check("labels ko → 나/상대",         speakerLabels(forLanguage: "ko") == ("나", "상대"))
+            check("labels en → Me/Them",        speakerLabels(forLanguage: "en") == ("Me", "Them"))
+            check("labels ja → 私/相手",         speakerLabels(forLanguage: "ja") == ("私", "相手"))
+            print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
+            exit(fails == 0 ? 0 : 1)
+        }
 
         // Subcommand: mic-status — is the default input device currently in use?
         if args.first == "mic-status" {
