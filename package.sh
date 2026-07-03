@@ -77,7 +77,7 @@ echo "▸ building macrec…"
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 swiftc -swift-version 5 -parse-as-library -O \
   -framework AVFoundation -framework CoreMedia -framework CoreAudio \
-  -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech \
+  -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech -framework Translation \
   "$HERE/macrec.swift" -o "$APP/Contents/MacOS/macrec"
 
 # ── 6) bundle whisper-cli + VAD + icon ──────────────────────────────────────────

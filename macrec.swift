@@ -13,6 +13,7 @@
 import Foundation
 import AVFoundation
 import CoreMedia
+import Translation   // macOS 26 on-device translation of live captions
 import Speech   // macOS 26 SpeechAnalyzer — real-time captions (whisper-cli stays the saved transcript)
 import CoreAudio
 import CoreGraphics
@@ -452,6 +453,8 @@ enum Pref {
     static let cal = "useCalendarTitles", model = "whisperModelName"
     static let calendars = "calendarNames"              // calendar titles to source event titles from (empty = all)
     static let liveTimestamps = "liveTimestamps"        // show timestamps in the live-caption overlay
+    static let captionLang = "liveCaptionLang"          // live-caption transcription locale ("" = system)
+    static let translateTo = "liveTranslateTo"          // live-caption translation target ("" = off)
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
     static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
     static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
@@ -1344,6 +1347,7 @@ final class RecordingEngine {
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let onSave: () -> Void
     private let segPopup = NSPopUpButton(), langPopup = NSPopUpButton()
+    private let captionLangPopup = NSPopUpButton(), translateToPopup = NSPopUpButton()   // live captions (macOS 26)
     private let modelPopup = NSPopUpButton()
     private let audioRetPopup = NSPopUpButton(), txtRetPopup = NSPopUpButton()
     private let addAppPopup = NSPopUpButton()
@@ -1362,6 +1366,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private let segValues = [900, 1800, 3600, 7200], segTitles = ["15 min", "30 min", "1 hour", "2 hours"]
     private let langValues = ["auto", "ko", "ja", "en"], langTitles = ["Auto-detect", "Korean", "Japanese", "English"]
+    // Live-caption languages (macOS 26 SpeechAnalyzer + Translation). "" = System (caption) / Off (translate).
+    private let capLangValues = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
+    private let capLangTitles  = ["System", "Korean", "Japanese", "English", "Chinese", "Spanish", "French", "German"]
+    private let transToValues  = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
+    private let transToTitles  = ["Off", "Korean", "Japanese", "English", "Chinese", "Spanish", "French", "German"]
     private let modelNames = WhisperCatalog.all.map { $0.name }   // popup order matches WhisperCatalog.all
     private let retValues = [7, 30, 90, 0], retTitles = ["7 days", "30 days", "90 days", "Unlimited"]
 
@@ -1383,6 +1392,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func buildForm() {
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
+        captionLangPopup.addItems(withTitles: capLangTitles); translateToPopup.addItems(withTitles: transToTitles)
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
         for f in [voiceField, dirField, audioDirField, customModelField] { f.translatesAutoresizingMaskIntoConstraints = false }
@@ -1408,6 +1418,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let grid = NSGridView(views: [
             [labeled("Segment length (on the hour):"), segPopup],
             [labeled("Transcription language:"), langPopup],
+            [labeled("Live caption language:"), captionLangPopup],
+            [labeled("Live translate to:"), translateToPopup],
             [labeled("Transcription model:"), modelPopup],
             [labeled("…or custom model:"), customModelField],
             [labeled("Min. speech (sec):"), voiceField],
@@ -1518,6 +1530,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let c = EngineConfig.load()
         segPopup.selectItem(at: idx(Int(c.segmentSeconds), segValues))
         langPopup.selectItem(at: idx(c.whisperLang, langValues))
+        captionLangPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.captionLang) ?? "", capLangValues))
+        translateToPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.translateTo) ?? "", transToValues))
         modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
@@ -1563,6 +1577,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let d = Pref.d
         d.set(Double(segValues[max(0, segPopup.indexOfSelectedItem)]), forKey: Pref.segment)
         d.set(langValues[max(0, langPopup.indexOfSelectedItem)], forKey: Pref.lang)
+        d.set(capLangValues[max(0, captionLangPopup.indexOfSelectedItem)], forKey: Pref.captionLang)
+        d.set(transToValues[max(0, translateToPopup.indexOfSelectedItem)], forKey: Pref.translateTo)
         d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
         d.set(customModelField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.customModel)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
@@ -1758,7 +1774,31 @@ final class LiveTranscriber {
     }
 }
 
-/// Owns the two per-source transcribers + the floating caption window. Menu toggles it on/off.
+/// On-device translation of finalized caption lines (macOS 26 Translation framework). Best-effort:
+/// if the language pair isn't installed/available it returns nil and captions show the original only.
+@available(macOS 26, *)
+final class LiveTranslator {
+    private let session: TranslationSession
+    private let lock = NSLock()
+    private var prepared = false
+
+    init(source: Locale.Language, target: Locale.Language) {
+        session = TranslationSession(installedSource: source, target: target)
+    }
+
+    func translate(_ text: String) async -> String? {
+        do {
+            lock.lock(); let needPrep = !prepared; lock.unlock()
+            if needPrep {                              // download/prepare the pair on first use
+                try await session.prepareTranslation()
+                lock.lock(); prepared = true; lock.unlock()   // only mark ready once prepare SUCCEEDS
+            }
+            return try await session.translate(text).targetText
+        } catch { elog("live: translate failed: \(error)"); return nil }
+    }
+}
+
+/// Owns the two per-source transcribers + optional translator + the floating caption window.
 @available(macOS 26, *)
 final class LiveCaptions {
     static let shared = LiveCaptions()
@@ -1767,8 +1807,9 @@ final class LiveCaptions {
     private let srcLock = NSLock()
     private var mic: LiveTranscriber?
     private var sys: LiveTranscriber?
+    private var translator: LiveTranslator?   // nil = no live translation
     private var window: LiveCaptionWindow?
-    private var lines: [(speaker: String, text: String, final: Bool, time: Date)] = []
+    private var lines: [(speaker: String, text: String, translated: String?, final: Bool, time: Date)] = []
     private var mineLabel = ""   // label used for the mic track (for speaker coloring)
     private let maxLines = 12
     private(set) var active = false
@@ -1781,9 +1822,17 @@ final class LiveCaptions {
         active = true; lines = []
         let win = LiveCaptionWindow(onClose: { [weak self] in self?.stop() })
         window = win; win.show()
-        let locale = Locale.current
+        // Caption language: the picker value ("" = system). Read directly so "" is respected
+        // (Pref.str treats "" as unset and would fall back to the default).
+        let capId = Pref.d.string(forKey: Pref.captionLang) ?? ""
+        let locale = capId.isEmpty ? Locale.current : Locale(identifier: capId)
         let (mine, theirs) = speakerLabels(forLanguage: locale.language.languageCode?.identifier)
         mineLabel = mine
+        // Optional translation of finalized lines — skip if the target language == caption language.
+        let toId = Pref.d.string(forKey: Pref.translateTo) ?? ""
+        if !toId.isEmpty, Locale(identifier: toId).language.languageCode?.identifier != locale.language.languageCode?.identifier {
+            translator = LiveTranslator(source: locale.language, target: Locale.Language(identifier: toId))
+        }
         let m = LiveTranscriber(label: mine, locale: locale,
             onLocale: { [weak self] loc in DispatchQueue.main.async { self?.window?.setLanguage(loc.identifier(.bcp47)) } }
         ) { [weak self] t, f in self?.post(mine, t, f) }
@@ -1798,6 +1847,7 @@ final class LiveCaptions {
         active = false
         srcLock.lock(); let m = mic, s = sys; mic = nil; sys = nil; srcLock.unlock()
         m?.stop(); s?.stop()
+        translator = nil
         let w = window; window = nil; w?.close()
         elog("live: captions OFF")
     }
@@ -1815,12 +1865,28 @@ final class LiveCaptions {
         if let i = lines.lastIndex(where: { $0.speaker == speaker && !$0.final }) {
             lines[i].text = text; lines[i].final = final
         } else {
-            lines.append((speaker, text, final, Date()))
+            lines.append((speaker, text, nil, final, Date()))
         }
         if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
+        render()
+        // Translate finalized lines only (bounded rate); fill it in when it returns.
+        if final, let translator, !text.isEmpty {
+            Task { [weak self] in
+                guard let out = await translator.translate(text) else { return }
+                await MainActor.run { self?.setTranslation(speaker, text, out) }
+            }
+        }
+    }
+    private func setTranslation(_ speaker: String, _ original: String, _ translated: String) {
+        // Update the most recent line matching this speaker + original text.
+        guard active, let i = lines.lastIndex(where: { $0.speaker == speaker && $0.text == original }) else { return }
+        lines[i].translated = translated
+        render()
+    }
+    private func render() {
         let showTS = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true)
-        window?.render(lines.map { (speaker: $0.speaker, text: $0.text, time: $0.time, mine: $0.speaker == mineLabel) },
-                       showTimestamps: showTS)
+        window?.render(lines.map { (speaker: $0.speaker, text: $0.text, translated: $0.translated,
+                                    time: $0.time, mine: $0.speaker == mineLabel) }, showTimestamps: showTS)
     }
 }
 
@@ -1846,7 +1912,9 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.delegate = self
-        let scroll = NSScrollView(frame: panel.contentView!.bounds)
+        let content = panel.contentView!
+        let barH: CGFloat = 26   // bottom strip holds the opacity slider
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: barH, width: content.bounds.width, height: content.bounds.height - barH))
         scroll.autoresizingMask = [.width, .height]
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
@@ -1865,7 +1933,15 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         textView.font = NSFont.systemFont(ofSize: 14)
         textView.textContainerInset = NSSize(width: 10, height: 8)
         scroll.documentView = textView
-        panel.contentView?.addSubview(scroll)
+        content.addSubview(scroll)
+        // Opacity slider along the bottom — adjust the overlay translucency right here (0.3–1.0).
+        let slider = NSSlider(value: Double(panel.alphaValue), minValue: 0.3, maxValue: 1.0,
+                              target: self, action: #selector(opacityChanged(_:)))
+        slider.frame = NSRect(x: 10, y: 3, width: content.bounds.width - 20, height: 19)
+        slider.autoresizingMask = [.width, .maxYMargin]
+        slider.controlSize = .mini
+        slider.toolTip = "Overlay opacity"
+        content.addSubview(slider)
     }
 
     func show() {
@@ -1883,26 +1959,34 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "HH:mm:ss"; return f
     }()
 
-    /// Render the caption lines as attributed text: optional dim timestamp, a bold color-coded
-    /// speaker label + separator, then the text. (mic speaker = blue, system speaker = green.)
-    func render(_ lines: [(speaker: String, text: String, time: Date, mine: Bool)], showTimestamps: Bool) {
+    /// Render the caption lines as attributed text. Each line is tinted by speaker (mic = blue,
+    /// system = green): bold label + ":" separator, then the text in the same hue so the whole line
+    /// reads as one; a subtle timestamp prefix (optional) and a dim "↳ translation" line below.
+    func render(_ lines: [(speaker: String, text: String, translated: String?, time: Date, mine: Bool)], showTimestamps: Bool) {
         let out = NSMutableAttributedString()
-        let body = NSFont.systemFont(ofSize: 14)
         for (i, l) in lines.enumerated() {
             if i > 0 { out.append(NSAttributedString(string: "\n")) }
+            let color: NSColor = l.mine ? .systemBlue : .systemGreen
             if showTimestamps {
-                out.append(NSAttributedString(string: "\(tsFormatter.string(from: l.time))  ", attributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
-                    .foregroundColor: NSColor.secondaryLabelColor]))
+                out.append(NSAttributedString(string: "\(tsFormatter.string(from: l.time)) ", attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
+                    .foregroundColor: NSColor.tertiaryLabelColor]))
             }
-            out.append(NSAttributedString(string: "\(l.speaker):", attributes: [
-                .font: NSFont.boldSystemFont(ofSize: 14),
-                .foregroundColor: l.mine ? NSColor.systemBlue : NSColor.systemGreen]))
-            out.append(NSAttributedString(string: "  \(l.text)", attributes: [.font: body, .foregroundColor: NSColor.labelColor]))
+            out.append(NSAttributedString(string: "\(l.speaker): ", attributes: [
+                .font: NSFont.boldSystemFont(ofSize: 14), .foregroundColor: color]))
+            out.append(NSAttributedString(string: l.text, attributes: [
+                .font: NSFont.systemFont(ofSize: 14), .foregroundColor: color]))   // whole line tinted
+            if let t = l.translated, !t.isEmpty {
+                out.append(NSAttributedString(string: "\n    ↳ \(t)", attributes: [
+                    .font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.secondaryLabelColor]))
+            }
         }
         textView.textStorage?.setAttributedString(out)
         textView.scrollToEndOfDocument(nil)
     }
+
+    /// Opacity slider callback (live-adjusts the panel translucency).
+    @objc func opacityChanged(_ sender: NSSlider) { panel.alphaValue = CGFloat(sender.doubleValue) }
 
     // User clicked the panel's close button → tear the session down (unless we closed it ourselves).
     func windowWillClose(_ notification: Notification) { if !suppressCloseCallback { onClose() } }
@@ -2220,7 +2304,7 @@ func installStopHandler(_ handler: @escaping () -> Void) {
 /// correctly even when run via the Homebrew `bin/macrec` symlink (where Bundle.main resolves to
 /// /opt/homebrew/bin, not the .app, so the Info.plist can't be read). install.sh / package.sh
 /// stamp CFBundleShortVersionString from THIS value, so the binary and the bundle never drift.
-let macrecVersion = "0.4.1"
+let macrecVersion = "0.5.0"
 
 func printMacrecHelp() {
     print("""
