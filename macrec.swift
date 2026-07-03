@@ -265,7 +265,7 @@ final class EchoDucker {
     private let maxRefSec = 3.0
     private let delaySec = 0.15                   // speaker→mic acoustic + capture latency
     private let refActive: Float = 0.02           // far-end considered "playing" above this RMS
-    private let duckMargin: Float = 2.5           // duck only if micRMS < predictedEcho*margin (else near-end speech)
+    private let duckMargin: Float = 2.0           // duck only if micRMS < predictedEcho*margin (else near-end speech)
     private let duckGain: Float = 0.08            // attenuation applied to echo-dominated mic blocks
     private var echoCoupling: Float = 0.15        // learned echo/ref ratio (lower-envelope; capture thread only)
 
@@ -304,7 +304,7 @@ final class EchoDucker {
             // slow release up — so near-end speech (high ratio) doesn't inflate it.
             let r = micRMS / refRMS
             echoCoupling += (r < echoCoupling ? 0.02 : 0.0005) * (r - echoCoupling)
-            echoCoupling = min(0.5, max(0.02, echoCoupling))
+            echoCoupling = min(0.25, max(0.02, echoCoupling))   // cap so sustained double-talk can't push the gate up onto real near-end speech
             // Duck only when the mic is near the PREDICTED echo level (echo-dominated); when the user is
             // actually speaking, micRMS is well above the predicted echo → not ducked (protects their voice).
             if micRMS < echoCoupling * refRMS * duckMargin { target = duckGain }
