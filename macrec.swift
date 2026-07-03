@@ -2514,19 +2514,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func setIcon(recording: Bool) {
-        // Distinct audio-recorder identity: waveform-with-mic while live, pause when not.
-        // variableLength (below) hugs the glyph so there's no fixed L/R slack around it.
+        // Distinct audio-recorder identity: a waveform-with-mic while live, pause when not.
         let primary = recording ? "waveform.badge.mic" : "pause.circle"
         let fallback = recording ? "waveform" : "pause"
-        let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+        // Fixed point size so the menu-bar icon never resizes (independent of which symbol).
+        let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
         let img = (NSImage(systemSymbolName: primary, accessibilityDescription: "macrec")
             ?? NSImage(systemSymbolName: fallback, accessibilityDescription: "macrec"))?
             .withSymbolConfiguration(cfg)
         img?.isTemplate = true
         statusItem.button?.image = img
-        statusItem.button?.imagePosition = .imageOnly
-        statusItem.length = NSStatusItem.variableLength   // hug the glyph — no fixed L/R slack
-        elog("icon set (recording=\(recording))")
+        statusItem.length = 30   // fixed width — our item won't reflow as system indicators come/go
+        elog("icon set (recording=\(recording)), statusItem.length=\(statusItem.length)")
     }
 
     private func item(_ title: String, _ sel: Selector, _ key: String = "", symbol: String = "") -> NSMenuItem {
