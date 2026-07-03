@@ -265,8 +265,9 @@ final class EchoDucker {
     private let maxRefSec = 3.0
     private let delaySec = 0.15                   // speaker→mic acoustic + capture latency
     private let refActive: Float = 0.02           // far-end considered "playing" above this RMS
-    private let duckRatio: Float = 0.6            // duck only if micRMS < refRMS*ratio (else it's near-end speech)
+    private let duckMargin: Float = 2.5           // duck only if micRMS < predictedEcho*margin (else near-end speech)
     private let duckGain: Float = 0.08            // attenuation applied to echo-dominated mic blocks
+    private var echoCoupling: Float = 0.15        // learned echo/ref ratio (lower-envelope; capture thread only)
 
     var enabled: Bool { Pref.bool(Pref.echoReduce, "MR_ECHO_REDUCE", false) }
     func reset() { lock.lock(); ref.removeAll(keepingCapacity: true); lastGain = 1; lock.unlock() }
@@ -297,7 +298,17 @@ final class EchoDucker {
         }
         lock.unlock()
         let refRMS = have ? (rs / Float(n)).squareRoot() : 0
-        let target: Float = (refRMS > refActive && micRMS < refRMS * duckRatio) ? duckGain : 1
+        var target: Float = 1
+        if refRMS > refActive {
+            // Track echo coupling (echo/ref) as the LOWER ENVELOPE of mic/ref — moderate attack down,
+            // slow release up — so near-end speech (high ratio) doesn't inflate it.
+            let r = micRMS / refRMS
+            echoCoupling += (r < echoCoupling ? 0.02 : 0.0005) * (r - echoCoupling)
+            echoCoupling = min(0.5, max(0.02, echoCoupling))
+            // Duck only when the mic is near the PREDICTED echo level (echo-dominated); when the user is
+            // actually speaking, micRMS is well above the predicted echo → not ducked (protects their voice).
+            if micRMS < echoCoupling * refRMS * duckMargin { target = duckGain }
+        }
         if lastGain != 1 || target != 1 {   // ramp across the block so gain changes don't click
             let g0 = lastGain, g1 = target, d = Float(max(1, n - 1))
             for i in 0..<n { mp[i] *= g0 + (g1 - g0) * (Float(i) / d) }
