@@ -1731,7 +1731,6 @@ final class LiveTranscriber: LiveTranscribing {
         if loc.identifier(.bcp47) != locale.identifier(.bcp47) {
             elog("live[\(label)]: locale \(locale.identifier) → \(loc.identifier(.bcp47))")
         }
-        onLocale?(loc)   // surface the active language (e.g. in the overlay title)
         let transcriber = SpeechTranscriber(locale: loc, transcriptionOptions: [],
                                             reportingOptions: [.volatileResults, .fastResults], attributeOptions: [])
         let t1 = ProcessInfo.processInfo.systemUptime
@@ -1751,6 +1750,7 @@ final class LiveTranscriber: LiveTranscribing {
         let tp = ProcessInfo.processInfo.systemUptime
         try await analyzer.prepareToAnalyze(in: fmt)
         lock.lock(); inputFormat = fmt; cont = c; lock.unlock()
+        onLocale?(loc)   // now warm — surface the active language (replaces the "preparing" title)
         let t3 = ProcessInfo.processInfo.systemUptime
         elog(String(format: "live[%@]: analyzer ready (%@) — resolve %.1fs · assets %.1fs · start %.1fs · prepare %.1fs",
                     label, loc.identifier(.bcp47), t1 - t0, t2 - t1, tp - t2, t3 - tp))
@@ -2087,6 +2087,7 @@ final class LiveCaptions {
     /// both the first start and a locale/engine/source change; the window is reused across all of them.
     private func buildEngine() {
         let cfg = liveConfig()
+        window?.setPreparing()   // title shows "starting…" until the analyzer warms up (onLocale replaces it)
         let (mine, theirs) = speakerLabels(forLanguage: cfg.locale.language.languageCode?.identifier)
         mineLabel = mine
         // A single speaker needs no label, so hide it (render then uses a neutral color).
@@ -2371,6 +2372,8 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
 
     /// Show the active transcription language in the title bar (human name, e.g. "🎙️ macrec live · Korean").
     func setLanguage(_ name: String) { panel.title = "\(Self.titleIcon) macrec live · \(name)" }
+    /// Shown while the analyzer warms up (model/ANE load) — the overlay is otherwise blank for ~10s.
+    func setPreparing() { panel.title = "\(Self.titleIcon) macrec live · starting…" }
 
     private let tsFormatter: DateFormatter = {
         let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "HH:mm:ss"; return f
