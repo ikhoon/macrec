@@ -2514,9 +2514,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func setIcon(recording: Bool) {
-        // Narrow mic glyph keeps the menu-bar footprint tight — filled = live, slashed = paused.
-        let primary = recording ? "mic.fill" : "mic.slash.fill"
-        let fallback = recording ? "mic" : "mic.slash"
+        // Distinct audio-recorder identity: waveform-with-mic while live, pause when not.
+        // variableLength (below) hugs the glyph so there's no fixed L/R slack around it.
+        let primary = recording ? "waveform.badge.mic" : "pause.circle"
+        let fallback = recording ? "waveform" : "pause"
         let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
         let img = (NSImage(systemSymbolName: primary, accessibilityDescription: "macrec")
             ?? NSImage(systemSymbolName: fallback, accessibilityDescription: "macrec"))?
