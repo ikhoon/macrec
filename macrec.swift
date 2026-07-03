@@ -457,6 +457,7 @@ enum Pref {
     static let translateTo = "liveTranslateTo"          // live-caption translation target ("" = off)
     static let liveFontSize = "liveFontSize"            // live-caption overlay font size (pt)
     static let liveOpacity = "liveOpacity"              // live-caption overlay opacity (0.3–1.0)
+    static let liveSource = "liveSource"                // which speakers to transcribe live: both|other|me
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
     static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
     static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
@@ -1351,6 +1352,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let segPopup = NSPopUpButton(), langPopup = NSPopUpButton()
     private let captionLangPopup = NSPopUpButton(), translateToPopup = NSPopUpButton()   // live captions (macOS 26)
     private let liveFontPopup = NSPopUpButton()      // live overlay font size (opacity is on the overlay itself)
+    private let liveSourcePopup = NSPopUpButton()    // which speakers to transcribe live (perf tradeoff)
     private let modelPopup = NSPopUpButton()
     private let audioRetPopup = NSPopUpButton(), txtRetPopup = NSPopUpButton()
     private let addAppPopup = NSPopUpButton()
@@ -1375,6 +1377,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let capLangTitles  = ["System", "Korean", "Japanese", "English", "Chinese", "Spanish", "French", "German"]
     private let transToValues  = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
     private let transToTitles  = ["Off", "Korean", "Japanese", "English", "Chinese", "Spanish", "French", "German"]
+    // Live-caption source (perf): index 0 is the default (other party only → one analyzer, lower latency).
+    private let liveSourceValues = ["other", "both", "me"]
+    private let liveSourceTitles = ["Other party only (faster)", "Both speakers", "Me only"]
     private let modelNames = WhisperCatalog.all.map { $0.name }   // popup order matches WhisperCatalog.all
     private let retValues = [7, 30, 90, 0], retTitles = ["7 days", "30 days", "90 days", "Unlimited"]
 
@@ -1398,6 +1403,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
         captionLangPopup.addItems(withTitles: capLangTitles); translateToPopup.addItems(withTitles: transToTitles)
         liveFontPopup.addItems(withTitles: fontTitles)
+        liveSourcePopup.addItems(withTitles: liveSourceTitles)
+        liveSourcePopup.toolTip = "Fewer speakers = less on-device work = lower latency. Applies next time captions start."
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
         for f in [voiceField, dirField, audioDirField, customModelField] { f.translatesAutoresizingMaskIntoConstraints = false }
@@ -1442,6 +1449,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         row("Language:", langPopup)
         sec("Live captions (macOS 26)")
         row("Caption language:", captionLangPopup)
+        row("Transcribe:", liveSourcePopup)
         row("Translate to:", translateToPopup)
         row("Font size:", liveFontPopup)
         row("", liveTimestampsBtn)
@@ -1567,6 +1575,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         langPopup.selectItem(at: idx(c.whisperLang, langValues))
         liveFontPopup.selectItem(at: idx(Pref.dbl(Pref.liveFontSize, "MR_LIVE_FONT_SIZE", 14), fontValues))
         captionLangPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.captionLang) ?? "", capLangValues))
+        liveSourcePopup.selectItem(at: idx(LiveSource.current.rawValue, liveSourceValues))
         translateToPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.translateTo) ?? "", transToValues))
         modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
@@ -1615,6 +1624,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(langValues[max(0, langPopup.indexOfSelectedItem)], forKey: Pref.lang)
         d.set(fontValues[max(0, liveFontPopup.indexOfSelectedItem)], forKey: Pref.liveFontSize)
         d.set(capLangValues[max(0, captionLangPopup.indexOfSelectedItem)], forKey: Pref.captionLang)
+        d.set(liveSourceValues[max(0, liveSourcePopup.indexOfSelectedItem)], forKey: Pref.liveSource)
         d.set(transToValues[max(0, translateToPopup.indexOfSelectedItem)], forKey: Pref.translateTo)
         d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
         d.set(customModelField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.customModel)
@@ -1835,6 +1845,15 @@ final class LiveTranslator {
     }
 }
 
+/// Which speakers to transcribe for the live overlay. Each source runs its own on-device analyzer,
+/// so transcribing one instead of two roughly halves inference load → lower latency. Default is
+/// `.other` (the remote party / system audio): you already know what you said, and it's the cheaper
+/// path. (The saved whisper transcript always covers everyone regardless of this setting.)
+enum LiveSource: String {
+    case both, other, me
+    static var current: LiveSource { LiveSource(rawValue: Pref.d.string(forKey: Pref.liveSource) ?? "") ?? .other }
+}
+
 /// Owns the two per-source transcribers + optional translator + the floating caption window.
 @available(macOS 26, *)
 final class LiveCaptions {
@@ -1857,7 +1876,7 @@ final class LiveCaptions {
 
     func start() {
         guard !active else { return }
-        active = true; lines = []
+        active = true; lines = []; renderScheduled = false   // clear any coalescing state left by a prior session
         // Caption language: the picker value ("" = system). Read directly so "" is respected
         // (Pref.str treats "" as unset and would fall back to the default).
         let capId = Pref.d.string(forKey: Pref.captionLang) ?? ""
@@ -1871,21 +1890,29 @@ final class LiveCaptions {
         if !toId.isEmpty, Locale(identifier: toId).language.languageCode?.identifier != locale.language.languageCode?.identifier {
             translator = LiveTranslator(source: locale.language, target: Locale.Language(identifier: toId))
         }
-        let m = LiveTranscriber(label: mine, locale: locale,
-            onLocale: { [weak self] loc in
-                let name = Locale.current.localizedString(forLanguageCode: loc.language.languageCode?.identifier ?? "")
-                    ?? loc.identifier(.bcp47)
-                DispatchQueue.main.async { self?.window?.setLanguage(name) } }
-        ) { [weak self] t, f in self?.post(mine, t, f) }
-        let s = LiveTranscriber(label: theirs, locale: locale) { [weak self] t, f in self?.post(theirs, t, f) }
+        // Which speakers to transcribe (perf tradeoff — one analyzer instead of two ~halves the load).
+        let mode = LiveSource.current
+        let onLocale: (Locale) -> Void = { [weak self] loc in
+            let name = Locale.current.localizedString(forLanguageCode: loc.language.languageCode?.identifier ?? "")
+                ?? loc.identifier(.bcp47)
+            DispatchQueue.main.async { self?.window?.setLanguage(name) }
+        }
+        var m: LiveTranscriber?, s: LiveTranscriber?
+        if mode == .both || mode == .me {
+            m = LiveTranscriber(label: mine, locale: locale, onLocale: onLocale) { [weak self] t, f in self?.post(mine, t, f) }
+        }
+        if mode == .both || mode == .other {
+            // Let whichever transcriber the mic isn't already covering report the resolved language.
+            s = LiveTranscriber(label: theirs, locale: locale, onLocale: m == nil ? onLocale : nil) { [weak self] t, f in self?.post(theirs, t, f) }
+        }
         srcLock.lock(); mic = m; sys = s; srcLock.unlock()
-        m.start(); s.start()
-        elog("live: captions ON (locale=\(locale.identifier))")
+        m?.start(); s?.start()
+        elog("live: captions ON (locale=\(locale.identifier), source=\(mode.rawValue))")
     }
 
     func stop() {
         guard active else { return }
-        active = false
+        active = false; renderScheduled = false   // drop any pending coalesced render (so a restart isn't suppressed)
         srcLock.lock(); let m = mic, s = sys; mic = nil; sys = nil; srcLock.unlock()
         m?.stop(); s?.stop()
         translator = nil
