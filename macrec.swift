@@ -2351,6 +2351,10 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
             guard let t = self.task else { return }
             self.task = nil
             let s = self.session; self.session = nil
+            if !self.pending.isEmpty {   // flush the sub-batch tail (≤100 ms) so the final caption isn't clipped
+                let tail = self.pending; self.pending.removeAll(keepingCapacity: false)
+                t.send(.data(tail)) { _ in }   // WebSocket frames are ordered — this precedes CloseStream
+            }
             // Cancel only after CloseStream had its chance to flush — an immediate cancel can drop it.
             t.send(.string(#"{"type":"CloseStream"}"#)) { _ in
                 t.cancel(with: .normalClosure, reason: nil)
