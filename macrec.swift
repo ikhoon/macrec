@@ -1927,9 +1927,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func saveAndClose() {
         // Keychain first — if a credential write fails, abort BEFORE touching any other setting so
-        // the user isn't left with a half-saved state (and no key is silently lost).
-        for (account, field, name) in [("deepgram", deepgramKeyField, "Deepgram"), ("openai", openaiKeyField, "OpenAI")] {
+        // the user isn't left with a half-saved state (and no key is silently lost). All-or-nothing:
+        // keys saved earlier in the loop are rolled back (best effort) on a later failure.
+        let creds = [("deepgram", deepgramKeyField, "Deepgram"), ("openai", openaiKeyField, "OpenAI")]
+        let previousKeys = creds.map { ($0.0, Keychain.get($0.0) ?? "") }
+        for (i, cred) in creds.enumerated() {
+            let (account, field, name) = cred
             if Keychain.set(account, field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) { continue }
+            for (acct, old) in previousKeys[..<i] { Keychain.set(acct, old) }   // best-effort rollback
             let a = NSAlert()
             a.messageText = "Couldn't save the \(name) API key"
             a.informativeText = "The Keychain write failed (see the log). Settings were not applied — try saving again."
