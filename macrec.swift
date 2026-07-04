@@ -2690,7 +2690,10 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     private func setControlBar(collapsed: Bool) {
         controlsAccessory?.isHidden = collapsed
         collapseBtn.image = NSImage(systemSymbolName: collapsed ? "chevron.down" : "chevron.up",
-                                    accessibilityDescription: collapsed ? "Show controls" : "Hide controls")
+                                    accessibilityDescription: nil)
+        let label = collapsed ? "Show caption controls" : "Hide caption controls"
+        collapseBtn.setAccessibilityLabel(label)   // VoiceOver reads the BUTTON's label, not the image's
+        collapseBtn.toolTip = label
         Pref.d.set(collapsed, forKey: Pref.liveBarCollapsed)
     }
 
@@ -2732,9 +2735,9 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         // so long meetings get the space back once the knobs are set. Sticky across sessions.
         collapseBtn.isBordered = false
         collapseBtn.bezelStyle = .regularSquare
+        collapseBtn.imagePosition = .imageOnly   // title-less button: avoid stray title padding
         collapseBtn.target = self
         collapseBtn.action = #selector(toggleControlBar)
-        collapseBtn.toolTip = "Show/hide the caption controls"
         let collapseHost = NSView(frame: NSRect(x: 0, y: 0, width: 26, height: 18))
         collapseBtn.frame = collapseHost.bounds
         collapseBtn.autoresizingMask = [.width, .height]
