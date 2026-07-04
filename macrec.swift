@@ -1774,7 +1774,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         langPopup.selectItem(at: idx(c.whisperLang, langValues))
         modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
-        deepgramKeyField.stringValue = Keychain.get("deepgram") ?? ""
+        deepgramKeyField.stringValue = DeepgramLiveTranscriber.storedKey ?? ""   // migrates legacy prefs too
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
         systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
@@ -2261,17 +2261,19 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
     private var lastSentAt = 0.0
     private let batchBytes = 1600 * 2          // 100 ms of 16 kHz Int16
 
-    static var apiKey: String {
+    /// The key the user stored (Keychain, migrating any pre-Keychain prefs value). Used by both the
+    /// engine and the Settings field, so upgraders see their key instead of an empty field. The legacy
+    /// value is removed ONLY once the Keychain write is confirmed (a failed save must not drop the
+    /// sole stored credential).
+    static var storedKey: String? {
         if let k = Keychain.get("deepgram") { return k }
-        // One-time migration: pre-Keychain builds kept the key in prefs — move it out. The legacy
-        // value is removed ONLY once the Keychain write is confirmed (a failed save must not drop
-        // the sole stored credential).
         if let k = Pref.d.string(forKey: Pref.deepgramKey), !k.isEmpty {
             if Keychain.set("deepgram", k) { Pref.d.removeObject(forKey: Pref.deepgramKey) }
             return k
         }
-        return ProcessInfo.processInfo.environment["MR_DEEPGRAM_KEY"] ?? ""
+        return nil
     }
+    static var apiKey: String { storedKey ?? ProcessInfo.processInfo.environment["MR_DEEPGRAM_KEY"] ?? "" }
 
     init(label: String, locale: Locale, onLocale: ((Locale) -> Void)? = nil,
          onUpdate: @escaping (String, Bool) -> Void) {
