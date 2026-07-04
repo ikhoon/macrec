@@ -2143,6 +2143,7 @@ final class LiveCaptions {
     // Last-applied live config — so reconfigure() can no-op on unchanged values and avoid needless
     // analyzer rebuilds (each rebuild re-pays the ~model warm-up).
     private var curLocaleId = "", curEngine = "", curSource = "", curTranslateId = ""
+    private var engineGen = 0   // bumped on translator rebuild; a translate Task from an older gen is ignored
     private let maxLines = 12
     private(set) var active = false
 
@@ -2181,6 +2182,7 @@ final class LiveCaptions {
 
     /// (Re)build the translator (nil = off, or target == caption language).
     private func rebuildTranslator(_ cfg: LiveCfg) {
+        engineGen &+= 1   // invalidate any in-flight translate Task started against the previous translator
         translator = nil
         if !cfg.translateId.isEmpty,
            Locale(identifier: cfg.translateId).language.languageCode?.identifier != cfg.locale.language.languageCode?.identifier {
@@ -2289,9 +2291,11 @@ final class LiveCaptions {
             let now = ProcessInfo.processInfo.systemUptime
             if final || now - (lastTranslateAt[speaker] ?? 0) >= translateThrottle {
                 lastTranslateAt[speaker] = now
+                let gen = engineGen
                 Task { [weak self] in
                     guard let out = await translator.translate(text) else { return }
-                    await MainActor.run { self?.setTranslation(speaker, text, out) }
+                    await MainActor.run { guard let self, self.engineGen == gen else { return }   // drop stale-generation results
+                        self.setTranslation(speaker, text, out) }
                 }
             }
         }
