@@ -28,7 +28,7 @@ jobs:
           SPEEX_PREFIX="$(brew --prefix speexdsp)"
           swiftc -swift-version 5 -parse-as-library -O \
             -framework AVFoundation -framework CoreMedia -framework CoreAudio \
-            -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement \
+            -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech -framework Translation \
             -import-objc-header speex-bridge.h -I "$SPEEX_PREFIX/include" "$SPEEX_PREFIX/lib/libspeexdsp.a" \
             macrec.swift -o "$RUNNER_TEMP/macrec"
 
