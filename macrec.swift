@@ -482,6 +482,9 @@ final class EchoCanceller {
     // (see the jitter regression test).
     var trimsForTest: Int { stateLock.lock(); defer { stateLock.unlock() }; return dbgTrim }
     var starvesForTest: Int { stateLock.lock(); defer { stateLock.unlock() }; return dbgStarve }
+    // Invariant hook: the push cap must cover ≥ gapNs of reference — a stall shorter than the gap-heal
+    // reset must never hit the cap (it would silently shift the pairing offset without a filter reset).
+    var capCoversGapForTest: Bool { Double(maxRef) / 16000.0 >= Double(gapNs) / 1e9 }
     private func ensureState() {
         guard st == nil else { return }
         guard let s = speex_echo_state_init(Int32(frame), Int32(filter)) else {
@@ -3474,6 +3477,20 @@ struct Main {
             let residue = EchoCanceller.shared.micDepthForTest == 100
             EchoCanceller.shared.reset()                            // …until a reset (or a mic-gap self-heal)
             check("AEC reset: buffered mic residue cleared", residue && EchoCanceller.shared.micDepthForTest == 0)
+            // Constant-relation regression: the ring cap must outlast the gap-heal threshold (see maxRef).
+            check("AEC invariant: ring cap covers the gap-heal window", EchoCanceller.shared.capCoversGapForTest)
+            // Garbage tuning knobs (NaN / overflow env-style values) must not trap during preprocessor
+            // (re)creation — Int32(Double.nan) crashes if unsanitized. Uses the real prefs path; cleaned up.
+            Pref.d.set(Double.nan, forKey: "echoSuppress")
+            Pref.d.set(1e308, forKey: "echoSuppressActive")
+            _ = EchoCanceller.shared.cancelMic(ecBuf(256))   // ensure the echo state exists
+            EchoCanceller.shared.reset()                     // recreates the preprocessor → reads the knobs
+            // Getting ANY buffer back is the pass condition — an unsanitized Int32(NaN) traps before
+            // returning. (0 frames is correct here: no reference yet → wait-for-ref holds the mic.)
+            let knobOut = EchoCanceller.shared.cancelMic(ecBuf(256)).map { Int($0.frameLength) } ?? -1
+            Pref.d.removeObject(forKey: "echoSuppress"); Pref.d.removeObject(forKey: "echoSuppressActive")
+            EchoCanceller.shared.reset()                     // back to sane knobs for any later checks
+            check("AEC knobs: garbage prefs don't crash preprocessor init", knobOut >= 0)
             // Deepgram engine: realtime-message parsing (interim → volatile, is_final → final, junk ignored).
             var dgGot: [(String, Bool)] = []
             let dg = DeepgramLiveTranscriber(label: "t", locale: Locale(identifier: "ko-KR")) { s, f in dgGot.append((s, f)) }
