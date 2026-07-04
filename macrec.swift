@@ -2654,6 +2654,8 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var engine: RecordingEngine?
+    private var stopTask: Task<Void, Never>?   // in-flight engine stop (pause) — resume/restart await it so
+                                               // two capture pipelines never overlap on the shared audio state
     private var statusLine: NSMenuItem!
     private var levelItem: NSMenuItem!
     private var lastSavedLine: NSMenuItem!
@@ -2842,10 +2844,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func togglePause() {
         if paused {
-            paused = false; refresh("Resuming…"); startEngine()
+            paused = false; refresh("Resuming…")
+            // Pause's stop is fire-and-forget (instant UI); a quick resume must WAIT for it, or two
+            // capture pipelines briefly overlap (two mic queues + two taps on the shared audio state).
+            if let stopping = stopTask {
+                stopTask = nil
+                Task {
+                    _ = await stopping.value
+                    await MainActor.run { if !self.paused && self.engine == nil { self.startEngine() } }
+                }
+            } else { startEngine() }
         } else {
             paused = true; setIcon(recording: false); refresh("⏸ Paused")
-            if let eng = engine { engine = nil; Task { await eng.stop() } }
+            if let eng = engine { engine = nil; stopTask = Task { await eng.stop() } }
         }
     }
 
@@ -2884,7 +2895,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh("Applying settings…")
         setupModelDownload()   // a newly-selected model starts downloading (if not already present)
         let old = engine; engine = nil; paused = false
+        let pending = stopTask; stopTask = nil   // settings saved while paused → that stop may still be in flight
         Task {
+            if let pending { _ = await pending.value }
             if let old = old { await old.stop() }
             await MainActor.run { self.startEngine() }
         }
