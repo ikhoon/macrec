@@ -495,12 +495,26 @@ final class EchoCanceller {
     /// converged; the preprocessor, bound to the echo state, suppresses it below transcription level.
     private func makePreprocessor(for echoState: OpaquePointer) {
         if let pp { speex_preprocess_state_destroy(pp); self.pp = nil }   // never leak/overwrite a live state
-        guard let p = speex_preprocess_state_init(Int32(frame), 16000) else { return }
+        guard let p = speex_preprocess_state_init(Int32(frame), 16000) else {
+            elog("echo(speex): preprocessor init failed — residual suppression disabled")
+            return
+        }
         guard speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_ECHO_STATE, UnsafeMutableRawPointer(echoState)) == 0 else {
             speex_preprocess_state_destroy(p)   // unbound preprocessor would silently skip suppression
             elog("echo(speex): preprocessor echo-state binding failed — residual suppression disabled")
             return
         }
+        // Pin the feature set explicitly (defaults could drift across speexdsp versions): DENOISE stays
+        // ON — residual echo suppression rides the same spectral-gain machinery, and a denoised mic
+        // transcribes better; AGC/VAD/dereverb are OFF — level/detection changes are not this class's job.
+        var on: Int32 = 1, off: Int32 = 0
+        var suppress: Int32 = -40, suppressActive: Int32 = -15   // dB — speexdsp's documented defaults, pinned
+        speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_DENOISE, &on)
+        speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_AGC, &off)
+        speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_VAD, &off)
+        speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_DEREVERB, &off)
+        speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, &suppress)
+        speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE, &suppressActive)
         pp = p
     }
 
