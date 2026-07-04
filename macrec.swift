@@ -787,6 +787,7 @@ enum Pref {
     static let echoReduce = "echoReduce"                // opt-in: duck speaker→mic echo using the tap as reference
     static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
     static let customModel = "customModelURL"           // custom model source (URL or local path) — overrides the popup
+    static let transcriptLang = "transcriptLang"        // saved-transcript FILE language: ""=system|en|ko|ja (scaffold only)
 
     static func dbl(_ key: String, _ env: String, _ def: Double) -> Double {
         if d.object(forKey: key) != nil { return d.double(forKey: key) }
@@ -1624,47 +1625,43 @@ final class RecordingEngine {
         let mins = Int((seg.durationSeconds + 30) / 60)
 
         // Title the transcript from the overlapping calendar event (prefers ones with a meeting link).
+        let l10n = TranscriptL10n.current
         let event = cfg.useCalendarTitles ? CalendarLookup.match(start: seg.start, end: end) : nil
-        let title = event?.title ?? "자동 전사"
+        let title = event?.title ?? l10n.autoTitle
         let base = nameF.string(from: seg.start)
         let slug = event.map { "\(base)-\(slugify($0.title))" } ?? base
 
         // keep the mixed WAV per the keepAudio setting (mixed is nil when keepAudio is off)
-        var audioLine = "- 오디오: _(보관 안 함)_"
+        var audioLine = "- \(l10n.audio): \(l10n.audioNotKept)"
         if cfg.keepAudio, let mixed = mixed {
             let audioMonthDir = cfg.audioDir.appendingPathComponent(monthF.string(from: seg.start), isDirectory: true)
             try fm.createDirectory(at: audioMonthDir, withIntermediateDirectories: true)
             let keptAudio = audioMonthDir.appendingPathComponent("\(slug).wav")
             try? fm.removeItem(at: keptAudio)
             try fm.moveItem(at: mixed, to: keptAudio)
-            audioLine = "- 오디오: [\(slug).wav](\(relativePath(fromDir: monthDir, toFile: keptAudio)))"
+            audioLine = "- \(l10n.audio): [\(slug).wav](\(relativePath(fromDir: monthDir, toFile: keptAudio)))"
         }
 
         var meta = ""
-        if let link = event?.link { meta += "\n- 회의 링크: \(link)" }
-        if let names = event?.attendees, !names.isEmpty { meta += "\n- 참석자: \(names.prefix(12).joined(separator: ", "))" }
+        if let link = event?.link { meta += "\n- \(l10n.meetingLink): \(link)" }
+        if let names = event?.attendees, !names.isEmpty { meta += "\n- \(l10n.attendees): \(names.prefix(12).joined(separator: ", "))" }
 
+        // The body's speaker labels follow the TRANSCRIPTION language (same derivation as Transcriber).
+        let bodyLang = cfg.whisperLang == "auto" ? Locale.current.language.languageCode?.identifier : cfg.whisperLang
+        let (bodyMine, bodyTheirs) = speakerLabels(forLanguage: bodyLang)
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "_(전사 실패 — whisper-cli/모델 확인: \(cfg.whisperModel))_" : text
-        let md = """
-        # \(dayF.string(from: seg.start)) \(hmF.string(from: seg.start))–\(hmF.string(from: end)) — \(title)
-
-        > [연속 녹음] whisper-cli 자동 전사 (화자: 나=마이크, 상대=시스템). \(cfg.excludeBundleIds.joined(separator: ", ")) 제외.
-
-        - 시각: \(dayF.string(from: seg.start)) \(hmF.string(from: seg.start))–\(hmF.string(from: end)) (\(mins)분)
-        - 발화: mic \(String(format: "%.1f", seg.micVoicedSeconds))s · sys \(String(format: "%.1f", seg.sysVoicedSeconds))s · 모델: `\(URL(fileURLWithPath: cfg.whisperModel).lastPathComponent)`
-        \(audioLine)\(meta)
-        - 태그: #transcript #auto
-
-        ## 전사 (transcript)
-
-        \(body)
-
-        ---
-        _자동 생성. 재사용할 지식은 `topics/`로 정제하세요._
-        """
+            ? l10n.failureNote(model: cfg.whisperModel) : text
+        let doc = TranscriptDoc(
+            title: title,
+            day: dayF.string(from: seg.start), hmStart: hmF.string(from: seg.start), hmEnd: hmF.string(from: end),
+            mins: mins,
+            micVoiced: seg.micVoicedSeconds, sysVoiced: seg.sysVoicedSeconds,
+            modelName: URL(fileURLWithPath: cfg.whisperModel).lastPathComponent,
+            audioLine: audioLine, meta: meta, excludes: cfg.excludeBundleIds.joined(separator: ", "),
+            bodyMine: bodyMine, bodyTheirs: bodyTheirs,
+            body: body)
         let mdURL = monthDir.appendingPathComponent("\(slug).md")
-        try md.write(to: mdURL, atomically: true, encoding: .utf8)
+        try doc.markdown(l10n).write(to: mdURL, atomically: true, encoding: .utf8)
         elog("engine:   → 전사 저장: \(mdURL.path)")
         return mdURL
     }
@@ -1696,6 +1693,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private let segValues = [900, 1800, 3600, 7200], segTitles = ["15 min", "30 min", "1 hour", "2 hours"]
     private let langValues = ["auto", "ko", "ja", "en"], langTitles = ["Auto-detect", "Korean", "Japanese", "English"]
+    private let transcriptLangPopup = NSPopUpButton()
+    private let tLangValues = ["", "en", "ko", "ja"], tLangTitles = ["System", "English", "한국어", "日本語"]
     private let modelNames = WhisperCatalog.all.map { $0.name }   // popup order matches WhisperCatalog.all
     private let retValues = [7, 30, 90, 0], retTitles = ["7 days", "30 days", "90 days", "Unlimited"]
 
@@ -1717,6 +1716,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func buildForm() {
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
+        transcriptLangPopup.addItems(withTitles: tLangTitles)
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
         for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField] { f.translatesAutoresizingMaskIntoConstraints = false }
@@ -1800,10 +1800,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             row("Add a running app:", addAppPopup),
         ]))
         tabs.addTabViewItem(tab("Transcription", [
-            row("Model:", modelPopup),
-            row("…or custom model:", customModelField),
-            row("Language:", langPopup),
-        ]))
+            row("Model:", modelPopup),                                                            // 0
+            row("…or custom model:", customModelField),                                           // 1
+            row("Language:", langPopup),                                                          // 2
+            fieldCaption("The spoken language whisper transcribes."),                             // 3
+            row("Transcript file language:", transcriptLangPopup),                                // 4
+            fieldCaption("Headings and labels of the saved markdown file (not the speech)."),     // 5
+        ], notes: [3, 5]))
         tabs.addTabViewItem(tab("Titling", [
             row("", calBtn),
             row("Calendars:", calListCell),
@@ -1921,6 +1924,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let c = EngineConfig.load()
         segPopup.selectItem(at: idx(Int(c.segmentSeconds), segValues))
         langPopup.selectItem(at: idx(c.whisperLang, langValues))
+        transcriptLangPopup.selectItem(at: idx(TranscriptL10n.configuredCode, tLangValues))   // explicit save (even "") beats env
         modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
         deepgramKeyField.stringValue = DeepgramLiveTranscriber.storedKey ?? ""   // migrates legacy prefs too
@@ -1985,6 +1989,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let d = Pref.d
         d.set(Double(segValues[max(0, segPopup.indexOfSelectedItem)]), forKey: Pref.segment)
         d.set(langValues[max(0, langPopup.indexOfSelectedItem)], forKey: Pref.lang)
+        d.set(tLangValues[max(0, transcriptLangPopup.indexOfSelectedItem)], forKey: Pref.transcriptLang)
         d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
         d.set(customModelField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.customModel)
         d.set(openaiBaseField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.openaiBase)
@@ -2076,6 +2081,95 @@ func speakerLabels(forLanguage lang: String?) -> (mine: String, theirs: String) 
     case "ja": return ("私", "相手")
     case "zh": return ("我", "对方")
     default:   return ("Me", "Them")
+    }
+}
+
+/// Localized scaffold strings for the SAVED transcript markdown (headings, metadata labels, notes).
+/// This is the FILE's language — the transcript body's speaker labels follow the transcription
+/// language separately (see `speakerLabels`). Pure + testable (see `macrec selftest`).
+struct TranscriptL10n {
+    let code: String
+    let autoTitle: String            // title fallback when no calendar event matches
+    let time: String, speech: String, model: String
+    let audio: String, audioNotKept: String
+    let meetingLink: String, attendees: String, tags: String
+    let section: String              // the transcript heading ("## …")
+
+    static func forLanguage(_ raw: String?) -> TranscriptL10n {
+        switch raw.map({ String($0.lowercased().prefix(2)) }) {
+        case "ko": return .init(code: "ko", autoTitle: "자동 전사", time: "시각", speech: "발화", model: "모델",
+                                audio: "오디오", audioNotKept: "_(보관 안 함)_", meetingLink: "회의 링크",
+                                attendees: "참석자", tags: "태그", section: "## 전사 (transcript)")
+        case "ja": return .init(code: "ja", autoTitle: "自動文字起こし", time: "時刻", speech: "発話", model: "モデル",
+                                audio: "音声", audioNotKept: "_(保存なし)_", meetingLink: "会議リンク",
+                                attendees: "参加者", tags: "タグ", section: "## 文字起こし (transcript)")
+        default:   return .init(code: "en", autoTitle: "Auto transcript", time: "Time", speech: "Speech", model: "Model",
+                                audio: "Audio", audioNotKept: "_(not kept)_", meetingLink: "Meeting link",
+                                attendees: "Attendees", tags: "Tags", section: "## Transcript")
+        }
+    }
+    /// The configured code: an EXPLICITLY saved value (even empty = "follow the system language")
+    /// beats the MR_TRANSCRIPT_LANG env — otherwise Settings couldn't restore System over the env.
+    static var configuredCode: String {
+        if Pref.d.object(forKey: Pref.transcriptLang) != nil { return Pref.d.string(forKey: Pref.transcriptLang) ?? "" }
+        return ProcessInfo.processInfo.environment["MR_TRANSCRIPT_LANG"] ?? ""
+    }
+    static var current: TranscriptL10n {
+        let pref = configuredCode
+        return forLanguage(pref.isEmpty ? Locale.current.language.languageCode?.identifier : pref)
+    }
+
+    func minutes(_ n: Int) -> String {
+        switch code { case "ko": return "\(n)분"; case "ja": return "\(n)分"; default: return "\(n) min" }
+    }
+    /// The blockquote note under the title. `mine`/`theirs` are the labels ACTUALLY used in the body
+    /// (they follow the transcription language, not this file language).
+    func recordingNote(mine: String, theirs: String, excludes: String) -> String {
+        switch code {
+        case "ko": return "> [연속 녹음] whisper-cli 자동 전사 (화자: \(mine)=마이크, \(theirs)=시스템)."
+                        + (excludes.isEmpty ? "" : " \(excludes) 제외.")
+        case "ja": return "> [連続録音] whisper-cli による自動文字起こし（話者: \(mine)=マイク、\(theirs)=システム音声）。"
+                        + (excludes.isEmpty ? "" : " \(excludes) は除外。")
+        default:   return "> [Continuous recording] Auto-transcribed by whisper-cli (speakers: \(mine) = microphone, \(theirs) = system audio)."
+                        + (excludes.isEmpty ? "" : " Excluded: \(excludes).")
+        }
+    }
+    func failureNote(model: String) -> String {
+        switch code {
+        case "ko": return "_(전사 실패 — whisper-cli/모델 확인: \(model))_"
+        case "ja": return "_(文字起こし失敗 — whisper-cli/モデルを確認: \(model))_"
+        default:   return "_(transcription failed — check whisper-cli/model: \(model))_"
+        }
+    }
+}
+
+/// Everything the saved transcript file contains, assembled into markdown by `markdown(_:)`.
+/// Pure + testable — `writeTranscript` only does the IO around it. (The old hardcoded footer
+/// "_자동 생성. 재사용할 지식은 topics/로 정제하세요._" is intentionally GONE: the app has no
+/// business prescribing the user's post-processing workflow.)
+struct TranscriptDoc {
+    var title: String
+    var day: String, hmStart: String, hmEnd: String, mins: Int
+    var micVoiced: Double, sysVoiced: Double, modelName: String
+    var audioLine: String, meta: String, excludes: String
+    var bodyMine: String, bodyTheirs: String
+    var body: String
+
+    func markdown(_ t: TranscriptL10n) -> String {
+        """
+        # \(day) \(hmStart)–\(hmEnd) — \(title)
+
+        \(t.recordingNote(mine: bodyMine, theirs: bodyTheirs, excludes: excludes))
+
+        - \(t.time): \(day) \(hmStart)–\(hmEnd) (\(t.minutes(mins)))
+        - \(t.speech): mic \(String(format: "%.1f", micVoiced))s · sys \(String(format: "%.1f", sysVoiced))s · \(t.model): `\(modelName)`
+        \(audioLine)\(meta)
+        - \(t.tags): #transcript #auto
+
+        \(t.section)
+
+        \(body)
+        """
     }
 }
 
@@ -3819,6 +3913,25 @@ struct Main {
             check("openai base: garbage → official", oaURL("ftp://nope") == oaOfficial && oaURL("::::") == oaOfficial)
             check("openai base: gateway query kept, intent deduped", oaURL("https://gw.example/x?intent=foo&team=a") ==
                   "wss://gw.example/x/v1/realtime?team=a&intent=transcription")
+            // Saved-transcript scaffold localization: language-selected labels, and the old workflow
+            // footer must never come back.
+            let tDoc = TranscriptDoc(title: "T", day: "2026-07-05", hmStart: "10:00", hmEnd: "11:00", mins: 60,
+                                     micVoiced: 1.0, sysVoiced: 2.0, modelName: "m.bin",
+                                     audioLine: "- x", meta: "", excludes: "com.spotify.client",
+                                     bodyMine: "나", bodyTheirs: "상대", body: "hello")
+            let mdKo = tDoc.markdown(.forLanguage("ko")), mdEn = tDoc.markdown(.forLanguage("en")), mdJa = tDoc.markdown(.forLanguage("ja"))
+            check("transcript md: section localized",
+                  mdKo.contains("## 전사 (transcript)") && mdEn.contains("## Transcript") && mdJa.contains("## 文字起こし"))
+            check("transcript md: labels localized",
+                  mdKo.contains("- 시각:") && mdEn.contains("- Time:") && mdJa.contains("- 時刻:") && mdEn.contains("(60 min)"))
+            check("transcript md: note keeps BODY speaker labels",
+                  mdEn.contains("나 = microphone") && mdEn.contains("Excluded: com.spotify.client"))
+            check("transcript md: workflow footer removed",
+                  !mdKo.contains("자동 생성") && !mdKo.contains("topics/") && !mdEn.contains("topics/"))
+            check("transcript l10n: failure + unknown lang fallback",
+                  TranscriptL10n.forLanguage("ko").failureNote(model: "m").contains("전사 실패")
+                  && TranscriptL10n.forLanguage("fr").section == "## Transcript"
+                  && TranscriptL10n.forLanguage(nil).section == "## Transcript")
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
             exit(fails == 0 ? 0 : 1)
         }
