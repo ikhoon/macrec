@@ -36,17 +36,24 @@ enum Keychain {
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var out: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
-              let d = out as? Data, let s = String(data: d, encoding: .utf8), !s.isEmpty else { return nil }
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        if status != errSecSuccess {
+            // Absent is normal; anything else is a real Keychain problem — don't disguise it as "no key".
+            if status != errSecItemNotFound { elog("keychain: read '\(account)' failed (\(status))") }
+            return nil
+        }
+        guard let d = out as? Data, let s = String(data: d, encoding: .utf8), !s.isEmpty else { return nil }
         return s
     }
     /// Empty value deletes the item. Update-then-add (never delete-then-add: a failed add would
     /// silently drop the stored credential); non-success statuses are logged, not swallowed.
-    static func set(_ account: String, _ value: String) {
+    /// Returns whether the operation actually succeeded (callers migrating data must check).
+    @discardableResult
+    static func set(_ account: String, _ value: String) -> Bool {
         guard !value.isEmpty else {
             let status = SecItemDelete(query(account) as CFDictionary)
-            if status != errSecSuccess && status != errSecItemNotFound { elog("keychain: delete '\(account)' failed (\(status))") }
-            return
+            if status != errSecSuccess && status != errSecItemNotFound { elog("keychain: delete '\(account)' failed (\(status))"); return false }
+            return true
         }
         let data = Data(value.utf8)
         var status = SecItemUpdate(query(account) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
@@ -55,7 +62,8 @@ enum Keychain {
             q[kSecValueData as String] = data
             status = SecItemAdd(q as CFDictionary, nil)
         }
-        if status != errSecSuccess { elog("keychain: save '\(account)' failed (\(status))") }
+        if status != errSecSuccess { elog("keychain: save '\(account)' failed (\(status))"); return false }
+        return true
     }
 }
 
@@ -2255,9 +2263,11 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
 
     static var apiKey: String {
         if let k = Keychain.get("deepgram") { return k }
-        // One-time migration: pre-Keychain builds kept the key in prefs — move it out.
+        // One-time migration: pre-Keychain builds kept the key in prefs — move it out. The legacy
+        // value is removed ONLY once the Keychain write is confirmed (a failed save must not drop
+        // the sole stored credential).
         if let k = Pref.d.string(forKey: Pref.deepgramKey), !k.isEmpty {
-            Keychain.set("deepgram", k); Pref.d.removeObject(forKey: Pref.deepgramKey)
+            if Keychain.set("deepgram", k) { Pref.d.removeObject(forKey: Pref.deepgramKey) }
             return k
         }
         return ProcessInfo.processInfo.environment["MR_DEEPGRAM_KEY"] ?? ""
