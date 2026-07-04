@@ -312,7 +312,10 @@ final class EchoCanceller {
     private let frame = 256           // 16 ms @ 16 kHz — SpeexDSP fixed processing frame
     private let filter = 8192         // ~512 ms adaptive tail — external DACs/speakers add latency, and a
                                       // longer tail also models more of the room's reverb (deeper ERLE)
-    private let maxRef = 4096         // push-side ring cap — memory bound while the mic is stalled
+    private let maxRef = 8192         // push-side ring cap — memory bound while the mic is stalled. Must
+                                      // cover ≥ gapNs of reference: a stall short of the gap-heal reset
+                                      // (< 0.5 s) must never hit this cap, or the FIFO silently loses
+                                      // reference and shifts the pairing offset without a filter reset.
     // Max reference STALENESS (samples) left in the ring after each drain. Speex's filter is CAUSAL: it
     // only cancels echo whose reference it has already been fed, so the fed reference must not lag the mic
     // by more than the real speaker→mic delay (~40–150 ms). Capture starts the tap BEFORE the mic, so the
