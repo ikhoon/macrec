@@ -1924,7 +1924,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let c = EngineConfig.load()
         segPopup.selectItem(at: idx(Int(c.segmentSeconds), segValues))
         langPopup.selectItem(at: idx(c.whisperLang, langValues))
-        transcriptLangPopup.selectItem(at: idx(Pref.str(Pref.transcriptLang, "MR_TRANSCRIPT_LANG", ""), tLangValues))
+        transcriptLangPopup.selectItem(at: idx(TranscriptL10n.configuredCode, tLangValues))   // explicit save (even "") beats env
         modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
         deepgramKeyField.stringValue = DeepgramLiveTranscriber.storedKey ?? ""   // migrates legacy prefs too
@@ -2103,14 +2103,19 @@ struct TranscriptL10n {
         case "ja": return .init(code: "ja", autoTitle: "自動文字起こし", time: "時刻", speech: "発話", model: "モデル",
                                 audio: "音声", audioNotKept: "_(保存なし)_", meetingLink: "会議リンク",
                                 attendees: "参加者", tags: "タグ", section: "## 文字起こし (transcript)")
-        default:   return .init(code: "en", autoTitle: "Auto transcript", time: "Time", speech: "Speech", model: "model",
+        default:   return .init(code: "en", autoTitle: "Auto transcript", time: "Time", speech: "Speech", model: "Model",
                                 audio: "Audio", audioNotKept: "_(not kept)_", meetingLink: "Meeting link",
                                 attendees: "Attendees", tags: "Tags", section: "## Transcript")
         }
     }
-    /// Resolved from the pref ("" = follow the system language).
+    /// The configured code: an EXPLICITLY saved value (even empty = "follow the system language")
+    /// beats the MR_TRANSCRIPT_LANG env — otherwise Settings couldn't restore System over the env.
+    static var configuredCode: String {
+        if Pref.d.object(forKey: Pref.transcriptLang) != nil { return Pref.d.string(forKey: Pref.transcriptLang) ?? "" }
+        return ProcessInfo.processInfo.environment["MR_TRANSCRIPT_LANG"] ?? ""
+    }
     static var current: TranscriptL10n {
-        let pref = Pref.str(Pref.transcriptLang, "MR_TRANSCRIPT_LANG", "")
+        let pref = configuredCode
         return forLanguage(pref.isEmpty ? Locale.current.language.languageCode?.identifier : pref)
     }
 
@@ -2124,7 +2129,7 @@ struct TranscriptL10n {
         case "ko": return "> [연속 녹음] whisper-cli 자동 전사 (화자: \(mine)=마이크, \(theirs)=시스템)."
                         + (excludes.isEmpty ? "" : " \(excludes) 제외.")
         case "ja": return "> [連続録音] whisper-cli による自動文字起こし（話者: \(mine)=マイク、\(theirs)=システム音声）。"
-                        + (excludes.isEmpty ? "" : "\(excludes) は除外。")
+                        + (excludes.isEmpty ? "" : " \(excludes) は除外。")
         default:   return "> [Continuous recording] Auto-transcribed by whisper-cli (speakers: \(mine) = microphone, \(theirs) = system audio)."
                         + (excludes.isEmpty ? "" : " Excluded: \(excludes).")
         }
