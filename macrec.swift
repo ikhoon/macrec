@@ -2767,23 +2767,36 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     private var suppressCloseCallback = false
     private let langPopup = NSPopUpButton(), sourcePopup = NSPopUpButton(), translatePopup = NSPopUpButton()
     private let tsToggle = NSButton(checkboxWithTitle: "Time", target: nil, action: nil)
-    private var controlsAccessory: NSTitlebarAccessoryViewController?   // the control strip (collapsible)
-    private let collapseBtn = NSButton()                                // chevron in the title row
+    private var controlsAccessory: NSTitlebarAccessoryViewController?   // the full control strip (collapsible)
+    private var miniAccessory: NSTitlebarAccessoryViewController?       // thin strip shown while collapsed
+    private let collapseBtn = NSButton()                                // in the strip, right after language
+    private let expandBtn = NSButton()                                  // centered in the mini strip
     private static let titleIcon = "🎙️"           // beautifies the "macrec live" title
 
     @objc private func toggleControlBar() {
         setControlBar(collapsed: !(controlsAccessory?.isHidden ?? false))
     }
     private func setControlBar(collapsed: Bool, persist: Bool = true) {
+        // Two swapped accessories (a hidden one gives its space back): the full 32 pt strip, or an
+        // 18 pt mini strip holding only a centered expand chevron. The corner placement read as part
+        // of the window rounding — in-bar (after language) / centered reads as a control.
         controlsAccessory?.isHidden = collapsed
-        collapseBtn.image = NSImage(systemSymbolName: collapsed ? "chevron.down" : "chevron.up",
-                                    accessibilityDescription: nil)
-        let label = collapsed ? "Show caption controls" : "Hide caption controls"
-        collapseBtn.setAccessibilityLabel(label)   // VoiceOver reads the BUTTON's label, not the image's
-        collapseBtn.toolTip = label
+        miniAccessory?.isHidden = !collapsed
         // Persist only on user toggles: writing during init would CREATE the defaults key on first
         // launch, and an existing key shadows the MR_LIVE_BAR_COLLAPSED env override forever after.
         if persist { Pref.d.set(collapsed, forKey: Pref.liveBarCollapsed) }
+    }
+    /// Shared chevron styling for the collapse/expand pair.
+    private func styleChevron(_ b: NSButton, symbol: String, label: String) {
+        b.isBordered = false
+        b.bezelStyle = .regularSquare
+        b.imagePosition = .imageOnly
+        b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        b.setAccessibilityLabel(label)   // VoiceOver reads the BUTTON's label, not the image's
+        b.toolTip = label
+        b.target = self
+        b.action = #selector(toggleControlBar)
+        b.setContentHuggingPriority(.required, for: .horizontal)
     }
 
     init(onClose: @escaping () -> Void, onReconfigure: @escaping () -> Void, onRestyle: @escaping () -> Void) {
@@ -2820,21 +2833,23 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         panel.addTitlebarAccessoryViewController(accessory)
         controlsAccessory = accessory
 
-        // Collapse toggle in the title row: hides the whole control strip (isHidden reclaims its 32 pt)
-        // so long meetings get the space back once the knobs are set. Sticky across sessions.
-        collapseBtn.isBordered = false
-        collapseBtn.bezelStyle = .regularSquare
-        collapseBtn.imagePosition = .imageOnly   // title-less button: avoid stray title padding
-        collapseBtn.target = self
-        collapseBtn.action = #selector(toggleControlBar)
-        let collapseHost = NSView(frame: NSRect(x: 0, y: 0, width: 26, height: 18))
-        collapseBtn.frame = collapseHost.bounds
-        collapseBtn.autoresizingMask = [.width, .height]
-        collapseHost.addSubview(collapseBtn)
-        let collapseAcc = NSTitlebarAccessoryViewController()
-        collapseAcc.layoutAttribute = .trailing
-        collapseAcc.view = collapseHost
-        panel.addTitlebarAccessoryViewController(collapseAcc)
+        // Collapsed state: a thin strip with a single centered expand chevron (the full strip's space
+        // is reclaimed). Sticky across sessions.
+        styleChevron(expandBtn, symbol: "chevron.down", label: "Show caption controls")
+        let miniHost = NSView(frame: NSRect(x: 0, y: 0, width: host.frame.width, height: 18))   // track the strip's width source
+        miniHost.autoresizingMask = [.width]
+        expandBtn.translatesAutoresizingMaskIntoConstraints = false
+        miniHost.addSubview(expandBtn)
+        NSLayoutConstraint.activate([
+            miniHost.heightAnchor.constraint(equalToConstant: 18),
+            expandBtn.centerXAnchor.constraint(equalTo: miniHost.centerXAnchor),
+            expandBtn.centerYAnchor.constraint(equalTo: miniHost.centerYAnchor),
+        ])
+        let miniAcc = NSTitlebarAccessoryViewController()
+        miniAcc.layoutAttribute = .bottom
+        miniAcc.view = miniHost
+        panel.addTitlebarAccessoryViewController(miniAcc)
+        miniAccessory = miniAcc
         setControlBar(collapsed: Pref.bool(Pref.liveBarCollapsed, "MR_LIVE_BAR_COLLAPSED", false), persist: false)
 
         // --- captions (scrollable text) fill the whole content (opacity moved up to the control bar) ---
@@ -2903,9 +2918,11 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             iv.setContentHuggingPriority(.required, for: .horizontal); return iv
         }
         let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        styleChevron(collapseBtn, symbol: "chevron.up", label: "Hide caption controls")
         let bar = NSStackView(views: [
             icon("cpu", "Engine"), enginePopup,
             icon("globe", "Caption language"), langPopup,
+            collapseBtn,   // requested spot: mid-bar right after language — not on the window corner
             icon("person.2", "Who to transcribe"), sourcePopup,
             icon("character.bubble", "Translate to"), translatePopup,
             spacer, aMinus, aPlus, tsToggle, opacity])
