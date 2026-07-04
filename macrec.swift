@@ -1726,11 +1726,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         customModelField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         customModelField.placeholderString = "https://…/ggml-model.bin  or  /path/to/model.bin"
         deepgramKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
-        deepgramKeyField.placeholderString = "Deepgram API key (console.deepgram.com) — audio streams to the cloud"
+        deepgramKeyField.placeholderString = "Deepgram API key"
         openaiKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
-        openaiKeyField.placeholderString = "OpenAI API key (platform.openai.com) — audio streams to the cloud"
+        openaiKeyField.placeholderString = "sk-…"
         openaiBaseField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
-        openaiBaseField.placeholderString = "https://api.openai.com  or your OpenAI-compatible proxy/gateway"
+        openaiBaseField.placeholderString = "https://api.openai.com"
 
         excludeTokens.translatesAutoresizingMaskIntoConstraints = false
         excludeTokens.tokenizingCharacterSet = CharacterSet(charactersIn: ", ")
@@ -1747,11 +1747,36 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         // Grouped into tabs (each pane stays short) instead of one long scrolling form.
         func row(_ label: String, _ control: NSView) -> [NSView] { [labeled(label), control] }
-        func tab(_ title: String, _ rows: [[NSView]]) -> NSTabViewItem {
+        // Section header (bold, spans both columns) and field caption (small gray hint under a field,
+        // aligned to the control column) — the grouping vocabulary for denser tabs like Live.
+        func sectionHeader(_ s: String) -> [NSView] {
+            let l = NSTextField(labelWithString: s)
+            l.font = .boldSystemFont(ofSize: 12)
+            return [l, NSView()]
+        }
+        func captionLabel(_ s: String, width: CGFloat) -> NSTextField {
+            let l = NSTextField(wrappingLabelWithString: s)
+            l.font = .systemFont(ofSize: 11)
+            l.textColor = .secondaryLabelColor
+            l.preferredMaxLayoutWidth = width
+            return l
+        }
+        func fieldCaption(_ s: String) -> [NSView] { [labeled(""), captionLabel(s, width: 340)] }
+        func sectionNote(_ s: String) -> [NSView] { [captionLabel(s, width: 440), NSView()] }   // full-width (merge via headers:)
+        /// headers: full-width bold rows (leading-aligned, extra air above); notes: captions pulled
+        /// tight under the field they describe.
+        func tab(_ title: String, _ rows: [[NSView]], headers: [Int] = [], notes: [Int] = []) -> NSTabViewItem {
             let grid = NSGridView(views: rows)
             grid.translatesAutoresizingMaskIntoConstraints = false
             grid.rowSpacing = 9; grid.columnSpacing = 18
             grid.column(at: 0).xPlacement = .trailing
+            for r in headers {
+                grid.mergeCells(inHorizontalRange: NSRange(location: 0, length: 2),
+                                verticalRange: NSRange(location: r, length: 1))
+                grid.cell(atColumnIndex: 0, rowIndex: r).xPlacement = .leading
+                if r > 0 { grid.row(at: r).topPadding = 14 }
+            }
+            for r in notes { grid.row(at: r).topPadding = -5 }
             let pane = NSView(); pane.addSubview(grid)
             NSLayoutConstraint.activate([
                 grid.topAnchor.constraint(equalTo: pane.topAnchor, constant: 20),
@@ -1783,10 +1808,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             row("Calendars:", calListCell),
         ]))
         tabs.addTabViewItem(tab("Live", [
-            row("Deepgram API key:", deepgramKeyField),
-            row("OpenAI API key:", openaiKeyField),
-            row("OpenAI base URL:", openaiBaseField),
-        ]))
+            sectionNote("Cloud caption engines stream audio off-device — only while the live overlay "
+                      + "runs with that engine selected. Keys are stored in the Keychain, never in "
+                      + "preferences or backups. Pick the engine in the overlay's control bar."),    // 0
+            sectionHeader("Deepgram ☁"),                                                             // 1
+            row("API key:", deepgramKeyField),                                                       // 2
+            fieldCaption("Get a key at console.deepgram.com (model: nova-2)."),                      // 3
+            sectionHeader("OpenAI ☁"),                                                               // 4
+            row("API key:", openaiKeyField),                                                         // 5
+            fieldCaption("platform.openai.com — or a key your gateway accepts (gpt-4o-transcribe)."), // 6
+            row("Base URL:", openaiBaseField),                                                       // 7
+            fieldCaption("OpenAI-compatible gateway / corporate proxy. Leave empty for api.openai.com."), // 8
+        ], headers: [0, 1, 4], notes: [3, 6, 8]))
         tabs.addTabViewItem(tab("Storage", [
             row("", keepAudioBtn),
             row("Keep audio for:", audioRetPopup),
@@ -3386,6 +3419,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Live input meter — only updates while the menu is open (cheap, and answers "is it working?").
     func menuWillOpen(_ menu: NSMenu) {
+        // tray-diag (local build only): the menu anchors to the status button's WINDOW — if it opens
+        // detached (screen edge), this frame is the evidence.
+        if let win = statusItem.button?.window {
+            let screens = NSScreen.screens.map { "(\(Int($0.frame.minX)),\(Int($0.frame.minY)) \(Int($0.frame.width))×\(Int($0.frame.height)))" }.joined(separator: " ")
+            elog("tray-diag open: btnWin=\(NSStringFromRect(win.frame)) onScreen=\(NSStringFromRect(win.screen?.frame ?? .zero)) mouse=\(NSStringFromPoint(NSEvent.mouseLocation)) len=\(statusItem.length) vis=\(statusItem.isVisible) screens=\(screens)")
+        }
+        if FileManager.default.fileExists(atPath: "/tmp/macrec-tray-probe") {
+            try? FileManager.default.removeItem(atPath: "/tmp/macrec-tray-probe")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { menu.cancelTracking() }
+        }
         updateLevels()
         // Reflect the live-captions state in case it was turned off by closing the floating panel.
         if #available(macOS 26, *) { liveItem?.state = LiveCaptions.shared.active ? .on : .off }
