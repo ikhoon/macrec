@@ -1891,7 +1891,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
         deepgramKeyField.stringValue = DeepgramLiveTranscriber.storedKey ?? ""   // migrates legacy prefs too
         openaiKeyField.stringValue = OpenAILiveTranscriber.storedKey ?? ""
-        openaiBaseField.stringValue = Pref.str(Pref.openaiBase, "MR_OPENAI_BASE", "")
+        openaiBaseField.stringValue = OpenAILiveTranscriber.configuredBase   // explicit save (even "") beats env
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
         systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
@@ -2584,7 +2584,8 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
         let raw = base.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return official }
         guard var comps = URLComponents(string: raw), let scheme = comps.scheme?.lowercased(), comps.host != nil else {
-            elog("openailive: invalid base URL '\(raw)' — using the official endpoint")
+            // Don't echo the raw value — a pasted URL can carry credentials/sensitive query params.
+            elog("openailive: invalid base URL (redacted) — using the official endpoint")
             return official
         }
         switch scheme {
@@ -2592,15 +2593,24 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
         case "http":  comps.scheme = "ws"
         case "wss", "ws": break
         default:
-            elog("openailive: unsupported scheme '\(scheme)' — using the official endpoint")
+            elog("openailive: unsupported base scheme '\(scheme)' — using the official endpoint")
             return official
         }
         while comps.path.hasSuffix("/") { comps.path.removeLast() }
         comps.path += "/v1/realtime"
-        comps.queryItems = (comps.queryItems ?? []) + [URLQueryItem(name: "intent", value: "transcription")]
+        // Gateways often need their own query params — keep them, but never duplicate `intent`.
+        var items = (comps.queryItems ?? []).filter { $0.name != "intent" }
+        items.append(URLQueryItem(name: "intent", value: "transcription"))
+        comps.queryItems = items
         return comps.url ?? official
     }
-    static var endpoint: URL { realtimeURL(base: Pref.str(Pref.openaiBase, "MR_OPENAI_BASE", "")) }
+    /// The configured base: an EXPLICITLY saved value (even empty = "use the official endpoint")
+    /// beats the MR_OPENAI_BASE env — otherwise clearing the Settings field couldn't override the env.
+    static var configuredBase: String {
+        if Pref.d.object(forKey: Pref.openaiBase) != nil { return Pref.d.string(forKey: Pref.openaiBase) ?? "" }
+        return ProcessInfo.processInfo.environment["MR_OPENAI_BASE"] ?? ""
+    }
+    static var endpoint: URL { realtimeURL(base: configuredBase) }
 
     init(label: String, locale: Locale, onLocale: ((Locale) -> Void)? = nil,
          onUpdate: @escaping (String, Bool) -> Void) {
@@ -3755,6 +3765,8 @@ struct Main {
             check("openai base: ws + port kept", oaURL("ws://localhost:8080") ==
                   "ws://localhost:8080/v1/realtime?intent=transcription")
             check("openai base: garbage → official", oaURL("ftp://nope") == oaOfficial && oaURL("::::") == oaOfficial)
+            check("openai base: gateway query kept, intent deduped", oaURL("https://gw.example/x?intent=foo&team=a") ==
+                  "wss://gw.example/x/v1/realtime?team=a&intent=transcription")
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
             exit(fails == 0 ? 0 : 1)
         }
