@@ -310,8 +310,12 @@ final class EchoCanceller {
     static let shared = EchoCanceller()
     private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
     private let frame = 256           // 16 ms @ 16 kHz — SpeexDSP fixed processing frame
-    private let filter = 4096         // ~256 ms adaptive tail (covers the speaker→mic delay + reverb)
-    private let maxRef = 4096         // push-side ring cap — memory bound while the mic is stalled
+    private let filter = 8192         // ~512 ms adaptive tail — external DACs/speakers add latency, and a
+                                      // longer tail also models more of the room's reverb (deeper ERLE)
+    private let maxRef = 8192         // push-side ring cap — memory bound while the mic is stalled. Must
+                                      // cover ≥ gapNs of reference: a stall short of the gap-heal reset
+                                      // (< 0.5 s) must never hit this cap, or the FIFO silently loses
+                                      // reference and shifts the pairing offset without a filter reset.
     // Max reference STALENESS (samples) left in the ring after each drain. Speex's filter is CAUSAL: it
     // only cancels echo whose reference it has already been fed, so the fed reference must not lag the mic
     // by more than the real speaker→mic delay (~40–150 ms). Capture starts the tap BEFORE the mic, so the
@@ -478,6 +482,9 @@ final class EchoCanceller {
     // (see the jitter regression test).
     var trimsForTest: Int { stateLock.lock(); defer { stateLock.unlock() }; return dbgTrim }
     var starvesForTest: Int { stateLock.lock(); defer { stateLock.unlock() }; return dbgStarve }
+    // Invariant hook: the push cap must cover ≥ gapNs of reference — a stall shorter than the gap-heal
+    // reset must never hit the cap (it would silently shift the pairing offset without a filter reset).
+    var capCoversGapForTest: Bool { Double(maxRef) / 16000.0 >= Double(gapNs) / 1e9 }
     private func ensureState() {
         guard st == nil else { return }
         guard let s = speex_echo_state_init(Int32(frame), Int32(filter)) else {
@@ -508,7 +515,16 @@ final class EchoCanceller {
         // ON — residual echo suppression rides the same spectral-gain machinery, and a denoised mic
         // transcribes better; AGC/VAD/dereverb are OFF — level/detection changes are not this class's job.
         var on: Int32 = 1, off: Int32 = 0
-        var suppress: Int32 = -40, suppressActive: Int32 = -15   // dB — speexdsp's documented defaults, pinned
+        // Stronger-than-default residual suppression: the goal is stopping double-TRANSCRIPTION, and
+        // whisper hears residuals that speex's defaults (-40/-15) consider inaudible. The active level
+        // is what applies during double-talk — too strong and it starts shaving the user's own voice,
+        // so both are tunable without a rebuild (defaults write com.ikhoon.macrec.prefs echoSuppress …).
+        func dbKnob(_ key: String, _ env: String, _ def: Double) -> Int32 {   // NaN/inf/garbage-proof
+            let v = Pref.dbl(key, env, def)
+            return Int32(max(-100, min(0, v.isFinite ? v.rounded() : def)))  // attenuations are ≤ 0 dB
+        }
+        var suppress = dbKnob("echoSuppress", "MR_ECHO_SUPPRESS", -60)
+        var suppressActive = dbKnob("echoSuppressActive", "MR_ECHO_SUPPRESS_ACTIVE", -30)
         speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_DENOISE, &on)
         speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_AGC, &off)
         speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_VAD, &off)
@@ -3478,6 +3494,20 @@ struct Main {
             let residue = EchoCanceller.shared.micDepthForTest == 100
             EchoCanceller.shared.reset()                            // …until a reset (or a mic-gap self-heal)
             check("AEC reset: buffered mic residue cleared", residue && EchoCanceller.shared.micDepthForTest == 0)
+            // Constant-relation regression: the ring cap must outlast the gap-heal threshold (see maxRef).
+            check("AEC invariant: ring cap covers the gap-heal window", EchoCanceller.shared.capCoversGapForTest)
+            // Garbage tuning knobs (NaN / overflow env-style values) must not trap during preprocessor
+            // (re)creation — Int32(Double.nan) crashes if unsanitized. Uses the real prefs path; cleaned up.
+            Pref.d.set(Double.nan, forKey: "echoSuppress")
+            Pref.d.set(1e308, forKey: "echoSuppressActive")
+            _ = EchoCanceller.shared.cancelMic(ecBuf(256))   // ensure the echo state exists
+            EchoCanceller.shared.reset()                     // recreates the preprocessor → reads the knobs
+            // Getting ANY buffer back is the pass condition — an unsanitized Int32(NaN) traps before
+            // returning. (0 frames is correct here: no reference yet → wait-for-ref holds the mic.)
+            let knobOut = EchoCanceller.shared.cancelMic(ecBuf(256)).map { Int($0.frameLength) } ?? -1
+            Pref.d.removeObject(forKey: "echoSuppress"); Pref.d.removeObject(forKey: "echoSuppressActive")
+            EchoCanceller.shared.reset()                     // back to sane knobs for any later checks
+            check("AEC knobs: garbage prefs don't crash preprocessor init", knobOut >= 0)
             // Deepgram engine: realtime-message parsing (interim → volatile, is_final → final, junk ignored).
             var dgGot: [(String, Bool)] = []
             let dg = DeepgramLiveTranscriber(label: "t", locale: Locale(identifier: "ko-KR")) { s, f in dgGot.append((s, f)) }
