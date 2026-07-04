@@ -2836,7 +2836,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         // Collapsed state: a thin strip with a single centered expand chevron (the full strip's space
         // is reclaimed). Sticky across sessions.
         styleChevron(expandBtn, symbol: "chevron.down", label: "Show caption controls")
-        let miniHost = NSView(frame: NSRect(x: 0, y: 0, width: 680, height: 18))
+        let miniHost = NSView(frame: NSRect(x: 0, y: 0, width: host.frame.width, height: 18))   // track the strip's width source
         miniHost.autoresizingMask = [.width]
         expandBtn.translatesAutoresizingMaskIntoConstraints = false
         miniHost.addSubview(expandBtn)
