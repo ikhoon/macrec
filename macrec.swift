@@ -513,8 +513,12 @@ final class EchoCanceller {
         // whisper hears residuals that speex's defaults (-40/-15) consider inaudible. The active level
         // is what applies during double-talk — too strong and it starts shaving the user's own voice,
         // so both are tunable without a rebuild (defaults write com.ikhoon.macrec.prefs echoSuppress …).
-        var suppress = Int32(Pref.dbl("echoSuppress", "MR_ECHO_SUPPRESS", -60))
-        var suppressActive = Int32(Pref.dbl("echoSuppressActive", "MR_ECHO_SUPPRESS_ACTIVE", -30))
+        func dbKnob(_ key: String, _ env: String, _ def: Double) -> Int32 {   // NaN/inf/garbage-proof
+            let v = Pref.dbl(key, env, def)
+            return Int32(max(-100, min(0, v.isFinite ? v.rounded() : def)))  // attenuations are ≤ 0 dB
+        }
+        var suppress = dbKnob("echoSuppress", "MR_ECHO_SUPPRESS", -60)
+        var suppressActive = dbKnob("echoSuppressActive", "MR_ECHO_SUPPRESS_ACTIVE", -30)
         speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_DENOISE, &on)
         speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_AGC, &off)
         speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_VAD, &off)
