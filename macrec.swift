@@ -3036,15 +3036,19 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         collapseBtn.imagePosition = .imageOnly
         collapseBtn.target = self
         collapseBtn.action = #selector(toggleControlBar)
+        var chevronAttached = false
         if let titlebar = panel.standardWindowButton(.closeButton)?.superview {
             collapseBtn.translatesAutoresizingMaskIntoConstraints = false
             titlebar.addSubview(collapseBtn)
             let lead = collapseBtn.leadingAnchor.constraint(equalTo: titlebar.centerXAnchor, constant: 60)
             chevronLead = lead
             NSLayoutConstraint.activate([lead, collapseBtn.centerYAnchor.constraint(equalTo: titlebar.centerYAnchor)])
+            chevronAttached = true
         }
         setTitle(panel.title)   // measure the initial title → position the chevron
-        setControlBar(collapsed: Pref.bool(Pref.liveBarCollapsed, "MR_LIVE_BAR_COLLAPSED", false), persist: false)
+        // Never RESTORE a collapsed bar when the toggle couldn't be attached — there'd be no way back.
+        let restoreCollapsed = chevronAttached && Pref.bool(Pref.liveBarCollapsed, "MR_LIVE_BAR_COLLAPSED", false)
+        setControlBar(collapsed: restoreCollapsed, persist: false)
 
         // --- captions (scrollable text) fill the whole content (opacity moved up to the control bar) ---
         let content = panel.contentView!
