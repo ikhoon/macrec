@@ -674,6 +674,7 @@ enum Pref {
     static let translateTo = "liveTranslateTo"          // live-caption translation target ("" = off)
     static let liveFontSize = "liveFontSize"            // live-caption overlay font size (pt)
     static let liveOpacity = "liveOpacity"              // live-caption overlay opacity (0.3–1.0)
+    static let liveBarCollapsed = "liveBarCollapsed"    // overlay control strip collapsed (space for captions)
     static let liveSource = "liveSource"                // which speakers to transcribe live: both|other|me
     static let liveEngine = "liveEngine"                // live transcription engine: apple|whisper|deepgram (extensible)
     static let deepgramKey = "deepgramKey"              // LEGACY (pre-Keychain builds) — read once for migration, then removed
@@ -2679,7 +2680,24 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     private var suppressCloseCallback = false
     private let langPopup = NSPopUpButton(), sourcePopup = NSPopUpButton(), translatePopup = NSPopUpButton()
     private let tsToggle = NSButton(checkboxWithTitle: "Time", target: nil, action: nil)
+    private var controlsAccessory: NSTitlebarAccessoryViewController?   // the control strip (collapsible)
+    private let collapseBtn = NSButton()                                // chevron in the title row
     private static let titleIcon = "🎙️"           // beautifies the "macrec live" title
+
+    @objc private func toggleControlBar() {
+        setControlBar(collapsed: !(controlsAccessory?.isHidden ?? false))
+    }
+    private func setControlBar(collapsed: Bool, persist: Bool = true) {
+        controlsAccessory?.isHidden = collapsed
+        collapseBtn.image = NSImage(systemSymbolName: collapsed ? "chevron.down" : "chevron.up",
+                                    accessibilityDescription: nil)
+        let label = collapsed ? "Show caption controls" : "Hide caption controls"
+        collapseBtn.setAccessibilityLabel(label)   // VoiceOver reads the BUTTON's label, not the image's
+        collapseBtn.toolTip = label
+        // Persist only on user toggles: writing during init would CREATE the defaults key on first
+        // launch, and an existing key shadows the MR_LIVE_BAR_COLLAPSED env override forever after.
+        if persist { Pref.d.set(collapsed, forKey: Pref.liveBarCollapsed) }
+    }
 
     init(onClose: @escaping () -> Void, onReconfigure: @escaping () -> Void, onRestyle: @escaping () -> Void) {
         self.onClose = onClose; self.onReconfigure = onReconfigure; self.onRestyle = onRestyle
@@ -2713,6 +2731,24 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         ])
         accessory.view = host
         panel.addTitlebarAccessoryViewController(accessory)
+        controlsAccessory = accessory
+
+        // Collapse toggle in the title row: hides the whole control strip (isHidden reclaims its 32 pt)
+        // so long meetings get the space back once the knobs are set. Sticky across sessions.
+        collapseBtn.isBordered = false
+        collapseBtn.bezelStyle = .regularSquare
+        collapseBtn.imagePosition = .imageOnly   // title-less button: avoid stray title padding
+        collapseBtn.target = self
+        collapseBtn.action = #selector(toggleControlBar)
+        let collapseHost = NSView(frame: NSRect(x: 0, y: 0, width: 26, height: 18))
+        collapseBtn.frame = collapseHost.bounds
+        collapseBtn.autoresizingMask = [.width, .height]
+        collapseHost.addSubview(collapseBtn)
+        let collapseAcc = NSTitlebarAccessoryViewController()
+        collapseAcc.layoutAttribute = .trailing
+        collapseAcc.view = collapseHost
+        panel.addTitlebarAccessoryViewController(collapseAcc)
+        setControlBar(collapsed: Pref.bool(Pref.liveBarCollapsed, "MR_LIVE_BAR_COLLAPSED", false), persist: false)
 
         // --- captions (scrollable text) fill the whole content (opacity moved up to the control bar) ---
         let content = panel.contentView!
