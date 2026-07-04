@@ -492,8 +492,13 @@ final class EchoCanceller {
     /// Residual echo suppression: the linear AEC leaves an audible (transcribable) residue even when
     /// converged; the preprocessor, bound to the echo state, suppresses it below transcription level.
     private func makePreprocessor(for echoState: OpaquePointer) {
+        if let pp { speex_preprocess_state_destroy(pp); self.pp = nil }   // never leak/overwrite a live state
         guard let p = speex_preprocess_state_init(Int32(frame), 16000) else { return }
-        speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_ECHO_STATE, UnsafeMutableRawPointer(echoState))
+        guard speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_ECHO_STATE, UnsafeMutableRawPointer(echoState)) == 0 else {
+            speex_preprocess_state_destroy(p)   // unbound preprocessor would silently skip suppression
+            elog("echo(speex): preprocessor echo-state binding failed — residual suppression disabled")
+            return
+        }
         pp = p
     }
 
