@@ -781,6 +781,7 @@ enum Pref {
     static let liveSource = "liveSource"                // which speakers to transcribe live: both|other|me
     static let liveEngine = "liveEngine"                // live transcription engine: apple|whisper|deepgram (extensible)
     static let deepgramKey = "deepgramKey"              // LEGACY (pre-Keychain builds) — read once for migration, then removed
+    static let openaiBase = "openaiBase"                // OpenAI-compatible base URL ("" = api.openai.com; e.g. a corporate proxy)
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
     static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
     static let echoReduce = "echoReduce"                // opt-in: duck speaker→mic echo using the tap as reference
@@ -1681,6 +1682,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let customModelField = NSTextField()   // custom model URL or local path (overrides the popup)
     private let deepgramKeyField = NSSecureTextField()   // cloud live engines — the only off-device features
     private let openaiKeyField = NSSecureTextField()
+    private let openaiBaseField = NSTextField()   // OpenAI-compatible proxy/gateway base URL ("" = official)
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
     // Calendar titling: a scrollable checkbox list of the user's calendars (none checked = all).
     private var calChecks: [(name: String, box: NSButton)] = []
@@ -1717,7 +1719,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
-        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField] { f.translatesAutoresizingMaskIntoConstraints = false }
+        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
         dirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
         audioDirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
@@ -1727,6 +1729,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         deepgramKeyField.placeholderString = "Deepgram API key (console.deepgram.com) — audio streams to the cloud"
         openaiKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         openaiKeyField.placeholderString = "OpenAI API key (platform.openai.com) — audio streams to the cloud"
+        openaiBaseField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        openaiBaseField.placeholderString = "https://api.openai.com  or your OpenAI-compatible proxy/gateway"
 
         excludeTokens.translatesAutoresizingMaskIntoConstraints = false
         excludeTokens.tokenizingCharacterSet = CharacterSet(charactersIn: ", ")
@@ -1781,6 +1785,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         tabs.addTabViewItem(tab("Live", [
             row("Deepgram API key:", deepgramKeyField),
             row("OpenAI API key:", openaiKeyField),
+            row("OpenAI base URL:", openaiBaseField),
         ]))
         tabs.addTabViewItem(tab("Storage", [
             row("", keepAudioBtn),
@@ -1886,6 +1891,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
         deepgramKeyField.stringValue = DeepgramLiveTranscriber.storedKey ?? ""   // migrates legacy prefs too
         openaiKeyField.stringValue = OpenAILiveTranscriber.storedKey ?? ""
+        openaiBaseField.stringValue = OpenAILiveTranscriber.configuredBase   // explicit save (even "") beats env
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
         systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
@@ -1947,6 +1953,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(langValues[max(0, langPopup.indexOfSelectedItem)], forKey: Pref.lang)
         d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
         d.set(customModelField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.customModel)
+        d.set(openaiBaseField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.openaiBase)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
@@ -2568,6 +2575,43 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
     static var storedKey: String? { Keychain.get("openai") }
     static var apiKey: String { storedKey ?? ProcessInfo.processInfo.environment["MR_OPENAI_KEY"] ?? "" }
 
+    /// Realtime endpoint for a BASE (an OpenAI-compatible proxy/gateway host, e.g. a corporate LLM
+    /// proxy). Accepts `https://`, `http://`, `wss://` or `ws://` bases, with or without a path prefix;
+    /// http(s) is mapped to the matching WebSocket scheme and `/v1/realtime?intent=transcription` is
+    /// appended. Empty/invalid → the official endpoint. Pure + testable (see `macrec selftest`).
+    static func realtimeURL(base: String) -> URL {
+        let official = URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!
+        let raw = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return official }
+        guard var comps = URLComponents(string: raw), let scheme = comps.scheme?.lowercased(), comps.host != nil else {
+            // Don't echo the raw value — a pasted URL can carry credentials/sensitive query params.
+            elog("openailive: invalid base URL (redacted) — using the official endpoint")
+            return official
+        }
+        switch scheme {
+        case "https": comps.scheme = "wss"
+        case "http":  comps.scheme = "ws"
+        case "wss", "ws": break
+        default:
+            elog("openailive: unsupported base scheme '\(scheme)' — using the official endpoint")
+            return official
+        }
+        while comps.path.hasSuffix("/") { comps.path.removeLast() }
+        comps.path += "/v1/realtime"
+        // Gateways often need their own query params — keep them, but never duplicate `intent`.
+        var items = (comps.queryItems ?? []).filter { $0.name != "intent" }
+        items.append(URLQueryItem(name: "intent", value: "transcription"))
+        comps.queryItems = items
+        return comps.url ?? official
+    }
+    /// The configured base: an EXPLICITLY saved value (even empty = "use the official endpoint")
+    /// beats the MR_OPENAI_BASE env — otherwise clearing the Settings field couldn't override the env.
+    static var configuredBase: String {
+        if Pref.d.object(forKey: Pref.openaiBase) != nil { return Pref.d.string(forKey: Pref.openaiBase) ?? "" }
+        return ProcessInfo.processInfo.environment["MR_OPENAI_BASE"] ?? ""
+    }
+    static var endpoint: URL { realtimeURL(base: configuredBase) }
+
     init(label: String, locale: Locale, onLocale: ((Locale) -> Void)? = nil,
          onUpdate: @escaping (String, Bool) -> Void) {
         self.label = label; self.locale = locale; self.onLocale = onLocale; self.onUpdate = onUpdate
@@ -2582,7 +2626,8 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
             return
         }
         let lang = locale.language.languageCode?.identifier ?? "en"
-        var req = URLRequest(url: URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!)
+        let endpoint = Self.endpoint
+        var req = URLRequest(url: endpoint)
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
         q.async { [self] in
@@ -2604,7 +2649,7 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
                 }
             }
         }
-        elog("openailive[\(label)]: connecting (lang=\(lang))")
+        elog("openailive[\(label)]: connecting (lang=\(lang), host=\(endpoint.host ?? "?"))")
     }
 
     func feed(_ buffer: AVAudioPCMBuffer) {
@@ -3710,6 +3755,18 @@ struct Main {
             check("openai: delta accumulation + completed reset", oaGot.count == 4
                   && oaGot[0] == ("안녕", false) && oaGot[1] == ("안녕하세요", false)
                   && oaGot[2] == ("안녕하세요", true) && oaGot[3] == ("반갑", false))
+            // OpenAI base-URL mapping (corporate proxies/gateways): https→wss, path prefix kept,
+            // trailing slash trimmed, invalid/garbage falls back to the official endpoint.
+            func oaURL(_ b: String) -> String { OpenAILiveTranscriber.realtimeURL(base: b).absoluteString }
+            let oaOfficial = "wss://api.openai.com/v1/realtime?intent=transcription"
+            check("openai base: empty → official", oaURL("") == oaOfficial)
+            check("openai base: https proxy + path", oaURL("https://llm.corp.example/openai/") ==
+                  "wss://llm.corp.example/openai/v1/realtime?intent=transcription")
+            check("openai base: ws + port kept", oaURL("ws://localhost:8080") ==
+                  "ws://localhost:8080/v1/realtime?intent=transcription")
+            check("openai base: garbage → official", oaURL("ftp://nope") == oaOfficial && oaURL("::::") == oaOfficial)
+            check("openai base: gateway query kept, intent deduped", oaURL("https://gw.example/x?intent=foo&team=a") ==
+                  "wss://gw.example/x/v1/realtime?team=a&intent=transcription")
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
             exit(fails == 0 ? 0 : 1)
         }
