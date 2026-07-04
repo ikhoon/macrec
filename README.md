@@ -1,12 +1,21 @@
-# 🎙️ macrec
+<p align="center">
+  <img src="assets/macrec-logo.png" alt="macrec logo" width="160" height="160">
+</p>
 
-![platform](https://img.shields.io/badge/macOS-15%2B-000000?logo=apple&logoColor=white)
-![arch](https://img.shields.io/badge/Apple%20Silicon-arm64-333333)
-![privacy](https://img.shields.io/badge/privacy-on--device_by_default-2ea44f)
-![install](https://img.shields.io/badge/install-brew-FBB040?logo=homebrew&logoColor=white)
-![transcription](https://img.shields.io/badge/transcription-whisper.cpp-4b8bbe)
+<h1 align="center">macrec</h1>
 
-> Always-on macOS meeting recorder — `mac` + `rec`, a sibling of `maccal` / `macmail`.
+<p align="center">
+  <b>Always-on macOS meeting recorder.</b><br>
+  Mic + system audio, on-device transcription — <code>mac</code> + <code>rec</code>, a sibling of <code>maccal</code> / <code>macmail</code>.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/macOS-15%2B-000000?logo=apple&logoColor=white" alt="macOS 15+">
+  <img src="https://img.shields.io/badge/Apple%20Silicon-arm64-333333" alt="Apple Silicon arm64">
+  <img src="https://img.shields.io/badge/privacy-on--device_by_default-2ea44f" alt="privacy: on-device by default">
+  <img src="https://img.shields.io/badge/install-brew-FBB040?logo=homebrew&logoColor=white" alt="install: brew">
+  <img src="https://img.shields.io/badge/transcription-whisper.cpp-4b8bbe" alt="transcription: whisper.cpp">
+</p>
 
 An always-on macOS **menu-bar app** (with a CLI) that continuously records your **microphone + system audio**, splits the day into **hourly segments**, and **transcribes** the hours that actually contain speech using `whisper.cpp` with **Voice Activity Detection**. Transcripts land as timestamped Markdown in a folder you choose.
 
