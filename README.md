@@ -24,7 +24,7 @@ Meeting boundaries are intentionally *not* detected — you get clean hourly tra
 ### ✨ Highlights
 
 - 🎙️ **Mic + system audio, 24/7** — hourly segments, only speech-containing hours get transcribed
-- 🔒 **On-device by default** — audio, transcripts, and the model stay local; the only network use is the one-time model download. Sole cloud feature: the optional **Deepgram / OpenAI** live-caption engines, off unless you select one *and* add an API key
+- 🔒 **On-device by default** — audio, transcripts, and the model stay local; the only network use is the one-time model download. The only cloud features are the optional **Deepgram / OpenAI** live-caption engines, off unless you select one *and* add an API key
 - 🪶 **Least-privilege capture** — system audio via a Core Audio tap ⇒ *System Audio Recording Only*, **never** Screen Recording (no orange dot)
 - 💬 **Live captions** (macOS 26) — a floating overlay transcribes in real time (`Me`/`Them`, speaker-labeled) with **optional live translation** and a **pluggable engine** (Apple on-device / Whisper streaming / Deepgram ☁ / OpenAI ☁), while `whisper.cpp` still writes the authoritative transcript
 - 🔇 **Echo cancellation** (opt-in) — a real adaptive AEC (SpeexDSP, statically linked) removes far-end speaker audio from your mic, so the other side isn't transcribed twice when you use speakers

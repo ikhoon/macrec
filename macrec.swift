@@ -1929,7 +1929,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         // Keychain first — if a credential write fails, abort BEFORE touching any other setting so
         // the user isn't left with a half-saved state (and no key is silently lost).
         for (account, field, name) in [("deepgram", deepgramKeyField, "Deepgram"), ("openai", openaiKeyField, "OpenAI")] {
-            guard !Keychain.set(account, field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) else { continue }
+            if Keychain.set(account, field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) { continue }
             let a = NSAlert()
             a.messageText = "Couldn't save the \(name) API key"
             a.informativeText = "The Keychain write failed (see the log). Settings were not applied — try saving again."
