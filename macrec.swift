@@ -788,6 +788,12 @@ enum Pref {
     static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
     static let customModel = "customModelURL"           // custom model source (URL or local path) — overrides the popup
     static let transcriptLang = "transcriptLang"        // saved-transcript FILE language: ""=system|en|ko|ja (scaffold only)
+    static let postProcessCmd = "postProcessCmd"        // command run after each saved transcript ("" = off)
+    /// Explicit save (even empty = off) beats the MR_POST_PROCESS env.
+    static var postProcessCommand: String {
+        if d.object(forKey: postProcessCmd) != nil { return d.string(forKey: postProcessCmd) ?? "" }
+        return ProcessInfo.processInfo.environment["MR_POST_PROCESS"] ?? ""
+    }
 
     static func dbl(_ key: String, _ env: String, _ def: Double) -> Double {
         if d.object(forKey: key) != nil { return d.double(forKey: key) }
@@ -1607,6 +1613,7 @@ final class RecordingEngine {
         do {
             let url = try writeTranscript(seg: seg, text: text, mixed: mixed)
             onTranscriptSaved?("Saved: \(url.lastPathComponent)")
+            runPostProcessHook(command: Pref.postProcessCommand, transcriptPath: url.path)
         } catch { elog("engine: writeTranscript: \(error)") }
     }
 
@@ -1667,6 +1674,37 @@ final class RecordingEngine {
     }
 }
 
+// MARK: - post-process hook (ETL stage 1: the app triggers, the user's script pipelines)
+//
+// After each transcript is saved, run the user's command with the file path appended — summarize with
+// an LLM, translate, load into a notes DB, whatever; the pipeline lives in the user's script, so it
+// changes without an app release. Runs in a LOGIN shell (`zsh -lc`) so PATH/brew/rc setup apply.
+/// Fire-and-forget: a slow or hung hook can never block the engine. Output (both streams) is read to
+/// EOF BEFORE waiting on exit — reading after would deadlock once the pipe buffer fills. `completion`
+/// receives the exit status (or -1 when the launch itself failed); used by the selftest.
+func runPostProcessHook(command: String, transcriptPath: String, completion: ((Int32) -> Void)? = nil) {
+    let cmd = command.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cmd.isEmpty else { return }
+    DispatchQueue.global(qos: .utility).async {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        let quoted = "'" + transcriptPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        p.arguments = ["-lc", cmd + " " + quoted]
+        let out = Pipe(); p.standardOutput = out; p.standardError = out
+        do {
+            try p.run()
+            let data = out.fileHandleForReading.readDataToEndOfFile()   // EOF first, then exit — no pipe deadlock
+            p.waitUntilExit()
+            let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            elog("post-process: exit \(p.terminationStatus)" + (s.isEmpty ? "" : " — \(s.prefix(400))"))
+            completion?(p.terminationStatus)
+        } catch {
+            elog("post-process: launch failed — \(error.localizedDescription)")
+            completion?(-1)
+        }
+    }
+}
+
 // MARK: - settings window (NSGridView form, persists to UserDefaults)
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
@@ -1680,6 +1718,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let deepgramKeyField = NSSecureTextField()   // cloud live engines — the only off-device features
     private let openaiKeyField = NSSecureTextField()
     private let openaiBaseField = NSTextField()   // OpenAI-compatible proxy/gateway base URL ("" = official)
+    private let postProcessField = NSTextField()  // command run after each saved transcript ("" = off)
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
     // Calendar titling: a scrollable checkbox list of the user's calendars (none checked = all).
     private var calChecks: [(name: String, box: NSButton)] = []
@@ -1719,7 +1758,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         transcriptLangPopup.addItems(withTitles: tLangTitles)
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
-        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField] { f.translatesAutoresizingMaskIntoConstraints = false }
+        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField, postProcessField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
         dirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
         audioDirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
@@ -1730,6 +1769,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         openaiKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         openaiKeyField.placeholderString = "sk-…"
         openaiBaseField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        postProcessField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        postProcessField.placeholderString = "~/bin/summarize-transcript.sh"
         openaiBaseField.placeholderString = "empty = api.openai.com"
 
         excludeTokens.translatesAutoresizingMaskIntoConstraints = false
@@ -1806,7 +1847,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             fieldCaption("The spoken language whisper transcribes."),                             // 3
             row("Transcript file language:", transcriptLangPopup),                                // 4
             fieldCaption("Headings and labels of the saved markdown file (not the speech)."),     // 5
-        ], notes: [3, 5]))
+            row("Post-process command:", postProcessField),                                       // 6
+            fieldCaption("Runs after each transcript is saved (login shell); the file path is "
+                       + "appended as the last argument. Summarize, translate, pipe to an LLM — "
+                       + "your script decides. Empty = off."),                                    // 7
+        ], notes: [3, 5, 7]))
         tabs.addTabViewItem(tab("Titling", [
             row("", calBtn),
             row("Calendars:", calListCell),
@@ -1930,6 +1975,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         deepgramKeyField.stringValue = DeepgramLiveTranscriber.storedKey ?? ""   // migrates legacy prefs too
         openaiKeyField.stringValue = OpenAILiveTranscriber.storedKey ?? ""
         openaiBaseField.stringValue = OpenAILiveTranscriber.configuredBase   // explicit save (even "") beats env
+        postProcessField.stringValue = Pref.postProcessCommand               // same explicit-save semantics
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
         systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
@@ -1993,6 +2039,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
         d.set(customModelField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.customModel)
         d.set(openaiBaseField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.openaiBase)
+        d.set(postProcessField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.postProcessCmd)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
@@ -3932,6 +3979,22 @@ struct Main {
                   TranscriptL10n.forLanguage("ko").failureNote(model: "m").contains("전사 실패")
                   && TranscriptL10n.forLanguage("fr").section == "## Transcript"
                   && TranscriptL10n.forLanguage(nil).section == "## Transcript")
+            // Post-process hook: really runs the command with the transcript path appended — including a
+            // quoting-hostile path (space + apostrophe), the case that breaks naive shell interpolation.
+            let hookDir = FileManager.default.temporaryDirectory
+            let marker = hookDir.appendingPathComponent("macrec hook's \(UUID().uuidString)")
+            var hookExit: Int32 = -99
+            let hookSem = DispatchSemaphore(value: 0)
+            runPostProcessHook(command: "touch", transcriptPath: marker.path) { code in hookExit = code; hookSem.signal() }
+            let hookDone = hookSem.wait(timeout: .now() + 10) == .success
+            check("post-process hook: runs with a quoting-safe path arg",
+                  hookDone && hookExit == 0 && FileManager.default.fileExists(atPath: marker.path))
+            try? FileManager.default.removeItem(at: marker)
+            // Empty command = off: completion must never fire.
+            var fired = false
+            runPostProcessHook(command: "   ", transcriptPath: "/tmp/x") { _ in fired = true }
+            Thread.sleep(forTimeInterval: 0.2)
+            check("post-process hook: empty command is a no-op", !fired)
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
             exit(fails == 0 ? 0 : 1)
         }
