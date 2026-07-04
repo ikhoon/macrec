@@ -1730,7 +1730,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         openaiKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         openaiKeyField.placeholderString = "sk-…"
         openaiBaseField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
-        openaiBaseField.placeholderString = "https://api.openai.com"
+        openaiBaseField.placeholderString = "empty = api.openai.com"
 
         excludeTokens.translatesAutoresizingMaskIntoConstraints = false
         excludeTokens.tokenizingCharacterSet = CharacterSet(charactersIn: ", ")
@@ -1763,8 +1763,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         func fieldCaption(_ s: String) -> [NSView] { [labeled(""), captionLabel(s, width: 340)] }
         func sectionNote(_ s: String) -> [NSView] { [captionLabel(s, width: 440), NSView()] }   // full-width (merge via headers:)
-        /// headers: full-width bold rows (leading-aligned, extra air above); notes: captions pulled
-        /// tight under the field they describe.
+        /// headers: FULL-WIDTH merged rows, leading-aligned with extra air above — section titles or
+        /// intro notes; the row's own view decides its styling. notes: captions pulled tight under the
+        /// field they describe.
         func tab(_ title: String, _ rows: [[NSView]], headers: [Int] = [], notes: [Int] = []) -> NSTabViewItem {
             let grid = NSGridView(views: rows)
             grid.translatesAutoresizingMaskIntoConstraints = false
