@@ -300,19 +300,27 @@ final class EchoDucker {
         var micFrame = [Int16](repeating: 0, count: frame)
         var refFrame = [Int16](repeating: 0, count: frame)
         var outFrame = [Int16](repeating: 0, count: frame)
-        while micBuf.count >= frame {
-            // Always flow the mic (never starve transcription); pair each frame with the most-recent
-            // reference (the ring is capped near the echo delay). If the reference is momentarily behind,
-            // zero-pad — that frame just isn't cancelled (it carries no echo, or the filter rides it out).
-            for k in 0..<frame { micFrame[k] = micBuf[k] }
-            micBuf.removeFirst(frame)
+        // Process all whole frames buffered so far. Always flow the mic (never starve transcription);
+        // pair each frame with the most-recent reference (the ring is capped near the echo delay). Snapshot
+        // that reference in ONE short locked section (so the tap thread isn't blocked while speex runs, and
+        // draining is a single O(n) removeFirst per buffer rather than one per frame). Any frame missing a
+        // reference is zero-padded — it just isn't cancelled (it carries no echo, or the filter rides it out).
+        let nFrames = micBuf.count / frame
+        if nFrames > 0 {
+            let want = nFrames * frame
+            var refSnap = [Int16]()
             refLock.lock()
-            let take = min(frame, refRing.count)
-            for k in 0..<frame { refFrame[k] = k < take ? refRing[k] : 0 }
-            if take > 0 { refRing.removeFirst(take) }
+            let refTake = min(want, refRing.count)
+            if refTake > 0 { refSnap.append(contentsOf: refRing[0..<refTake]); refRing.removeFirst(refTake) }
             refLock.unlock()
-            speex_echo_cancellation(st, &micFrame, &refFrame, &outFrame)   // (state, near-end/mic, far-end/ref, out)
-            cleaned.append(contentsOf: outFrame)
+            for f in 0..<nFrames {
+                let m = f * frame
+                for k in 0..<frame { micFrame[k] = micBuf[m + k] }
+                for k in 0..<frame { let r = m + k; refFrame[k] = r < refSnap.count ? refSnap[r] : 0 }
+                speex_echo_cancellation(st, &micFrame, &refFrame, &outFrame)   // (state, near-end/mic, far-end/ref, out)
+                cleaned.append(contentsOf: outFrame)
+            }
+            micBuf.removeFirst(want)
         }
         if debug {   // cumulative counters (not per-call — per-call out aliases against the frame size)
             dbgN &+= 1; dbgIn &+= mic16.count; dbgOut &+= cleaned.count
@@ -332,9 +340,13 @@ final class EchoDucker {
     private var dbgN = 0, dbgIn = 0, dbgOut = 0   // debug counters (gated by `debug`)
     private func ensureState() {
         guard st == nil else { return }
-        st = speex_echo_state_init(Int32(frame), Int32(filter))
+        guard let s = speex_echo_state_init(Int32(frame), Int32(filter)) else {
+            elog("echo(speex): echo-state init FAILED — falling back to raw mic")   // cancelMic guards on st == nil
+            return
+        }
         var rate: Int32 = 16000
-        speex_echo_ctl(st, SPEEX_ECHO_SET_SAMPLING_RATE, &rate)
+        speex_echo_ctl(s, SPEEX_ECHO_SET_SAMPLING_RATE, &rate)
+        st = s
         if debug { elog("echo(speex): AEC initialized (frame=\(frame) filter=\(filter))") }
     }
 

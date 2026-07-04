@@ -76,6 +76,7 @@ fi
 echo "▸ building macrec…"
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 SPEEX_PREFIX="$(brew --prefix speexdsp 2>/dev/null || echo /opt/homebrew/opt/speexdsp)"
+[[ -f "$SPEEX_PREFIX/lib/libspeexdsp.a" ]] || { echo "❌ speexdsp 미설치 — 에코 캔슬러(AEC) 정적 링크에 필요합니다:  brew install speexdsp"; exit 1; }
 swiftc -swift-version 5 -parse-as-library -O \
   -framework AVFoundation -framework CoreMedia -framework CoreAudio \
   -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech -framework Translation \
