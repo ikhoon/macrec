@@ -1517,6 +1517,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
 
         let tabs = NSTabView(); tabs.translatesAutoresizingMaskIntoConstraints = false
+        tabs.focusRingType = .none   // clicking a tab otherwise shows a blue focus ring on top of the tab highlight ("double blue")
         tabs.addTabViewItem(tab("Recording", [
             row("Segment length (on the hour):", segPopup),
             row("", systemAudioBtn),
