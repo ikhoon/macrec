@@ -2,7 +2,7 @@
 
 ![platform](https://img.shields.io/badge/macOS-15%2B-000000?logo=apple&logoColor=white)
 ![arch](https://img.shields.io/badge/Apple%20Silicon-arm64-333333)
-![privacy](https://img.shields.io/badge/100%25-on--device-2ea44f)
+![privacy](https://img.shields.io/badge/privacy-on--device_by_default-2ea44f)
 ![install](https://img.shields.io/badge/install-brew-FBB040?logo=homebrew&logoColor=white)
 ![transcription](https://img.shields.io/badge/transcription-whisper.cpp-4b8bbe)
 
@@ -15,9 +15,9 @@ Meeting boundaries are intentionally *not* detected — you get clean hourly tra
 ### ✨ Highlights
 
 - 🎙️ **Mic + system audio, 24/7** — hourly segments, only speech-containing hours get transcribed
-- 🔒 **100% on-device** — audio, transcripts, and the model stay local; the only network use is the one-time model download
+- 🔒 **On-device by default** — audio, transcripts, and the model stay local; the only network use is the one-time model download. Sole cloud feature: the optional **Deepgram** live-caption engine, off unless you select it *and* add an API key
 - 🪶 **Least-privilege capture** — system audio via a Core Audio tap ⇒ *System Audio Recording Only*, **never** Screen Recording (no orange dot)
-- 💬 **Live captions** (macOS 26) — a floating overlay transcribes in real time (`Me`/`Them`, speaker-labeled) with **optional live translation** and a **pluggable engine** (Apple on-device / Whisper streaming), while `whisper.cpp` still writes the authoritative transcript
+- 💬 **Live captions** (macOS 26) — a floating overlay transcribes in real time (`Me`/`Them`, speaker-labeled) with **optional live translation** and a **pluggable engine** (Apple on-device / Whisper streaming / Deepgram ☁ cloud), while `whisper.cpp` still writes the authoritative transcript
 - 🔇 **Echo cancellation** (opt-in) — a real adaptive AEC (SpeexDSP, statically linked) removes far-end speaker audio from your mic, so the other side isn't transcribed twice when you use speakers
 - 🗓️ **Auto-titled** from the overlapping calendar event · monthly folders · self-contained (bundled `whisper-cli` + VAD)
 
@@ -38,7 +38,7 @@ Meeting boundaries are intentionally *not* detected — you get clean hourly tra
   ⏻  Quit
 ```
 
-The overlay's title bar holds the live controls: caption **language**, **engine** (Apple / Whisper), **source filter** (Both / Me / Them), and an **opacity** slider.
+The overlay's title bar holds the live controls: caption **language**, **engine** (Apple / Whisper / Deepgram ☁), **source filter** (Both / Me / Them), and an **opacity** slider. The Deepgram engine needs an API key (Settings → Live) and is the only feature that sends audio off-device — the saved whisper transcript stays local regardless.
 
 ## Install
 
@@ -203,7 +203,7 @@ macrec --out out.wav --duration 20 [--exclude-app <bundleid>] [--no-mic]   # one
 
 ## Privacy
 
-Records your mic **and** other participants' audio. Use only for meetings you're allowed to record (recording a conversation you take part in is legal in both KR and JP). Audio/transcripts and the model all stay **local** — the only network access is the one-time model download from Hugging Face.
+Records your mic **and** other participants' audio. Use only for meetings you're allowed to record (recording a conversation you take part in is legal in both KR and JP). Audio/transcripts and the model all stay **local** — the only network access is the one-time model download from Hugging Face. **Exception:** selecting the **Deepgram** live-caption engine streams the live audio to Deepgram's cloud API while the overlay is open (opt-in: requires choosing the engine *and* entering an API key); the saved transcript still comes from local whisper.
 
 ## Requirements
 
