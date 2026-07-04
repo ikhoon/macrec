@@ -20,8 +20,35 @@ import CoreGraphics
 import AppKit
 import EventKit
 import ServiceManagement
+import Security   // Keychain — API keys don't belong in UserDefaults
 
 // MARK: - helpers
+
+/// Minimal Keychain string store for long-lived credentials (generic passwords under this app's service).
+enum Keychain {
+    private static func query(_ account: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: "com.ikhoon.macrec",
+         kSecAttrAccount as String: account]
+    }
+    static func get(_ account: String) -> String? {
+        var q = query(account)
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+              let d = out as? Data, let s = String(data: d, encoding: .utf8), !s.isEmpty else { return nil }
+        return s
+    }
+    /// Empty value deletes the item.
+    static func set(_ account: String, _ value: String) {
+        SecItemDelete(query(account) as CFDictionary)
+        guard !value.isEmpty else { return }
+        var q = query(account)
+        q[kSecValueData as String] = Data(value.utf8)
+        SecItemAdd(q as CFDictionary, nil)
+    }
+}
 
 func elog(_ s: String) {
     FileHandle.standardError.write((s + "\n").data(using: .utf8)!)
@@ -630,7 +657,7 @@ enum Pref {
     static let liveOpacity = "liveOpacity"              // live-caption overlay opacity (0.3–1.0)
     static let liveSource = "liveSource"                // which speakers to transcribe live: both|other|me
     static let liveEngine = "liveEngine"                // live transcription engine: apple|whisper|deepgram (extensible)
-    static let deepgramKey = "deepgramKey"              // Deepgram API key for the cloud live engine ("" = unset)
+    static let deepgramKey = "deepgramKey"              // LEGACY (pre-Keychain builds) — read once for migration, then removed
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
     static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
     static let echoReduce = "echoReduce"                // opt-in: duck speaker→mic echo using the tap as reference
@@ -1730,7 +1757,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         langPopup.selectItem(at: idx(c.whisperLang, langValues))
         modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
-        deepgramKeyField.stringValue = Pref.d.string(forKey: Pref.deepgramKey) ?? ""
+        deepgramKeyField.stringValue = Keychain.get("deepgram") ?? ""
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
         systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
@@ -1776,7 +1803,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(langValues[max(0, langPopup.indexOfSelectedItem)], forKey: Pref.lang)
         d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
         d.set(customModelField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.customModel)
-        d.set(deepgramKeyField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.deepgramKey)
+        Keychain.set("deepgram", deepgramKeyField.stringValue.trimmingCharacters(in: .whitespaces))   // credential → Keychain, not prefs
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
@@ -2218,7 +2245,12 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
     private let batchBytes = 1600 * 2          // 100 ms of 16 kHz Int16
 
     static var apiKey: String {
-        if let k = Pref.d.string(forKey: Pref.deepgramKey), !k.isEmpty { return k }
+        if let k = Keychain.get("deepgram") { return k }
+        // One-time migration: pre-Keychain builds kept the key in prefs — move it out.
+        if let k = Pref.d.string(forKey: Pref.deepgramKey), !k.isEmpty {
+            Keychain.set("deepgram", k); Pref.d.removeObject(forKey: Pref.deepgramKey)
+            return k
+        }
         return ProcessInfo.processInfo.environment["MR_DEEPGRAM_KEY"] ?? ""
     }
 
@@ -2250,27 +2282,31 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
         ]
         var req = URLRequest(url: comps.url!)
         req.setValue("Token \(key)", forHTTPHeaderField: "Authorization")
-        let s = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-        let t = s.webSocketTask(with: req)
-        session = s; task = t
-        t.resume()
-        receiveLoop(t)
-        // Deepgram closes the socket after ~10 s without messages; audio normally flows continuously
-        // (silence included), but a paused/stalled source shouldn't kill the connection.
-        let ka = DispatchSource.makeTimerSource(queue: q)
-        ka.schedule(deadline: .now() + 5, repeating: 5)
-        ka.setEventHandler { [weak self] in
-            guard let self, let t = self.task, !self.stopped else { return }
-            if ProcessInfo.processInfo.systemUptime - self.lastSentAt > 5 {
-                t.send(.string(#"{"type":"KeepAlive"}"#)) { _ in }
+        q.async { [self] in   // all connection state (task/session/pending/lastSentAt/stopped) lives on q
+            let s = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+            let t = s.webSocketTask(with: req)
+            session = s; task = t
+            lastSentAt = ProcessInfo.processInfo.systemUptime   // fresh socket = no send gap yet
+            t.resume()
+            receiveLoop(t)
+            // Deepgram closes the socket after ~10 s without messages; audio normally flows continuously
+            // (silence included), but a paused/stalled source shouldn't kill the connection.
+            let ka = DispatchSource.makeTimerSource(queue: q)
+            ka.schedule(deadline: .now() + 5, repeating: 5)
+            ka.setEventHandler { [weak self] in
+                guard let self, let t = self.task, !self.stopped else { return }
+                if ProcessInfo.processInfo.systemUptime - self.lastSentAt > 5 {
+                    t.send(.string(#"{"type":"KeepAlive"}"#)) { _ in }
+                }
             }
+            ka.resume(); keepalive = ka
         }
-        ka.resume(); keepalive = ka
         elog("deepgram[\(label)]: connecting (lang=\(lang))")
     }
 
     func feed(_ buffer: AVAudioPCMBuffer) {
-        guard task != nil else { return }
+        // No early `task` check — that state is q-confined (reading it here would race start()/stop()).
+        // The no-connection case (e.g. missing key) just converts ~µs worth and drops inside q.async.
         guard let mono = toCanon(buffer), let ch = mono.floatChannelData?[0] else { return }
         let n = Int(mono.frameLength); guard n > 0 else { return }
         var i16 = [Int16](repeating: 0, count: n)
@@ -2293,10 +2329,14 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
             guard let self, !self.stopped else { return }
             self.stopped = true
             self.keepalive?.cancel(); self.keepalive = nil
-            self.task?.send(.string(#"{"type":"CloseStream"}"#)) { _ in }
-            self.task?.cancel(with: .normalClosure, reason: nil)
+            guard let t = self.task else { return }
             self.task = nil
-            self.session?.finishTasksAndInvalidate(); self.session = nil
+            let s = self.session; self.session = nil
+            // Cancel only after CloseStream had its chance to flush — an immediate cancel can drop it.
+            t.send(.string(#"{"type":"CloseStream"}"#)) { _ in
+                t.cancel(with: .normalClosure, reason: nil)
+                s?.finishTasksAndInvalidate()
+            }
             elog("deepgram[\(self.label)]: stopped")
         }
     }
@@ -2304,16 +2344,16 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
     private func receiveLoop(_ t: URLSessionWebSocketTask) {
         t.receive { [weak self] result in
             guard let self else { return }
-            switch result {
-            case .failure(let err):
-                self.q.async {
-                    guard !self.stopped else { return }
+            self.q.async {   // state (stopped) is q-confined; also serializes handle() with teardown
+                guard !self.stopped else { return }
+                switch result {
+                case .failure(let err):
                     elog("deepgram[\(self.label)] receive: \(err.localizedDescription)")
                     self.onUpdate("(Deepgram connection lost: \(err.localizedDescription))", true)
+                case .success(let msg):
+                    if case .string(let text) = msg { self.handle(text) }
+                    self.receiveLoop(t)   // keep listening (also drains pings/metadata)
                 }
-            case .success(let msg):
-                if case .string(let text) = msg { self.handle(text) }
-                self.receiveLoop(t)   // keep listening (also drains pings/metadata)
             }
         }
     }
