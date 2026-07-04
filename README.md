@@ -17,7 +17,8 @@ Meeting boundaries are intentionally *not* detected — you get clean hourly tra
 - 🎙️ **Mic + system audio, 24/7** — hourly segments, only speech-containing hours get transcribed
 - 🔒 **100% on-device** — audio, transcripts, and the model stay local; the only network use is the one-time model download
 - 🪶 **Least-privilege capture** — system audio via a Core Audio tap ⇒ *System Audio Recording Only*, **never** Screen Recording (no orange dot)
-- 💬 **Live captions** (macOS 26) — a floating overlay transcribes in real time (`Me`/`Them`, speaker-labeled) with **optional live translation**, while `whisper.cpp` still writes the authoritative transcript
+- 💬 **Live captions** (macOS 26) — a floating overlay transcribes in real time (`Me`/`Them`, speaker-labeled) with **optional live translation** and a **pluggable engine** (Apple on-device / Whisper streaming), while `whisper.cpp` still writes the authoritative transcript
+- 🔇 **Echo cancellation** (opt-in) — a real adaptive AEC (SpeexDSP, statically linked) removes far-end speaker audio from your mic, so the other side isn't transcribed twice when you use speakers
 - 🗓️ **Auto-titled** from the overlapping calendar event · monthly folders · self-contained (bundled `whisper-cli` + VAD)
 
 ### What it looks like
@@ -36,6 +37,8 @@ Meeting boundaries are intentionally *not* detected — you get clean hourly tra
   ⚙️  Settings…      📂 Open transcripts
   ⏻  Quit
 ```
+
+The overlay's title bar holds the live controls: caption **language**, **engine** (Apple / Whisper), **source filter** (Both / Me / Them), and an **opacity** slider.
 
 ## Install
 
@@ -128,6 +131,7 @@ Design notes (each one is a bug we actually hit):
 - **The tap excludes our own process** (and any apps you list, e.g. Spotify), so macrec never records itself and excluded apps stay out of the transcript.
 - **A tap created before the permission is granted delivers silence.** So the engine starts the tap anyway, then watches for the grant and **rebuilds the tap the moment you click Allow** — capture just begins, no manual restart.
 - **Mic is captured via a separate `AVCaptureSession`** on its own path, independent of the system-audio tap.
+- **Speaker→mic echo is cancelled with a real AEC** (opt-in *Reduce mic echo on speakers*): when the far end plays through speakers it leaks into the mic and gets transcribed a second time under `나`. Apple's voice-processing AEC can't help (it only cancels audio the *same* process renders), so macrec feeds the process-tap system audio to a **SpeexDSP** echo canceller as the far-end reference — the echo is subtracted from the mic while your own voice is preserved, even when both sides talk at once. `libspeexdsp` is statically linked, so the app stays self-contained. Set `defaults write com.ikhoon.macrec echoDebug -bool true` to log the canceller's in/out counters for tuning.
 - **The app never sets the default output device** — that's left to macOS / tools like SoundSource, so it can't hijack what you're listening to.
 - **VAD (silero) + `--suppress-nst`** skip silence/noise, so transcripts don't fill up with whisper's silence hallucinations ("Thank you", subtitle credits, etc.).
 - **System audio is the digital mix before your DAC**, so transcription quality is unaffected by analog/output-device noise.
@@ -146,6 +150,7 @@ Stored in `UserDefaults` (suite `com.ikhoon.macrec.prefs`); saving restarts the 
 | Min. speech to transcribe | 5 s |
 | Remove noise/silence (VAD) | on |
 | Capture system audio (other participants) | on |
+| Reduce mic echo on speakers (SpeexDSP AEC) | off |
 | Title transcripts from calendar | on |
 | Calendars for titles | all (pick specific ones — empty = all) |
 | **Live caption language** (macOS 26) | System |
@@ -189,6 +194,7 @@ macrec --out out.wav --duration 20 [--exclude-app <bundleid>] [--no-mic]   # one
 | `macrec.swift` | the whole app: capture engine, model store, transcriber, menu-bar UI, settings, login item, CLI |
 | `install.sh` | build + sign + install to `/Applications/macrec.app` + LaunchAgent (dev machine) |
 | `package.sh` | build static `whisper-cli` + bundle into a self-contained, self-signed `macrec.app` → `dist/macrec.zip` |
+| `speex-bridge.h` | C bridging header exposing the statically linked SpeexDSP echo canceller to Swift |
 | `make-signing-cert.sh` | create the stable self-signed signing certificate (once) |
 | `config.sh.example` | template for per-machine `config.sh` (paths, model, knobs) — copied on first run |
 | `make-icon.swift` | generate the colorful app icon |
@@ -202,4 +208,4 @@ Records your mic **and** other participants' audio. Use only for meetings you're
 ## Requirements
 
 - **End users (download / Homebrew):** macOS 15+ on Apple Silicon. Nothing else — `whisper-cli` and the VAD are bundled; the model downloads on first run.
-- **Building from source:** Xcode Command Line Tools (`swiftc`, and `cmake` for `package.sh`). `install.sh`'s dev build can also use a Homebrew `whisper-cli` + `~/whisper-models/` if present.
+- **Building from source:** Xcode Command Line Tools (`swiftc`, and `cmake` for `package.sh`) plus `brew install speexdsp` (the echo canceller is statically linked into the binary). `install.sh`'s dev build can also use a Homebrew `whisper-cli` + `~/whisper-models/` if present.

@@ -43,8 +43,8 @@ jobs:
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
-      - name: Install cmake (for the whisper.cpp static build)
-        run: brew install cmake
+      - name: Install build deps (cmake for whisper.cpp; speexdsp for the AEC — statically linked into the .app)
+        run: brew install cmake speexdsp
 
       - name: Import signing certificate into a temporary keychain
         env:

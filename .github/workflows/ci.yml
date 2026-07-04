@@ -20,20 +20,27 @@ jobs:
       - name: Toolchain
         run: swift --version && sw_vers
 
-      - name: Build (swiftc — same frameworks as install.sh, unsigned)
+      - name: Install speexdsp (AEC — statically linked into the binary)
+        run: brew install speexdsp
+
+      - name: Build (swiftc — same frameworks/libs as install.sh, unsigned)
         run: |
+          SPEEX_PREFIX="$(brew --prefix speexdsp)"
           swiftc -swift-version 5 -parse-as-library -O \
             -framework AVFoundation -framework CoreMedia -framework CoreAudio \
-            -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement \
+            -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech -framework Translation \
+            -import-objc-header speex-bridge.h -I "$SPEEX_PREFIX/include" "$SPEEX_PREFIX/lib/libspeexdsp.a" \
             macrec.swift -o "$RUNNER_TEMP/macrec"
 
-      - name: Guard against ScreenCaptureKit creeping back in
+      - name: Guard — no ScreenCaptureKit + speexdsp is statically linked
         run: |
           if otool -L "$RUNNER_TEMP/macrec" | grep -qi ScreenCaptureKit; then
-            echo "::error::binary links ScreenCaptureKit — system audio must use the Core Audio tap"
-            exit 1
+            echo "::error::binary links ScreenCaptureKit — system audio must use the Core Audio tap"; exit 1
           fi
-          echo "✅ no ScreenCaptureKit dependency"
+          if otool -L "$RUNNER_TEMP/macrec" | grep -qi speexdsp; then
+            echo "::error::binary links libspeexdsp dynamically — must be static so the .app is self-contained"; exit 1
+          fi
+          echo "✅ no ScreenCaptureKit; speexdsp statically linked"
 
       - name: Smoke-test CLI (headless, no GUI / permissions)
         run: |
