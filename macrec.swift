@@ -1679,7 +1679,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let addAppPopup = NSPopUpButton()
     private let voiceField = NSTextField(), dirField = NSTextField(), audioDirField = NSTextField()
     private let customModelField = NSTextField()   // custom model URL or local path (overrides the popup)
-    private let deepgramKeyField = NSSecureTextField()   // cloud live engine — the only off-device feature
+    private let deepgramKeyField = NSSecureTextField()   // cloud live engines — the only off-device features
+    private let openaiKeyField = NSSecureTextField()
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
     // Calendar titling: a scrollable checkbox list of the user's calendars (none checked = all).
     private var calChecks: [(name: String, box: NSButton)] = []
@@ -1716,7 +1717,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
-        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField] { f.translatesAutoresizingMaskIntoConstraints = false }
+        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
         dirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
         audioDirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
@@ -1724,6 +1725,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         customModelField.placeholderString = "https://…/ggml-model.bin  or  /path/to/model.bin"
         deepgramKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         deepgramKeyField.placeholderString = "Deepgram API key (console.deepgram.com) — audio streams to the cloud"
+        openaiKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        openaiKeyField.placeholderString = "OpenAI API key (platform.openai.com) — audio streams to the cloud"
 
         excludeTokens.translatesAutoresizingMaskIntoConstraints = false
         excludeTokens.tokenizingCharacterSet = CharacterSet(charactersIn: ", ")
@@ -1777,6 +1780,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ]))
         tabs.addTabViewItem(tab("Live", [
             row("Deepgram API key:", deepgramKeyField),
+            row("OpenAI API key:", openaiKeyField),
         ]))
         tabs.addTabViewItem(tab("Storage", [
             row("", keepAudioBtn),
@@ -1881,6 +1885,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
         deepgramKeyField.stringValue = DeepgramLiveTranscriber.storedKey ?? ""   // migrates legacy prefs too
+        openaiKeyField.stringValue = OpenAILiveTranscriber.storedKey ?? ""
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
         systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
@@ -1921,12 +1926,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func saveAndClose() {
-        // Keychain first — if the credential write fails, abort BEFORE touching any other setting so
-        // the user isn't left with a half-saved state (and the key isn't silently lost).
-        if !Keychain.set("deepgram", deepgramKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) {
+        // Keychain first — if a credential write fails, abort BEFORE touching any other setting so
+        // the user isn't left with a half-saved state (and no key is silently lost). All-or-nothing:
+        // keys saved earlier in the loop are rolled back (best effort) on a later failure.
+        let creds = [("deepgram", deepgramKeyField, "Deepgram"), ("openai", openaiKeyField, "OpenAI")]
+        let previousKeys = creds.map { ($0.0, Keychain.get($0.0) ?? "") }
+        for (i, cred) in creds.enumerated() {
+            let (account, field, name) = cred
+            if Keychain.set(account, field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) { continue }
+            for (acct, old) in previousKeys[..<i] { Keychain.set(acct, old) }   // best-effort rollback
             let a = NSAlert()
-            a.messageText = "Couldn't save the Deepgram API key"
-            a.informativeText = "The Keychain write failed (see the log). Nothing was saved — try again."
+            a.messageText = "Couldn't save the \(name) API key"
+            a.informativeText = "The Keychain write failed (see the log). Settings were not applied — try saving again."
             a.alertStyle = .warning
             a.runModal()
             return   // keep Settings open
@@ -2194,13 +2205,14 @@ protocol LiveTranscribing: AnyObject {
 
 /// Selectable live engine. Extensible: add a case, a title, and a branch in `makeTranscriber`.
 enum LiveEngine: String, CaseIterable {
-    case apple, whisper, deepgram
+    case apple, whisper, deepgram, openai
     static var current: LiveEngine { LiveEngine(rawValue: Pref.d.string(forKey: Pref.liveEngine) ?? "") ?? .apple }
     var title: String {
         switch self {
         case .apple:    return "Apple"
         case .whisper:  return "Whisper"
         case .deepgram: return "Deepgram ☁"
+        case .openai:   return "OpenAI ☁"
         }
     }
 }
@@ -2534,6 +2546,173 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
     }
 }
 
+/// Cloud live engine #2: OpenAI's Realtime transcription API (gpt-4o-transcribe). Streams pcm16 @ 24 kHz
+/// over a WebSocket; the server VAD segments turns, transcript DELTAS append to the current line and
+/// `completed` finalizes it. Same rules as Deepgram: sends audio off-device ONLY while the overlay runs
+/// with this engine selected; API key in the Keychain (Settings → Live; `MR_OPENAI_KEY`). No SDK.
+final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSocketDelegate {
+    private let label: String
+    private let locale: Locale
+    private let onUpdate: (String, Bool) -> Void
+    private let onLocale: ((Locale) -> Void)?
+    private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24000, channels: 1, interleaved: false)!
+    private let q = DispatchQueue(label: "macrec.openailive", qos: .userInitiated)   // confines all connection state
+    private var converter: AVAudioConverter?   // feed thread only (one capture thread per transcriber)
+    private var task: URLSessionWebSocketTask?
+    private var session: URLSession?
+    private var pending = Data()               // audio awaiting send (batch ≈100 ms)
+    private var accum = ""                     // running transcript of the current turn (deltas append)
+    private var stopped = false
+    private let batchBytes = 2400 * 2          // 100 ms of 24 kHz Int16
+
+    static var storedKey: String? { Keychain.get("openai") }
+    static var apiKey: String { storedKey ?? ProcessInfo.processInfo.environment["MR_OPENAI_KEY"] ?? "" }
+
+    init(label: String, locale: Locale, onLocale: ((Locale) -> Void)? = nil,
+         onUpdate: @escaping (String, Bool) -> Void) {
+        self.label = label; self.locale = locale; self.onLocale = onLocale; self.onUpdate = onUpdate
+    }
+
+    func start() {
+        onLocale?(locale)
+        let key = Self.apiKey
+        guard !key.isEmpty else {
+            onUpdate("OpenAI API key not set — Settings → Live (or MR_OPENAI_KEY)", true)
+            elog("openailive[\(label)]: no API key — engine idle")
+            return
+        }
+        let lang = locale.language.languageCode?.identifier ?? "en"
+        var req = URLRequest(url: URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!)
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        req.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
+        q.async { [self] in
+            guard !stopped else { return }   // stop() can land before this block on a quick toggle
+            let s = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+            let t = s.webSocketTask(with: req)
+            session = s; task = t
+            t.resume()
+            receiveLoop(t)
+            // Configure the transcription session: raw pcm16 in, server VAD segmenting turns.
+            let cfg: [String: Any] = ["type": "transcription_session.update", "session": [
+                "input_audio_format": "pcm16",
+                "input_audio_transcription": ["model": "gpt-4o-transcribe", "language": lang],
+                "turn_detection": ["type": "server_vad", "silence_duration_ms": 500],
+            ]]
+            if let d = try? JSONSerialization.data(withJSONObject: cfg), let str = String(data: d, encoding: .utf8) {
+                t.send(.string(str)) { [weak self] err in
+                    if let err, let self, !self.stopped { elog("openailive[\(self.label)] config: \(err.localizedDescription)") }
+                }
+            }
+        }
+        elog("openailive[\(label)]: connecting (lang=\(lang))")
+    }
+
+    func feed(_ buffer: AVAudioPCMBuffer) {
+        // No off-queue state peeks (q-confined); the no-connection case just converts ~µs and drops.
+        guard let mono = toCanon(buffer), let ch = mono.floatChannelData?[0] else { return }
+        let n = Int(mono.frameLength); guard n > 0 else { return }
+        var i16 = [Int16](repeating: 0, count: n)
+        for i in 0..<n { let v = max(-1, min(1, ch[i])); i16[i] = Int16(v * 32767) }
+        let data = i16.withUnsafeBufferPointer { Data(buffer: $0) }   // little-endian on all Apple platforms
+        q.async { [weak self] in
+            guard let self, self.task != nil, !self.stopped else { return }
+            self.pending.append(data)
+            guard self.pending.count >= self.batchBytes else { return }
+            let out = self.pending; self.pending.removeAll(keepingCapacity: true)
+            self.sendAudio(out)
+        }
+    }
+
+    private func sendAudio(_ chunk: Data) {   // caller is on q
+        guard let t = task else { return }
+        let msg = #"{"type":"input_audio_buffer.append","audio":""# + chunk.base64EncodedString() + #""}"#
+        t.send(.string(msg)) { [weak self] err in
+            if let err, let self, !self.stopped { elog("openailive[\(self.label)] send: \(err.localizedDescription)") }
+        }
+    }
+
+    func stop() {
+        q.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.stopped = true
+            guard let t = self.task else { return }
+            self.task = nil
+            let s = self.session; self.session = nil
+            // Best-effort final flush: append any sub-batch tail, then COMMIT so the server transcribes
+            // what it's holding before the close (server VAD normally commits on silence, but we're
+            // closing now). A commit on a too-small/empty buffer can error — harmless: `stopped` is
+            // already set, so the receive loop drops any late error event.
+            let finish = {
+                t.send(.string(#"{"type":"input_audio_buffer.commit"}"#)) { _ in
+                    t.cancel(with: .normalClosure, reason: nil)
+                    s?.finishTasksAndInvalidate()
+                }
+            }
+            if !self.pending.isEmpty {
+                let msg = #"{"type":"input_audio_buffer.append","audio":""# + self.pending.base64EncodedString() + #""}"#
+                self.pending.removeAll(keepingCapacity: false)
+                t.send(.string(msg)) { _ in finish() }
+            } else {
+                finish()
+            }
+            elog("openailive[\(self.label)]: stopped")
+        }
+    }
+
+    private func receiveLoop(_ t: URLSessionWebSocketTask) {
+        t.receive { [weak self] result in
+            guard let self else { return }
+            self.q.async {   // state is q-confined; also serializes handle() with teardown
+                guard !self.stopped else { return }
+                switch result {
+                case .failure(let err):
+                    elog("openailive[\(self.label)] receive: \(err.localizedDescription)")
+                    self.onUpdate("(OpenAI connection lost: \(err.localizedDescription))", true)
+                    // Dead connection → full teardown; nothing should keep sending into it.
+                    self.stopped = true
+                    self.task?.cancel(with: .abnormalClosure, reason: nil); self.task = nil
+                    self.session?.finishTasksAndInvalidate(); self.session = nil
+                case .success(let msg):
+                    if case .string(let text) = msg { self.handle(text) }
+                    self.receiveLoop(t)
+                }
+            }
+        }
+    }
+
+    func handle(_ text: String) {   // internal for the selftest (event parsing is the pure logic here)
+        guard let data = text.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = obj["type"] as? String else { return }
+        switch type {
+        case "conversation.item.input_audio_transcription.delta":
+            guard let delta = obj["delta"] as? String, !delta.isEmpty else { return }
+            accum += delta                     // OpenAI deltas APPEND (Deepgram interims replace)
+            onUpdate(accum, false)
+        case "conversation.item.input_audio_transcription.completed":
+            let transcript = obj["transcript"] as? String ?? accum
+            accum = ""
+            guard !transcript.isEmpty else { return }
+            onUpdate(transcript, true)
+        case "error":
+            elog("openailive[\(label)] error: \(text.prefix(300))")
+            onUpdate("(OpenAI error — check the API key / log)", true)
+        default: break   // session.created / committed / speech_started … — not caption-relevant
+        }
+    }
+
+    private func toCanon(_ buf: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        if buf.format == fmt { return buf }
+        if converter == nil || converter?.inputFormat != buf.format { converter = AVAudioConverter(from: buf.format, to: fmt) }
+        guard let c = converter else { return nil }
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * fmt.sampleRate / buf.format.sampleRate) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return nil }
+        var fed = false; var err: NSError?
+        c.convert(to: out, error: &err) { _, s in if fed { s.pointee = .noDataNow; return nil }; fed = true; s.pointee = .haveData; return buf }
+        return (err == nil && out.frameLength > 0) ? out : nil
+    }
+}
+
 /// Which speakers to transcribe for the live overlay. Each source runs its own on-device analyzer,
 /// so transcribing one instead of two roughly halves inference load → lower latency. Default is
 /// `.other` (the remote party / system audio): you already know what you said, and it's the cheaper
@@ -2653,6 +2832,7 @@ final class LiveCaptions {
         switch LiveEngine.current {
         case .whisper:  return WhisperLiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
         case .deepgram: return DeepgramLiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
+        case .openai:   return OpenAILiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
         case .apple:    return LiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
         }
     }
@@ -3518,6 +3698,18 @@ struct Main {
             dg.handle("not json at all")                                                                       // junk → dropped
             check("deepgram: interim/final parsing", dgGot.count == 2
                   && dgGot[0] == ("안녕하세요", false) && dgGot[1] == ("안녕하세요 반갑습니다", true))
+            // OpenAI Realtime engine: deltas APPEND to the running line; completed finalizes and resets.
+            var oaGot: [(String, Bool)] = []
+            let oa = OpenAILiveTranscriber(label: "t", locale: Locale(identifier: "ko-KR")) { s, f in oaGot.append((s, f)) }
+            oa.handle(#"{"type":"conversation.item.input_audio_transcription.delta","delta":"안녕"}"#)
+            oa.handle(#"{"type":"conversation.item.input_audio_transcription.delta","delta":"하세요"}"#)
+            oa.handle(#"{"type":"conversation.item.input_audio_transcription.completed","transcript":"안녕하세요"}"#)
+            oa.handle(#"{"type":"conversation.item.input_audio_transcription.delta","delta":"반갑"}"#)   // new turn restarts
+            oa.handle(#"{"type":"session.created"}"#)                                                    // non-caption → dropped
+            oa.handle("junk")                                                                            // junk → dropped
+            check("openai: delta accumulation + completed reset", oaGot.count == 4
+                  && oaGot[0] == ("안녕", false) && oaGot[1] == ("안녕하세요", false)
+                  && oaGot[2] == ("안녕하세요", true) && oaGot[3] == ("반갑", false))
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
             exit(fails == 0 ? 0 : 1)
         }
