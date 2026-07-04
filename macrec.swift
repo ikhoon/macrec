@@ -310,7 +310,8 @@ final class EchoCanceller {
     static let shared = EchoCanceller()
     private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
     private let frame = 256           // 16 ms @ 16 kHz — SpeexDSP fixed processing frame
-    private let filter = 4096         // ~256 ms adaptive tail (covers the speaker→mic delay + reverb)
+    private let filter = 8192         // ~512 ms adaptive tail — external DACs/speakers add latency, and a
+                                      // longer tail also models more of the room's reverb (deeper ERLE)
     private let maxRef = 4096         // push-side ring cap — memory bound while the mic is stalled
     // Max reference STALENESS (samples) left in the ring after each drain. Speex's filter is CAUSAL: it
     // only cancels echo whose reference it has already been fed, so the fed reference must not lag the mic
@@ -508,7 +509,12 @@ final class EchoCanceller {
         // ON — residual echo suppression rides the same spectral-gain machinery, and a denoised mic
         // transcribes better; AGC/VAD/dereverb are OFF — level/detection changes are not this class's job.
         var on: Int32 = 1, off: Int32 = 0
-        var suppress: Int32 = -40, suppressActive: Int32 = -15   // dB — speexdsp's documented defaults, pinned
+        // Stronger-than-default residual suppression: the goal is stopping double-TRANSCRIPTION, and
+        // whisper hears residuals that speex's defaults (-40/-15) consider inaudible. The active level
+        // is what applies during double-talk — too strong and it starts shaving the user's own voice,
+        // so both are tunable without a rebuild (defaults write com.ikhoon.macrec.prefs echoSuppress …).
+        var suppress = Int32(Pref.dbl("echoSuppress", "MR_ECHO_SUPPRESS", -60))
+        var suppressActive = Int32(Pref.dbl("echoSuppressActive", "MR_ECHO_SUPPRESS_ACTIVE", -30))
         speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_DENOISE, &on)
         speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_AGC, &off)
         speex_preprocess_ctl(p, SPEEX_PREPROCESS_SET_VAD, &off)
