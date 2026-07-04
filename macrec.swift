@@ -332,8 +332,8 @@ final class EchoCanceller {
     private var lastMicNs: UInt64 = 0 // uptime of the previous cancelMic (gap detection)
     private var anchored = false      // first drain after reset sets the FIFO pairing offset
     private var winMinDepth = Int.max // min post-drain ring depth in the current re-anchor window
-    private var winStartNs: UInt64 = 0
-    private let winNs: UInt64 = 5_000_000_000
+    private var winProcessed = 0      // AUDIO time in the window (processed samples) — deterministic,
+    private let winSamples = 16000 * 5   // independent of wall-clock/scheduling (and of test speed)
     // Reusable work buffers (stateLock-guarded) — the mic path runs ~100×/s; keep it allocation-free.
     private var wkMic = [Int16](), wkRef = [Int16](), wkOut = [Int16](), wkClean = [Int16](), wkSnap = [Int16]()
 
@@ -348,7 +348,7 @@ final class EchoCanceller {
         refLock.lock(); refRing.removeAll(keepingCapacity: true); refLock.unlock()
         micBuf.removeAll(keepingCapacity: true)
         lastMicNs = 0
-        anchored = false; winMinDepth = .max; winStartNs = 0
+        anchored = false; winMinDepth = .max; winProcessed = 0
         if let st { speex_echo_state_reset(st) }
         // The preprocessor has no reset API — recreate so its noise/echo estimates don't span streams.
         if let pp { speex_preprocess_state_destroy(pp); self.pp = nil }
@@ -411,7 +411,7 @@ final class EchoCanceller {
                 let excess = refRing.count - (nFrames * frame + maxLag)
                 if excess > 0 { refRing.removeFirst(excess); dbgTrim &+= excess }
                 anchored = true
-                winStartNs = now; winMinDepth = .max
+                winProcessed = 0; winMinDepth = .max
             }
             // Process only reference-covered frames; hold the rest for the next call (the ring refills
             // within ~11 ms). If the reference is genuinely absent (system audio off, tap dead) don't
@@ -426,14 +426,15 @@ final class EchoCanceller {
             // pairing offset net of jitter. Only that excess is trimmed — transient clumps never are.
             // This catches real drift (clock skew, dropped mic buffers) without touching a healthy stream.
             winMinDepth = min(winMinDepth, refRing.count)
-            if now &- winStartNs > winNs {
+            winProcessed += want
+            if winProcessed >= winSamples {
                 if winMinDepth != .max, winMinDepth > maxLag {
                     let cut = min(winMinDepth - maxLag, refRing.count)
                     refRing.removeFirst(cut)
                     dbgTrim &+= cut
                     if debug { elog("echo-diag REANCHOR cut=\(cut)") }
                 }
-                winStartNs = now; winMinDepth = .max
+                winProcessed = 0; winMinDepth = .max
             }
             refLock.unlock()
             if zeroPad > 0 { dbgStarve &+= zeroPad; if debug { elog("echo-diag STARVE zeroPad=\(zeroPad)") } }
@@ -688,8 +689,9 @@ final class MicCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private weak var recorder: Recorder?
 
     // Dropped mic buffers are otherwise INVISIBLE — but they shift the mic/reference alignment the
-    // echo canceller depends on, so surface them (diag for the echo work; cheap enough to keep).
+    // echo canceller depends on, so surface them while echo diagnostics are on (opt-in, no log spam).
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard Pref.bool("echoDebug", "MR_ECHO_DEBUG", false) else { return }
         elog("echo-diag MICDROP samples=\(CMSampleBufferGetNumSamples(sampleBuffer))")
     }
 
