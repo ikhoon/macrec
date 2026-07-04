@@ -1819,7 +1819,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc private func saveAndClose() {
         // Keychain first — if the credential write fails, abort BEFORE touching any other setting so
         // the user isn't left with a half-saved state (and the key isn't silently lost).
-        if !Keychain.set("deepgram", deepgramKeyField.stringValue.trimmingCharacters(in: .whitespaces)) {
+        if !Keychain.set("deepgram", deepgramKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) {
             let a = NSAlert()
             a.messageText = "Couldn't save the Deepgram API key"
             a.informativeText = "The Keychain write failed (see the log). Nothing was saved — try again."
@@ -2315,6 +2315,7 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
         var req = URLRequest(url: comps.url!)
         req.setValue("Token \(key)", forHTTPHeaderField: "Authorization")
         q.async { [self] in   // all connection state (task/session/pending/lastSentAt/stopped) lives on q
+            guard !stopped else { return }   // stop() can land before this block on a quick toggle — don't orphan a socket
             let s = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
             let t = s.webSocketTask(with: req)
             session = s; task = t
