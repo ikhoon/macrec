@@ -60,6 +60,8 @@ enum Keychain {
         if status == errSecItemNotFound {
             var q = query(account)
             q[kSecValueData as String] = data
+            // Credential stays on THIS machine (no backup/migration restore) but is readable after login.
+            q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
             status = SecItemAdd(q as CFDictionary, nil)
         }
         if status != errSecSuccess { elog("keychain: save '\(account)' failed (\(status))"); return false }
@@ -1815,12 +1817,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func saveAndClose() {
+        // Keychain first — if the credential write fails, abort BEFORE touching any other setting so
+        // the user isn't left with a half-saved state (and the key isn't silently lost).
+        if !Keychain.set("deepgram", deepgramKeyField.stringValue.trimmingCharacters(in: .whitespaces)) {
+            let a = NSAlert()
+            a.messageText = "Couldn't save the Deepgram API key"
+            a.informativeText = "The Keychain write failed (see the log). Nothing was saved — try again."
+            a.alertStyle = .warning
+            a.runModal()
+            return   // keep Settings open
+        }
         let d = Pref.d
         d.set(Double(segValues[max(0, segPopup.indexOfSelectedItem)]), forKey: Pref.segment)
         d.set(langValues[max(0, langPopup.indexOfSelectedItem)], forKey: Pref.lang)
         d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
         d.set(customModelField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.customModel)
-        Keychain.set("deepgram", deepgramKeyField.stringValue.trimmingCharacters(in: .whitespaces))   // credential → Keychain, not prefs
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
