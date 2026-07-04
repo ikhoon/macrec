@@ -3056,7 +3056,8 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         // its 32 pt comes back to the captions, and the chevron stays visible to expand again.
         controlsAccessory?.isHidden = collapsed
         let label = collapsed ? "Show caption controls" : "Hide caption controls"
-        collapseBtn.image = NSImage(systemSymbolName: collapsed ? "chevron.down" : "chevron.up",
+        // The compact chevron is the "sheet grabber" glyph — reads as a drawer handle, not a plain caret.
+        collapseBtn.image = NSImage(systemSymbolName: collapsed ? "chevron.compact.down" : "chevron.compact.up",
                                     accessibilityDescription: nil)
         collapseBtn.setAccessibilityLabel(label)   // VoiceOver reads the BUTTON's label, not the image's
         collapseBtn.toolTip = label
@@ -3123,7 +3124,8 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             chevronLead = lead
             // Y pins to the CLOSE BUTTON (which sits in the title row) — the titlebar container also
             // spans the bottom accessory strip, so its centerY would drop the chevron onto the controls.
-            NSLayoutConstraint.activate([lead, collapseBtn.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor)])
+            // The -2 pt trims the symbol's bottom-heavy optical balance against the title text.
+            NSLayoutConstraint.activate([lead, collapseBtn.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor, constant: -2)])
             chevronAttached = true
         }
         setTitle(panel.title)   // measure the initial title → position the chevron
