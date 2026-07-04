@@ -2687,14 +2687,16 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     @objc private func toggleControlBar() {
         setControlBar(collapsed: !(controlsAccessory?.isHidden ?? false))
     }
-    private func setControlBar(collapsed: Bool) {
+    private func setControlBar(collapsed: Bool, persist: Bool = true) {
         controlsAccessory?.isHidden = collapsed
         collapseBtn.image = NSImage(systemSymbolName: collapsed ? "chevron.down" : "chevron.up",
                                     accessibilityDescription: nil)
         let label = collapsed ? "Show caption controls" : "Hide caption controls"
         collapseBtn.setAccessibilityLabel(label)   // VoiceOver reads the BUTTON's label, not the image's
         collapseBtn.toolTip = label
-        Pref.d.set(collapsed, forKey: Pref.liveBarCollapsed)
+        // Persist only on user toggles: writing during init would CREATE the defaults key on first
+        // launch, and an existing key shadows the MR_LIVE_BAR_COLLAPSED env override forever after.
+        if persist { Pref.d.set(collapsed, forKey: Pref.liveBarCollapsed) }
     }
 
     init(onClose: @escaping () -> Void, onReconfigure: @escaping () -> Void, onRestyle: @escaping () -> Void) {
@@ -2746,7 +2748,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         collapseAcc.layoutAttribute = .trailing
         collapseAcc.view = collapseHost
         panel.addTitlebarAccessoryViewController(collapseAcc)
-        setControlBar(collapsed: Pref.bool(Pref.liveBarCollapsed, "MR_LIVE_BAR_COLLAPSED", false))
+        setControlBar(collapsed: Pref.bool(Pref.liveBarCollapsed, "MR_LIVE_BAR_COLLAPSED", false), persist: false)
 
         // --- captions (scrollable text) fill the whole content (opacity moved up to the control bar) ---
         let content = panel.contentView!
