@@ -2638,16 +2638,22 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
             guard let t = self.task else { return }
             self.task = nil
             let s = self.session; self.session = nil
-            if !self.pending.isEmpty {   // flush the sub-batch tail so the final words aren't clipped
-                let msg = #"{"type":"input_audio_buffer.append","audio":""# + self.pending.base64EncodedString() + #""}"#
-                self.pending.removeAll(keepingCapacity: false)
-                t.send(.string(msg)) { _ in
+            // Best-effort final flush: append any sub-batch tail, then COMMIT so the server transcribes
+            // what it's holding before the close (server VAD normally commits on silence, but we're
+            // closing now). A commit on a too-small/empty buffer can error — harmless: `stopped` is
+            // already set, so the receive loop drops any late error event.
+            let finish = {
+                t.send(.string(#"{"type":"input_audio_buffer.commit"}"#)) { _ in
                     t.cancel(with: .normalClosure, reason: nil)
                     s?.finishTasksAndInvalidate()
                 }
+            }
+            if !self.pending.isEmpty {
+                let msg = #"{"type":"input_audio_buffer.append","audio":""# + self.pending.base64EncodedString() + #""}"#
+                self.pending.removeAll(keepingCapacity: false)
+                t.send(.string(msg)) { _ in finish() }
             } else {
-                t.cancel(with: .normalClosure, reason: nil)
-                s?.finishTasksAndInvalidate()
+                finish()
             }
             elog("openailive[\(self.label)]: stopped")
         }
