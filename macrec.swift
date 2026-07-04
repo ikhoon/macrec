@@ -472,9 +472,10 @@ final class EchoCanceller {
     }
 
     private var dbgN = 0, dbgIn = 0, dbgOut = 0                // debug counters (gated by `debug`)
-    private var dbgTrim = 0, dbgStarve = 0                     // always counted (cheap) — health + selftest
+    private var dbgTrim = 0, dbgStarve = 0                     // SAMPLES trimmed / zero-padded (not events) — health + selftest
     private var dbgMicE = 0.0, dbgOutE = 0.0                   // ERLE accumulators (ref-active frames only)
-    // Selftest hooks — a healthy stream must show ZERO trims/zero-pads (see the jitter regression test).
+    // Selftest hooks — cumulative SAMPLE counts; a healthy stream must add zero to either
+    // (see the jitter regression test).
     var trimsForTest: Int { stateLock.lock(); defer { stateLock.unlock() }; return dbgTrim }
     var starvesForTest: Int { stateLock.lock(); defer { stateLock.unlock() }; return dbgStarve }
     private func ensureState() {
@@ -3384,8 +3385,8 @@ struct Main {
             for _ in 0..<40 { nrOut += EchoCanceller.shared.cancelMic(ecBuf(171)).map { Int($0.frameLength) } ?? -99999; nrIn += 171 }
             check("AEC framing: mic flows (out ≈ in, no reference)", nrIn - nrOut >= 0 && nrIn - nrOut <= 256 * 5)
             // Jitter regression: the MEASURED real-world cadence — the mic delivering in ~32 ms clumps
-            // (3×171) against a steady per-chunk reference — must cause ZERO trims and ZERO zero-padded
-            // frames. Trimming/starving on this normal jitter shredded the reference continuity and
+            // (3×171) against a steady per-chunk reference — must trim ZERO samples and zero-pad ZERO
+            // samples. Trimming/starving on this normal jitter shredded the reference continuity and
             // pinned real-call ERLE at ~6 dB (the "echo not improved" bug).
             EchoCanceller.shared.reset()
             _ = EchoCanceller.shared.cancelMic(ecBuf(256))     // anchor the pairing offset
@@ -3395,7 +3396,7 @@ struct Main {
                 for _ in 0..<3 { EchoCanceller.shared.pushReference(ecBuf(171)) }   // tap: continuous
                 for _ in 0..<3 { _ = EchoCanceller.shared.cancelMic(ecBuf(171)) }   // mic: clumped
             }
-            check("AEC jitter: clumped mic delivery → no trims, no zero-pads",
+            check("AEC jitter: clumped mic delivery → 0 trimmed / 0 zero-padded samples",
                   EchoCanceller.shared.trimsForTest == jt && EchoCanceller.shared.starvesForTest == js)
             // Staleness invariant: the reference backlog the tap builds while the mic spins up must be
             // dropped when the stream anchors (first drain) — a persistent backlog makes the causal
