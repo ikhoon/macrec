@@ -3041,7 +3041,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
 
     init(onClose: @escaping () -> Void, onReconfigure: @escaping () -> Void, onRestyle: @escaping () -> Void) {
         self.onClose = onClose; self.onReconfigure = onReconfigure; self.onRestyle = onRestyle
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: 150),
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: 172),   // default fits one more caption line
                         styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         super.init()
@@ -3082,12 +3082,14 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         collapseBtn.target = self
         collapseBtn.action = #selector(toggleControlBar)
         var chevronAttached = false
-        if let titlebar = panel.standardWindowButton(.closeButton)?.superview {
+        if let closeBtn = panel.standardWindowButton(.closeButton), let titlebar = closeBtn.superview {
             collapseBtn.translatesAutoresizingMaskIntoConstraints = false
             titlebar.addSubview(collapseBtn)
             let lead = collapseBtn.leadingAnchor.constraint(equalTo: titlebar.centerXAnchor, constant: 60)
             chevronLead = lead
-            NSLayoutConstraint.activate([lead, collapseBtn.centerYAnchor.constraint(equalTo: titlebar.centerYAnchor)])
+            // Y pins to the CLOSE BUTTON (which sits in the title row) — the titlebar container also
+            // spans the bottom accessory strip, so its centerY would drop the chevron onto the controls.
+            NSLayoutConstraint.activate([lead, collapseBtn.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor)])
             chevronAttached = true
         }
         setTitle(panel.title)   // measure the initial title → position the chevron
