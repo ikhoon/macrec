@@ -2,7 +2,7 @@
 
 ![platform](https://img.shields.io/badge/macOS-15%2B-000000?logo=apple&logoColor=white)
 ![arch](https://img.shields.io/badge/Apple%20Silicon-arm64-333333)
-![privacy](https://img.shields.io/badge/100%25-on--device-2ea44f)
+![privacy](https://img.shields.io/badge/privacy-on--device_by_default-2ea44f)
 ![install](https://img.shields.io/badge/install-brew-FBB040?logo=homebrew&logoColor=white)
 ![transcription](https://img.shields.io/badge/transcription-whisper.cpp-4b8bbe)
 
@@ -15,7 +15,7 @@ Meeting boundaries are intentionally *not* detected — you get clean hourly tra
 ### ✨ Highlights
 
 - 🎙️ **Mic + system audio, 24/7** — hourly segments, only speech-containing hours get transcribed
-- 🔒 **100% on-device** — audio, transcripts, and the model stay local; the only network use is the one-time model download (exception: the optional **Deepgram** live-caption engine streams audio to the cloud — off unless you select it and add an API key)
+- 🔒 **On-device by default** — audio, transcripts, and the model stay local; the only network use is the one-time model download. Sole cloud feature: the optional **Deepgram** live-caption engine, off unless you select it *and* add an API key
 - 🪶 **Least-privilege capture** — system audio via a Core Audio tap ⇒ *System Audio Recording Only*, **never** Screen Recording (no orange dot)
 - 💬 **Live captions** (macOS 26) — a floating overlay transcribes in real time (`Me`/`Them`, speaker-labeled) with **optional live translation** and a **pluggable engine** (Apple on-device / Whisper streaming), while `whisper.cpp` still writes the authoritative transcript
 - 🔇 **Echo cancellation** (opt-in) — a real adaptive AEC (SpeexDSP, statically linked) removes far-end speaker audio from your mic, so the other side isn't transcribed twice when you use speakers

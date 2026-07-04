@@ -40,13 +40,22 @@ enum Keychain {
               let d = out as? Data, let s = String(data: d, encoding: .utf8), !s.isEmpty else { return nil }
         return s
     }
-    /// Empty value deletes the item.
+    /// Empty value deletes the item. Update-then-add (never delete-then-add: a failed add would
+    /// silently drop the stored credential); non-success statuses are logged, not swallowed.
     static func set(_ account: String, _ value: String) {
-        SecItemDelete(query(account) as CFDictionary)
-        guard !value.isEmpty else { return }
-        var q = query(account)
-        q[kSecValueData as String] = Data(value.utf8)
-        SecItemAdd(q as CFDictionary, nil)
+        guard !value.isEmpty else {
+            let status = SecItemDelete(query(account) as CFDictionary)
+            if status != errSecSuccess && status != errSecItemNotFound { elog("keychain: delete '\(account)' failed (\(status))") }
+            return
+        }
+        let data = Data(value.utf8)
+        var status = SecItemUpdate(query(account) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var q = query(account)
+            q[kSecValueData as String] = data
+            status = SecItemAdd(q as CFDictionary, nil)
+        }
+        if status != errSecSuccess { elog("keychain: save '\(account)' failed (\(status))") }
     }
 }
 
@@ -2350,6 +2359,12 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
                 case .failure(let err):
                     elog("deepgram[\(self.label)] receive: \(err.localizedDescription)")
                     self.onUpdate("(Deepgram connection lost: \(err.localizedDescription))", true)
+                    // Dead connection → full teardown; otherwise KeepAlive keeps firing and feed()
+                    // keeps queueing sends into a socket that will never deliver.
+                    self.stopped = true
+                    self.keepalive?.cancel(); self.keepalive = nil
+                    self.task?.cancel(with: .abnormalClosure, reason: nil); self.task = nil
+                    self.session?.finishTasksAndInvalidate(); self.session = nil
                 case .success(let msg):
                     if case .string(let text) = msg { self.handle(text) }
                     self.receiveLoop(t)   // keep listening (also drains pings/metadata)
