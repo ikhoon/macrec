@@ -254,44 +254,73 @@ func mixDown(sysURL: URL, micURL: URL?, outURL: URL) throws {
 // process-tap system audio as the REFERENCE and the mic as the near-end — it subtracts the echo while
 // preserving the user's own voice, even during double-talk. libspeexdsp is statically linked
 // (see speex-bridge.h + install.sh), so the .app stays self-contained. Opt-in (default off).
+//
+// Two invariants keep the canceller effective (both found by adversarial review, not obvious):
+//  1. STALENESS — the reference fed to speex must not lag the mic by more than the real speaker→mic
+//     delay, or the causal filter cancels nothing; every drain trims the ring to ≤ maxLag staleness.
+//  2. FRESHNESS ACROSS GAPS — after the mic goes silent (pause/sleep/toggle/restart), buffered residue
+//     and the adapted filter belong to a dead stream; cancelMic self-heals by resetting on a >0.5 s gap.
 final class EchoDucker {
     static let shared = EchoDucker()
     private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
     private let frame = 256           // 16 ms @ 16 kHz — SpeexDSP fixed processing frame
     private let filter = 4096         // ~256 ms adaptive tail (covers the speaker→mic delay + reverb)
-    private let refLock = NSLock()    // guards refRing (tap thread writes, capture thread drains)
+    private let maxRef = 4096         // push-side ring cap — memory bound while the mic is stalled
+    // Max reference STALENESS (samples) left in the ring after each drain. Speex's filter is CAUSAL: it
+    // only cancels echo whose reference it has already been fed, so the fed reference must not lag the mic
+    // by more than the real speaker→mic delay (~40–150 ms). Capture starts the tap BEFORE the mic, so the
+    // ring pre-fills during mic spin-up — and since fill and drain rates are both 16 kHz, that backlog would
+    // otherwise persist for the whole session and silently disable the AEC (reference too old → cancels 0 dB).
+    private let maxLag = 512          // ~32 ms
+    private let gapNs: UInt64 = 500_000_000   // mic silent this long → treat buffered state as a dead stream
+    private let refLock = NSLock()    // guards refRing + refConv (tap thread pushes, capture thread drains)
+    private let stateLock = NSLock()  // serializes cancelMic/reset (micBuf, micConv, st): capture sessions can
+                                      // briefly OVERLAP on pause→quick-resume, so two mic queues may call in
     private var refRing = [Int16]()   // far-end reference, 16k mono, FIFO
-    private let maxRef = 4096          // ~256ms @16k — keep the reference recent (≈ echo delay); drop older so
-                                       // the mic always pairs with a near-current reference, not a stale backlog
-    private var refConv: AVAudioConverter?   // tap thread only
-    private var micConv: AVAudioConverter?   // capture thread only
-    private var micBuf = [Int16]()           // capture thread only — mic samples awaiting a full frame
-    private var st: OpaquePointer?           // capture thread only — Speex echo-canceller state
+    private var refConv: AVAudioConverter?
+    private var micConv: AVAudioConverter?
+    private var micBuf = [Int16]()    // mic samples awaiting a full frame
+    private var st: OpaquePointer?    // Speex echo-canceller state
+    private var lastMicNs: UInt64 = 0 // uptime of the previous cancelMic (gap detection)
 
     var enabled: Bool { Pref.bool(Pref.echoReduce, "MR_ECHO_REDUCE", false) }
     // Opt-in diagnostics (`defaults write com.ikhoon.macrec echoDebug -bool true`): logs the AEC's
     // cumulative in/out + reference-ring depth so echo behaviour can be tuned against a real call.
     private var debug: Bool { Pref.bool("echoDebug", "MR_ECHO_DEBUG", false) }
 
-    /// Clear buffered audio + reset the adaptive filter (safe to call on capture thread / session start).
-    func reset() {
+    /// Clear buffered audio + reset the adaptive filter. Thread-safe.
+    func reset() { stateLock.lock(); resetLocked(); stateLock.unlock() }
+    private func resetLocked() {   // caller holds stateLock
         refLock.lock(); refRing.removeAll(keepingCapacity: true); refLock.unlock()
         micBuf.removeAll(keepingCapacity: true)
+        lastMicNs = 0
         if let st { speex_echo_state_reset(st) }
     }
 
     /// Feed a system-audio (reference) buffer — 16k mono Int16 into the ring (tap thread).
     func pushReference(_ buf: AVAudioPCMBuffer) {
-        guard let s = to16kInt16(buf, &refConv) else { return }
         refLock.lock()
+        defer { refLock.unlock() }
+        guard let s = to16kInt16(buf, &refConv) else { return }
         refRing.append(contentsOf: s)
         if refRing.count > maxRef { refRing.removeFirst(refRing.count - maxRef) }
-        refLock.unlock()
     }
+
+    // Selftest hooks — buffered depths (not part of the audio path).
+    var refDepthForTest: Int { refLock.lock(); defer { refLock.unlock() }; return refRing.count }
+    var micDepthForTest: Int { stateLock.lock(); defer { stateLock.unlock() }; return micBuf.count }
 
     /// Echo-cancel the mic against the buffered reference; returns cleaned 16k mono float (capture thread).
     /// May return fewer samples than the input (frame buffering) or 0 while filling the first frame.
     func cancelMic(_ pcm: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        // After a mic gap (session (re)start, pause→resume, sleep/wake, device switch, toggle-on) the
+        // buffered residue and the adaptive filter belong to a DEAD stream: stale micBuf samples would be
+        // injected into the new recording and the filter starts converged to the wrong echo path. Start clean.
+        let now = DispatchTime.now().uptimeNanoseconds
+        if lastMicNs == 0 || now &- lastMicNs > gapNs { resetLocked() }
+        lastMicNs = now
         guard let mic16 = to16kInt16(pcm, &micConv) else { return nil }
         ensureState()
         guard let st else { return nil }   // init failed → fall back to raw mic
@@ -301,15 +330,21 @@ final class EchoDucker {
         var refFrame = [Int16](repeating: 0, count: frame)
         var outFrame = [Int16](repeating: 0, count: frame)
         // Process all whole frames buffered so far. Always flow the mic (never starve transcription);
-        // pair each frame with the most-recent reference (the ring is capped near the echo delay). Snapshot
-        // that reference in ONE short locked section (so the tap thread isn't blocked while speex runs, and
-        // draining is a single O(n) removeFirst per buffer rather than one per frame). Any frame missing a
-        // reference is zero-padded — it just isn't cancelled (it carries no echo, or the filter rides it out).
+        // pair each frame with the most-recent reference. Snapshot that reference in ONE short locked
+        // section (so the tap thread isn't blocked while speex runs, and draining is a single O(n)
+        // removeFirst per buffer rather than one per frame). Any frame missing a reference is zero-padded —
+        // it just isn't cancelled (it carries no echo, or the filter rides it out).
         let nFrames = micBuf.count / frame
         if nFrames > 0 {
             let want = nFrames * frame
             var refSnap = [Int16]()
             refLock.lock()
+            // Bound reference staleness (see maxLag): drop the OLDEST samples so that at most maxLag
+            // remain after this drain — the mic then always pairs with a near-current reference. The
+            // trim punches a small discontinuity into the fed reference, but that only happens after a
+            // fill/drain imbalance (startup, mic stall) where the filter had lost causality anyway.
+            let excess = refRing.count - (want + maxLag)
+            if excess > 0 { refRing.removeFirst(excess); if debug { dbgTrim &+= excess } }
             let refTake = min(want, refRing.count)
             if refTake > 0 { refSnap.append(contentsOf: refRing[0..<refTake]); refRing.removeFirst(refTake) }
             refLock.unlock()
@@ -326,7 +361,7 @@ final class EchoDucker {
             dbgN &+= 1; dbgIn &+= mic16.count; dbgOut &+= cleaned.count
             if dbgN % 90 == 0 {
                 refLock.lock(); let rr = refRing.count; refLock.unlock()
-                elog("echo(speex): cumIn=\(dbgIn) cumOut=\(dbgOut) refRing=\(rr) micBuf=\(micBuf.count)")
+                elog("echo(speex): cumIn=\(dbgIn) cumOut=\(dbgOut) refRing=\(rr) micBuf=\(micBuf.count) trimmed=\(dbgTrim)")
             }
         }
         guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(max(1, cleaned.count))) else { return nil }
@@ -337,7 +372,7 @@ final class EchoDucker {
         return out
     }
 
-    private var dbgN = 0, dbgIn = 0, dbgOut = 0   // debug counters (gated by `debug`)
+    private var dbgN = 0, dbgIn = 0, dbgOut = 0, dbgTrim = 0   // debug counters (gated by `debug`)
     private func ensureState() {
         guard st == nil else { return }
         guard let s = speex_echo_state_init(Int32(frame), Int32(filter)) else {
@@ -3006,6 +3041,20 @@ struct Main {
             var nrIn = 0, nrOut = 0
             for _ in 0..<40 { nrOut += EchoDucker.shared.cancelMic(ecBuf(171)).map { Int($0.frameLength) } ?? -99999; nrIn += 171 }
             check("AEC framing: mic flows (out ≈ in, no reference)", nrIn - nrOut >= 0 && nrIn - nrOut <= 256)
+            // Staleness invariant: a reference backlog (tap running while the mic spins up / stalls) must be
+            // trimmed on drain so the mic pairs with a near-current reference — a persistent backlog makes the
+            // causal filter cancel 0 dB for the whole session (regression found by adversarial review).
+            EchoDucker.shared.reset()
+            _ = EchoDucker.shared.cancelMic(ecBuf(256))          // prime (first call after reset self-heals)
+            EchoDucker.shared.pushReference(ecBuf(6000))         // backlog far beyond any real echo delay
+            _ = EchoDucker.shared.cancelMic(ecBuf(512))          // one drain must re-anchor the ring
+            check("AEC staleness: ring trimmed to ≤ 512 after drain", EchoDucker.shared.refDepthForTest <= 512)
+            // Gap/reset invariant: buffered mic residue must not leak into a later stream.
+            EchoDucker.shared.reset()
+            _ = EchoDucker.shared.cancelMic(ecBuf(100))          // sub-frame residue stays buffered…
+            let residue = EchoDucker.shared.micDepthForTest == 100
+            EchoDucker.shared.reset()                            // …until a reset (or a mic-gap self-heal)
+            check("AEC reset: buffered mic residue cleared", residue && EchoDucker.shared.micDepthForTest == 0)
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
             exit(fails == 0 ? 0 : 1)
         }
