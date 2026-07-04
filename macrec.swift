@@ -246,87 +246,118 @@ func mixDown(sysURL: URL, micURL: URL?, outURL: URL) throws {
     }
 }
 
-// MARK: - echo ducker (opt-in speaker→mic echo reduction, no external AEC lib)
+// MARK: - echo canceller (opt-in speaker→mic echo reduction via SpeexDSP AEC)
 //
 // When the far-end plays through SPEAKERS it leaks into the mic and gets transcribed a second time under
-// the mic speaker. We can't use Apple's voice-processing AEC (it only cancels audio THIS process renders;
-// the far-end is another app's output). Instead we use the process-tap system audio as a REFERENCE: when
-// the (delayed) far-end is active and the mic isn't dominated by near-end speech, we duck that mic block.
-// Coarse energy-gating — enough to kill the double-transcription — not a full adaptive AEC. Opt-in.
+// the mic speaker. Apple's voice-processing AEC can't help (it only cancels audio THIS process renders;
+// the far-end is another app's output). Instead we run a real adaptive echo canceller (SpeexDSP) with the
+// process-tap system audio as the REFERENCE and the mic as the near-end — it subtracts the echo while
+// preserving the user's own voice, even during double-talk. libspeexdsp is statically linked
+// (see speex-bridge.h + install.sh), so the .app stays self-contained. Opt-in (default off).
 final class EchoDucker {
     static let shared = EchoDucker()
     private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
-    private let lock = NSLock()
-    private var ref: [Float] = []                 // recent reference (system) samples, 16k mono
-    private var refConv: AVAudioConverter?        // used only on the tap thread (pushReference)
-    private var micConv: AVAudioConverter?        // used only on the capture thread (duckMic)
-    private var lastGain: Float = 1               // for click-free gain ramping (capture thread only)
-    // Tunables (kept named for future exposure / testing).
-    private let maxRefSec = 3.0
-    private let delaySec = 0.15                   // speaker→mic acoustic + capture latency
-    private let refActive: Float = 0.02           // far-end considered "playing" above this RMS
-    private let duckMargin: Float = 2.0           // duck only if micRMS < predictedEcho*margin (else near-end speech)
-    private let duckGain: Float = 0.08            // attenuation applied to echo-dominated mic blocks
-    private var echoCoupling: Float = 0.15        // learned echo/ref ratio (lower-envelope; capture thread only)
+    private let frame = 256           // 16 ms @ 16 kHz — SpeexDSP fixed processing frame
+    private let filter = 4096         // ~256 ms adaptive tail (covers the speaker→mic delay + reverb)
+    private let refLock = NSLock()    // guards refRing (tap thread writes, capture thread drains)
+    private var refRing = [Int16]()   // far-end reference, 16k mono, FIFO
+    private let maxRef = 4096          // ~256ms @16k — keep the reference recent (≈ echo delay); drop older so
+                                       // the mic always pairs with a near-current reference, not a stale backlog
+    private var refConv: AVAudioConverter?   // tap thread only
+    private var micConv: AVAudioConverter?   // capture thread only
+    private var micBuf = [Int16]()           // capture thread only — mic samples awaiting a full frame
+    private var st: OpaquePointer?           // capture thread only — Speex echo-canceller state
 
     var enabled: Bool { Pref.bool(Pref.echoReduce, "MR_ECHO_REDUCE", false) }
-    func reset() { lock.lock(); ref.removeAll(keepingCapacity: true); lastGain = 1; lock.unlock() }
+    // Opt-in diagnostics (`defaults write com.ikhoon.macrec echoDebug -bool true`): logs the AEC's
+    // cumulative in/out + reference-ring depth so echo behaviour can be tuned against a real call.
+    private var debug: Bool { Pref.bool("echoDebug", "MR_ECHO_DEBUG", false) }
 
-    /// Feed a system-audio (reference) buffer — converted to 16k mono, appended to the ring.
-    func pushReference(_ buf: AVAudioPCMBuffer) {
-        guard let out = toCanon(buf, &refConv), let ch = out.floatChannelData?[0] else { return }
-        let n = Int(out.frameLength); guard n > 0 else { return }
-        lock.lock()
-        ref.append(contentsOf: UnsafeBufferPointer(start: ch, count: n))
-        let cap = Int(fmt.sampleRate * maxRefSec)
-        if ref.count > cap { ref.removeFirst(ref.count - cap) }
-        lock.unlock()
+    /// Clear buffered audio + reset the adaptive filter (safe to call on capture thread / session start).
+    func reset() {
+        refLock.lock(); refRing.removeAll(keepingCapacity: true); refLock.unlock()
+        micBuf.removeAll(keepingCapacity: true)
+        if let st { speex_echo_state_reset(st) }
     }
 
-    /// Return the mic buffer as 16k mono, ducked where it's dominated by the delayed far-end reference.
-    func duckMic(_ pcm: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        guard let out = toCanon(pcm, &micConv), let mp = out.floatChannelData?[0] else { return nil }
-        let n = Int(out.frameLength); guard n > 0 else { return out }
-        var ms: Float = 0; for i in 0..<n { ms += mp[i] * mp[i] }
-        let micRMS = (ms / Float(n)).squareRoot()
-        let delay = Int(fmt.sampleRate * delaySec)
-        lock.lock()
-        var rs: Float = 0; var have = false
-        if ref.count >= delay + n {
-            let start = ref.count - delay - n
-            for i in 0..<n { let v = ref[start + i]; rs += v * v }; have = true
+    /// Feed a system-audio (reference) buffer — 16k mono Int16 into the ring (tap thread).
+    func pushReference(_ buf: AVAudioPCMBuffer) {
+        guard let s = to16kInt16(buf, &refConv) else { return }
+        refLock.lock()
+        refRing.append(contentsOf: s)
+        if refRing.count > maxRef { refRing.removeFirst(refRing.count - maxRef) }
+        refLock.unlock()
+    }
+
+    /// Echo-cancel the mic against the buffered reference; returns cleaned 16k mono float (capture thread).
+    /// May return fewer samples than the input (frame buffering) or 0 while filling the first frame.
+    func cancelMic(_ pcm: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let mic16 = to16kInt16(pcm, &micConv) else { return nil }
+        ensureState()
+        guard let st else { return nil }   // init failed → fall back to raw mic
+        micBuf.append(contentsOf: mic16)
+        var cleaned = [Int16](); cleaned.reserveCapacity(micBuf.count)
+        var micFrame = [Int16](repeating: 0, count: frame)
+        var refFrame = [Int16](repeating: 0, count: frame)
+        var outFrame = [Int16](repeating: 0, count: frame)
+        while micBuf.count >= frame {
+            // Always flow the mic (never starve transcription); pair each frame with the most-recent
+            // reference (the ring is capped near the echo delay). If the reference is momentarily behind,
+            // zero-pad — that frame just isn't cancelled (it carries no echo, or the filter rides it out).
+            for k in 0..<frame { micFrame[k] = micBuf[k] }
+            micBuf.removeFirst(frame)
+            refLock.lock()
+            let take = min(frame, refRing.count)
+            for k in 0..<frame { refFrame[k] = k < take ? refRing[k] : 0 }
+            if take > 0 { refRing.removeFirst(take) }
+            refLock.unlock()
+            speex_echo_cancellation(st, &micFrame, &refFrame, &outFrame)   // (state, near-end/mic, far-end/ref, out)
+            cleaned.append(contentsOf: outFrame)
         }
-        lock.unlock()
-        let refRMS = have ? (rs / Float(n)).squareRoot() : 0
-        var target: Float = 1
-        if refRMS > refActive {
-            // Track echo coupling (echo/ref) as the LOWER ENVELOPE of mic/ref — moderate attack down,
-            // slow release up — so near-end speech (high ratio) doesn't inflate it.
-            let r = micRMS / refRMS
-            echoCoupling += (r < echoCoupling ? 0.02 : 0.0005) * (r - echoCoupling)
-            echoCoupling = min(0.25, max(0.02, echoCoupling))   // cap so sustained double-talk can't push the gate up onto real near-end speech
-            // Duck only when the mic is near the PREDICTED echo level (echo-dominated); when the user is
-            // actually speaking, micRMS is well above the predicted echo → not ducked (protects their voice).
-            if micRMS < echoCoupling * refRMS * duckMargin { target = duckGain }
+        if debug {   // cumulative counters (not per-call — per-call out aliases against the frame size)
+            dbgN &+= 1; dbgIn &+= mic16.count; dbgOut &+= cleaned.count
+            if dbgN % 90 == 0 {
+                refLock.lock(); let rr = refRing.count; refLock.unlock()
+                elog("echo(speex): cumIn=\(dbgIn) cumOut=\(dbgOut) refRing=\(rr) micBuf=\(micBuf.count)")
+            }
         }
-        if lastGain != 1 || target != 1 {   // ramp across the block so gain changes don't click
-            let g0 = lastGain, g1 = target, d = Float(max(1, n - 1))
-            for i in 0..<n { mp[i] *= g0 + (g1 - g0) * (Float(i) / d) }
+        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(max(1, cleaned.count))) else { return nil }
+        out.frameLength = AVAudioFrameCount(cleaned.count)
+        if let ch = out.floatChannelData?[0] {
+            for i in 0..<cleaned.count { ch[i] = Float(cleaned[i]) / 32768.0 }
         }
-        lastGain = target
         return out
     }
 
-    private func toCanon(_ buf: AVAudioPCMBuffer, _ conv: inout AVAudioConverter?) -> AVAudioPCMBuffer? {
-        if buf.format == fmt { return buf }
-        if conv == nil || conv?.inputFormat != buf.format { conv = AVAudioConverter(from: buf.format, to: fmt) }
-        guard let c = conv else { return nil }
-        let ratio = fmt.sampleRate / buf.format.sampleRate
-        let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 1024
-        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return nil }
-        var fed = false; var err: NSError?
-        c.convert(to: out, error: &err) { _, s in if fed { s.pointee = .noDataNow; return nil }; fed = true; s.pointee = .haveData; return buf }
-        return (err == nil && out.frameLength > 0) ? out : nil
+    private var dbgN = 0, dbgIn = 0, dbgOut = 0   // debug counters (gated by `debug`)
+    private func ensureState() {
+        guard st == nil else { return }
+        st = speex_echo_state_init(Int32(frame), Int32(filter))
+        var rate: Int32 = 16000
+        speex_echo_ctl(st, SPEEX_ECHO_SET_SAMPLING_RATE, &rate)
+        if debug { elog("echo(speex): AEC initialized (frame=\(frame) filter=\(filter))") }
+    }
+
+    /// Convert an arbitrary-format PCM buffer to 16 kHz mono Int16 (clamped).
+    private func to16kInt16(_ buf: AVAudioPCMBuffer, _ conv: inout AVAudioConverter?) -> [Int16]? {
+        let floatBuf: AVAudioPCMBuffer
+        if buf.format == fmt { floatBuf = buf }
+        else {
+            if conv == nil || conv?.inputFormat != buf.format { conv = AVAudioConverter(from: buf.format, to: fmt) }
+            guard let c = conv else { return nil }
+            let ratio = fmt.sampleRate / buf.format.sampleRate
+            let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 1024
+            guard let o = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return nil }
+            var fed = false; var err: NSError?
+            c.convert(to: o, error: &err) { _, s in if fed { s.pointee = .noDataNow; return nil }; fed = true; s.pointee = .haveData; return buf }
+            guard err == nil, o.frameLength > 0 else { return nil }
+            floatBuf = o
+        }
+        guard let fp = floatBuf.floatChannelData?[0] else { return nil }
+        let n = Int(floatBuf.frameLength)
+        var s = [Int16](repeating: 0, count: n)
+        for i in 0..<n { let v = max(-1, min(1, fp[i])); s[i] = Int16(v * 32767) }
+        return s
     }
 }
 
@@ -355,8 +386,8 @@ final class Recorder {
     /// sys writes and rotation swaps; live captions are fed directly (converted once) for low latency.
     func appendMic(_ sb: CMSampleBuffer) {
         guard CMSampleBufferDataIsReady(sb), let pcm = SourceWriter.pcm(from: sb) else { return }
-        // Opt-in: duck speaker→mic echo (returns 16k-mono). Off = original raw PCM, zero overhead.
-        let out = EchoDucker.shared.enabled ? (EchoDucker.shared.duckMic(pcm) ?? pcm) : pcm
+        // Opt-in: cancel speaker→mic echo via SpeexDSP (returns 16k-mono). Off = original raw PCM, zero overhead.
+        let out = EchoDucker.shared.enabled ? (EchoDucker.shared.cancelMic(pcm) ?? pcm) : pcm
         if #available(macOS 26, *) { LiveCaptions.shared.feedMic(out) }
         queue.async { self.micWriter?.append(out) }
     }
@@ -2941,6 +2972,28 @@ struct Main {
             check("labels ko → 나/상대",         speakerLabels(forLanguage: "ko") == ("나", "상대"))
             check("labels en → Me/Them",        speakerLabels(forLanguage: "en") == ("Me", "Them"))
             check("labels ja → 私/相手",         speakerLabels(forLanguage: "ja") == ("私", "相手"))
+            // EchoDucker (SpeexDSP AEC) framing/plumbing — deterministic, no audio device needed.
+            // Guards the contract: the mic ALWAYS flows through (cumulative out ≈ in, ±one buffered frame),
+            // whether or not a reference is present — a regression that starved the mic would fail here.
+            let ecFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+            func ecBuf(_ n: Int) -> AVAudioPCMBuffer {
+                let b = AVAudioPCMBuffer(pcmFormat: ecFmt, frameCapacity: AVAudioFrameCount(n))!
+                b.frameLength = AVAudioFrameCount(n)
+                let ch = b.floatChannelData![0]; for i in 0..<n { ch[i] = 0.3 * sinf(Float(i) * 0.19) }
+                return b
+            }
+            EchoDucker.shared.reset()
+            var ecIn = 0, ecOut = 0
+            for _ in 0..<40 {
+                EchoDucker.shared.pushReference(ecBuf(171))                       // far-end reference
+                ecOut += EchoDucker.shared.cancelMic(ecBuf(171)).map { Int($0.frameLength) } ?? -99999
+                ecIn += 171
+            }
+            check("AEC framing: mic flows (out ≈ in, with reference)", ecIn - ecOut >= 0 && ecIn - ecOut <= 256)
+            EchoDucker.shared.reset()   // no reference at all → mic must still pass through, never starve
+            var nrIn = 0, nrOut = 0
+            for _ in 0..<40 { nrOut += EchoDucker.shared.cancelMic(ecBuf(171)).map { Int($0.frameLength) } ?? -99999; nrIn += 171 }
+            check("AEC framing: mic flows (out ≈ in, no reference)", nrIn - nrOut >= 0 && nrIn - nrOut <= 256)
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
             exit(fails == 0 ? 0 : 1)
         }

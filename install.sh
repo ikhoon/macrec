@@ -25,9 +25,11 @@ fi
 
 echo "▸ building macrec…"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
+SPEEX_PREFIX="$(brew --prefix speexdsp 2>/dev/null || echo /opt/homebrew/opt/speexdsp)"
 swiftc -swift-version 5 -parse-as-library -O \
   -framework AVFoundation -framework CoreMedia -framework CoreAudio \
   -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech -framework Translation \
+  -import-objc-header "$HERE/speex-bridge.h" -I "$SPEEX_PREFIX/include" "$SPEEX_PREFIX/lib/libspeexdsp.a" \
   "$HERE/macrec.swift" -o "$STAGE_BIN"
 
 echo "▸ writing Info.plist + icon…"
