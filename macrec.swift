@@ -246,6 +246,90 @@ func mixDown(sysURL: URL, micURL: URL?, outURL: URL) throws {
     }
 }
 
+// MARK: - echo ducker (opt-in speaker→mic echo reduction, no external AEC lib)
+//
+// When the far-end plays through SPEAKERS it leaks into the mic and gets transcribed a second time under
+// the mic speaker. We can't use Apple's voice-processing AEC (it only cancels audio THIS process renders;
+// the far-end is another app's output). Instead we use the process-tap system audio as a REFERENCE: when
+// the (delayed) far-end is active and the mic isn't dominated by near-end speech, we duck that mic block.
+// Coarse energy-gating — enough to kill the double-transcription — not a full adaptive AEC. Opt-in.
+final class EchoDucker {
+    static let shared = EchoDucker()
+    private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+    private let lock = NSLock()
+    private var ref: [Float] = []                 // recent reference (system) samples, 16k mono
+    private var refConv: AVAudioConverter?        // used only on the tap thread (pushReference)
+    private var micConv: AVAudioConverter?        // used only on the capture thread (duckMic)
+    private var lastGain: Float = 1               // for click-free gain ramping (capture thread only)
+    // Tunables (kept named for future exposure / testing).
+    private let maxRefSec = 3.0
+    private let delaySec = 0.15                   // speaker→mic acoustic + capture latency
+    private let refActive: Float = 0.02           // far-end considered "playing" above this RMS
+    private let duckMargin: Float = 2.0           // duck only if micRMS < predictedEcho*margin (else near-end speech)
+    private let duckGain: Float = 0.08            // attenuation applied to echo-dominated mic blocks
+    private var echoCoupling: Float = 0.15        // learned echo/ref ratio (lower-envelope; capture thread only)
+
+    var enabled: Bool { Pref.bool(Pref.echoReduce, "MR_ECHO_REDUCE", false) }
+    func reset() { lock.lock(); ref.removeAll(keepingCapacity: true); lastGain = 1; lock.unlock() }
+
+    /// Feed a system-audio (reference) buffer — converted to 16k mono, appended to the ring.
+    func pushReference(_ buf: AVAudioPCMBuffer) {
+        guard let out = toCanon(buf, &refConv), let ch = out.floatChannelData?[0] else { return }
+        let n = Int(out.frameLength); guard n > 0 else { return }
+        lock.lock()
+        ref.append(contentsOf: UnsafeBufferPointer(start: ch, count: n))
+        let cap = Int(fmt.sampleRate * maxRefSec)
+        if ref.count > cap { ref.removeFirst(ref.count - cap) }
+        lock.unlock()
+    }
+
+    /// Return the mic buffer as 16k mono, ducked where it's dominated by the delayed far-end reference.
+    func duckMic(_ pcm: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let out = toCanon(pcm, &micConv), let mp = out.floatChannelData?[0] else { return nil }
+        let n = Int(out.frameLength); guard n > 0 else { return out }
+        var ms: Float = 0; for i in 0..<n { ms += mp[i] * mp[i] }
+        let micRMS = (ms / Float(n)).squareRoot()
+        let delay = Int(fmt.sampleRate * delaySec)
+        lock.lock()
+        var rs: Float = 0; var have = false
+        if ref.count >= delay + n {
+            let start = ref.count - delay - n
+            for i in 0..<n { let v = ref[start + i]; rs += v * v }; have = true
+        }
+        lock.unlock()
+        let refRMS = have ? (rs / Float(n)).squareRoot() : 0
+        var target: Float = 1
+        if refRMS > refActive {
+            // Track echo coupling (echo/ref) as the LOWER ENVELOPE of mic/ref — moderate attack down,
+            // slow release up — so near-end speech (high ratio) doesn't inflate it.
+            let r = micRMS / refRMS
+            echoCoupling += (r < echoCoupling ? 0.02 : 0.0005) * (r - echoCoupling)
+            echoCoupling = min(0.25, max(0.02, echoCoupling))   // cap so sustained double-talk can't push the gate up onto real near-end speech
+            // Duck only when the mic is near the PREDICTED echo level (echo-dominated); when the user is
+            // actually speaking, micRMS is well above the predicted echo → not ducked (protects their voice).
+            if micRMS < echoCoupling * refRMS * duckMargin { target = duckGain }
+        }
+        if lastGain != 1 || target != 1 {   // ramp across the block so gain changes don't click
+            let g0 = lastGain, g1 = target, d = Float(max(1, n - 1))
+            for i in 0..<n { mp[i] *= g0 + (g1 - g0) * (Float(i) / d) }
+        }
+        lastGain = target
+        return out
+    }
+
+    private func toCanon(_ buf: AVAudioPCMBuffer, _ conv: inout AVAudioConverter?) -> AVAudioPCMBuffer? {
+        if buf.format == fmt { return buf }
+        if conv == nil || conv?.inputFormat != buf.format { conv = AVAudioConverter(from: buf.format, to: fmt) }
+        guard let c = conv else { return nil }
+        let ratio = fmt.sampleRate / buf.format.sampleRate
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return nil }
+        var fed = false; var err: NSError?
+        c.convert(to: out, error: &err) { _, s in if fed { s.pointee = .noDataNow; return nil }; fed = true; s.pointee = .haveData; return buf }
+        return (err == nil && out.frameLength > 0) ? out : nil
+    }
+}
+
 // MARK: - recorder (holds the per-source writers)
 
 final class Recorder {
@@ -261,6 +345,7 @@ final class Recorder {
     /// System audio arrives from the Core Audio tap (an owned copy — safe to hand to the queue).
     /// Live captions are fed straight from here (lowest latency — no WAV-write/canon-convert/queue hop).
     func appendSys(_ buf: AVAudioPCMBuffer) {
+        if EchoDucker.shared.enabled { EchoDucker.shared.pushReference(buf) }   // reference for mic echo ducking
         if #available(macOS 26, *) { LiveCaptions.shared.feedSystem(buf) }
         queue.async { self.sysWriter?.append(buf) }
     }
@@ -270,9 +355,10 @@ final class Recorder {
     /// sys writes and rotation swaps; live captions are fed directly (converted once) for low latency.
     func appendMic(_ sb: CMSampleBuffer) {
         guard CMSampleBufferDataIsReady(sb), let pcm = SourceWriter.pcm(from: sb) else { return }
-        // Convert once: feed live captions immediately, then hand the same PCM to the writer.
-        if #available(macOS 26, *) { LiveCaptions.shared.feedMic(pcm) }
-        queue.async { self.micWriter?.append(pcm) }
+        // Opt-in: duck speaker→mic echo (returns 16k-mono). Off = original raw PCM, zero overhead.
+        let out = EchoDucker.shared.enabled ? (EchoDucker.shared.duckMic(pcm) ?? pcm) : pcm
+        if #available(macOS 26, *) { LiveCaptions.shared.feedMic(out) }
+        queue.async { self.micWriter?.append(out) }
     }
 
     /// Drain in-flight callbacks, then release the AVAudioFiles so they flush their WAV headers
@@ -458,8 +544,10 @@ enum Pref {
     static let liveFontSize = "liveFontSize"            // live-caption overlay font size (pt)
     static let liveOpacity = "liveOpacity"              // live-caption overlay opacity (0.3–1.0)
     static let liveSource = "liveSource"                // which speakers to transcribe live: both|other|me
+    static let liveEngine = "liveEngine"                // live transcription engine: apple|whisper (extensible)
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
     static let systemAudio = "captureSystemAudio"       // capture other-party (system) audio via SCK
+    static let echoReduce = "echoReduce"                // opt-in: duck speaker→mic echo using the tap as reference
     static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
     static let customModel = "customModelURL"           // custom model source (URL or local path) — overrides the popup
 
@@ -1350,9 +1438,6 @@ final class RecordingEngine {
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let onSave: () -> Void
     private let segPopup = NSPopUpButton(), langPopup = NSPopUpButton()
-    private let captionLangPopup = NSPopUpButton(), translateToPopup = NSPopUpButton()   // live captions (macOS 26)
-    private let liveFontPopup = NSPopUpButton()      // live overlay font size (opacity is on the overlay itself)
-    private let liveSourcePopup = NSPopUpButton()    // which speakers to transcribe live (perf tradeoff)
     private let modelPopup = NSPopUpButton()
     private let audioRetPopup = NSPopUpButton(), txtRetPopup = NSPopUpButton()
     private let addAppPopup = NSPopUpButton()
@@ -1364,22 +1449,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let keepAudioBtn = NSButton(checkboxWithTitle: "Keep audio (WAV) too", target: nil, action: nil)
     private let vadBtn = NSButton(checkboxWithTitle: "Remove noise/silence (VAD)", target: nil, action: nil)
     private let calBtn = NSButton(checkboxWithTitle: "Title transcripts from calendar events", target: nil, action: nil)
-    private let liveTimestampsBtn = NSButton(checkboxWithTitle: "Show timestamps", target: nil, action: nil)
     private let loginBtn = NSButton(checkboxWithTitle: "Start at login (24/7 recording)", target: nil, action: nil)
     private let systemAudioBtn = NSButton(checkboxWithTitle: "Capture system audio (other participants)", target: nil, action: nil)
+    private let echoBtn = NSButton(checkboxWithTitle: "Reduce mic echo on speakers (experimental)", target: nil, action: nil)
     private var runningAppIds: [String] = []
 
     private let segValues = [900, 1800, 3600, 7200], segTitles = ["15 min", "30 min", "1 hour", "2 hours"]
     private let langValues = ["auto", "ko", "ja", "en"], langTitles = ["Auto-detect", "Korean", "Japanese", "English"]
-    // Live-caption languages (macOS 26 SpeechAnalyzer + Translation). "" = System (caption) / Off (translate).
-    private let fontValues: [Double] = [12, 14, 16, 18, 22], fontTitles = ["Small", "Medium", "Large", "X-Large", "XX-Large"]
-    private let capLangValues = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
-    private let capLangTitles  = ["System", "Korean", "Japanese", "English", "Chinese", "Spanish", "French", "German"]
-    private let transToValues  = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
-    private let transToTitles  = ["Off", "Korean", "Japanese", "English", "Chinese", "Spanish", "French", "German"]
-    // Live-caption source (perf): index 0 is the default (other party only → one analyzer, lower latency).
-    private let liveSourceValues = ["other", "both", "me"]
-    private let liveSourceTitles = ["Other party only (faster)", "Both speakers", "Me only"]
     private let modelNames = WhisperCatalog.all.map { $0.name }   // popup order matches WhisperCatalog.all
     private let retValues = [7, 30, 90, 0], retTitles = ["7 days", "30 days", "90 days", "Unlimited"]
 
@@ -1392,7 +1468,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         w.delegate = self
         buildForm()
         load()
-        w.setContentSize(NSSize(width: 600, height: 600))   // roomy fixed size; form top, buttons bottom
+        w.setContentSize(NSSize(width: 560, height: 440))   // sized to the tabbed panes; buttons pinned bottom
         w.center()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -1401,10 +1477,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func buildForm() {
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
-        captionLangPopup.addItems(withTitles: capLangTitles); translateToPopup.addItems(withTitles: transToTitles)
-        liveFontPopup.addItems(withTitles: fontTitles)
-        liveSourcePopup.addItems(withTitles: liveSourceTitles)
-        liveSourcePopup.toolTip = "Fewer speakers = less on-device work = lower latency. Applies next time captions start."
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
         for f in [voiceField, dirField, audioDirField, customModelField] { f.translatesAutoresizingMaskIntoConstraints = false }
@@ -1427,79 +1499,68 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let audioChooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseAudioDir))
         let audioStack = NSStackView(views: [audioDirField, audioChooseBtn]); audioStack.orientation = .horizontal; audioStack.spacing = 6
 
-        func sectionHeader(_ s: String) -> NSTextField {
-            let l = NSTextField(labelWithString: s.uppercased())
-            l.font = .systemFont(ofSize: 11, weight: .semibold); l.textColor = .secondaryLabelColor
-            return l
+        // Grouped into tabs (each pane stays short) instead of one long scrolling form.
+        func row(_ label: String, _ control: NSView) -> [NSView] { [labeled(label), control] }
+        func tab(_ title: String, _ rows: [[NSView]]) -> NSTabViewItem {
+            let grid = NSGridView(views: rows)
+            grid.translatesAutoresizingMaskIntoConstraints = false
+            grid.rowSpacing = 9; grid.columnSpacing = 18
+            grid.column(at: 0).xPlacement = .trailing
+            let pane = NSView(); pane.addSubview(grid)
+            NSLayoutConstraint.activate([
+                grid.topAnchor.constraint(equalTo: pane.topAnchor, constant: 20),
+                grid.centerXAnchor.constraint(equalTo: pane.centerXAnchor),
+                grid.leadingAnchor.constraint(greaterThanOrEqualTo: pane.leadingAnchor, constant: 24),
+            ])
+            let item = NSTabViewItem(); item.label = title; item.view = pane
+            return item
         }
-        var rows: [[NSView]] = []; var headerRows: [Int] = []
-        func sec(_ t: String) { headerRows.append(rows.count); rows.append([sectionHeader(t), NSGridCell.emptyContentView]) }
-        func row(_ label: String, _ control: NSView) { rows.append([labeled(label), control]) }
 
-        sec("Recording")
-        row("Segment length (on the hour):", segPopup)
-        row("", systemAudioBtn)
-        row("Min. speech (sec):", voiceField)
-        row("", vadBtn)
-        row("Excluded apps:", excludeTokens)
-        row("Add a running app:", addAppPopup)
-        sec("Transcription (whisper)")
-        row("Model:", modelPopup)
-        row("…or custom model:", customModelField)
-        row("Language:", langPopup)
-        sec("Live captions (macOS 26)")
-        row("Caption language:", captionLangPopup)
-        row("Transcribe:", liveSourcePopup)
-        row("Translate to:", translateToPopup)
-        row("Font size:", liveFontPopup)
-        row("", liveTimestampsBtn)
-        sec("Titling")
-        row("", calBtn)
-        row("Calendars:", calListCell)
-        sec("Storage")
-        row("", keepAudioBtn)
-        row("Keep audio for:", audioRetPopup)
-        row("Keep transcripts for:", txtRetPopup)
-        row("Save transcripts to:", dirStack)
-        row("Save audio to:", audioStack)
-        sec("General")
-        row("", loginBtn)
-
-        let grid = NSGridView(views: rows)
-        grid.translatesAutoresizingMaskIntoConstraints = false
-        grid.rowSpacing = 9; grid.columnSpacing = 18
-        grid.column(at: 0).xPlacement = .trailing
-        for r in headerRows {
-            grid.mergeCells(inHorizontalRange: NSRange(location: 0, length: 2), verticalRange: NSRange(location: r, length: 1))
-            grid.cell(atColumnIndex: 0, rowIndex: r).xPlacement = .leading
-            if r > 0 { grid.row(at: r).topPadding = 14 }
-        }
+        let tabs = NSTabView(); tabs.translatesAutoresizingMaskIntoConstraints = false
+        tabs.focusRingType = .none   // clicking a tab otherwise shows a blue focus ring on top of the tab highlight ("double blue")
+        tabs.addTabViewItem(tab("Recording", [
+            row("Segment length (on the hour):", segPopup),
+            row("", systemAudioBtn),
+            row("", echoBtn),
+            row("Min. speech (sec):", voiceField),
+            row("", vadBtn),
+            row("Excluded apps:", excludeTokens),
+            row("Add a running app:", addAppPopup),
+        ]))
+        tabs.addTabViewItem(tab("Transcription", [
+            row("Model:", modelPopup),
+            row("…or custom model:", customModelField),
+            row("Language:", langPopup),
+        ]))
+        tabs.addTabViewItem(tab("Titling", [
+            row("", calBtn),
+            row("Calendars:", calListCell),
+        ]))
+        tabs.addTabViewItem(tab("Storage", [
+            row("", keepAudioBtn),
+            row("Keep audio for:", audioRetPopup),
+            row("Keep transcripts for:", txtRetPopup),
+            row("Save transcripts to:", dirStack),
+            row("Save audio to:", audioStack),
+        ]))
+        tabs.addTabViewItem(tab("General", [
+            row("", loginBtn),
+        ]))
 
         let saveBtn = NSButton(title: "Save & Apply", target: self, action: #selector(saveAndClose)); saveBtn.keyEquivalent = "\r"
         let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(closeOnly)); cancelBtn.keyEquivalent = "\u{1b}"
         let btns = NSStackView(views: [cancelBtn, saveBtn]); btns.orientation = .horizontal; btns.spacing = 10
         btns.translatesAutoresizingMaskIntoConstraints = false
 
-        // Scrollable form (many grouped rows) with the buttons pinned below it.
-        let doc = NSView(); doc.translatesAutoresizingMaskIntoConstraints = false
-        doc.addSubview(grid)
-        let scroll = NSScrollView(); scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.hasVerticalScroller = true; scroll.scrollerStyle = .overlay; scroll.drawsBackground = false
-        scroll.documentView = doc
         let content = NSView()
-        content.addSubview(scroll); content.addSubview(btns)
+        content.addSubview(tabs); content.addSubview(btns)
         NSLayoutConstraint.activate([
-            grid.topAnchor.constraint(equalTo: doc.topAnchor, constant: 20),
-            grid.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 34),
-            grid.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -34),
-            grid.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -20),
-            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-            scroll.topAnchor.constraint(equalTo: content.topAnchor),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: btns.topAnchor, constant: -12),
-            btns.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -34),
-            btns.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -22),
+            tabs.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            tabs.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            tabs.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            tabs.bottomAnchor.constraint(equalTo: btns.topAnchor, constant: -12),
+            btns.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            btns.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
         window?.contentView = content
     }
@@ -1553,7 +1614,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = stack
         scroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
-        scroll.heightAnchor.constraint(equalToConstant: 108).isActive = true
+        // Grow to fit all calendars up to a cap, then scroll (instead of a fixed short box).
+        let naturalH = CGFloat(max(1, names.count)) * 21 + 14
+        scroll.heightAnchor.constraint(equalToConstant: min(naturalH, 220)).isActive = true
         let clip = scroll.contentView
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: clip.topAnchor),
@@ -1573,17 +1636,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let c = EngineConfig.load()
         segPopup.selectItem(at: idx(Int(c.segmentSeconds), segValues))
         langPopup.selectItem(at: idx(c.whisperLang, langValues))
-        liveFontPopup.selectItem(at: idx(Pref.dbl(Pref.liveFontSize, "MR_LIVE_FONT_SIZE", 14), fontValues))
-        captionLangPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.captionLang) ?? "", capLangValues))
-        liveSourcePopup.selectItem(at: idx(LiveSource.current.rawValue, liveSourceValues))
-        translateToPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.translateTo) ?? "", transToValues))
         modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
         systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
+        echoBtn.state = Pref.bool(Pref.echoReduce, "MR_ECHO_REDUCE", false) ? .on : .off
         calBtn.state = c.useCalendarTitles ? .on : .off
-        liveTimestampsBtn.state = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true) ? .on : .off
         keepAudioBtn.state = c.keepAudio ? .on : .off
         audioRetPopup.selectItem(at: idx(c.audioRetentionDays, retValues))
         txtRetPopup.selectItem(at: idx(c.transcriptRetentionDays, retValues))
@@ -1622,17 +1681,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let d = Pref.d
         d.set(Double(segValues[max(0, segPopup.indexOfSelectedItem)]), forKey: Pref.segment)
         d.set(langValues[max(0, langPopup.indexOfSelectedItem)], forKey: Pref.lang)
-        d.set(fontValues[max(0, liveFontPopup.indexOfSelectedItem)], forKey: Pref.liveFontSize)
-        d.set(capLangValues[max(0, captionLangPopup.indexOfSelectedItem)], forKey: Pref.captionLang)
-        d.set(liveSourceValues[max(0, liveSourcePopup.indexOfSelectedItem)], forKey: Pref.liveSource)
-        d.set(transToValues[max(0, translateToPopup.indexOfSelectedItem)], forKey: Pref.translateTo)
         d.set(modelNames[max(0, modelPopup.indexOfSelectedItem)], forKey: Pref.model)
         d.set(customModelField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.customModel)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
+        d.set(echoBtn.state == .on, forKey: Pref.echoReduce)
         d.set(calBtn.state == .on, forKey: Pref.cal)
-        d.set(liveTimestampsBtn.state == .on, forKey: Pref.liveTimestamps)
         d.set(keepAudioBtn.state == .on, forKey: Pref.keepAudio)
         d.set(retValues[max(0, audioRetPopup.indexOfSelectedItem)], forKey: Pref.audioRetention)
         d.set(retValues[max(0, txtRetPopup.indexOfSelectedItem)], forKey: Pref.txtRetention)
@@ -1739,7 +1794,7 @@ func pickSpeechLocale(requested: Locale, from pool: [Locale]) -> Locale? {
 // segment rotation stays the authoritative, saved transcript — this overlay is an ephemeral view.
 
 @available(macOS 26, *)
-final class LiveTranscriber {
+final class LiveTranscriber: LiveTranscribing {
     private let label: String
     private let locale: Locale
     private let onUpdate: (String, Bool) -> Void   // (text, isFinal)
@@ -1761,24 +1816,38 @@ final class LiveTranscriber {
     private func run() async throws {
         // Locale.current can be a region SpeechTranscriber doesn't support (e.g. en_KR → error 15
         // "unsupported locale"). Map it to a supported (ideally already-installed) locale.
-        guard let loc = await Self.resolvedLocale(locale) else {
+        let t0 = ProcessInfo.processInfo.systemUptime
+        guard let (loc, isInstalled) = await Self.resolvedLocale(locale) else {
             elog("live[\(label)]: no supported speech locale for \(locale.identifier)"); return
         }
         if loc.identifier(.bcp47) != locale.identifier(.bcp47) {
             elog("live[\(label)]: locale \(locale.identifier) → \(loc.identifier(.bcp47))")
         }
-        onLocale?(loc)   // surface the active language (e.g. in the overlay title)
         let transcriber = SpeechTranscriber(locale: loc, transcriptionOptions: [],
-                                            reportingOptions: [.volatileResults], attributeOptions: [])
-        if let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+                                            reportingOptions: [.volatileResults, .fastResults], attributeOptions: [])
+        let t1 = ProcessInfo.processInfo.systemUptime
+        // Only download/prepare when the locale isn't already installed — doing this on every start was
+        // the main startup lag (seconds of dead air before the analyzer accepted audio).
+        if !isInstalled, let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
             elog("live[\(label)]: downloading speech model (\(loc.identifier(.bcp47)))…"); try await req.downloadAndInstall()
         }
+        let t2 = ProcessInfo.processInfo.systemUptime
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         let fmt = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
         let (stream, c) = AsyncStream<AnalyzerInput>.makeStream()
-        try await analyzer.start(inputSequence: stream)   // only accept feeds once the analyzer is up
+        try await analyzer.start(inputSequence: stream)
+        if Task.isCancelled { c.finish(); return }   // stopped mid-setup → EOF the input, don't publish
+        // SpeechAnalyzer defers its model/ANE warm-up to the first audio buffer (~10s of dead air before
+        // the first caption). Force it NOW, before exposing `cont`, so the warm-up runs during setup and
+        // audio fed meanwhile is dropped (not queued) — the first real buffer then transcribes immediately.
+        let tp = ProcessInfo.processInfo.systemUptime
+        try await analyzer.prepareToAnalyze(in: fmt)
+        if Task.isCancelled { c.finish(); return }   // stopped during warm-up → don't publish cont / clobber title
         lock.lock(); inputFormat = fmt; cont = c; lock.unlock()
-        elog("live[\(label)]: analyzer ready (\(loc.identifier(.bcp47)))")
+        onLocale?(loc)   // now warm — surface the active language (replaces the "preparing" title)
+        let t3 = ProcessInfo.processInfo.systemUptime
+        elog(String(format: "live[%@]: analyzer ready (%@) — resolve %.1fs · assets %.1fs · start %.1fs · prepare %.1fs",
+                    label, loc.identifier(.bcp47), t1 - t0, t2 - t1, tp - t2, t3 - tp))
         for try await result in transcriber.results {
             let text = String(result.text.characters)
             if !text.isEmpty { onUpdate(text, result.isFinal) }
@@ -1787,18 +1856,21 @@ final class LiveTranscriber {
 
     /// Map a requested locale to one SpeechTranscriber supports (exact → same-language same-region →
     /// same-language preferring en-US/GB → any same-language), preferring an already-installed one.
-    private static func resolvedLocale(_ requested: Locale) async -> Locale? {
-        let supported = await SpeechTranscriber.supportedLocales
+    private static func resolvedLocale(_ requested: Locale) async -> (locale: Locale, installed: Bool)? {
         let installed = await SpeechTranscriber.installedLocales
-        return pickSpeechLocale(requested: requested, from: installed)   // prefer already-installed
-            ?? pickSpeechLocale(requested: requested, from: supported)
+        if let hit = pickSpeechLocale(requested: requested, from: installed) { return (hit, true) }
+        // Only query the (larger, slower) supported set when we don't already have it installed.
+        let supported = await SpeechTranscriber.supportedLocales
+        if let hit = pickSpeechLocale(requested: requested, from: supported) { return (hit, false) }
+        return nil
     }
 
     /// Feed a captured PCM buffer (tap: 48 kHz stereo · mic: its native format) — convert to the
     /// analyzer's format and yield it. Called off the capture thread; the lock guards converter + cont.
     func feed(_ buf: AVAudioPCMBuffer) {
         lock.lock(); defer { lock.unlock() }
-        guard let cont, let target = inputFormat else { return }   // analyzer not ready yet → drop
+        guard let cont else { return }   // analyzer not ready yet → drop
+        guard let target = inputFormat else { cont.yield(AnalyzerInput(buffer: buf)); return }   // no negotiated format → pass through
         if buf.format == target { cont.yield(AnalyzerInput(buffer: buf)); return }
         if converter == nil || converter?.inputFormat != buf.format {
             converter = AVAudioConverter(from: buf.format, to: target)
@@ -1831,6 +1903,12 @@ final class LiveTranslator {
 
     init(source: Locale.Language, target: Locale.Language) {
         session = TranslationSession(installedSource: source, target: target)
+        // Pre-warm the pair now — the first translate can otherwise stall on the model download.
+        Task { [weak self] in
+            guard let self else { return }
+            do { try await session.prepareTranslation(); lock.lock(); prepared = true; lock.unlock(); elog("live: translator ready") }
+            catch { elog("live: translate prewarm failed: \(error)") }
+        }
     }
 
     func translate(_ text: String) async -> String? {
@@ -1845,6 +1923,185 @@ final class LiveTranslator {
     }
 }
 
+// MARK: - live transcription engines (pluggable)
+//
+// A live engine consumes fed PCM and calls back with caption text. Two implementations today —
+// Apple SpeechAnalyzer (LiveTranscriber, low latency) and whisper.cpp (WhisperLiveTranscriber, higher
+// accuracy esp. non-English). Add another — on-device (sherpa-onnx, Vosk) or a paid streaming CLOUD
+// API (Deepgram, OpenAI realtime, …) for low-latency + high quality — by conforming to LiveTranscribing
+// (feed audio, emit text) + a LiveEngine case; its API key/endpoint would come from Prefs in init.
+
+/// One caption source's transcription engine. `feed` is called off the audio thread; `onUpdate(text,
+/// isFinal)` reports a (possibly volatile) line; `onLocale` surfaces the active language for the UI.
+protocol LiveTranscribing: AnyObject {
+    func start()
+    func feed(_ buffer: AVAudioPCMBuffer)
+    func stop()
+}
+
+/// Selectable live engine. Extensible: add a case, a title, and a branch in `makeTranscriber`.
+enum LiveEngine: String, CaseIterable {
+    case apple, whisper
+    static var current: LiveEngine { LiveEngine(rawValue: Pref.d.string(forKey: Pref.liveEngine) ?? "") ?? .apple }
+    var title: String {
+        switch self {
+        case .apple:   return "Apple"
+        case .whisper: return "Whisper"
+        }
+    }
+}
+
+/// whisper.cpp live engine: accumulates fed audio into a 16 kHz mono segment, and every ~2 s re-runs
+/// `whisper-cli` on the current segment for a volatile caption line. A lightweight energy gate finalizes
+/// the line after ~1 s of silence (or a 12 s cap). Reuses the same whisper-cli + model as the saved
+/// transcript. Not on the real-time path — runs on its own queue. Tunables are named constants below.
+final class WhisperLiveTranscriber: LiveTranscribing {
+    private let label: String
+    private let locale: Locale
+    private let lang: String                    // whisper -l code (e.g. "ko"; "auto" if unknown)
+    private let onUpdate: (String, Bool) -> Void
+    private let onLocale: ((Locale) -> Void)?
+    private let cfg = EngineConfig.load()
+    private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+    private let wavURL = FileManager.default.temporaryDirectory.appendingPathComponent("macrec-live-\(UUID().uuidString).wav")
+    private let q = DispatchQueue(label: "macrec.whisperlive", qos: .userInitiated)
+    private let lock = NSLock()
+    private var converter: AVAudioConverter?
+    private var seg: [Float] = []               // current segment samples (16 kHz mono)
+    private var startedAt = 0.0                 // systemUptime when the segment began
+    private var lastVoiceAt = 0.0               // systemUptime of the last non-silent buffer
+    private var timer: DispatchSourceTimer?
+    private var running = false                 // a whisper-cli run is in flight
+    private var proc: Process?                  // the in-flight whisper-cli, so stop() can terminate it
+
+    // Tunables (kept named for future exposure as options).
+    private let tick = 1.0, minDur = 0.6, silenceGap = 0.8, maxDur = 8.0, maxWindow = 30.0
+    private let voiceRMS: Float = 0.006         // ~ -44 dBFS gate — permissive; only drops true silence
+    private var voicedSamples = 0               // above-threshold samples in the current segment
+    private let minVoicedSec = 0.2              // require this much real speech before running whisper
+
+    init(label: String, locale: Locale, onLocale: ((Locale) -> Void)? = nil,
+         onUpdate: @escaping (String, Bool) -> Void) {
+        self.label = label; self.locale = locale; self.onLocale = onLocale; self.onUpdate = onUpdate
+        self.lang = locale.language.languageCode?.identifier ?? "auto"
+    }
+
+    func start() {
+        onLocale?(locale)   // whisper uses the requested language directly; surface it in the title
+        let t = DispatchSource.makeTimerSource(queue: q)
+        t.schedule(deadline: .now() + tick, repeating: tick)
+        t.setEventHandler { [weak self] in self?.transcribeIfReady() }
+        t.resume(); timer = t
+        elog("whisperlive[\(label)]: started (lang=\(lang), model=\((cfg.whisperModel as NSString).lastPathComponent))")
+    }
+
+    func feed(_ buffer: AVAudioPCMBuffer) {
+        guard let conv = to16kMono(buffer), let ch = conv.floatChannelData?[0] else { return }
+        let n = Int(conv.frameLength); guard n > 0 else { return }
+        var sum: Float = 0; for i in 0..<n { sum += ch[i] * ch[i] }
+        let rms = (sum / Float(n)).squareRoot()
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        if seg.isEmpty { startedAt = now; voicedSamples = 0 }
+        seg.append(contentsOf: UnsafeBufferPointer(start: ch, count: n))
+        if rms > voiceRMS { lastVoiceAt = now; voicedSamples += n }
+        let cap = Int(fmt.sampleRate * maxWindow)
+        if seg.count > cap { seg.removeFirst(seg.count - cap) }
+        lock.unlock()
+    }
+
+    func stop() {
+        timer?.cancel(); timer = nil
+        lock.lock(); let p = proc; proc = nil; lock.unlock()
+        p?.terminate()   // kill any in-flight whisper-cli so it doesn't keep burning CPU / leak
+        q.async {   // runs after any in-flight transcribeIfReady() (serial queue) so the wav isn't recreated post-delete
+            self.lock.lock(); self.seg.removeAll(); self.running = false; self.lock.unlock()
+            try? FileManager.default.removeItem(at: self.wavURL)
+        }
+    }
+
+    /// Convert an incoming buffer (mic native / 48 kHz tap) to 16 kHz mono float.
+    private func to16kMono(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        if buffer.format == fmt { return buffer }
+        lock.lock()
+        if converter == nil || converter?.inputFormat != buffer.format { converter = AVAudioConverter(from: buffer.format, to: fmt) }
+        let c = converter; lock.unlock()
+        guard let c else { return nil }
+        let ratio = fmt.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: capacity) else { return nil }
+        var fed = false; var err: NSError?
+        c.convert(to: out, error: &err) { _, status in
+            if fed { status.pointee = .noDataNow; return nil }
+            fed = true; status.pointee = .haveData; return buffer
+        }
+        return (err == nil && out.frameLength > 0) ? out : nil
+    }
+
+    /// Timer handler (on `q`). Snapshots the segment, decides finalize vs volatile, runs whisper-cli.
+    private func transcribeIfReady() {
+        lock.lock()
+        if running { lock.unlock(); return }
+        let samples = seg, started = startedAt, lastVoice = lastVoiceAt, voiced = voicedSamples
+        lock.unlock()
+        let now = ProcessInfo.processInfo.systemUptime
+        let dur = Double(samples.count) / fmt.sampleRate
+        guard dur >= minDur else { return }
+        // Whisper hallucinates ("감사합니다", "Thank you"…) on silence — only run it once the segment holds
+        // enough real voice; otherwise drop the silence untranscribed.
+        if Double(voiced) / fmt.sampleRate < minVoicedSec {
+            lock.lock(); seg.removeAll(keepingCapacity: true); startedAt = 0; voicedSamples = 0; lock.unlock()
+            return
+        }
+        let finalize = (now - lastVoice > silenceGap) || (now - started > maxDur)
+        lock.lock(); running = true; lock.unlock()
+        let text = runWhisper(samples)
+        if !text.isEmpty { onUpdate(text, finalize) }
+        lock.lock()
+        if finalize { seg.removeAll(keepingCapacity: true); startedAt = 0; voicedSamples = 0 }
+        running = false
+        lock.unlock()
+    }
+
+    private func runWhisper(_ samples: [Float]) -> String {
+        guard FileManager.default.isExecutableFile(atPath: cfg.whisperCli),
+              FileManager.default.fileExists(atPath: cfg.whisperModel) else {
+            elog("whisperlive[\(label)]: whisper-cli or model missing (\(cfg.whisperCli))"); return ""
+        }
+        guard writeWav(samples) else { return "" }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: cfg.whisperCli)
+        // -nt: plain text (no timestamps); -bs 1: greedy for latency; half the cores to spare the engine.
+        p.arguments = ["-m", cfg.whisperModel, "-f", wavURL.path, "-l", lang, "-nt", "-np", "-sns",
+                       "-bs", "1", "-t", String(max(4, ProcessInfo.processInfo.activeProcessorCount - 2))]
+        let out = Pipe(); p.standardOutput = out
+        p.standardError = FileHandle.nullDevice   // discard stderr — draining a Pipe we never read can deadlock waitUntilExit()
+        lock.lock(); proc = p; lock.unlock()
+        do { try p.run() } catch { elog("whisperlive run: \(error)"); lock.lock(); proc = nil; lock.unlock(); return "" }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        lock.lock(); proc = nil; lock.unlock()
+        let raw = String(data: data, encoding: .utf8) ?? ""
+        let text = raw.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("[") }.joined(separator: " ")
+        if text.isEmpty || p.terminationStatus != 0 { elog("whisperlive[\(label)]: whisper exit \(p.terminationStatus), raw \(raw.count) chars → empty") }
+        return text
+    }
+
+    private func writeWav(_ samples: [Float]) -> Bool {
+        guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(samples.count)) else { return false }
+        buf.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { buf.floatChannelData![0].update(from: $0.baseAddress!, count: samples.count) }
+        let settings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000.0,
+            AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false]
+        do {
+            let file = try AVAudioFile(forWriting: wavURL, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+            try file.write(from: buf); return true
+        } catch { elog("whisperlive writeWav: \(error)"); return false }
+    }
+}
+
 /// Which speakers to transcribe for the live overlay. Each source runs its own on-device analyzer,
 /// so transcribing one instead of two roughly halves inference load → lower latency. Default is
 /// `.other` (the remote party / system audio): you already know what you said, and it's the cheaper
@@ -1852,6 +2109,18 @@ final class LiveTranslator {
 enum LiveSource: String {
     case both, other, me
     static var current: LiveSource { LiveSource(rawValue: Pref.d.string(forKey: Pref.liveSource) ?? "") ?? .other }
+}
+
+/// Option lists for the live-caption overlay's control bar. These settings live on the overlay itself
+/// (not the Settings window) so changes apply immediately. Index 0 of each is the default. Language
+/// names are endonyms (한국어, 日本語 …) for quick recognition; translation is prefixed with →.
+enum LiveCaptionOptions {
+    static let langValues   = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
+    static let langTitles   = ["System", "한국어", "日本語", "English", "中文", "Español", "Français", "Deutsch"]
+    static let sourceValues = ["other", "both", "me"]
+    static let sourceTitles = ["Them", "Both", "Me"]
+    static let transValues  = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
+    static let transTitles  = ["Off", "→한국어", "→日本語", "→English", "→中文", "→Español", "→Français", "→Deutsch"]
 }
 
 /// Owns the two per-source transcribers + optional translator + the floating caption window.
@@ -1862,12 +2131,19 @@ final class LiveCaptions {
     // lock guards the reference swap. LiveTranscriber.feed is itself thread-safe.
     private let srcLock = NSLock()
     private let feedQueue = DispatchQueue(label: "macrec.live.feed", qos: .userInitiated)
-    private var mic: LiveTranscriber?
-    private var sys: LiveTranscriber?
+    private var mic: (any LiveTranscribing)?
+    private var sys: (any LiveTranscribing)?
     private var translator: LiveTranslator?   // nil = no live translation
     private var window: LiveCaptionWindow?
     private var lines: [(speaker: String, text: String, translated: String?, final: Bool, time: Date)] = []
     private var mineLabel = ""   // label used for the mic track (for speaker coloring)
+    private var showLabels = true   // false in single-speaker modes (one voice → the label is redundant)
+    private var lastTranslateAt: [String: Double] = [:]   // per-speaker throttle for live translation
+    private let translateThrottle = 0.5
+    // Last-applied live config — so reconfigure() can no-op on unchanged values and avoid needless
+    // analyzer rebuilds (each rebuild re-pays the ~model warm-up).
+    private var curLocaleId = "", curEngine = "", curSource = "", curTranslateId = ""
+    private var engineGen = 0   // bumped on translator rebuild; a translate Task from an older gen is ignored
     private let maxLines = 12
     private(set) var active = false
 
@@ -1877,37 +2153,108 @@ final class LiveCaptions {
     func start() {
         guard !active else { return }
         active = true; lines = []; renderScheduled = false   // clear any coalescing state left by a prior session
-        // Caption language: the picker value ("" = system). Read directly so "" is respected
-        // (Pref.str treats "" as unset and would fall back to the default).
-        let capId = Pref.d.string(forKey: Pref.captionLang) ?? ""
-        let locale = capId.isEmpty ? Locale.current : Locale(identifier: capId)
-        let win = LiveCaptionWindow(onClose: { [weak self] in self?.stop() })
+        let win = LiveCaptionWindow(
+            onClose: { [weak self] in self?.stop() },
+            onReconfigure: { [weak self] in self?.reconfigure() },   // language / source / translate changed
+            onRestyle: { [weak self] in self?.render() })            // text size / timestamps changed
         window = win; win.show()
-        let (mine, theirs) = speakerLabels(forLanguage: locale.language.languageCode?.identifier)
-        mineLabel = mine
-        // Optional translation of finalized lines — skip if the target language == caption language.
-        let toId = Pref.d.string(forKey: Pref.translateTo) ?? ""
-        if !toId.isEmpty, Locale(identifier: toId).language.languageCode?.identifier != locale.language.languageCode?.identifier {
-            translator = LiveTranslator(source: locale.language, target: Locale.Language(identifier: toId))
-        }
-        // Which speakers to transcribe (perf tradeoff — one analyzer instead of two ~halves the load).
-        let mode = LiveSource.current
-        let onLocale: (Locale) -> Void = { [weak self] loc in
+        buildEngine()
+        elog("live: captions ON")
+    }
+
+    private typealias LiveCfg = (locale: Locale, engine: LiveEngine, source: LiveSource, translateId: String)
+
+    /// Snapshot the current live prefs.
+    private func liveConfig() -> LiveCfg {
+        let capId = Pref.d.string(forKey: Pref.captionLang) ?? ""   // "" = system
+        let locale = capId.isEmpty ? Locale.current : Locale(identifier: capId)
+        return (locale, LiveEngine.current, LiveSource.current, Pref.d.string(forKey: Pref.translateTo) ?? "")
+    }
+
+    /// Reports the resolved language into the overlay title.
+    private func makeOnLocale() -> (Locale) -> Void {
+        { [weak self] loc in
             let name = Locale.current.localizedString(forLanguageCode: loc.language.languageCode?.identifier ?? "")
                 ?? loc.identifier(.bcp47)
             DispatchQueue.main.async { self?.window?.setLanguage(name) }
         }
-        var m: LiveTranscriber?, s: LiveTranscriber?
-        if mode == .both || mode == .me {
-            m = LiveTranscriber(label: mine, locale: locale, onLocale: onLocale) { [weak self] t, f in self?.post(mine, t, f) }
+    }
+
+    /// (Re)build the translator (nil = off, or target == caption language).
+    private func rebuildTranslator(_ cfg: LiveCfg) {
+        engineGen &+= 1   // invalidate any in-flight translate Task started against the previous translator
+        translator = nil
+        if !cfg.translateId.isEmpty,
+           Locale(identifier: cfg.translateId).language.languageCode?.identifier != cfg.locale.language.languageCode?.identifier {
+            translator = LiveTranslator(source: cfg.locale.language, target: Locale.Language(identifier: cfg.translateId))
         }
-        if mode == .both || mode == .other {
-            // Let whichever transcriber the mic isn't already covering report the resolved language.
-            s = LiveTranscriber(label: theirs, locale: locale, onLocale: m == nil ? onLocale : nil) { [weak self] t, f in self?.post(theirs, t, f) }
+    }
+
+    /// Full build of the transcriber(s) + translator from current prefs (warms up the analyzer). Serves
+    /// both the first start and a locale/engine/source change; the window is reused across all of them.
+    private func buildEngine() {
+        let cfg = liveConfig()
+        window?.setPreparing()   // title shows "starting…" until the analyzer warms up (onLocale replaces it)
+        let (mine, theirs) = speakerLabels(forLanguage: cfg.locale.language.languageCode?.identifier)
+        mineLabel = mine
+        // A single speaker needs no label, so hide it (render then uses a neutral color).
+        showLabels = (cfg.source == .both)
+        rebuildTranslator(cfg)
+        let onLocale = makeOnLocale()
+        var m: (any LiveTranscribing)?, s: (any LiveTranscribing)?
+        if cfg.source == .both || cfg.source == .me {
+            m = makeTranscriber(label: mine, locale: cfg.locale, onLocale: onLocale) { [weak self] t, f in self?.post(mine, t, f) }
+        }
+        if cfg.source == .both || cfg.source == .other {
+            s = makeTranscriber(label: theirs, locale: cfg.locale, onLocale: m == nil ? onLocale : nil) { [weak self] t, f in self?.post(theirs, t, f) }
         }
         srcLock.lock(); mic = m; sys = s; srcLock.unlock()
         m?.start(); s?.start()
-        elog("live: captions ON (locale=\(locale.identifier), source=\(mode.rawValue))")
+        curLocaleId = cfg.locale.identifier; curEngine = cfg.engine.rawValue
+        curSource = cfg.source.rawValue; curTranslateId = cfg.translateId
+        elog("live: engine built (engine=\(cfg.engine.rawValue), locale=\(cfg.locale.identifier), source=\(cfg.source.rawValue), translate=\(cfg.translateId.isEmpty ? "off" : cfg.translateId))")
+    }
+
+    /// Build the configured engine for one source. Extensible: add a LiveEngine case + a branch here.
+    private func makeTranscriber(label: String, locale: Locale, onLocale: ((Locale) -> Void)?,
+                                 onUpdate: @escaping (String, Bool) -> Void) -> any LiveTranscribing {
+        switch LiveEngine.current {
+        case .whisper: return WhisperLiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
+        case .apple:   return LiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
+        }
+    }
+
+    /// Apply an overlay control-bar change. Keeps the transcript history; only rebuilds the analyzer
+    /// (which re-warms) when the locale/engine/source actually changed. Re-picking the active value is a
+    /// no-op, and a translate-only change swaps just the translator (instant, no warm-up).
+    private func reconfigure() {
+        guard active else { return }
+        let cfg = liveConfig()
+        let sameSources = cfg.locale.identifier == curLocaleId && cfg.engine.rawValue == curEngine && cfg.source.rawValue == curSource
+        let sameTranslate = cfg.translateId == curTranslateId
+        if sameSources && sameTranslate { return }   // nothing changed (e.g. re-picked the active language)
+        // Keep the transcript history on every change — the overlay filters what it SHOWS by source
+        // (Both→Me hides the other party's lines; switching back to Both reveals them again).
+        for i in lines.indices where !lines[i].final { lines[i].final = true }
+        // Caption language changed → remap kept lines' speaker labels so their label/color stay correct.
+        let (oldMine, oldTheirs) = speakerLabels(forLanguage: Locale(identifier: curLocaleId).language.languageCode?.identifier)
+        let (newMine, newTheirs) = speakerLabels(forLanguage: cfg.locale.language.languageCode?.identifier)
+        if oldMine != newMine || oldTheirs != newTheirs {
+            for i in lines.indices {
+                if lines[i].speaker == oldMine { lines[i].speaker = newMine }
+                else if lines[i].speaker == oldTheirs { lines[i].speaker = newTheirs }
+            }
+        }
+        if !sameSources {
+            srcLock.lock(); let m = mic, s = sys; mic = nil; sys = nil; srcLock.unlock()
+            m?.stop(); s?.stop()
+            buildEngine()   // rebuild (warms up); the existing captions stay on screen
+            elog("live: reconfigured (rebuild)")
+        } else {
+            rebuildTranslator(cfg); curTranslateId = cfg.translateId   // translate-only → instant
+            elog("live: reconfigured (translator only)")
+        }
+        renderScheduled = false; render()
     }
 
     func stop() {
@@ -1939,17 +2286,26 @@ final class LiveCaptions {
         }
         if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
         render()
-        // Translate finalized lines only (bounded rate); fill it in when it returns.
-        if final, let translator, !text.isEmpty {
-            Task { [weak self] in
-                guard let out = await translator.translate(text) else { return }
-                await MainActor.run { self?.setTranslation(speaker, text, out) }
+        // Translate the live text too (not just finals), throttled per speaker so it streams along.
+        if let translator, !text.isEmpty {
+            let now = ProcessInfo.processInfo.systemUptime
+            if final || now - (lastTranslateAt[speaker] ?? 0) >= translateThrottle {
+                lastTranslateAt[speaker] = now
+                let gen = engineGen
+                Task { [weak self] in
+                    guard let out = await translator.translate(text) else { return }
+                    await MainActor.run { guard let self, self.engineGen == gen else { return }   // drop stale-generation results
+                        self.setTranslation(speaker, text, out) }
+                }
             }
         }
     }
     private func setTranslation(_ speaker: String, _ original: String, _ translated: String) {
-        // Update the most recent line matching this speaker + original text.
-        guard active, let i = lines.lastIndex(where: { $0.speaker == speaker && $0.text == original }) else { return }
+        guard active else { return }
+        // Prefer the exact source line; else the speaker's current line (volatile text has since moved on).
+        let i = lines.lastIndex(where: { $0.speaker == speaker && $0.text == original })
+            ?? lines.lastIndex(where: { $0.speaker == speaker && !$0.final })   // else the current in-progress line
+        guard let i else { return }
         lines[i].translated = translated
         render()
     }
@@ -1965,39 +2321,73 @@ final class LiveCaptions {
             guard self.active else { return }
             let showTS = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true)
             let fontSize = CGFloat(Pref.dbl(Pref.liveFontSize, "MR_LIVE_FONT_SIZE", 14))
-            self.window?.render(self.lines.map { (speaker: $0.speaker, text: $0.text, translated: $0.translated,
-                                        time: $0.time, mine: $0.speaker == self.mineLabel) },
-                                showTimestamps: showTS, fontSize: fontSize)
+            // Show only the lines matching the current source (Both = all; Me = mine; Them = the rest).
+            let mode = LiveSource(rawValue: self.curSource) ?? .both
+            let visible = self.lines.filter { l in
+                switch mode {
+                case .both:  return true
+                case .me:    return l.speaker == self.mineLabel
+                case .other: return l.speaker != self.mineLabel
+                }
+            }
+            self.window?.render(visible.map { (speaker: $0.speaker, text: $0.text, translated: $0.translated,
+                                        time: $0.time, mine: $0.speaker == self.mineLabel, inProgress: !$0.final) },
+                                showTimestamps: showTS, fontSize: fontSize, showLabels: self.showLabels)
         }
     }
 }
 
-/// Floating always-on-top panel showing the live captions — captions only; every control (language,
-/// translate, font size, opacity, timestamps) lives in Settings, so the overlay stays clean.
+/// Floating always-on-top panel showing the live captions. A compact control bar along the top holds
+/// the live settings (language, who to transcribe, translation, text size, timestamps) so changes take
+/// effect immediately; opacity is the drag slider along the bottom. Nothing lives in the Settings window.
 @available(macOS 26, *)
 final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     private let panel: NSPanel
     private let textView = NSTextView()
     private let onClose: () -> Void
+    private let onReconfigure: () -> Void   // language / source / translation changed → rebuild the engine
+    private let onRestyle: () -> Void        // text size / timestamps changed → just re-render
     private var suppressCloseCallback = false
+    private let langPopup = NSPopUpButton(), sourcePopup = NSPopUpButton(), translatePopup = NSPopUpButton()
+    private let tsToggle = NSButton(checkboxWithTitle: "Time", target: nil, action: nil)
+    private static let titleIcon = "🎙️"           // beautifies the "macrec live" title
 
-    init(onClose: @escaping () -> Void) {
-        self.onClose = onClose
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 150),
+    init(onClose: @escaping () -> Void, onReconfigure: @escaping () -> Void, onRestyle: @escaping () -> Void) {
+        self.onClose = onClose; self.onReconfigure = onReconfigure; self.onRestyle = onRestyle
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: 150),
                         styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         super.init()
-        panel.title = "macrec live"
-        panel.alphaValue = CGFloat(min(1.0, max(0.3, Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 0.92))))
+        panel.title = "\(Self.titleIcon) macrec live"
+        panel.alphaValue = CGFloat(min(1.0, max(0.3, Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 1.0))))
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.delegate = self
+
+        // Controls live in the titlebar (a full-width accessory strip just below it) so they read as
+        // window chrome, not content — the caption area stays clean. Each control applies immediately.
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.layoutAttribute = .bottom
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 680, height: 32))
+        host.autoresizingMask = [.width]
+        let bar = buildControlBar()
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(bar)
+        NSLayoutConstraint.activate([
+            host.heightAnchor.constraint(equalToConstant: 32),
+            bar.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 8),
+            bar.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -8),
+            bar.centerYAnchor.constraint(equalTo: host.centerYAnchor),
+        ])
+        accessory.view = host
+        panel.addTitlebarAccessoryViewController(accessory)
+
+        // --- captions (scrollable text) fill the whole content (opacity moved up to the control bar) ---
         let content = panel.contentView!
-        let barH: CGFloat = 22   // slim bottom strip for the opacity drag slider
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: barH, width: content.bounds.width, height: content.bounds.height - barH))
+        let scroll = NSScrollView(frame: content.bounds)
         scroll.autoresizingMask = [.width, .height]
         scroll.hasVerticalScroller = true
         scroll.scrollerStyle = .overlay        // auto-hiding overlay scroller (no permanent bar)
@@ -2018,14 +2408,81 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         textView.textContainerInset = NSSize(width: 10, height: 8)
         scroll.documentView = textView
         content.addSubview(scroll)
-        // Opacity: a drag slider along the bottom (live translucency; persists to Prefs).
-        let slider = NSSlider(value: Double(panel.alphaValue), minValue: 0.3, maxValue: 1.0,
-                              target: self, action: #selector(opacityChanged(_:)))
-        slider.frame = NSRect(x: 10, y: 2, width: content.bounds.width - 20, height: 16)
-        slider.autoresizingMask = [.width, .maxYMargin]
-        slider.controlSize = .mini
-        slider.toolTip = "Overlay opacity"
-        content.addSubview(slider)
+    }
+
+    /// Build the top control bar. Each control writes its Pref and fires the matching callback so the
+    /// change is live: engine rebuild for language/source/translation, re-render for text size/timestamps.
+    private func buildControlBar() -> NSStackView {
+        func fill(_ p: NSPopUpButton, _ titles: [String], _ sel: Int, _ tip: String, _ action: Selector) {
+            p.addItems(withTitles: titles); p.selectItem(at: sel)
+            p.controlSize = .small; p.font = .systemFont(ofSize: 11); p.toolTip = tip
+            p.target = self; p.action = action
+            p.setContentHuggingPriority(.required, for: .horizontal)
+        }
+        let O = LiveCaptionOptions.self
+        fill(langPopup, O.langTitles, idx(Pref.d.string(forKey: Pref.captionLang) ?? "", O.langValues),
+             "Caption language", #selector(langChanged(_:)))
+        fill(sourcePopup, O.sourceTitles, idx(LiveSource.current.rawValue, O.sourceValues),
+             "Who to transcribe (fewer = faster)", #selector(sourceChanged(_:)))
+        fill(translatePopup, O.transTitles, idx(Pref.d.string(forKey: Pref.translateTo) ?? "", O.transValues),
+             "Translate captions to…", #selector(translateChanged(_:)))
+        let aMinus = NSButton(title: "A－", target: self, action: #selector(fontSmaller))
+        let aPlus  = NSButton(title: "A＋", target: self, action: #selector(fontBigger))
+        for b in [aMinus, aPlus] { b.controlSize = .small; b.bezelStyle = .roundRect; b.font = .systemFont(ofSize: 11) }
+        aMinus.toolTip = "Smaller text"; aPlus.toolTip = "Bigger text"
+        tsToggle.controlSize = .small; tsToggle.font = .systemFont(ofSize: 11); tsToggle.toolTip = "Show timestamps"
+        tsToggle.state = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true) ? .on : .off
+        tsToggle.target = self; tsToggle.action = #selector(tsToggled(_:))
+        // Engine select box — Apple (fast) vs Whisper (accurate / better Korean).
+        let enginePopup = NSPopUpButton()
+        fill(enginePopup, LiveEngine.allCases.map { $0.title }, LiveEngine.allCases.firstIndex(of: .current) ?? 0,
+             "Engine — Apple: fast · Whisper: accurate (better Korean)", #selector(engineChanged(_:)))
+        // Opacity drag slider, now on the top bar (was a bottom strip).
+        let opacity = NSSlider(value: Double(panel.alphaValue), minValue: 0.3, maxValue: 1.0,
+                               target: self, action: #selector(opacityChanged(_:)))
+        opacity.controlSize = .mini; opacity.toolTip = "Overlay opacity"
+        opacity.translatesAutoresizingMaskIntoConstraints = false
+        opacity.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        // A small leading icon per select box says what it controls, without text-label clutter.
+        func icon(_ name: String, _ tip: String) -> NSImageView {
+            let iv = NSImageView(image: NSImage(systemSymbolName: name, accessibilityDescription: tip) ?? NSImage())
+            iv.symbolConfiguration = .init(pointSize: 12, weight: .regular)
+            iv.contentTintColor = .secondaryLabelColor; iv.toolTip = tip
+            iv.setContentHuggingPriority(.required, for: .horizontal); return iv
+        }
+        let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        let bar = NSStackView(views: [
+            icon("cpu", "Engine"), enginePopup,
+            icon("globe", "Caption language"), langPopup,
+            icon("person.2", "Who to transcribe"), sourcePopup,
+            icon("character.bubble", "Translate to"), translatePopup,
+            spacer, aMinus, aPlus, tsToggle, opacity])
+        bar.orientation = .horizontal; bar.alignment = .centerY; bar.spacing = 5; bar.distribution = .fill
+        return bar
+    }
+
+    private func idx<T: Equatable>(_ v: T, _ arr: [T]) -> Int { arr.firstIndex(of: v) ?? 0 }
+
+    @objc private func langChanged(_ s: NSPopUpButton) {
+        Pref.d.set(LiveCaptionOptions.langValues[max(0, s.indexOfSelectedItem)], forKey: Pref.captionLang); onReconfigure()
+    }
+    @objc private func sourceChanged(_ s: NSPopUpButton) {
+        Pref.d.set(LiveCaptionOptions.sourceValues[max(0, s.indexOfSelectedItem)], forKey: Pref.liveSource); onReconfigure()
+    }
+    @objc private func translateChanged(_ s: NSPopUpButton) {
+        Pref.d.set(LiveCaptionOptions.transValues[max(0, s.indexOfSelectedItem)], forKey: Pref.translateTo); onReconfigure()
+    }
+    @objc private func fontSmaller() { adjustFont(-2) }
+    @objc private func fontBigger()  { adjustFont(+2) }
+    private func adjustFont(_ delta: CGFloat) {
+        let next = min(28, max(11, CGFloat(Pref.dbl(Pref.liveFontSize, "MR_LIVE_FONT_SIZE", 14)) + delta))
+        Pref.d.set(Double(next), forKey: Pref.liveFontSize); onRestyle()
+    }
+    @objc private func tsToggled(_ s: NSButton) { Pref.d.set(s.state == .on, forKey: Pref.liveTimestamps); onRestyle() }
+    @objc private func engineChanged(_ s: NSPopUpButton) {
+        let engines = LiveEngine.allCases
+        let e = engines[min(max(0, s.indexOfSelectedItem), engines.count - 1)]
+        Pref.d.set(e.rawValue, forKey: Pref.liveEngine); onReconfigure()
     }
 
     @objc private func opacityChanged(_ s: NSSlider) {
@@ -2041,39 +2498,62 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     }
     func close() { suppressCloseCallback = true; panel.close() }
 
-    /// Show the active transcription language in the title bar (human name, e.g. "macrec live · Korean").
-    func setLanguage(_ name: String) { panel.title = "macrec live · \(name)" }
+    /// Show the active transcription language in the title bar (human name, e.g. "🎙️ macrec live · Korean").
+    func setLanguage(_ name: String) { panel.title = "\(Self.titleIcon) macrec live · \(name)" }
+    /// Shown while the analyzer warms up (model/ANE load) — the overlay is otherwise blank for ~10s.
+    func setPreparing() { panel.title = "\(Self.titleIcon) macrec live · starting…" }
 
     private let tsFormatter: DateFormatter = {
         let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "HH:mm:ss"; return f
     }()
 
-    /// Render for glanceable reading: each speaker gets a distinct tint (mic = teal, system = orange —
-    /// deliberately not blue) on a bold label + the text, a subtle timestamp, and a hanging indent so
-    /// wrapped lines align under the text instead of sliding under the timestamp/label.
-    func render(_ lines: [(speaker: String, text: String, translated: String?, time: Date, mine: Bool)],
-                showTimestamps: Bool, fontSize: CGFloat) {
+    /// Render for glanceable reading. With both speakers each gets a distinct tint (teal = you, orange =
+    /// them) on a bold label; a single speaker drops the label and uses the primary color. All text starts
+    /// at one shared column via a tab stop, and wrapped lines hang-indent to that same column — so line 2+
+    /// aligns flush under the text regardless of the timestamp/label prefix width.
+    func render(_ lines: [(speaker: String, text: String, translated: String?, time: Date, mine: Bool, inProgress: Bool)],
+                showTimestamps: Bool, fontSize: CGFloat, showLabels: Bool) {
+        let tsFont = NSFont.monospacedDigitSystemFont(ofSize: max(9, fontSize - 3), weight: .regular)
+        let labelFont = NSFont.boldSystemFont(ofSize: fontSize)
+        let textFont = NSFont.systemFont(ofSize: fontSize)
+        let transFont = NSFont.systemFont(ofSize: fontSize)   // same size as the caption — translation is the point
+        func w(_ s: String, _ f: NSFont) -> CGFloat { (s as NSString).size(withAttributes: [.font: f]).width }
+        // Shared text column = timestamp width (constant, monospaced) + widest speaker label + a gap.
+        let tsW = showTimestamps ? w("00:00:00  ", tsFont) : 0
+        let labelW = showLabels ? (lines.map { w("\($0.speaker)  ", labelFont) }.max() ?? 0) : 0
+        let hasPrefix = showTimestamps || showLabels
+        let col = hasPrefix ? tsW + labelW + 8 : 0
+        let tsBaseline = showTimestamps ? (textFont.capHeight - tsFont.capHeight) / 2 : 0   // vertically center the smaller timestamp
         let para = NSMutableParagraphStyle()
-        para.headIndent = fontSize * 2.4       // wrapped lines hang-indent (don't run under the prefix)
-        para.lineHeightMultiple = 1.1
-        para.paragraphSpacing = 4
+        para.firstLineHeadIndent = 0; para.headIndent = col
+        para.lineHeightMultiple = 1.1; para.paragraphSpacing = 4
+        if hasPrefix { para.tabStops = [NSTextTab(textAlignment: .left, location: col)]; para.defaultTabInterval = col }
+        let trans = NSMutableParagraphStyle()
+        trans.firstLineHeadIndent = col; trans.headIndent = col + w("↳ ", transFont); trans.lineHeightMultiple = 1.1
         let out = NSMutableAttributedString()
         for (i, l) in lines.enumerated() {
             if i > 0 { out.append(NSAttributedString(string: "\n")) }
-            let color: NSColor = l.mine ? .systemTeal : .systemOrange
+            let tint: NSColor = l.mine ? .systemTeal : .systemOrange   // colors the LABEL only (both-speaker mode)
             if showTimestamps {
                 out.append(NSAttributedString(string: "\(tsFormatter.string(from: l.time))  ", attributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: max(9, fontSize - 3), weight: .regular),
-                    .foregroundColor: NSColor.tertiaryLabelColor, .paragraphStyle: para]))
+                    .font: tsFont, .foregroundColor: NSColor.secondaryLabelColor, .baselineOffset: tsBaseline, .paragraphStyle: para]))
             }
-            out.append(NSAttributedString(string: "\(l.speaker)  ", attributes: [
-                .font: NSFont.boldSystemFont(ofSize: fontSize), .foregroundColor: color, .paragraphStyle: para]))
-            out.append(NSAttributedString(string: l.text, attributes: [
-                .font: NSFont.systemFont(ofSize: fontSize), .foregroundColor: color, .paragraphStyle: para]))
+            if showLabels {
+                out.append(NSAttributedString(string: "\(l.speaker)  ", attributes: [
+                    .font: labelFont, .foregroundColor: tint, .paragraphStyle: para]))
+            }
+            if hasPrefix { out.append(NSAttributedString(string: "\t", attributes: [.font: textFont, .paragraphStyle: para])) }
+            out.append(NSAttributedString(string: l.text, attributes: [   // text stays neutral like single-speaker mode
+                .font: textFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: para]))
+            if l.inProgress {   // still transcribing this line → typing indicator inside the text
+                out.append(NSAttributedString(string: (l.text.isEmpty ? "…" : " …"), attributes: [
+                    .font: textFont, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
+            }
             if let t = l.translated, !t.isEmpty {
-                out.append(NSAttributedString(string: "\n     ↳ \(t)", attributes: [
-                    .font: NSFont.systemFont(ofSize: max(11, fontSize - 1)),
-                    .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
+                out.append(NSAttributedString(string: "\n↳ ", attributes: [
+                    .font: transFont, .foregroundColor: NSColor.tertiaryLabelColor, .paragraphStyle: trans]))
+                out.append(NSAttributedString(string: t, attributes: [   // readable, but a touch dimmer than the original → clear hierarchy
+                    .font: transFont, .foregroundColor: NSColor.labelColor.withAlphaComponent(0.8), .paragraphStyle: trans]))
             }
         }
         textView.textStorage?.setAttributedString(out)
@@ -2120,11 +2600,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         LoginItem.autoEnableOnceIfDistributed()   // distributed app: enable 24/7 autostart on first run
         startEngine()
         installStopHandler { [weak self] in
-            if let eng = self?.engine {
-                let s = DispatchSemaphore(value: 0)
-                Task { await eng.stop(); s.signal() }
-                _ = s.wait(timeout: .now() + 15)
-            }
+            self?.stopEngineSync()
             DispatchQueue.main.async { NSApp.terminate(nil) }
         }
     }
@@ -2140,8 +2616,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .withSymbolConfiguration(cfg)
         img?.isTemplate = true
         statusItem.button?.image = img
-        statusItem.length = 30   // fixed width — our item won't reflow as system indicators come/go
-        elog("icon set (recording=\(recording)), statusItem.length=\(statusItem.length)")
+        // Hug the glyph's real width (+ a hair) so there's no wide L/R slack — WITHOUT touching pointSize
+        // or imagePosition (fixed length keeps the vertical centering that variableLength/imageOnly broke).
+        let glyphW = img?.size.width ?? 22
+        statusItem.length = ceil(glyphW) + 4
+        elog("icon set (recording=\(recording)), glyphW=\(glyphW), length=\(statusItem.length)")
     }
 
     private func item(_ title: String, _ sel: Selector, _ key: String = "", symbol: String = "") -> NSMenuItem {
@@ -2356,14 +2835,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ])
     }
 
-    @objc private func quit() {
-        if let eng = engine {
-            let s = DispatchSemaphore(value: 0)
-            Task { await eng.stop(); s.signal() }
-            _ = s.wait(timeout: .now() + 15)
-        }
-        NSApp.terminate(nil)
+    /// Stop the engine (→ destroys the Core Audio process tap + aggregate device) synchronously, once.
+    /// A leaked tap can wedge coreaudiod ("no sound until killall coreaudiod"), so run it on EVERY
+    /// termination path: menu Quit, SIGTERM/kickstart, and logout/shutdown (applicationWillTerminate).
+    private func stopEngineSync() {
+        guard let eng = engine else { return }
+        engine = nil   // idempotent — later callers see nil and skip (no double-stop)
+        let s = DispatchSemaphore(value: 0)
+        Task { await eng.stop(); s.signal() }
+        _ = s.wait(timeout: .now() + 15)
     }
+
+    func applicationWillTerminate(_ notification: Notification) { stopEngineSync() }
+
+    @objc private func quit() { stopEngineSync(); NSApp.terminate(nil) }
 }
 
 var appController: AppController?   // retained for process lifetime
