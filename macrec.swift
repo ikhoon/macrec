@@ -1770,13 +1770,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             grid.translatesAutoresizingMaskIntoConstraints = false
             grid.rowSpacing = 9; grid.columnSpacing = 18
             grid.column(at: 0).xPlacement = .trailing
-            for r in headers {
+            for r in headers where rows.indices.contains(r) {   // row-index typos must not crash Settings
                 grid.mergeCells(inHorizontalRange: NSRange(location: 0, length: 2),
                                 verticalRange: NSRange(location: r, length: 1))
                 grid.cell(atColumnIndex: 0, rowIndex: r).xPlacement = .leading
                 if r > 0 { grid.row(at: r).topPadding = 14 }
             }
-            for r in notes { grid.row(at: r).topPadding = -5 }
+            for r in notes where rows.indices.contains(r) { grid.row(at: r).topPadding = -5 }
             let pane = NSView(); pane.addSubview(grid)
             NSLayoutConstraint.activate([
                 grid.topAnchor.constraint(equalTo: pane.topAnchor, constant: 20),
@@ -3419,15 +3419,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Live input meter — only updates while the menu is open (cheap, and answers "is it working?").
     func menuWillOpen(_ menu: NSMenu) {
-        // tray-diag (local build only): the menu anchors to the status button's WINDOW — if it opens
-        // detached (screen edge), this frame is the evidence.
-        if let win = statusItem.button?.window {
-            let screens = NSScreen.screens.map { "(\(Int($0.frame.minX)),\(Int($0.frame.minY)) \(Int($0.frame.width))×\(Int($0.frame.height)))" }.joined(separator: " ")
-            elog("tray-diag open: btnWin=\(NSStringFromRect(win.frame)) onScreen=\(NSStringFromRect(win.screen?.frame ?? .zero)) mouse=\(NSStringFromPoint(NSEvent.mouseLocation)) len=\(statusItem.length) vis=\(statusItem.isVisible) screens=\(screens)")
-        }
-        if FileManager.default.fileExists(atPath: "/tmp/macrec-tray-probe") {
-            try? FileManager.default.removeItem(atPath: "/tmp/macrec-tray-probe")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { menu.cancelTracking() }
+        // Opt-in tray diagnostics (`defaults write com.ikhoon.macrec.prefs trayDebug -bool true`): the
+        // menu anchors to the status button's WINDOW — if it ever opens detached (screen edge, the
+        // reported multi-display bug), this frame is the evidence. The probe file additionally lets a
+        // remote diagnostic open+auto-close the menu (`touch /tmp/macrec-tray-probe && open -a macrec`).
+        if Pref.bool("trayDebug", "MR_TRAY_DEBUG", false) {
+            if let win = statusItem.button?.window {
+                let screens = NSScreen.screens.map { "(\(Int($0.frame.minX)),\(Int($0.frame.minY)) \(Int($0.frame.width))×\(Int($0.frame.height)))" }.joined(separator: " ")
+                elog("tray-diag open: btnWin=\(NSStringFromRect(win.frame)) onScreen=\(NSStringFromRect(win.screen?.frame ?? .zero)) mouse=\(NSStringFromPoint(NSEvent.mouseLocation)) len=\(statusItem.length) vis=\(statusItem.isVisible) screens=\(screens)")
+            }
+            if FileManager.default.fileExists(atPath: "/tmp/macrec-tray-probe") {
+                try? FileManager.default.removeItem(atPath: "/tmp/macrec-tray-probe")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { menu.cancelTracking() }
+            }
         }
         updateLevels()
         // Reflect the live-captions state in case it was turned off by closing the floating panel.
