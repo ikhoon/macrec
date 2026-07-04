@@ -349,6 +349,7 @@ final class EchoCanceller {
         micBuf.removeAll(keepingCapacity: true)
         lastMicNs = 0
         anchored = false; winMinDepth = .max; winProcessed = 0
+        dbgMicE = 0; dbgOutE = 0   // ERLE must reflect only the CURRENT stream (metric guides tuning)
         if let st { speex_echo_state_reset(st) }
         // The preprocessor has no reset API — recreate so its noise/echo estimates don't span streams.
         if let pp { speex_preprocess_state_destroy(pp); self.pp = nil }
