@@ -1870,12 +1870,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             fieldCaption("OpenAI-compatible gateway / corporate proxy. Leave empty for api.openai.com."), // 8
         ], headers: [0, 1, 4], notes: [3, 6, 8]))
         tabs.addTabViewItem(tab("Storage", [
-            row("", keepAudioBtn),
-            row("Keep audio for:", audioRetPopup),
-            row("Keep transcripts for:", txtRetPopup),
-            row("Save transcripts to:", dirStack),
-            row("Save audio to:", audioStack),
-        ]))
+            sectionHeader("Transcripts"),          // 0
+            row("Keep for:", txtRetPopup),         // 1
+            row("Save to:", dirStack),             // 2
+            sectionHeader("Audio"),                // 3
+            row("", keepAudioBtn),                 // 4
+            row("Keep for:", audioRetPopup),       // 5
+            row("Save to:", audioStack),           // 6
+        ], headers: [0, 3]))
         tabs.addTabViewItem(tab("General", [
             row("", loginBtn),
         ]))
