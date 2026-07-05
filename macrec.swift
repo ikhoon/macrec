@@ -1770,8 +1770,13 @@ func runPostProcessCommand(_ command: String, completion: ((Int32) -> Void)? = n
 
 // MARK: - settings window (NSGridView form, persists to UserDefaults)
 
+/// Scroll-document container whose origin is the TOP (AppKit views are bottom-up by default) —
+/// forms in a scroll view should start at the top and grow downward.
+final class FlippedDocView: NSView { override var isFlipped: Bool { true } }
+
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let onSave: () -> Void
+    private(set) var tabsForTest: NSTabView?   // selftest hook: every pane must host its grid in a scroll view
     private let segPopup = NSPopUpButton(), langPopup = NSPopUpButton()
     private let modelPopup = NSPopUpButton()
     private let audioRetPopup = NSPopUpButton(), txtRetPopup = NSPopUpButton()
@@ -1896,17 +1901,38 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 if r > 0 { grid.row(at: r).topPadding = 14 }
             }
             for r in notes where rows.indices.contains(r) { grid.row(at: r).topPadding = -5 }
-            let pane = NSView(); pane.addSubview(grid)
+            // The grid lives in a SCROLLABLE pane: a tab taller than the window must scroll, never clip
+            // (regression: the Post-process rows sat unreachable below the window edge).
+            let doc = FlippedDocView()   // flipped so the form starts at the TOP of the scroll area
+            doc.translatesAutoresizingMaskIntoConstraints = false
+            doc.addSubview(grid)
+            let scroll = NSScrollView()
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            scroll.hasVerticalScroller = true
+            scroll.scrollerStyle = .overlay
+            scroll.autohidesScrollers = true
+            scroll.drawsBackground = false
+            scroll.documentView = doc
+            let pane = NSView(); pane.addSubview(scroll)
             NSLayoutConstraint.activate([
-                grid.topAnchor.constraint(equalTo: pane.topAnchor, constant: 20),
-                grid.centerXAnchor.constraint(equalTo: pane.centerXAnchor),
-                grid.leadingAnchor.constraint(greaterThanOrEqualTo: pane.leadingAnchor, constant: 24),
+                scroll.topAnchor.constraint(equalTo: pane.topAnchor),
+                scroll.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+                scroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+                scroll.bottomAnchor.constraint(equalTo: pane.bottomAnchor),
+                doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+                doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+                doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+                grid.topAnchor.constraint(equalTo: doc.topAnchor, constant: 20),
+                grid.centerXAnchor.constraint(equalTo: doc.centerXAnchor),
+                grid.leadingAnchor.constraint(greaterThanOrEqualTo: doc.leadingAnchor, constant: 24),
+                grid.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -20),   // content sets doc height → scrolls
             ])
             let item = NSTabViewItem(); item.label = title; item.view = pane
             return item
         }
 
         let tabs = NSTabView(); tabs.translatesAutoresizingMaskIntoConstraints = false
+        tabsForTest = tabs
         tabs.focusRingType = .none   // clicking a tab otherwise shows a blue focus ring on top of the tab highlight ("double blue")
         tabs.addTabViewItem(tab("Recording", [
             row("Segment length (on the hour):", segPopup),
@@ -1924,20 +1950,24 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             fieldCaption("The spoken language whisper transcribes."),                             // 3
             row("Transcript file language:", transcriptLangPopup),                                // 4
             fieldCaption("Headings and labels of the saved markdown file (not the speech)."),     // 5
-            sectionHeader("Post-process"),                                                        // 6
-            row("Mode:", ppModePopup),                                                            // 7
+        ], notes: [3, 5]))
+        tabs.addTabViewItem(tab("Post-process", [
+            sectionNote("Runs after each hourly transcript is saved."),                           // 0
+            row("Mode:", ppModePopup),                                                            // 1
             fieldCaption("Automatic summary is built in — pick who writes it; or take full "
-                       + "control with a custom command."),                                       // 8
-            row("Summarize with:", runnerPopup),                                                  // 9
-            row("Prompt:", promptField),                                                          // 10
+                       + "control with a custom command."),                                       // 2
+            sectionHeader("Automatic summary"),                                                   // 3
+            row("Summarize with:", runnerPopup),                                                  // 4
+            row("Prompt:", promptField),                                                          // 5
             fieldCaption("Default asks for key points, decisions, and action items — answered "
-                       + "in the transcript's language."),                                        // 11
-            row("Save summary to:", summaryOutField),                                             // 12
-            fieldCaption("Folder for <name>.summary.md. Empty = next to the transcript."),        // 13
-            row("Custom command:", postProcessField),                                             // 14
+                       + "in the transcript's language."),                                        // 6
+            row("Save summary to:", summaryOutField),                                             // 7
+            fieldCaption("Folder for <name>.summary.md. Empty = next to the transcript."),        // 8
+            sectionHeader("Custom command"),                                                      // 9
+            row("Command:", postProcessField),                                                    // 10
             fieldCaption("Freeform: runs in a login shell with the transcript path appended "
-                       + "as the last argument."),                                                // 15
-        ], headers: [6], notes: [3, 5, 8, 11, 13, 15]))
+                       + "as the last argument."),                                                // 11
+        ], headers: [0, 3, 9], notes: [2, 6, 8, 11]))
         tabs.addTabViewItem(tab("Titling", [
             row("", calBtn),
             row("Calendars:", calListCell),
@@ -4122,6 +4152,20 @@ struct Main {
             runPostProcessCommand("   ") { _ in fired = true }
             Thread.sleep(forTimeInterval: 0.2)
             check("post-process: empty command is a no-op", !fired)
+            // Settings layout regression (user-reported): a tab taller than the window CLIPPED its rows
+            // (Post-process settings were unreachable). Every pane must host its grid in a scroll view,
+            // and Post-process must be its own tab. Headless: builds the real form, no window shown.
+            let sw = SettingsWindowController(onSave: {})
+            if let tv = sw.tabsForTest {
+                let allScroll = tv.tabViewItems.allSatisfy { item in
+                    item.view?.subviews.contains { ($0 as? NSScrollView)?.documentView != nil } ?? false
+                }
+                check("settings: every tab pane scrolls (rows can never be clipped away)", allScroll)
+                check("settings: Post-process is its own tab",
+                      tv.tabViewItems.contains { $0.label == "Post-process" })
+            } else {
+                check("settings: tabs built for inspection", false)
+            }
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
             exit(fails == 0 ? 0 : 1)
         }
