@@ -1833,6 +1833,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let deepgramKeyField = NSSecureTextField()   // cloud live engines — the only off-device features
     private let openaiKeyField = NSSecureTextField()
     private let openaiBaseField = NSTextField()   // OpenAI-compatible proxy/gateway base URL ("" = official)
+    private let gladiaKeyField = NSSecureTextField()
     private let postProcessField = NSTextField()  // freeform post-process command (shell mode)
     private let ppModePopup = NSPopUpButton()     // Off / Automatic summary (built-in) / Custom command
     private let ppModeValues = ["off", "summary", "shell"], ppModeTitles = ["Off", "Automatic summary", "Custom command"]
@@ -1885,7 +1886,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         transcriptLangPopup.addItems(withTitles: tLangTitles)
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
-        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField, postProcessField] { f.translatesAutoresizingMaskIntoConstraints = false }
+        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField, gladiaKeyField, postProcessField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
         dirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
         audioDirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
@@ -1896,6 +1897,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         openaiKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         openaiKeyField.placeholderString = "sk-…"
         openaiBaseField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        gladiaKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        gladiaKeyField.placeholderString = "Gladia API key"
         postProcessField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         postProcessField.placeholderString = "~/bin/my-pipeline.sh"
         summaryOutField.translatesAutoresizingMaskIntoConstraints = false
@@ -2076,7 +2079,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             fieldCaption("platform.openai.com — or a key your gateway accepts (gpt-4o-transcribe)."), // 6
             row("Base URL:", openaiBaseField),                                                       // 7
             fieldCaption("OpenAI-compatible gateway / corporate proxy. Leave empty for api.openai.com."), // 8
-        ], headers: [0, 1, 4], notes: [3, 6, 8]))
+            sectionHeader("Gladia", symbol: "waveform.circle"),                                      // 9
+            row("API key:", gladiaKeyField),                                                         // 10
+            fieldCaption("app.gladia.io — broad language coverage incl. Korean streaming."),         // 11
+        ], headers: [0, 1, 4, 9], notes: [3, 6, 8, 11]))
         tabs.addTabViewItem(tab("Storage", [
             sectionHeader("Transcripts", symbol: "doc.text"),          // 0
             row("Keep for:", txtRetPopup),         // 1
@@ -2195,6 +2201,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
         deepgramKeyField.stringValue = DeepgramLiveTranscriber.storedKey ?? ""   // migrates legacy prefs too
         openaiKeyField.stringValue = OpenAILiveTranscriber.storedKey ?? ""
+        gladiaKeyField.stringValue = GladiaLiveTranscriber.storedKey ?? ""
         openaiBaseField.stringValue = OpenAILiveTranscriber.configuredBase   // explicit save (even "") beats env
         postProcessField.stringValue = Pref.postProcessCommand               // same explicit-save semantics
         ppModePopup.selectItem(at: idx(Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"), ppModeValues))
@@ -2254,7 +2261,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         // Keychain first — if a credential write fails, abort BEFORE touching any other setting so
         // the user isn't left with a half-saved state (and no key is silently lost). All-or-nothing:
         // keys saved earlier in the loop are rolled back (best effort) on a later failure.
-        let creds = [("deepgram", deepgramKeyField, "Deepgram"), ("openai", openaiKeyField, "OpenAI")]
+        let creds = [("deepgram", deepgramKeyField, "Deepgram"), ("openai", openaiKeyField, "OpenAI"),
+                     ("gladia", gladiaKeyField, "Gladia")]
         let previousKeys = creds.map { ($0.0, Keychain.get($0.0) ?? "") }
         for (i, cred) in creds.enumerated() {
             let (account, field, name) = cred
@@ -2629,7 +2637,7 @@ protocol LiveTranscribing: AnyObject {
 
 /// Selectable live engine. Extensible: add a case, a title, and a branch in `makeTranscriber`.
 enum LiveEngine: String, CaseIterable {
-    case apple, whisper, deepgram, openai
+    case apple, whisper, deepgram, openai, gladia
     static var current: LiveEngine { LiveEngine(rawValue: Pref.d.string(forKey: Pref.liveEngine) ?? "") ?? .apple }
     var title: String {
         switch self {
@@ -2637,6 +2645,7 @@ enum LiveEngine: String, CaseIterable {
         case .whisper:  return "Whisper"
         case .deepgram: return "Deepgram ☁"
         case .openai:   return "OpenAI ☁"
+        case .gladia:   return "Gladia ☁"
         }
     }
 }
@@ -3198,6 +3207,170 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
     }
 }
 
+/// Cloud live engine #3: Gladia realtime v2 — notable for broad language coverage including Korean
+/// STREAMING (the reason it was picked over AssemblyAI, whose realtime is English-centric). Two-step
+/// protocol: a REST init (X-Gladia-Key) returns a single-use WebSocket URL; audio then streams as
+/// binary pcm16 @ 16 kHz. Same rules as the other cloud engines: audio leaves the device ONLY while
+/// the overlay runs with this engine; key in the Keychain (Settings → Live; MR_GLADIA_KEY). No SDK.
+final class GladiaLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSocketDelegate {
+    private let label: String
+    private let locale: Locale
+    private let onUpdate: (String, Bool) -> Void
+    private let onLocale: ((Locale) -> Void)?
+    private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+    private let q = DispatchQueue(label: "macrec.gladialive", qos: .userInitiated)   // confines all connection state
+    private var converter: AVAudioConverter?   // feed thread only (one capture thread per transcriber)
+    private var task: URLSessionWebSocketTask?
+    private var session: URLSession?
+    private var pending = Data()               // audio awaiting send (batch ≈100 ms)
+    private var stopped = false
+    private let batchBytes = 1600 * 2          // 100 ms of 16 kHz Int16
+
+    static var storedKey: String? { Keychain.get("gladia") }
+    static var apiKey: String { storedKey ?? ProcessInfo.processInfo.environment["MR_GLADIA_KEY"] ?? "" }
+
+    init(label: String, locale: Locale, onLocale: ((Locale) -> Void)? = nil,
+         onUpdate: @escaping (String, Bool) -> Void) {
+        self.label = label; self.locale = locale; self.onLocale = onLocale; self.onUpdate = onUpdate
+    }
+
+    /// The REST-init body: stream format + language + the hints dictionary as custom vocabulary.
+    /// Pure + testable (see `macrec selftest`).
+    static func initBody(lang: String, vocabulary: [String]) -> [String: Any] {
+        var body: [String: Any] = [
+            "encoding": "wav/pcm", "sample_rate": 16000, "bit_depth": 16, "channels": 1,
+        ]
+        if !lang.isEmpty { body["language_config"] = ["languages": [lang], "code_switching": false] }
+        if !vocabulary.isEmpty {
+            body["realtime_processing"] = ["custom_vocabulary": true,
+                                           "custom_vocabulary_config": ["vocabulary": vocabulary]] as [String: Any]
+        }
+        return body
+    }
+
+    func start() {
+        onLocale?(locale)
+        let key = Self.apiKey
+        guard !key.isEmpty else {
+            onUpdate("Gladia API key not set — Settings → Live (or MR_GLADIA_KEY)", true)
+            elog("gladialive[\(label)]: no API key — engine idle")
+            return
+        }
+        let lang = locale.language.languageCode?.identifier ?? ""
+        let vocab = parseHintTerms(transcriptionHints(start: Date(), end: Date()))
+        var req = URLRequest(url: URL(string: "https://api.gladia.io/v2/live")!)
+        req.httpMethod = "POST"
+        req.setValue(key, forHTTPHeaderField: "X-Gladia-Key")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: Self.initBody(lang: lang, vocabulary: vocab))
+        elog("gladialive[\(label)]: requesting session (lang=\(lang.isEmpty ? "auto" : lang))")
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+            guard let self else { return }
+            self.q.async {
+                guard !self.stopped else { return }   // stop() can land before the session arrives
+                let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                guard err == nil, (200..<300).contains(status), let data,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let urlStr = obj["url"] as? String, let wsURL = URL(string: urlStr) else {
+                    elog("gladialive[\(self.label)] init failed: status \(status) \(err?.localizedDescription ?? "")")
+                    self.onUpdate("(Gladia session failed — check the API key / log)", true)
+                    return
+                }
+                let s = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+                let t = s.webSocketTask(with: wsURL)   // single-use URL carries the auth token
+                self.session = s; self.task = t
+                t.resume()
+                self.receiveLoop(t)
+            }
+        }.resume()
+    }
+
+    func feed(_ buffer: AVAudioPCMBuffer) {
+        // No off-queue state peeks (q-confined); the no-connection case just converts ~µs and drops.
+        guard let mono = toCanon(buffer), let ch = mono.floatChannelData?[0] else { return }
+        let n = Int(mono.frameLength); guard n > 0 else { return }
+        var i16 = [Int16](repeating: 0, count: n)
+        for i in 0..<n { let v = max(-1, min(1, ch[i])); i16[i] = Int16(v * 32767) }
+        let data = i16.withUnsafeBufferPointer { Data(buffer: $0) }   // little-endian on all Apple platforms
+        q.async { [weak self] in
+            guard let self, let t = self.task, !self.stopped else { return }
+            self.pending.append(data)
+            guard self.pending.count >= self.batchBytes else { return }
+            let out = self.pending; self.pending.removeAll(keepingCapacity: true)
+            t.send(.data(out)) { [weak self] err in
+                if let err, let self, !self.stopped { elog("gladialive[\(self.label)] send: \(err.localizedDescription)") }
+            }
+        }
+    }
+
+    func stop() {
+        q.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.stopped = true
+            guard let t = self.task else { return }
+            self.task = nil
+            let s = self.session; self.session = nil
+            if !self.pending.isEmpty {   // flush the sub-batch tail so the final words aren't clipped
+                let tail = self.pending; self.pending.removeAll(keepingCapacity: false)
+                t.send(.data(tail)) { _ in }   // frames are ordered — precedes stop_recording
+            }
+            t.send(.string(#"{"type":"stop_recording"}"#)) { _ in
+                t.cancel(with: .normalClosure, reason: nil)
+                s?.finishTasksAndInvalidate()
+            }
+            elog("gladialive[\(self.label)]: stopped")
+        }
+    }
+
+    private func receiveLoop(_ t: URLSessionWebSocketTask) {
+        t.receive { [weak self] result in
+            guard let self else { return }
+            self.q.async {   // state is q-confined; also serializes handle() with teardown
+                guard !self.stopped else { return }
+                switch result {
+                case .failure(let err):
+                    elog("gladialive[\(self.label)] receive: \(err.localizedDescription)")
+                    self.onUpdate("(Gladia connection lost: \(err.localizedDescription))", true)
+                    self.stopped = true   // dead connection → full teardown
+                    self.task?.cancel(with: .abnormalClosure, reason: nil); self.task = nil
+                    self.session?.finishTasksAndInvalidate(); self.session = nil
+                case .success(let msg):
+                    if case .string(let text) = msg { self.handle(text) }
+                    self.receiveLoop(t)
+                }
+            }
+        }
+    }
+
+    func handle(_ text: String) {   // internal for the selftest (message parsing is the pure logic here)
+        guard let data = text.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = obj["type"] as? String else { return }
+        switch type {
+        case "transcript":
+            guard let d = obj["data"] as? [String: Any],
+                  let utterance = d["utterance"] as? [String: Any],
+                  let t = utterance["text"] as? String, !t.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+            onUpdate(t.trimmingCharacters(in: .whitespaces), (d["is_final"] as? Bool) ?? false)
+        case "error":
+            elog("gladialive[\(label)] error: \(text.prefix(300))")
+            onUpdate("(Gladia error — check the API key / log)", true)
+        default: break   // audio_chunk acks / lifecycle events — not caption-relevant
+        }
+    }
+
+    private func toCanon(_ buf: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        if buf.format == fmt { return buf }
+        if converter == nil || converter?.inputFormat != buf.format { converter = AVAudioConverter(from: buf.format, to: fmt) }
+        guard let c = converter else { return nil }
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * fmt.sampleRate / buf.format.sampleRate) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return nil }
+        var fed = false; var err: NSError?
+        c.convert(to: out, error: &err) { _, s in if fed { s.pointee = .noDataNow; return nil }; fed = true; s.pointee = .haveData; return buf }
+        return (err == nil && out.frameLength > 0) ? out : nil
+    }
+}
+
 /// Which speakers to transcribe for the live overlay. Each source runs its own on-device analyzer,
 /// so transcribing one instead of two roughly halves inference load → lower latency. Default is
 /// `.other` (the remote party / system audio): you already know what you said, and it's the cheaper
@@ -3318,6 +3491,7 @@ final class LiveCaptions {
         case .whisper:  return WhisperLiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
         case .deepgram: return DeepgramLiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
         case .openai:   return OpenAILiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
+        case .gladia:   return GladiaLiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
         case .apple:    return LiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
         }
     }
@@ -4338,6 +4512,25 @@ struct Main {
             let oaTrNo = (oaCfgNoHints["session"] as? [String: Any])?["input_audio_transcription"] as? [String: Any]
             check("hints: openai transcription prompt set only when non-empty",
                   (oaTr?["prompt"] as? String) == "Kubernetes, 김철수" && oaTrNo?["prompt"] == nil)
+            // Gladia engine: REST-init body (language + vocabulary only when present) + transcript parsing.
+            let glBody = GladiaLiveTranscriber.initBody(lang: "ko", vocabulary: ["Kubernetes"])
+            let glLangs = (glBody["language_config"] as? [String: Any])?["languages"] as? [String]
+            let glVocab = (((glBody["realtime_processing"] as? [String: Any])?["custom_vocabulary_config"]
+                            as? [String: Any])?["vocabulary"]) as? [String]
+            let glPlain = GladiaLiveTranscriber.initBody(lang: "", vocabulary: [])
+            check("gladia: init body carries language + vocabulary only when present",
+                  glLangs == ["ko"] && glVocab == ["Kubernetes"]
+                  && glPlain["language_config"] == nil && glPlain["realtime_processing"] == nil
+                  && glPlain["sample_rate"] as? Int == 16000)
+            var glGot: [(String, Bool)] = []
+            let gl = GladiaLiveTranscriber(label: "t", locale: Locale(identifier: "ko-KR")) { s, f in glGot.append((s, f)) }
+            gl.handle(#"{"type":"transcript","data":{"is_final":false,"utterance":{"text":" 안녕하세"}}}"#)
+            gl.handle(#"{"type":"transcript","data":{"is_final":true,"utterance":{"text":"안녕하세요"}}}"#)
+            gl.handle(#"{"type":"transcript","data":{"is_final":true,"utterance":{"text":"  "}}}"#)   // blank → dropped
+            gl.handle(#"{"type":"audio_chunk","acknowledged":true}"#)                                  // ack → dropped
+            gl.handle("junk")                                                                          // junk → dropped
+            check("gladia: partial/final parsing (trimmed, junk dropped)", glGot.count == 2
+                  && glGot[0] == ("안녕하세", false) && glGot[1] == ("안녕하세요", true))
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
             exit(fails == 0 ? 0 : 1)
         }
