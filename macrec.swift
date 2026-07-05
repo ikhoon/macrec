@@ -2068,6 +2068,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         hintsTermsField.placeholderString = "Kubernetes, gRPC, 김철수, …"
         hintsFileField.placeholderString = "~/notes/hints.txt"
+        // PATH-carrying fields: a long path used to truncate at the TAIL, hiding the part that matters
+        // (user report on "Save summary to"). Truncate the HEAD instead ("…/notes/summaries"), widen,
+        // and mirror the full value into the tooltip on load (see load()).
+        for f in [dirField, audioDirField, customModelField, hintsFileField, promptFileField,
+                  summaryOutField, postProcessField] {
+            f.cell?.lineBreakMode = .byTruncatingHead
+            f.widthAnchor.constraint(greaterThanOrEqualToConstant: 380).isActive = true
+        }
         // Multiline prompt editor (user feedback: a one-line field is too small for a real prompt).
         promptScroll.translatesAutoresizingMaskIntoConstraints = false
         promptScroll.hasVerticalScroller = true
@@ -2194,6 +2202,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             row("", vadBtn),
             row("Excluded apps:", excludeTokens),
             row("Add a running app:", addAppPopup),
+            // Storage lives here too (user pick: what gets recorded and where it lands is one story).
+            sectionHeader("Transcripts", symbol: "doc.text"),
+            row("Keep for:", txtRetPopup),
+            row("Save to:", dirStack),
+            sectionHeader("Audio", symbol: "waveform"),
+            row("", keepAudioBtn),
+            row("Keep for:", audioRetPopup),
+            row("Save to:", audioStack),
         ]))
         tabs.addTabViewItem(tab("Transcription", [
             row("Model:", modelPopup),                                                            // 0
@@ -2249,15 +2265,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             sectionHeader("Gladia", symbol: "waveform.circle"),                                      // 9
             row("API key:", gladiaKeyField),                                                         // 10
             fieldCaption("app.gladia.io — broad language coverage incl. Korean streaming."),         // 11
-        ]))
-        tabs.addTabViewItem(tab("Storage", [
-            sectionHeader("Transcripts", symbol: "doc.text"),          // 0
-            row("Keep for:", txtRetPopup),         // 1
-            row("Save to:", dirStack),             // 2
-            sectionHeader("Audio", symbol: "waveform"),                // 3
-            row("", keepAudioBtn),                 // 4
-            row("Keep for:", audioRetPopup),       // 5
-            row("Save to:", audioStack),           // 6
         ]))
         tabs.addTabViewItem(tab("General", [
             row("", loginBtn),
@@ -2393,6 +2400,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         hintsTermsField.stringValue = Pref.explicit(Pref.hintsTerms, "MR_HINTS")
         hintsFileField.stringValue = Pref.explicit(Pref.hintsFile, "MR_HINTS_FILE")
         hintsCalBtn.state = Pref.bool(Pref.hintsCalendar, "MR_HINTS_CALENDAR", false) ? .on : .off
+        // Long paths head-truncate in the field — the tooltip always carries the full value.
+        for f in [dirField, audioDirField, customModelField, hintsFileField, promptFileField,
+                  summaryOutField, postProcessField] {
+            f.toolTip = f.stringValue.isEmpty ? nil : f.stringValue
+        }
         updatePostProcessEnabled()
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
