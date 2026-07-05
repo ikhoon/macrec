@@ -2248,6 +2248,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func idx<T: Equatable>(_ v: T, _ arr: [T]) -> Int { arr.firstIndex(of: v) ?? 0 }
 
+    /// The controller instance is cached by the app — RELOAD the fields from prefs on every open,
+    /// or edits abandoned with Cancel linger in the form and a later Save silently persists them
+    /// (confirmed review finding).
+    override func showWindow(_ sender: Any?) {
+        load()
+        super.showWindow(sender)
+    }
+
     private func load() {
         let c = EngineConfig.load()
         segPopup.selectItem(at: idx(Int(c.segmentSeconds), segValues))
