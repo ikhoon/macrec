@@ -3376,6 +3376,12 @@ final class GladiaLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
                 self.session = s; self.task = t
                 t.resume()
                 self.receiveLoop(t)
+                if !self.pending.isEmpty {   // flush the PRE-ROLL buffered while the REST init ran
+                    let out = self.pending; self.pending.removeAll(keepingCapacity: true)
+                    t.send(.data(out)) { [weak self] err in
+                        if let err, let self, !self.stopped { elog("gladialive[\(self.label)] preroll send: \(err.localizedDescription)") }
+                    }
+                }
             }
         }.resume()
     }
@@ -3388,9 +3394,13 @@ final class GladiaLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
         for i in 0..<n { let v = max(-1, min(1, ch[i])); i16[i] = Int16(v * 32767) }
         let data = i16.withUnsafeBufferPointer { Data(buffer: $0) }   // little-endian on all Apple platforms
         q.async { [weak self] in
-            guard let self, let t = self.task, !self.stopped else { return }
+            guard let self, !self.stopped else { return }
+            // PRE-ROLL: unlike the other engines, the socket only exists after Gladia's REST init
+            // returns — audio spoken during that round trip must buffer, not drop (review finding:
+            // the opening words after enabling captions were lost). Cap ~30 s in case init hangs.
             self.pending.append(data)
-            guard self.pending.count >= self.batchBytes else { return }
+            if self.pending.count > 16000 * 2 * 30 { self.pending.removeFirst(self.pending.count - 16000 * 2 * 30) }
+            guard let t = self.task, self.pending.count >= self.batchBytes else { return }
             let out = self.pending; self.pending.removeAll(keepingCapacity: true)
             t.send(.data(out)) { [weak self] err in
                 if let err, let self, !self.stopped { elog("gladialive[\(self.label)] send: \(err.localizedDescription)") }
@@ -4033,8 +4043,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         LoginItem.autoEnableOnceIfDistributed()   // distributed app: enable 24/7 autostart on first run
         startEngine()
         installStopHandler { [weak self] in
-            self?.stopEngineSync()
-            DispatchQueue.main.async { NSApp.terminate(nil) }
+            // `engine` is main-confined (voice poll, menu actions read it there) — the signal source
+            // fires on its own queue, so hop to main before touching it (review finding: racy mutation).
+            DispatchQueue.main.async {
+                self?.stopEngineSync()
+                NSApp.terminate(nil)
+            }
         }
     }
 
