@@ -1870,12 +1870,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         // Grouped into tabs (each pane stays short) instead of one long scrolling form.
         func row(_ label: String, _ control: NSView) -> [NSView] { [labeled(label), control] }
-        // Section header (bold, spans both columns) and field caption (small gray hint under a field,
-        // aligned to the control column) — the grouping vocabulary for denser tabs like Live.
-        func sectionHeader(_ s: String) -> [NSView] {
+        // Section header (semibold + accent-tinted SF Symbol, spans both columns) and field caption
+        // (small gray hint under a field) — the grouping vocabulary for denser tabs. The icon is what
+        // makes sections read as sections at a glance (user feedback: bold text alone didn't pop).
+        func sectionHeader(_ s: String, symbol: String? = nil) -> [NSView] {
             let l = NSTextField(labelWithString: s)
-            l.font = .boldSystemFont(ofSize: 12)
-            return [l, NSView()]
+            l.font = .systemFont(ofSize: 13, weight: .semibold)
+            guard let symbol, let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) else {
+                return [l, NSView()]
+            }
+            let iv = NSImageView(image: img)
+            iv.symbolConfiguration = .init(pointSize: 13, weight: .semibold)
+            iv.contentTintColor = .controlAccentColor
+            iv.setContentHuggingPriority(.required, for: .horizontal)
+            let st = NSStackView(views: [iv, l])
+            st.orientation = .horizontal; st.spacing = 6; st.alignment = .centerY
+            return [st, NSView()]
         }
         func captionLabel(_ s: String, width: CGFloat) -> NSTextField {
             let l = NSTextField(wrappingLabelWithString: s)
@@ -1956,14 +1966,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             row("Mode:", ppModePopup),                                                            // 1
             fieldCaption("Automatic summary is built in — pick who writes it; or take full "
                        + "control with a custom command."),                                       // 2
-            sectionHeader("Automatic summary"),                                                   // 3
+            sectionHeader("Automatic summary", symbol: "wand.and.stars"),                                                   // 3
             row("Summarize with:", runnerPopup),                                                  // 4
             row("Prompt:", promptField),                                                          // 5
             fieldCaption("Default asks for key points, decisions, and action items — answered "
                        + "in the transcript's language."),                                        // 6
             row("Save summary to:", summaryOutField),                                             // 7
             fieldCaption("Folder for <name>.summary.md. Empty = next to the transcript."),        // 8
-            sectionHeader("Custom command"),                                                      // 9
+            sectionHeader("Custom command", symbol: "terminal"),                                                      // 9
             row("Command:", postProcessField),                                                    // 10
             fieldCaption("Freeform: runs in a login shell with the transcript path appended "
                        + "as the last argument."),                                                // 11
@@ -1976,20 +1986,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             sectionNote("Cloud caption engines stream audio off-device — only while the live overlay "
                       + "runs with that engine selected. Keys are stored in the Keychain, never in "
                       + "preferences or backups. Pick the engine in the overlay's control bar."),    // 0
-            sectionHeader("Deepgram ☁"),                                                             // 1
+            sectionHeader("Deepgram", symbol: "cloud"),                                                             // 1
             row("API key:", deepgramKeyField),                                                       // 2
             fieldCaption("Get a key at console.deepgram.com (model: nova-2)."),                      // 3
-            sectionHeader("OpenAI ☁"),                                                               // 4
+            sectionHeader("OpenAI", symbol: "sparkles"),                                                               // 4
             row("API key:", openaiKeyField),                                                         // 5
             fieldCaption("platform.openai.com — or a key your gateway accepts (gpt-4o-transcribe)."), // 6
             row("Base URL:", openaiBaseField),                                                       // 7
             fieldCaption("OpenAI-compatible gateway / corporate proxy. Leave empty for api.openai.com."), // 8
         ], headers: [0, 1, 4], notes: [3, 6, 8]))
         tabs.addTabViewItem(tab("Storage", [
-            sectionHeader("Transcripts"),          // 0
+            sectionHeader("Transcripts", symbol: "doc.text"),          // 0
             row("Keep for:", txtRetPopup),         // 1
             row("Save to:", dirStack),             // 2
-            sectionHeader("Audio"),                // 3
+            sectionHeader("Audio", symbol: "waveform"),                // 3
             row("", keepAudioBtn),                 // 4
             row("Keep for:", audioRetPopup),       // 5
             row("Save to:", audioStack),           // 6
