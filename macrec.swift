@@ -1948,9 +1948,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         // Grouped into tabs (each pane stays short) instead of one long scrolling form.
         func row(_ label: String, _ control: NSView) -> [NSView] { [labeled(label), control] }
-        // Section header (semibold + accent-tinted SF Symbol, spans both columns) and field caption
-        // (small gray hint under a field) — the grouping vocabulary for denser tabs. The icon is what
-        // makes sections read as sections at a glance (user feedback: bold text alone didn't pop).
+        // Section header (semibold + SF Symbol, spans both columns) and field caption (small gray hint
+        // under a field) — the grouping vocabulary for denser tabs. The icon is what makes sections
+        // read as sections at a glance; it matches the TEXT color (user feedback: the accent-blue
+        // version read poorly — tinted icons look like links, and contrast suffered in dark mode).
         func sectionHeader(_ s: String, symbol: String? = nil) -> [NSView] {
             let l = NSTextField(labelWithString: s)
             l.font = .systemFont(ofSize: 13, weight: .semibold)
@@ -1959,7 +1960,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             }
             let iv = NSImageView(image: img)
             iv.symbolConfiguration = .init(pointSize: 13, weight: .semibold)
-            iv.contentTintColor = .controlAccentColor
+            iv.contentTintColor = .labelColor
             iv.setContentHuggingPriority(.required, for: .horizontal)
             let st = NSStackView(views: [iv, l])
             st.orientation = .horizontal; st.spacing = 6; st.alignment = .centerY
