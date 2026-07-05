@@ -1878,6 +1878,31 @@ func runPostProcessCommand(_ command: String, completion: ((Int32) -> Void)? = n
 /// forms in a scroll view should start at the top and grow downward.
 final class FlippedDocView: NSView { override var isFlipped: Bool { true } }
 
+/// Form-row role markers: a row's ROLE travels with its views, so grid styling (header merges, caption
+/// padding) is derived instead of hand-indexed — inserting a row can no longer desync a styling list.
+final class SectionHeaderCell: NSStackView {}   // col 0 → full-width merged section header
+final class CaptionCell: NSTextField {}         // col 0 → full-width intro note; col 1 → field caption
+
+/// Find the first NSGridView in a view tree (the settings selftest inspects panes through their
+/// scroll-view wrapper).
+func firstGrid(in view: NSView?) -> NSGridView? {
+    guard let view else { return nil }
+    if let g = view as? NSGridView { return g }
+    if let sv = view as? NSScrollView { return firstGrid(in: sv.documentView) }
+    for sub in view.subviews { if let g = firstGrid(in: sub) { return g } }
+    return nil
+}
+
+/// Derive (headers, notes) row indices from marker types. Pure + testable (see `macrec selftest`).
+func formRowRoles(_ rows: [[NSView]]) -> (headers: [Int], notes: [Int]) {
+    var headers: [Int] = [], notes: [Int] = []
+    for (i, r) in rows.enumerated() {
+        if r.first is SectionHeaderCell || r.first is CaptionCell { headers.append(i) }
+        else if r.count > 1, r[1] is CaptionCell { notes.append(i) }
+    }
+    return (headers, notes)
+}
+
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let onSave: () -> Void
     private(set) var tabsForTest: NSTabView?   // selftest hook: every pane must host its grid in a scroll view
@@ -2012,44 +2037,49 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         // under a field) — the grouping vocabulary for denser tabs. The icon is what makes sections
         // read as sections at a glance; it matches the TEXT color (user feedback: the accent-blue
         // version read poorly — tinted icons look like links, and contrast suffered in dark mode).
+        // Row ROLES are carried by marker types (SectionHeaderCell / CaptionCell) and derived by
+        // formRowRoles — the old hand-maintained index lists went stale the moment rows were inserted
+        // (regression: the Post-process tab shipped with a field row merged as a header).
         func sectionHeader(_ s: String, symbol: String? = nil) -> [NSView] {
             let l = NSTextField(labelWithString: s)
             l.font = .systemFont(ofSize: 13, weight: .semibold)
-            guard let symbol, let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) else {
-                return [l, NSView()]
+            var content: [NSView] = [l]
+            if let symbol, let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+                let iv = NSImageView(image: img)
+                iv.symbolConfiguration = .init(pointSize: 13, weight: .semibold)
+                iv.contentTintColor = .labelColor
+                iv.setContentHuggingPriority(.required, for: .horizontal)
+                content = [iv, l]
             }
-            let iv = NSImageView(image: img)
-            iv.symbolConfiguration = .init(pointSize: 13, weight: .semibold)
-            iv.contentTintColor = .labelColor
-            iv.setContentHuggingPriority(.required, for: .horizontal)
-            let st = NSStackView(views: [iv, l])
+            let st = SectionHeaderCell(views: content)
             st.orientation = .horizontal; st.spacing = 6; st.alignment = .centerY
             return [st, NSView()]
         }
-        func captionLabel(_ s: String, width: CGFloat) -> NSTextField {
-            let l = NSTextField(wrappingLabelWithString: s)
+        func captionLabel(_ s: String, width: CGFloat) -> CaptionCell {
+            let l = CaptionCell(wrappingLabelWithString: s)
             l.font = .systemFont(ofSize: 11)
             l.textColor = .secondaryLabelColor
             l.preferredMaxLayoutWidth = width
             return l
         }
         func fieldCaption(_ s: String) -> [NSView] { [labeled(""), captionLabel(s, width: 340)] }
-        func sectionNote(_ s: String) -> [NSView] { [captionLabel(s, width: 440), NSView()] }   // full-width (merge via headers:)
-        /// headers: FULL-WIDTH merged rows, leading-aligned with extra air above — section titles or
-        /// intro notes; the row's own view decides its styling. notes: captions pulled tight under the
-        /// field they describe.
-        func tab(_ title: String, _ rows: [[NSView]], headers: [Int] = [], notes: [Int] = []) -> NSTabViewItem {
+        func sectionNote(_ s: String) -> [NSView] { [captionLabel(s, width: 440), NSView()] }   // full-width via role derivation
+        /// Headers (section titles / full-width intro notes) merge both columns with extra air above;
+        /// captions pull tight under the field they describe. Roles are DERIVED from the row's views
+        /// (see formRowRoles) — nothing to renumber when rows are inserted.
+        func tab(_ title: String, _ rows: [[NSView]]) -> NSTabViewItem {
             let grid = NSGridView(views: rows)
             grid.translatesAutoresizingMaskIntoConstraints = false
             grid.rowSpacing = 9; grid.columnSpacing = 18
             grid.column(at: 0).xPlacement = .trailing
-            for r in headers where rows.indices.contains(r) {   // row-index typos must not crash Settings
+            let roles = formRowRoles(rows)
+            for r in roles.headers {
                 grid.mergeCells(inHorizontalRange: NSRange(location: 0, length: 2),
                                 verticalRange: NSRange(location: r, length: 1))
                 grid.cell(atColumnIndex: 0, rowIndex: r).xPlacement = .leading
                 if r > 0 { grid.row(at: r).topPadding = 14 }
             }
-            for r in notes where rows.indices.contains(r) { grid.row(at: r).topPadding = -5 }
+            for r in roles.notes { grid.row(at: r).topPadding = -5 }
             // The grid lives in a SCROLLABLE pane: a tab taller than the window must scroll, never clip
             // (regression: the Post-process rows sat unreachable below the window edge).
             let doc = FlippedDocView()   // flipped so the form starts at the TOP of the scroll area
@@ -2106,7 +2136,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             row("…or hints file:", hintsFileField),                                               // 9
             fieldCaption("One term per line, # comments — merged with the terms above."),         // 10
             row("", hintsCalBtn),                                                                 // 11
-        ], headers: [6], notes: [3, 5, 8, 10]))
+        ]))
         tabs.addTabViewItem(tab("Post-process", [
             sectionNote("Runs after each hourly transcript is saved."),                           // 0
             row("Mode:", ppModePopup),                                                            // 1
@@ -2126,7 +2156,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             row("Command:", postProcessField),                                                    // 12
             fieldCaption("Freeform: runs in a login shell with the transcript path appended "
                        + "as the last argument."),                                                // 13
-        ], headers: [0, 3, 9], notes: [2, 6, 8, 11]))
+        ]))
         tabs.addTabViewItem(tab("Titling", [
             row("", calBtn),
             row("Calendars:", calListCell),
@@ -2146,7 +2176,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             sectionHeader("Gladia", symbol: "waveform.circle"),                                      // 9
             row("API key:", gladiaKeyField),                                                         // 10
             fieldCaption("app.gladia.io — broad language coverage incl. Korean streaming."),         // 11
-        ], headers: [0, 1, 4, 9], notes: [3, 6, 8, 11]))
+        ]))
         tabs.addTabViewItem(tab("Storage", [
             sectionHeader("Transcripts", symbol: "doc.text"),          // 0
             row("Keep for:", txtRetPopup),         // 1
@@ -2155,7 +2185,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             row("", keepAudioBtn),                 // 4
             row("Keep for:", audioRetPopup),       // 5
             row("Save to:", audioStack),           // 6
-        ], headers: [0, 3]))
+        ]))
         tabs.addTabViewItem(tab("General", [
             row("", loginBtn),
         ]))
@@ -4622,9 +4652,30 @@ struct Main {
                 check("settings: every tab pane scrolls (rows can never be clipped away)", allScroll)
                 check("settings: Post-process is its own tab",
                       tv.tabViewItems.contains { $0.label == "Post-process" })
+                // Layout regression (user-reported: Post-process UI broke): every merged row must be a
+                // marker-typed header/note — a stale hand-kept index list once merged a real field row
+                // ("Save summary to") into a section header, destroying its label+control layout.
+                var intact = true
+                for item in tv.tabViewItems {
+                    guard let grid = firstGrid(in: item.view) else { intact = false; continue }
+                    for r in 0..<grid.numberOfRows {
+                        let c0 = grid.cell(atColumnIndex: 0, rowIndex: r).contentView
+                        let merged = grid.numberOfColumns > 1
+                            && grid.cell(atColumnIndex: 1, rowIndex: r).contentView === c0
+                        let isRoleRow = c0 is SectionHeaderCell || c0 is CaptionCell
+                        if merged && !isRoleRow { intact = false }   // a field row got eaten by a header merge
+                    }
+                }
+                check("settings: only role-marked rows are merged (no field row eaten)", intact)
             } else {
                 check("settings: tabs built for inspection", false)
             }
+            // Role derivation is pure — headers from marker col-0, notes from marker col-1, fields plain.
+            let rolesProbe = formRowRoles([[SectionHeaderCell(), NSView()], [NSView(), NSView()],
+                                           [NSView(), CaptionCell(labelWithString: "c")],
+                                           [CaptionCell(labelWithString: "n"), NSView()]])
+            check("settings: form row roles derived from markers",
+                  rolesProbe.headers == [0, 3] && rolesProbe.notes == [2])
             // Transcription hints: parsing (comma/newline/#comment), case-insensitive dedupe, cap.
             check("hints: parse comma/newline + comments",
                   parseHintTerms("Kubernetes, gRPC\n# note\n김철수\n\n") == ["Kubernetes", "gRPC", "김철수"])
