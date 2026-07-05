@@ -3944,13 +3944,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func setIcon(recording: Bool, voice: Bool = false) {
         // Distinct audio-recorder identity: a waveform-with-mic while live, pause when not. While
-        // VOICE is being picked up, the glyph tints with the user's ACCENT color — reads as "active"
-        // without the alarm of a hot color (user feedback: orange looked off in the menu bar).
+        // VOICE is being picked up, the glyph tints a LIGHT orange — the recording color, softened
+        // (user pick after trying full orange → accent → this: orange family, but lighter).
         let primary = recording ? "waveform.badge.mic" : "pause.circle"
         let fallback = recording ? "waveform" : "pause"
         // Fixed point size so the menu-bar icon never resizes (independent of which symbol).
         var cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
-        if voice { cfg = cfg.applying(.init(paletteColors: [.controlAccentColor])) }
+        if voice {
+            let lightOrange = NSColor.systemOrange.blended(withFraction: 0.35, of: .white) ?? .systemOrange
+            cfg = cfg.applying(.init(paletteColors: [lightOrange]))
+        }
         let img = (NSImage(systemSymbolName: primary, accessibilityDescription: "macrec")
             ?? NSImage(systemSymbolName: fallback, accessibilityDescription: "macrec"))?
             .withSymbolConfiguration(cfg)
