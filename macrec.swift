@@ -1769,18 +1769,32 @@ func postProcessInvocation(mode: PostProcessMode, runner: SummaryRunner, prompt:
         let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let effective = p.isEmpty ? defaultSummaryPrompt : p
         let out = summaryOutputPath(transcriptPath: transcriptPath, outDir: outDir)
+        let dir = URL(fileURLWithPath: out).deletingLastPathComponent().path
+        let runnerCmd: String
         switch runner {
-        case .claude: return "claude -p \(shq(effective)) < \(shq(transcriptPath)) > \(shq(out))"
-        case .gemini: return "gemini -p \(shq(effective)) < \(shq(transcriptPath)) > \(shq(out))"
+        case .claude: runnerCmd = "claude -p \(shq(effective)) < \(shq(transcriptPath))"
+        case .gemini: runnerCmd = "gemini -p \(shq(effective)) < \(shq(transcriptPath))"
         // codex exec takes the prompt from stdin with `-`; prepend it to the transcript.
-        case .codex:  return "{ printf '%s\\n\\n' \(shq(effective)); cat \(shq(transcriptPath)); } | codex exec - > \(shq(out))"
+        case .codex:  runnerCmd = "{ printf '%s\\n\\n' \(shq(effective)); cat \(shq(transcriptPath)); } | codex exec -"
         }
+        // The output dir may not exist (review finding: the redirect just failed); and a failed run
+        // must not leave a misleading empty .summary.md — write .partial, promote only on success.
+        return "mkdir -p \(shq(dir)) && \(runnerCmd) > \(shq(out + ".partial")) && mv \(shq(out + ".partial")) \(shq(out))"
     }
+}
+
+/// The effective mode. Migration (review finding): v1 had no mode key — the hook fired whenever the
+/// command was set. An UNSET mode with a non-empty v1 command (pref or MR_POST_PROCESS) therefore
+/// means `.shell`, or upgrading would silently kill an existing pipeline. Pure + testable.
+func effectivePostProcessMode(rawMode: String, shellCmd: String) -> PostProcessMode {
+    if let m = PostProcessMode(rawValue: rawMode) { return m }
+    return shellCmd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .off : .shell
 }
 
 /// Read the post-process prefs and build the invocation for a just-saved transcript.
 func postProcessInvocationFromPrefs(transcriptPath: String) -> String? {
-    let mode = PostProcessMode(rawValue: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE")) ?? .off
+    let mode = effectivePostProcessMode(rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
+                                        shellCmd: Pref.postProcessCommand)
     let runner = SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude
     return postProcessInvocation(mode: mode, runner: runner,
                                  prompt: Pref.explicit(Pref.summaryPrompt, "MR_SUMMARY_PROMPT"),
@@ -1800,11 +1814,26 @@ func runPostProcessCommand(_ command: String, completion: ((Int32) -> Void)? = n
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
         p.arguments = ["-lc", cmd]
+        // `zsh -l` reads .zprofile/.zshenv but NOT .zshrc — where many users export PATH. Prepend the
+        // common CLI install dirs so `claude`/`gemini`/`codex` resolve regardless of rc-file layout.
+        var env = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:\(home)/.local/bin:\(home)/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
+        p.environment = env
         let out = Pipe(); p.standardOutput = out; p.standardError = out
         do {
             try p.run()
+            // A hook whose child keeps the pipe open would pin this thread forever (review finding) —
+            // terminate after 15 min; readDataToEndOfFile then unblocks on pipe EOF.
+            let killer = DispatchWorkItem { [weak p] in
+                guard let p, p.isRunning else { return }
+                elog("post-process: timed out after 15 min — terminating")
+                p.terminate()
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 900, execute: killer)
             let data = out.fileHandleForReading.readDataToEndOfFile()   // EOF first, then exit — no pipe deadlock
             p.waitUntilExit()
+            killer.cancel()
             let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             elog("post-process: exit \(p.terminationStatus)" + (s.isEmpty ? "" : " — \(s.prefix(400))"))
             completion?(p.terminationStatus)
@@ -2205,7 +2234,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         gladiaKeyField.stringValue = GladiaLiveTranscriber.storedKey ?? ""
         openaiBaseField.stringValue = OpenAILiveTranscriber.configuredBase   // explicit save (even "") beats env
         postProcessField.stringValue = Pref.postProcessCommand               // same explicit-save semantics
-        ppModePopup.selectItem(at: idx(Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"), ppModeValues))
+        // Show the EFFECTIVE mode (incl. the v1 migration: unset mode + v1 command = Custom command) —
+        // displaying Off while a hook is live would let Save silently kill it.
+        ppModePopup.selectItem(at: idx(effectivePostProcessMode(
+            rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
+            shellCmd: Pref.postProcessCommand).rawValue, ppModeValues))
         runnerPopup.selectItem(at: idx(Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER"), runnerValues))
         let savedPrompt = Pref.explicit(Pref.summaryPrompt, "MR_SUMMARY_PROMPT")
         promptView.string = savedPrompt.isEmpty ? defaultSummaryPrompt : savedPrompt   // show the editable default
@@ -4458,12 +4491,21 @@ struct Main {
                   inv(.off, .claude) == nil && inv(.shell, .claude) == nil)
             check("post-process: shell appends quoted path",
                   inv(.shell, .claude, shell: "./x.sh") == "./x.sh '/t/a b'\\''s.md'")
-            check("post-process: claude summary template",
-                  inv(.summary, .claude) == "claude -p 'P' < '/t/a b'\\''s.md' > '/t/a b'\\''s.summary.md'")
+            check("post-process: claude summary template (mkdir + .partial promote)",
+                  inv(.summary, .claude) == "mkdir -p '/t' && claude -p 'P' < '/t/a b'\\''s.md' "
+                                          + "> '/t/a b'\\''s.summary.md.partial' "
+                                          + "&& mv '/t/a b'\\''s.summary.md.partial' '/t/a b'\\''s.summary.md'")
             check("post-process: gemini summary template",
-                  inv(.summary, .gemini)?.hasPrefix("gemini -p 'P'") == true)
+                  inv(.summary, .gemini)?.contains("gemini -p 'P'") == true)
             check("post-process: codex pipes prompt+transcript via stdin",
                   inv(.summary, .codex)?.contains("| codex exec -") == true)
+            // v1→v2 migration: an unset mode with a v1 command must run as .shell (upgrades must not
+            // silently kill an existing pipeline); explicit modes always win.
+            check("post-process: v1 hook migrates to shell mode",
+                  effectivePostProcessMode(rawMode: "", shellCmd: "./x.sh") == .shell
+                  && effectivePostProcessMode(rawMode: "", shellCmd: " ") == .off
+                  && effectivePostProcessMode(rawMode: "off", shellCmd: "./x.sh") == .off
+                  && effectivePostProcessMode(rawMode: "summary", shellCmd: "./x.sh") == .summary)
             check("post-process: empty prompt falls back to the built-in default",
                   inv(.summary, .claude, prompt: " ")?.contains(defaultSummaryPrompt.prefix(25)) == true)
             check("post-process: summary path derivation (custom dir + tilde)",
