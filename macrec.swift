@@ -769,6 +769,7 @@ enum Pref {
     // 키 상수 (설정 UI와 공유)
     static let segment = "segmentSeconds", voiceMin = "voiceMinSeconds", lang = "whisperLang"
     static let keepAudio = "keepAudio", audioRetention = "audioRetentionDays", txtRetention = "transcriptRetentionDays"
+    static let audioRawDays = "audioRawDays"            // days a WAV stays raw before AAC compression (0 = never compress)
     static let exclude = "excludeApps", txtDir = "transcriptsDir", vad = "vadEnabled", autoStart = "autoStart"
     static let cal = "useCalendarTitles", model = "whisperModelName"
     static let calendars = "calendarNames"              // calendar titles to source event titles from (empty = all)
@@ -1021,6 +1022,7 @@ struct EngineConfig {
     var useCalendarTitles: Bool         // title transcripts from the overlapping calendar event
     var whisperLang: String
     var keepAudio: Bool                 // false면 전사만 남기고 오디오 삭제
+    var audioRawDays: Int               // WAV 그대로 두는 일수, 이후 AAC 압축 (0 = 압축 안 함)
     var audioRetentionDays: Int         // 0 = 무제한
     var transcriptRetentionDays: Int    // 0 = 무제한
     var excludeBundleIds: [String]
@@ -1049,7 +1051,8 @@ struct EngineConfig {
             useCalendarTitles: Pref.bool(Pref.cal, "MR_CALENDAR_TITLES", true),
             whisperLang: Pref.str(Pref.lang, "MR_WHISPER_LANG", "auto"),
             keepAudio: Pref.bool(Pref.keepAudio, "MR_KEEP_AUDIO", true),
-            audioRetentionDays: Pref.int(Pref.audioRetention, "MR_AUDIO_RETENTION_DAYS", 30),
+            audioRawDays: Pref.int(Pref.audioRawDays, "MR_AUDIO_RAW_DAYS", 7),
+            audioRetentionDays: Pref.int(Pref.audioRetention, "MR_AUDIO_RETENTION_DAYS", 90),
             transcriptRetentionDays: Pref.int(Pref.txtRetention, "MR_TRANSCRIPT_RETENTION_DAYS", 0),
             excludeBundleIds: excl)
     }
@@ -1598,25 +1601,61 @@ final class RecordingEngine {
         elog("engine: stopped (trailing partial segment discarded)")
     }
 
-    /// Delete audio/transcripts older than the retention window (0 = keep forever).
+    /// CLI `sweep` entry — one retention/archive pass, synchronously.
+    func runRetentionSweep() { cleanupRetention() }
+
+    /// Age audio through the archive tiers (raw WAV → AAC → deleted) and drop expired transcripts.
+    /// Recurses under each root so the monthly subfolders are covered too (transcripts/YYYY-MM/*.md,
+    /// audioDir/YYYY-MM/*.{wav,m4a} plus any legacy layout). Runs on processQueue.
     private func cleanupRetention() {
         let fm = FileManager.default
-        // Recurse under each root so retention prunes the monthly subfolders too:
-        // transcripts/YYYY-MM/*.md and audioDir/YYYY-MM/*.wav (plus any legacy layout).
-        func purge(_ root: URL, days: Int, ext: String) {
-            guard days > 0,
-                  let en = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
-            let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
-            var n = 0
-            for case let u as URL in en where u.pathExtension.lowercased() == ext {
-                if let m = (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate, m < cutoff {
-                    try? fm.removeItem(at: u); n += 1
-                }
-            }
-            if n > 0 { elog("engine: retention — \(ext) \(n)개 삭제(>\(days)일)") }
+        func ageDays(_ u: URL) -> Double? {
+            guard let m = (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            else { return nil }
+            return Date().timeIntervalSince(m) / 86400
         }
-        purge(cfg.audioDir, days: cfg.audioRetentionDays, ext: "wav")
-        purge(cfg.transcriptsDir, days: cfg.transcriptRetentionDays, ext: "md")
+        if cfg.transcriptRetentionDays > 0,
+           let en = fm.enumerator(at: cfg.transcriptsDir, includingPropertiesForKeys: [.contentModificationDateKey]) {
+            var n = 0
+            for case let u as URL in en where u.pathExtension.lowercased() == "md" {
+                if let a = ageDays(u), a >= Double(cfg.transcriptRetentionDays) { try? fm.removeItem(at: u); n += 1 }
+            }
+            if n > 0 { elog("engine: retention — md \(n)개 삭제(>\(cfg.transcriptRetentionDays)일)") }
+        }
+        let policy = AudioArchivePolicy(rawDays: cfg.audioRawDays, totalDays: cfg.audioRetentionDays)
+        guard let en = fm.enumerator(at: cfg.audioDir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        var deleted = 0, archived = 0
+        var budget = 12   // bound conversions per sweep (~1 s each) — transcription shares this queue
+        for case let u as URL in en {
+            let ext = u.pathExtension.lowercased()
+            guard ext == "wav" || ext == "m4a", let a = ageDays(u) else { continue }
+            switch policy.tier(ageDays: a) {
+            case .deleted:
+                try? fm.removeItem(at: u); deleted += 1
+            case .compressed where ext == "wav" && budget > 0:
+                let out = u.deletingPathExtension().appendingPathExtension("m4a")
+                if AudioArchiver.compress(u, to: out) {
+                    relinkTranscriptAudio(from: u)
+                    try? fm.removeItem(at: u)
+                    archived += 1; budget -= 1
+                }
+            default: break
+            }
+        }
+        if deleted > 0 || archived > 0 {
+            elog("engine: retention — 오디오 \(deleted)개 삭제, \(archived)개 AAC 압축(raw>\(cfg.audioRawDays)일)")
+        }
+    }
+
+    /// After archiving audio/YYYY-MM/<slug>.wav → .m4a, point the matching transcript's audio link
+    /// at the new file. The transcript shares the slug: transcripts/YYYY-MM/<slug>.md.
+    private func relinkTranscriptAudio(from wav: URL) {
+        let slug = wav.deletingPathExtension().lastPathComponent
+        let month = wav.deletingLastPathComponent().lastPathComponent
+        let md = cfg.transcriptsDir.appendingPathComponent(month).appendingPathComponent("\(slug).md")
+        guard let text = try? String(contentsOf: md, encoding: .utf8), text.contains("\(slug).wav") else { return }
+        try? text.replacingOccurrences(of: "\(slug).wav", with: "\(slug).m4a")
+            .write(to: md, atomically: true, encoding: .utf8)
     }
 
     private func process(_ seg: CompletedSegment) {
@@ -1707,6 +1746,76 @@ final class RecordingEngine {
         try doc.markdown(l10n).write(to: mdURL, atomically: true, encoding: .utf8)
         elog("engine:   → 전사 저장: \(mdURL.path)")
         return mdURL
+    }
+}
+
+// MARK: - audio archive tiers (raw WAV → AAC after N days → deleted after M days)
+//
+// An hour of voiced 16 kHz mono PCM is ~115 MB; the same hour as 32 kbps AAC is ~14 MB (⅛).
+// Recent segments stay WAV (instant scrubbing / re-transcription); older ones are archived to
+// .m4a and the transcript's audio link is rewritten to match. Deletion applies to both forms.
+
+enum AudioTier: Equatable { case raw, compressed, deleted }
+
+struct AudioArchivePolicy: Equatable {
+    var rawDays: Int      // days a file stays raw WAV; 0 = never compress
+    var totalDays: Int    // age at which audio (raw or compressed) is deleted; 0 = keep forever
+
+    func tier(ageDays: Double) -> AudioTier {
+        if totalDays > 0, ageDays >= Double(totalDays) { return .deleted }   // delete beats compress
+        if rawDays > 0, ageDays >= Double(rawDays) { return .compressed }
+        return .raw
+    }
+
+    /// Combo-box text → days. "90 days" / "6 months" / "2 weeks" / "1 year" / bare "45";
+    /// "Unlimited" / "Don't compress" / "0" → 0 (forever / never). nil = unparseable.
+    static func parseRetentionDays(_ s: String) -> Int? {
+        let t = s.trimmingCharacters(in: .whitespaces).lowercased()
+        if t.isEmpty { return nil }
+        if t == "0" || t.hasPrefix("unlimited") || t.hasPrefix("forever")
+            || t.hasPrefix("never") || t.hasPrefix("don") { return 0 }
+        let digits = t.prefix { $0.isNumber }
+        guard !digits.isEmpty, let n = Int(digits), n >= 0 else { return nil }
+        let unit = t.dropFirst(digits.count).trimmingCharacters(in: .whitespaces)
+        if unit.isEmpty || unit.hasPrefix("d") { return n }
+        if unit.hasPrefix("w") { return n * 7 }
+        if unit.hasPrefix("mo") { return n * 30 }
+        if unit.hasPrefix("y") { return n * 365 }
+        return nil
+    }
+
+    static func retentionTitle(_ days: Int) -> String {
+        if days == 0 { return "Unlimited" }
+        if days % 365 == 0 { return days == 365 ? "1 year" : "\(days / 365) years" }
+        return "\(days) days"
+    }
+}
+
+enum AudioArchiver {
+    /// WAV → AAC 32 kbps .m4a (afconvert). Writes to a .partial temp, then promotes — a killed
+    /// sweep never leaves a half-written archive behind. The original's modification date is
+    /// carried over so the retention clock keeps counting from RECORDING time, not archive time.
+    /// 16 kHz mono rejects higher AAC bitrates (64k fails with '!dat'), so 32k is also the ceiling.
+    static func compress(_ wav: URL, to out: URL) -> Bool {
+        let fm = FileManager.default
+        let tmp = out.appendingPathExtension("partial")
+        try? fm.removeItem(at: tmp)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/afconvert")
+        p.arguments = ["-f", "m4af", "-d", "aac", "-b", "32000", wav.path, tmp.path]
+        do { try p.run() } catch { elog("archive: afconvert launch failed: \(error)"); return false }
+        p.waitUntilExit()
+        let size = (try? fm.attributesOfItem(atPath: tmp.path))?[.size] as? Int ?? 0
+        guard p.terminationStatus == 0, size > 0 else {
+            elog("archive: afconvert failed (status \(p.terminationStatus)) — keeping \(wav.lastPathComponent)")
+            try? fm.removeItem(at: tmp)
+            return false
+        }
+        let mdate = (try? wav.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        try? fm.removeItem(at: out)
+        do { try fm.moveItem(at: tmp, to: out) } catch { try? fm.removeItem(at: tmp); return false }
+        if let mdate { try? fm.setAttributes([.modificationDate: mdate], ofItemAtPath: out.path) }
+        return true
     }
 }
 
@@ -2086,24 +2195,37 @@ func formRowRoles(_ rows: [[NSView]]) -> (headers: [Int], notes: [Int]) {
     return (headers, notes)
 }
 
-final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextFieldDelegate {
+final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSComboBoxDelegate {
 
-    /// A schedule field the parser can't read must LOOK broken while typing — silently falling open
-    /// to "record everything" is a privacy failure for the one feature meant to stop recording.
+    /// A field the parser can't read must LOOK broken while typing — schedule fields silently
+    /// falling open to "record everything" is a privacy failure; a retention typo would silently
+    /// keep the last saved period. Invalid input turns red and is ignored on save.
     func controlTextDidChange(_ obj: Notification) {
-        guard let f = obj.object as? NSTextField, f === schedDaysField || f === schedHoursField else { return }
-        recolorScheduleFields()
+        guard let f = obj.object as? NSTextField else { return }
+        if f === schedDaysField || f === schedHoursField { recolorScheduleFields() }
+        if f === audioRawCombo || f === audioRetCombo { recolorRetentionCombos() }
     }
 
     fileprivate func recolorScheduleFields() {
         schedDaysField.textColor = RecordSchedule.daysValid(schedDaysField.stringValue) ? .labelColor : .systemRed
         schedHoursField.textColor = RecordSchedule.hoursValid(schedHoursField.stringValue) ? .labelColor : .systemRed
     }
+
+    fileprivate func recolorRetentionCombos() {
+        for c in [audioRawCombo, audioRetCombo] {
+            c.textColor = AudioArchivePolicy.parseRetentionDays(c.stringValue) != nil ? .labelColor : .systemRed
+        }
+    }
+
+    func comboBoxSelectionDidChange(_ notification: Notification) {
+        DispatchQueue.main.async { self.recolorRetentionCombos() }   // stringValue updates after this fires
+    }
     private let onSave: () -> Void
     private(set) var tabsForTest: NSTabView?   // selftest hook: every pane must host its grid in a scroll view
     private let segPopup = NSPopUpButton(), langPopup = NSPopUpButton()
     private let modelPopup = NSPopUpButton()
-    private let audioRetPopup = NSPopUpButton(), txtRetPopup = NSPopUpButton()
+    private let txtRetPopup = NSPopUpButton()
+    private let audioRawCombo = NSComboBox(), audioRetCombo = NSComboBox()   // editable: any "45 days" works
     private let addAppPopup = NSPopUpButton()
     private let voiceField = NSTextField(), dirField = NSTextField(), audioDirField = NSTextField()
     private let customModelField = NSTextField()   // custom model URL or local path (overrides the popup)
@@ -2144,7 +2266,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private let transcriptLangPopup = NSPopUpButton()
     private let tLangValues = ["", "en", "ko", "ja"], tLangTitles = ["System", "English", "한국어", "日本語"]
     private let modelNames = WhisperCatalog.all.map { $0.name }   // popup order matches WhisperCatalog.all
-    private let retValues = [7, 30, 90, 0], retTitles = ["7 days", "30 days", "90 days", "Unlimited"]
+    private let retValues = [7, 30, 90, 180, 365, 0]
+    private let retTitles = ["7 days", "30 days", "90 days", "180 days", "1 year", "Unlimited"]
 
     init(onSave: @escaping () -> Void) {
         self.onSave = onSave
@@ -2175,7 +2298,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
         transcriptLangPopup.addItems(withTitles: tLangTitles)
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
-        audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
+        txtRetPopup.addItems(withTitles: retTitles)
+        audioRawCombo.addItems(withObjectValues: ["3 days", "7 days", "14 days", "30 days", "Don't compress"])
+        audioRetCombo.addItems(withObjectValues: ["30 days", "90 days", "180 days", "1 year", "Unlimited"])
+        for c in [audioRawCombo, audioRetCombo] {
+            c.translatesAutoresizingMaskIntoConstraints = false
+            c.widthAnchor.constraint(equalToConstant: 140).isActive = true
+            c.completes = true
+            c.delegate = self   // red-on-invalid, same treatment as the schedule fields
+        }
         for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField, gladiaKeyField, postProcessField, promptFileField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
         dirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
@@ -2349,7 +2480,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             row("Save to:", dirStack),
             sectionHeader("Audio", symbol: "waveform"),
             row("", keepAudioBtn),
-            row("Keep for:", audioRetPopup),
+            row("Compress after:", audioRawCombo),
+            fieldCaption("Recent recordings stay WAV; older ones are archived to AAC (~⅛ the size). "
+                       + "Type any period — 45 days, 6 months, 1 year."),
+            row("Delete after:", audioRetCombo),
+            fieldCaption("Audio older than this is deleted, raw or compressed. Unlimited keeps it forever."),
             row("Save to:", audioStack),
         ]))
         tabs.addTabViewItem(tab("Schedule", [
@@ -2568,7 +2703,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         echoBtn.state = Pref.bool(Pref.echoReduce, "MR_ECHO_REDUCE", false) ? .on : .off
         calBtn.state = c.useCalendarTitles ? .on : .off
         keepAudioBtn.state = c.keepAudio ? .on : .off
-        audioRetPopup.selectItem(at: idx(c.audioRetentionDays, retValues))
+        audioRawCombo.stringValue = c.audioRawDays == 0 ? "Don't compress"
+                                                        : AudioArchivePolicy.retentionTitle(c.audioRawDays)
+        audioRetCombo.stringValue = AudioArchivePolicy.retentionTitle(c.audioRetentionDays)
+        recolorRetentionCombos()
         txtRetPopup.selectItem(at: idx(c.transcriptRetentionDays, retValues))
         excludeTokens.objectValue = c.excludeBundleIds
         // Trim stored titles (older builds stored via a token field that could carry stray spaces).
@@ -2649,7 +2787,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         d.set(echoBtn.state == .on, forKey: Pref.echoReduce)
         d.set(calBtn.state == .on, forKey: Pref.cal)
         d.set(keepAudioBtn.state == .on, forKey: Pref.keepAudio)
-        d.set(retValues[max(0, audioRetPopup.indexOfSelectedItem)], forKey: Pref.audioRetention)
+        // Unparseable combo text (shown red) keeps the previously saved period instead of guessing.
+        if let v = AudioArchivePolicy.parseRetentionDays(audioRawCombo.stringValue) { d.set(v, forKey: Pref.audioRawDays) }
+        if let v = AudioArchivePolicy.parseRetentionDays(audioRetCombo.stringValue) { d.set(v, forKey: Pref.audioRetention) }
         d.set(retValues[max(0, txtRetPopup.indexOfSelectedItem)], forKey: Pref.txtRetention)
         let ids = (excludeTokens.objectValue as? [String]) ?? []
         d.set(ids.joined(separator: " "), forKey: Pref.exclude)
@@ -4777,6 +4917,8 @@ func printMacrecHelp() {
       perm-status            exit 0 if System Audio Recording + Microphone are granted
       request-permission     trigger the macOS permission prompts
       mic-status             exit 0 if the default input device is in use right now
+      sweep                  run one retention/archive pass (WAV→AAC tiers) and exit
+                             [--audio-dir D] [--transcripts-dir D] [--raw-days N] [--keep-days N]
       version, --version     print the version and exit
       help,    --help        show this help
 
@@ -4800,6 +4942,26 @@ struct Main {
         // Subcommands: help / version (accept the common flag spellings too).
         if let a = args.first, ["help", "--help", "-h"].contains(a) { printMacrecHelp(); exit(0) }
         if let a = args.first, ["version", "--version", "-v"].contains(a) { print("macrec \(macrecVersion)"); exit(0) }
+
+        // Subcommand: sweep — run one retention/archive pass now (WAV→AAC tiers + expiry) and exit.
+        // The tray app does this on start and after each segment; this is for manual runs and the
+        // integration smoke test. Saved Settings BEAT env vars everywhere in this app, so the flags
+        // exist to aim a one-off sweep at an explicit layout without touching the real library.
+        if args.first == "sweep" {
+            var cfg = EngineConfig.load()
+            var it = args.dropFirst().makeIterator()
+            while let a = it.next() {
+                switch a {
+                case "--audio-dir":       if let v = it.next() { cfg.audioDir = URL(fileURLWithPath: v) }
+                case "--transcripts-dir": if let v = it.next() { cfg.transcriptsDir = URL(fileURLWithPath: v) }
+                case "--raw-days":        if let v = it.next(), let n = Int(v) { cfg.audioRawDays = n }
+                case "--keep-days":       if let v = it.next(), let n = Int(v) { cfg.audioRetentionDays = n }
+                default: print("unknown sweep option: \(a) (see: help)"); exit(2)
+                }
+            }
+            RecordingEngine(cfg: cfg).runRetentionSweep()
+            exit(0)
+        }
 
         // Subcommand: selftest — assertions on pure logic (run in CI). No GUI/permissions needed.
         if args.first == "selftest" {
@@ -5087,6 +5249,52 @@ struct Main {
                   RecordSchedule.from(enabled: false, days: "", hours: "").isActive(at: schedDate("2026-07-05 03:00"), calendar: utc)
                   && RecordSchedule.from(enabled: true, days: "mon-fri", hours: "").isActive(at: schedDate("2026-07-06 03:00"), calendar: utc)
                   && RecordSchedule.from(enabled: true, days: "", hours: "10:00-11:00").isActive(at: schedDate("2026-07-05 10:30"), calendar: utc))
+            // Audio archive tiers: raw → compressed → deleted, with 0 disabling a stage.
+            check("audio tiers: raw → compressed → deleted (0 = never/forever)",
+                  AudioArchivePolicy(rawDays: 7, totalDays: 90).tier(ageDays: 3) == .raw
+                  && AudioArchivePolicy(rawDays: 7, totalDays: 90).tier(ageDays: 7) == .compressed
+                  && AudioArchivePolicy(rawDays: 7, totalDays: 90).tier(ageDays: 90) == .deleted
+                  && AudioArchivePolicy(rawDays: 0, totalDays: 90).tier(ageDays: 60) == .raw          // never compress
+                  && AudioArchivePolicy(rawDays: 7, totalDays: 0).tier(ageDays: 400) == .compressed   // keep forever
+                  && AudioArchivePolicy(rawDays: 30, totalDays: 14).tier(ageDays: 20) == .deleted)    // delete wins
+            check("audio tiers: retention combo text parsing",
+                  AudioArchivePolicy.parseRetentionDays("90 days") == 90
+                  && AudioArchivePolicy.parseRetentionDays("1 year") == 365
+                  && AudioArchivePolicy.parseRetentionDays("6 months") == 180
+                  && AudioArchivePolicy.parseRetentionDays("2 weeks") == 14
+                  && AudioArchivePolicy.parseRetentionDays("45") == 45
+                  && AudioArchivePolicy.parseRetentionDays("Unlimited") == 0
+                  && AudioArchivePolicy.parseRetentionDays("Don't compress") == 0
+                  && AudioArchivePolicy.parseRetentionDays("soon") == nil
+                  && AudioArchivePolicy.parseRetentionDays("") == nil)
+            check("audio tiers: titles round-trip through the parser",
+                  [7, 90, 180, 365, 730, 0].allSatisfy {
+                      AudioArchivePolicy.parseRetentionDays(AudioArchivePolicy.retentionTitle($0)) == $0
+                  })
+            // Real afconvert round-trip — would have caught 64 kbps being rejected ('!dat') at 16 kHz
+            // mono. Also proves the retention clock survives archiving (mdate carried over).
+            do {
+                let fm = FileManager.default
+                let dir = fm.temporaryDirectory.appendingPathComponent("macrec-selftest-\(ProcessInfo.processInfo.processIdentifier)")
+                try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                let wav = dir.appendingPathComponent("tone.wav"), m4a = dir.appendingPathComponent("tone.m4a")
+                let settings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000.0,
+                                               AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16]
+                if let file = try? AVAudioFile(forWriting: wav, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false),
+                   let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 16000) {
+                    buf.frameLength = 16000
+                    for i in 0..<16000 { buf.floatChannelData![0][i] = sinf(Float(i) * 0.1) * 0.3 }
+                    try? file.write(from: buf)
+                }
+                let past = Date(timeIntervalSinceNow: -86400 * 10)
+                try? fm.setAttributes([.modificationDate: past], ofItemAtPath: wav.path)
+                let ok = AudioArchiver.compress(wav, to: m4a)
+                let size = (try? fm.attributesOfItem(atPath: m4a.path))?[.size] as? Int ?? 0
+                let mdate = (try? m4a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date()
+                check("audio tiers: afconvert AAC round-trip keeps the retention clock",
+                      ok && size > 0 && abs(mdate.timeIntervalSince(past)) < 2)
+                try? fm.removeItem(at: dir)
+            }
             // nextBoundary anchors the manual-override expiry: a wall-clock timestamp, so sleeping
             // across boundaries still expires it. Fri 20:00 → next flip is MONDAY 10:00 (skips the weekend).
             check("schedule: next boundary (lunch edge, weekend skip, never-flips → nil)",
@@ -5143,7 +5351,7 @@ struct Main {
         if args.first == "config" {
             let c = EngineConfig.load()
             print("suite=\(Pref.suiteName)")
-            print("segmentSeconds=\(Int(c.segmentSeconds)) voiceMin=\(Int(c.voiceMinSeconds)) lang=\(c.whisperLang) vad=\(c.vadEnabled) keepAudio=\(c.keepAudio) audioRetDays=\(c.audioRetentionDays) txtRetDays=\(c.transcriptRetentionDays)")
+            print("segmentSeconds=\(Int(c.segmentSeconds)) voiceMin=\(Int(c.voiceMinSeconds)) lang=\(c.whisperLang) vad=\(c.vadEnabled) keepAudio=\(c.keepAudio) audioRawDays=\(c.audioRawDays) audioRetDays=\(c.audioRetentionDays) txtRetDays=\(c.transcriptRetentionDays)")
             print("exclude=\(c.excludeBundleIds) transcriptsDir=\(c.transcriptsDir.path)")
             print("model=\(WhisperCatalog.selected.name) ready=\(ModelStore.shared.isReady)")
             print("whisperCli=\(c.whisperCli)")
