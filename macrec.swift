@@ -4501,6 +4501,12 @@ func flushOutcome(for status: String) -> (title: String, body: String)? {
     return nil
 }
 
+/// How much longer to keep the flush spinner up before revealing the outcome. Instant outcomes
+/// ("no speech" lands in ~0.3 s) must still spin visibly, or the click reads as a dead button.
+func spinnerHold(elapsed: Double, minimum: Double = 1.0) -> Double {
+    max(0, minimum - elapsed)
+}
+
 enum Notifier {
     static func requestAuth() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, err in
@@ -4581,6 +4587,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var trayBusyGeneration = 0         // failsafe-timeout token (a new flush invalidates old timers)
     private var transcribeBtn: NSButton!               // "Transcribe now" row (view-backed: menu stays open)
     private let menuRowSpinner = NSProgressIndicator() // replaces the row's icon while the flush runs
+    private var transcribeRowTitle = "Transcribe now"  // flashes the outcome ("No speech found") briefly
+    private var rowHovered = false                     // hover restyle must not clobber a flashed title
+    private var spinStartedAt: TimeInterval = 0        // enforce a visible minimum spin (see spinnerHold)
     private var schedulePaused = false         // the SCHEDULE stopped the engine (vs the user's `paused`)
     private var scheduleOverrideUntil: Date?   // manual Pause/Resume wins until this boundary passes
     private var startTask: Task<Void, Never>?  // in-flight engine start — stops must wait for it
@@ -4703,17 +4712,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let tView = MenuHoverView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
         let tBtn = NSButton(title: "Transcribe now", target: self, action: #selector(flushNow))
         tBtn.isBordered = false; tBtn.alignment = .left
-        // Borderless buttons render the gray "button" text style — force the menu-item look, and
-        // flip to white while the hover pill is showing, like native rows.
-        func styleTranscribeNow(hovered: Bool) {
-            let fg: NSColor = hovered ? .selectedMenuItemTextColor : .labelColor
-            tBtn.attributedTitle = NSAttributedString(
-                string: "Transcribe now",
-                attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: fg])
-            tBtn.contentTintColor = fg
+        transcribeBtn = tBtn
+        styleTranscribeRow()
+        tView.onHover = { [weak self] hovered in
+            self?.rowHovered = hovered
+            self?.styleTranscribeRow()
         }
-        styleTranscribeNow(hovered: false)
-        tView.onHover = { styleTranscribeNow(hovered: $0) }
         tBtn.image = NSImage(systemSymbolName: "doc.badge.plus", accessibilityDescription: "Transcribe now")
         tBtn.imagePosition = .imageLeading
         // AppKit's default image↔title gap matches the standard imaged items; a small left inset
@@ -4725,7 +4729,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menuRowSpinner.isDisplayedWhenStopped = false
         menuRowSpinner.frame = NSRect(x: 13, y: 3, width: 16, height: 16)   // sits where the icon was
         tView.addSubview(tBtn); tView.addSubview(menuRowSpinner); tItem.view = tView
-        transcribeBtn = tBtn
         menu.addItem(tItem)
         toggleItem = item("Pause", #selector(togglePause), symbol: "pause.circle"); menu.addItem(toggleItem)
         if #available(macOS 26, *) {   // real-time caption overlay (on-device SpeechAnalyzer)
@@ -4867,13 +4870,45 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// One push per armed "Transcribe now": the first TERMINAL status (saved / no speech / failed)
-    /// consumes the flag; intermediate ones ("Transcribing…") don't.
+    /// consumes the flag; intermediate ones ("Transcribing…") don't. The reveal is held so the
+    /// spinner stays visible ≥1 s — a "no speech" outcome lands in ~0.3 s, and a click that shows
+    /// nothing reads as a dead button (user report). The row then flashes the outcome in place.
     private func pushFlushOutcomeIfNeeded(_ status: String) {
         guard notifyWhenTranscribed, let o = flushOutcome(for: status) else { return }
         notifyWhenTranscribed = false
-        hideTraySpinner()
         let file = status.hasPrefix("Saved: ") ? lastTranscriptURL?.path : nil
-        Notifier.push(title: o.title, body: o.body, filePath: file)
+        let gen = trayBusyGeneration
+        let hold = spinnerHold(elapsed: ProcessInfo.processInfo.systemUptime - spinStartedAt)
+        DispatchQueue.main.asyncAfter(deadline: .now() + hold) { [weak self] in
+            guard let self, self.trayBusyGeneration == gen else { return }
+            self.hideTraySpinner()
+            self.flashTranscribeRow(o.title)   // in-menu answer, e.g. "No speech found"
+            Notifier.push(title: o.title, body: o.body, filePath: file)
+        }
+    }
+
+    /// Menu-item look for the Transcribe-now row (borderless buttons default to the gray button
+    /// style), flipping to white while the hover pill shows — and rendering whatever the current
+    /// row title is, so a flashed outcome survives hover changes.
+    private func styleTranscribeRow() {
+        let fg: NSColor = rowHovered ? .selectedMenuItemTextColor : .labelColor
+        transcribeBtn.attributedTitle = NSAttributedString(
+            string: transcribeRowTitle,
+            attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: fg])
+        transcribeBtn.contentTintColor = fg
+    }
+
+    /// Show the flush outcome in the row itself for a moment ("No speech found"), then restore
+    /// "Transcribe now" — the menu stays open on click, so the answer belongs where the user is looking.
+    private func flashTranscribeRow(_ text: String) {
+        transcribeRowTitle = text
+        styleTranscribeRow()
+        let gen = trayBusyGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self, self.trayBusyGeneration == gen else { return }   // a newer flush owns the row
+            self.transcribeRowTitle = "Transcribe now"
+            self.styleTranscribeRow()
+        }
     }
 
     /// While a manual flush transcribes, progress spins in BOTH places the user might be looking:
@@ -4882,6 +4917,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !trayBusy, let btn = statusItem.button else { return }
         trayBusy = true
         trayBusyGeneration += 1
+        spinStartedAt = ProcessInfo.processInfo.systemUptime
         traySpinner.style = .spinning
         traySpinner.controlSize = .small
         traySpinner.isIndeterminate = true
@@ -5509,6 +5545,11 @@ struct Main {
                   && flushOutcome(for: "Transcribing…") == nil
                   && flushOutcome(for: "Recording · mic + system audio") == nil
                   && flushOutcome(for: "Paused (locked/asleep)") == nil)
+            check("flush push: spinner holds to a visible minimum, never negative",
+                  abs(spinnerHold(elapsed: 0.3) - 0.7) < 1e-9
+                  && spinnerHold(elapsed: 1.0) == 0
+                  && spinnerHold(elapsed: 45) == 0
+                  && spinnerHold(elapsed: 0) == 1.0)
             // File naming: start + END time, so a mid-hour "Transcribe now" shows the cut point.
             check("naming: transcript base carries start AND end times",
                   transcriptBaseName(start: schedDate("2026-07-05 21:00"), end: schedDate("2026-07-05 21:30"),
