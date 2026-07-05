@@ -791,6 +791,7 @@ enum Pref {
     static let postProcessMode = "postProcessMode"      // off | summary (built-in) | shell (freeform)
     static let summaryRunner = "summaryRunner"          // automatic summary runner: claude | codex | gemini
     static let summaryPrompt = "summaryPrompt"          // summary prompt (absent = built-in default)
+    static let summaryPromptFile = "summaryPromptFile"  // external prompt file — overrides the text when readable
     static let summaryOut = "summaryOut"                // summary output dir ("" = next to the transcript)
     static let postProcessCmd = "postProcessCmd"        // freeform command ("" = off)
     static let hintsTerms = "hintsTerms"                // transcription hint terms (comma/newline separated)
@@ -1792,12 +1793,30 @@ func effectivePostProcessMode(rawMode: String, shellCmd: String) -> PostProcessM
 }
 
 /// Read the post-process prefs and build the invocation for a just-saved transcript.
+/// The effective summary prompt: a readable prompt FILE overrides the inline text (same "…or file"
+/// pattern as the hints; keep the prompt in your notes repo and iterate without touching Settings).
+/// An unreadable configured file falls back to the inline text — and logs, never fails silently.
+func effectiveSummaryPrompt(inline: String, filePath: String) -> String {
+    let fp = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !fp.isEmpty {
+        let path = (fp as NSString).expandingTildeInPath
+        if let txt = try? String(contentsOfFile: path, encoding: .utf8),
+           !txt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return txt.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        elog("summary: couldn't read prompt file \(path) — using the inline prompt")
+    }
+    return inline
+}
+
 func postProcessInvocationFromPrefs(transcriptPath: String) -> String? {
     let mode = effectivePostProcessMode(rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
                                         shellCmd: Pref.postProcessCommand)
     let runner = SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude
+    let prompt = effectiveSummaryPrompt(inline: Pref.explicit(Pref.summaryPrompt, "MR_SUMMARY_PROMPT"),
+                                        filePath: Pref.explicit(Pref.summaryPromptFile, "MR_SUMMARY_PROMPT_FILE"))
     return postProcessInvocation(mode: mode, runner: runner,
-                                 prompt: Pref.explicit(Pref.summaryPrompt, "MR_SUMMARY_PROMPT"),
+                                 prompt: prompt,
                                  shellCmd: Pref.postProcessCommand,
                                  transcriptPath: transcriptPath,
                                  outDir: Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT"))
@@ -1869,6 +1888,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let runnerPopup = NSPopUpButton()     // which agent CLI writes the summary
     private let runnerValues = ["claude", "codex", "gemini"], runnerTitles = ["Claude CLI", "Codex CLI", "Gemini CLI"]
     private let promptView = NSTextView()         // summary prompt — a real TEXT AREA (prompts are sentences)
+    private let promptFileField = NSTextField()   // external prompt file — overrides the text when readable
     private let promptScroll = NSScrollView()     // its bordered, scrolling host
     private let summaryOutField = NSTextField()   // summary output dir ("" = next to the transcript)
     private var summaryChooseBtn: NSButton?       // folder picker for the summary output dir
@@ -1915,7 +1935,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         transcriptLangPopup.addItems(withTitles: tLangTitles)
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         audioRetPopup.addItems(withTitles: retTitles); txtRetPopup.addItems(withTitles: retTitles)
-        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField, gladiaKeyField, postProcessField] { f.translatesAutoresizingMaskIntoConstraints = false }
+        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField, gladiaKeyField, postProcessField, promptFileField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
         dirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
         audioDirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
@@ -1928,6 +1948,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         openaiBaseField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         gladiaKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         gladiaKeyField.placeholderString = "Gladia API key"
+        promptFileField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        promptFileField.placeholderString = "~/notes/summary-prompt.md"
         postProcessField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         postProcessField.placeholderString = "~/bin/my-pipeline.sh"
         summaryOutField.translatesAutoresizingMaskIntoConstraints = false
@@ -2086,12 +2108,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             row("Prompt:", promptScroll),                                                         // 5
             fieldCaption("Default asks for key points, decisions, and action items — answered "
                        + "in the transcript's language."),                                        // 6
-            row("Save summary to:", summaryStack),                                                // 7
-            fieldCaption("Folder for <name>.summary.md. Empty = next to the transcript."),        // 8
-            sectionHeader("Custom command", symbol: "terminal"),                                                      // 9
-            row("Command:", postProcessField),                                                    // 10
+            row("…or prompt file:", promptFileField),                                             // 7
+            fieldCaption("Overrides the text above when readable — keep the prompt in your "
+                       + "notes repo and iterate without opening Settings."),                     // 8
+            row("Save summary to:", summaryStack),                                                // 9
+            fieldCaption("Folder for <name>.summary.md. Empty = next to the transcript."),        // 10
+            sectionHeader("Custom command", symbol: "terminal"),                                  // 11
+            row("Command:", postProcessField),                                                    // 12
             fieldCaption("Freeform: runs in a login shell with the transcript path appended "
-                       + "as the last argument."),                                                // 11
+                       + "as the last argument."),                                                // 13
         ], headers: [0, 3, 9], notes: [2, 6, 8, 11]))
         tabs.addTabViewItem(tab("Titling", [
             row("", calBtn),
@@ -2166,6 +2191,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let mode = PostProcessMode(rawValue: ppModeValues[max(0, ppModePopup.indexOfSelectedItem)]) ?? .off
         for c in [runnerPopup, summaryOutField] as [NSControl] { c.isEnabled = mode == .summary }
         summaryChooseBtn?.isEnabled = mode == .summary
+        promptFileField.isEnabled = mode == .summary
         promptView.isEditable = mode == .summary
         promptScroll.alphaValue = mode == .summary ? 1 : 0.45   // NSTextView isn't an NSControl — dim to match
         postProcessField.isEnabled = mode == .shell
@@ -2242,6 +2268,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         runnerPopup.selectItem(at: idx(Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER"), runnerValues))
         let savedPrompt = Pref.explicit(Pref.summaryPrompt, "MR_SUMMARY_PROMPT")
         promptView.string = savedPrompt.isEmpty ? defaultSummaryPrompt : savedPrompt   // show the editable default
+        promptFileField.stringValue = Pref.explicit(Pref.summaryPromptFile, "MR_SUMMARY_PROMPT_FILE")
         summaryOutField.stringValue = Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT")
         hintsTermsField.stringValue = Pref.explicit(Pref.hintsTerms, "MR_HINTS")
         hintsFileField.stringValue = Pref.explicit(Pref.hintsFile, "MR_HINTS_FILE")
@@ -2320,6 +2347,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(ppModeValues[max(0, ppModePopup.indexOfSelectedItem)], forKey: Pref.postProcessMode)
         d.set(runnerValues[max(0, runnerPopup.indexOfSelectedItem)], forKey: Pref.summaryRunner)
         d.set(promptView.string.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryPrompt)
+        d.set(promptFileField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryPromptFile)
         d.set(summaryOutField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryOut)
         d.set(hintsTermsField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.hintsTerms)
         d.set(hintsFileField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.hintsFile)
@@ -4506,6 +4534,14 @@ struct Main {
                   && effectivePostProcessMode(rawMode: "", shellCmd: " ") == .off
                   && effectivePostProcessMode(rawMode: "off", shellCmd: "./x.sh") == .off
                   && effectivePostProcessMode(rawMode: "summary", shellCmd: "./x.sh") == .summary)
+            // Prompt file: readable file overrides inline; blank/missing file falls back (logged).
+            let pfURL = FileManager.default.temporaryDirectory.appendingPathComponent("macrec-prompt-\(UUID().uuidString).md")
+            try? "  file prompt\n".write(to: pfURL, atomically: true, encoding: .utf8)
+            check("post-process: prompt file overrides inline (trimmed) + fallback",
+                  effectiveSummaryPrompt(inline: "inline", filePath: pfURL.path) == "file prompt"
+                  && effectiveSummaryPrompt(inline: "inline", filePath: "/nonexistent/p.md") == "inline"
+                  && effectiveSummaryPrompt(inline: "inline", filePath: " ") == "inline")
+            try? FileManager.default.removeItem(at: pfURL)
             check("post-process: empty prompt falls back to the built-in default",
                   inv(.summary, .claude, prompt: " ")?.contains(defaultSummaryPrompt.prefix(25)) == true)
             check("post-process: summary path derivation (custom dir + tilde)",
