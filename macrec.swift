@@ -793,6 +793,9 @@ enum Pref {
     static let summaryPrompt = "summaryPrompt"          // summary prompt (absent = built-in default)
     static let summaryOut = "summaryOut"                // summary output dir ("" = next to the transcript)
     static let postProcessCmd = "postProcessCmd"        // freeform command ("" = off)
+    static let hintsTerms = "hintsTerms"                // transcription hint terms (comma/newline separated)
+    static let hintsFile = "hintsFile"                  // external hints file (one term per line, # comments)
+    static let hintsCalendar = "hintsCalendar"          // merge the overlapping event's title + attendees
     /// Explicit save (even empty) beats the env — for fields where empty is meaningful.
     static func explicit(_ key: String, _ env: String) -> String {
         if d.object(forKey: key) != nil { return d.string(forKey: key) ?? "" }
@@ -1350,7 +1353,7 @@ enum CalendarLookup {
 
 enum Transcriber {
     /// Run whisper-cli (VAD + suppress-non-speech) on a 16kHz/16-bit WAV; return its timestamped stdout.
-    private static func runWhisper(_ wav16: URL, _ cfg: EngineConfig) -> String {
+    private static func runWhisper(_ wav16: URL, _ cfg: EngineConfig, hints: String = "") -> String {
         guard FileManager.default.isExecutableFile(atPath: cfg.whisperCli),
               FileManager.default.fileExists(atPath: cfg.whisperModel) else {
             elog("transcribe: whisper-cli or model missing (\(cfg.whisperCli))"); return ""
@@ -1361,6 +1364,7 @@ enum Transcriber {
         if cfg.vadEnabled && FileManager.default.fileExists(atPath: cfg.vadModel) {
             args += ["--vad", "--vad-model", cfg.vadModel]
         }
+        if !hints.isEmpty { args += ["--prompt", hints] }   // proper-noun dictionary biases decoding
         p.arguments = args
         let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
         do { try p.run() } catch { elog("whisper run: \(error)"); return "" }
@@ -1417,13 +1421,15 @@ enum Transcriber {
         // Speaker labels follow the transcription language (auto → the system language).
         let lang = cfg.whisperLang == "auto" ? Locale.current.language.languageCode?.identifier : cfg.whisperLang
         let (mine, theirs) = speakerLabels(forLanguage: lang)
+        let hints = transcriptionHints(start: seg.start, end: seg.start.addingTimeInterval(seg.durationSeconds))
+        if !hints.isEmpty { elog("transcribe: hints (\(hints.split(separator: ",").count) terms)") }
         var merged: [(start: Double, who: String, text: String)] = []
         if let mic16 = convert16(seg.micURL) {
-            merged += parse(runWhisper(mic16, cfg)).map { (start: $0.0, who: mine, text: $0.1) }
+            merged += parse(runWhisper(mic16, cfg, hints: hints)).map { (start: $0.0, who: mine, text: $0.1) }
             try? FileManager.default.removeItem(at: mic16)
         }
         if let sys16 = convert16(seg.sysURL) {
-            merged += parse(runWhisper(sys16, cfg)).map { (start: $0.0, who: theirs, text: $0.1) }
+            merged += parse(runWhisper(sys16, cfg, hints: hints)).map { (start: $0.0, who: theirs, text: $0.1) }
             try? FileManager.default.removeItem(at: sys16)
         }
         merged.sort { $0.start < $1.start }
@@ -1679,6 +1685,47 @@ final class RecordingEngine {
     }
 }
 
+// MARK: - transcription hints (a proper-noun dictionary biases recognition toward YOUR vocabulary)
+//
+// whisper's initial prompt (--prompt) steers decoding toward the given tokens — team/product names,
+// domain jargon, attendee names stop coming out mangled. Merged from three sources: the Settings terms,
+// an external file (git-manageable), and optionally the overlapping calendar event.
+
+/// Split a hints blob into terms: comma- or newline-separated, trimmed, `#`-comment lines dropped.
+func parseHintTerms(_ text: String) -> [String] {
+    text.split(whereSeparator: { $0 == "\n" || $0 == "," })
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+}
+
+/// Merge hint sources in priority order, dedupe case-insensitively, cap the count (whisper's prompt
+/// window is small — past ~60 terms the tail is ignored anyway). Pure + testable.
+func mergeHintTerms(direct: [String], file: [String], event: [String], cap: Int = 60) -> [String] {
+    var seen = Set<String>(), out: [String] = []
+    for t in direct + file + event where out.count < cap {
+        let k = t.lowercased()
+        if !seen.contains(k) { seen.insert(k); out.append(t) }
+    }
+    return out
+}
+
+/// Assemble the effective hints prompt for a recording window from prefs (+ calendar when enabled).
+func transcriptionHints(start: Date, end: Date) -> String {
+    let direct = parseHintTerms(Pref.explicit(Pref.hintsTerms, "MR_HINTS"))
+    var file: [String] = []
+    let fp = Pref.explicit(Pref.hintsFile, "MR_HINTS_FILE").trimmingCharacters(in: .whitespacesAndNewlines)
+    if !fp.isEmpty {
+        let path = (fp as NSString).expandingTildeInPath
+        if let txt = try? String(contentsOfFile: path, encoding: .utf8) { file = parseHintTerms(txt) }
+        else { elog("hints: couldn't read \(path) — skipping the file terms") }
+    }
+    var event: [String] = []
+    if Pref.bool(Pref.hintsCalendar, "MR_HINTS_CALENDAR", false), let e = CalendarLookup.match(start: start, end: end) {
+        event = [e.title] + e.attendees
+    }
+    return mergeHintTerms(direct: direct, file: file, event: event).joined(separator: ", ")
+}
+
 // MARK: - post-process hook (ETL stage 1: the app triggers, the user's script pipelines)
 //
 // After each transcript is saved, run the user's command with the file path appended — summarize with
@@ -1794,6 +1841,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let promptView = NSTextView()         // summary prompt — a real TEXT AREA (prompts are sentences)
     private let promptScroll = NSScrollView()     // its bordered, scrolling host
     private let summaryOutField = NSTextField()   // summary output dir ("" = next to the transcript)
+    private let hintsTermsField = NSTextField()   // hint terms (comma/newline separated)
+    private let hintsFileField = NSTextField()    // external hints file path
+    private let hintsCalBtn = NSButton(checkboxWithTitle: "Add the meeting's title & attendees from Calendar",
+                                       target: nil, action: nil)
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
     // Calendar titling: a scrollable checkbox list of the user's calendars (none checked = all).
     private var calChecks: [(name: String, box: NSButton)] = []
@@ -1849,6 +1900,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         summaryOutField.translatesAutoresizingMaskIntoConstraints = false
         summaryOutField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         summaryOutField.placeholderString = "empty = next to the transcript"
+        for f in [hintsTermsField, hintsFileField] {
+            f.translatesAutoresizingMaskIntoConstraints = false
+            f.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        }
+        hintsTermsField.placeholderString = "Alpha, Kubernetes, 김철수, …"
+        hintsFileField.placeholderString = "~/notes/hints.txt"
         // Multiline prompt editor (user feedback: a one-line field is too small for a real prompt).
         promptScroll.translatesAutoresizingMaskIntoConstraints = false
         promptScroll.hasVerticalScroller = true
@@ -1975,7 +2032,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             fieldCaption("The spoken language whisper transcribes."),                             // 3
             row("Transcript file language:", transcriptLangPopup),                                // 4
             fieldCaption("Headings and labels of the saved markdown file (not the speech)."),     // 5
-        ], notes: [3, 5]))
+            sectionHeader("Hints", symbol: "character.book.closed"),                              // 6
+            row("Terms:", hintsTermsField),                                                       // 7
+            fieldCaption("Team/product names, jargon, people — comma or newline separated. "
+                       + "Biases recognition so proper nouns stop coming out mangled."),          // 8
+            row("…or hints file:", hintsFileField),                                               // 9
+            fieldCaption("One term per line, # comments — merged with the terms above."),         // 10
+            row("", hintsCalBtn),                                                                 // 11
+        ], headers: [6], notes: [3, 5, 8, 10]))
         tabs.addTabViewItem(tab("Post-process", [
             sectionNote("Runs after each hourly transcript is saved."),                           // 0
             row("Mode:", ppModePopup),                                                            // 1
@@ -2134,6 +2198,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let savedPrompt = Pref.explicit(Pref.summaryPrompt, "MR_SUMMARY_PROMPT")
         promptView.string = savedPrompt.isEmpty ? defaultSummaryPrompt : savedPrompt   // show the editable default
         summaryOutField.stringValue = Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT")
+        hintsTermsField.stringValue = Pref.explicit(Pref.hintsTerms, "MR_HINTS")
+        hintsFileField.stringValue = Pref.explicit(Pref.hintsFile, "MR_HINTS_FILE")
+        hintsCalBtn.state = Pref.bool(Pref.hintsCalendar, "MR_HINTS_CALENDAR", false) ? .on : .off
         updatePostProcessEnabled()
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
@@ -2203,6 +2270,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(runnerValues[max(0, runnerPopup.indexOfSelectedItem)], forKey: Pref.summaryRunner)
         d.set(promptView.string.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryPrompt)
         d.set(summaryOutField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryOut)
+        d.set(hintsTermsField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.hintsTerms)
+        d.set(hintsFileField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.hintsFile)
+        d.set(hintsCalBtn.state == .on, forKey: Pref.hintsCalendar)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
@@ -4193,6 +4263,14 @@ struct Main {
             } else {
                 check("settings: tabs built for inspection", false)
             }
+            // Transcription hints: parsing (comma/newline/#comment), case-insensitive dedupe, cap.
+            check("hints: parse comma/newline + comments",
+                  parseHintTerms("Alpha, Kubernetes\n# note\n김철수\n\n") == ["Alpha", "Kubernetes", "김철수"])
+            check("hints: dedupe (case-insensitive) + priority order",
+                  mergeHintTerms(direct: ["Kubernetes", "Beta"], file: ["kubernetes", "gRPC"], event: ["Beta", "김철수"])
+                  == ["Kubernetes", "Beta", "gRPC", "김철수"])
+            check("hints: cap respected",
+                  mergeHintTerms(direct: (1...100).map(String.init), file: [], event: []).count == 60)
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
             exit(fails == 0 ? 0 : 1)
         }
