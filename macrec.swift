@@ -4476,6 +4476,55 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
 
 // MARK: - menu-bar app (tray icon)
 
+/// Container for a custom NSMenuItem view that replicates the NATIVE hover behavior a plain view
+/// lacks: the selection-material pill behind the row and an inverted (white) label while hovered.
+/// AppKit draws that for ordinary items only — a `view`-backed item gets nothing, which made the
+/// row feel dead under the mouse (user report). Tracking uses .activeAlways because menu tracking
+/// runs in its own event mode, not the app's normal run loop.
+final class MenuHoverView: NSView {
+    private let highlight = NSVisualEffectView()
+    var onHover: ((Bool) -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        autoresizingMask = [.width]              // stretch with whatever width the menu settles on
+        highlight.material = .selection
+        highlight.state = .active
+        highlight.isEmphasized = true
+        highlight.blendingMode = .behindWindow
+        highlight.wantsLayer = true
+        highlight.layer?.cornerRadius = 4
+        highlight.layer?.cornerCurve = .continuous
+        highlight.isHidden = true
+        highlight.frame = bounds.insetBy(dx: 5, dy: 0)   // native menus inset the pill ~5 pt
+        highlight.autoresizingMask = [.width, .height]
+        addSubview(highlight, positioned: .below, relativeTo: nil)
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) { setHover(true) }
+    override func mouseExited(with event: NSEvent) { setHover(false) }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        setHover(false)   // a menu reopen must never resurrect last time's highlight
+    }
+
+    func setHover(_ inside: Bool) {
+        highlight.isHidden = !inside
+        onHover?(inside)
+    }
+
+    var highlightVisibleForTest: Bool { !highlight.isHidden }
+    var trackingReadyForTest: Bool { updateTrackingAreas(); return !trackingAreas.isEmpty }
+}
+
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var engine: RecordingEngine?
@@ -4598,23 +4647,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Transcribe now — custom-view button so clicking it does NOT dismiss the menu (watch the
         // live meter + status update in place). Its leading icon aligns with the imaged items below.
         let tItem = NSMenuItem()
-        let tView = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
+        let tView = MenuHoverView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
         let tBtn = NSButton(title: "Transcribe now", target: self, action: #selector(flushNow))
         tBtn.isBordered = false; tBtn.alignment = .left
         // A borderless button renders its title in the gray button style, which read as DISABLED
         // next to the real menu items — force the menu-item look (label color, menu font). And
         // "waveform" said "speech", not what the click does; "new document" says it: cut here,
         // write the transcript file now.
-        tBtn.attributedTitle = NSAttributedString(
-            string: "Transcribe now",
-            attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: NSColor.labelColor])
+        func styleTranscribeNow(hovered: Bool) {
+            let fg: NSColor = hovered ? .selectedMenuItemTextColor : .labelColor
+            tBtn.attributedTitle = NSAttributedString(
+                string: "Transcribe now",
+                attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: fg])
+            tBtn.contentTintColor = fg
+        }
+        styleTranscribeNow(hovered: false)
+        tView.onHover = { styleTranscribeNow(hovered: $0) }   // white-on-selection like native rows
         tBtn.image = NSImage(systemSymbolName: "doc.badge.plus", accessibilityDescription: "Transcribe now")
-        tBtn.contentTintColor = .labelColor
         tBtn.imagePosition = .imageLeading
         // AppKit's default image↔title gap matches the standard imaged items; a small left inset
         // lines the icon up with them. (No leading space in the title — that would leak into the
         // accessibility label and render inconsistently across fonts.)
         tBtn.frame = NSRect(x: 14, y: 1, width: 221, height: 20)
+        tBtn.autoresizingMask = [.width]   // keep the click target spanning the stretched row
         tView.addSubview(tBtn); tItem.view = tView
         menu.addItem(tItem)
         toggleItem = item("Pause", #selector(togglePause), symbol: "pause.circle"); menu.addItem(toggleItem)
@@ -5296,6 +5351,22 @@ struct Main {
                   RecordSchedule.from(enabled: false, days: "", hours: "").isActive(at: schedDate("2026-07-05 03:00"), calendar: utc)
                   && RecordSchedule.from(enabled: true, days: "mon-fri", hours: "").isActive(at: schedDate("2026-07-06 03:00"), calendar: utc)
                   && RecordSchedule.from(enabled: true, days: "", hours: "10:00-11:00").isActive(at: schedDate("2026-07-05 10:30"), calendar: utc))
+            // Menu hover: a view-backed item gets NO native highlight — MenuHoverView must provide
+            // the selection pill + notify the label restyle, and reset when the menu reopens.
+            do {
+                let hv = MenuHoverView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
+                var hoverStates: [Bool] = []
+                hv.onHover = { hoverStates.append($0) }
+                let initiallyOff = !hv.highlightVisibleForTest
+                hv.setHover(true)
+                let litAndNotified = hv.highlightVisibleForTest && hoverStates == [true]
+                hv.setHover(false)
+                let offAgain = !hv.highlightVisibleForTest && hoverStates == [true, false]
+                check("menu hover: pill shows on hover, hides after, restyle notified",
+                      initiallyOff && litAndNotified && offAgain)
+                check("menu hover: tracking area installed (mouse enter/exit will arrive)",
+                      hv.trackingReadyForTest)
+            }
             // File naming: start + END time, so a mid-hour "Transcribe now" shows the cut point.
             check("naming: transcript base carries start AND end times",
                   transcriptBaseName(start: schedDate("2026-07-05 21:00"), end: schedDate("2026-07-05 21:30"),
