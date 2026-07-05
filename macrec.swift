@@ -1299,6 +1299,17 @@ func slugify(_ s: String) -> String {
     return out.isEmpty ? "meeting" : out
 }
 
+/// Transcript/audio file base: start datetime + END time — "2026-07-05-2100-2130". Both endpoints
+/// in the name because "Transcribe now" cuts mid-segment: consecutive files must show where one
+/// stops and the next begins. A segment past midnight keeps the START's date ("…-2350-0020").
+func transcriptBaseName(start: Date, end: Date, timeZone: TimeZone = .current) -> String {
+    let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = timeZone
+    f.dateFormat = "yyyy-MM-dd-HHmm"
+    let g = DateFormatter(); g.locale = Locale(identifier: "en_US_POSIX"); g.timeZone = timeZone
+    g.dateFormat = "HHmm"
+    return "\(f.string(from: start))-\(g.string(from: end))"
+}
+
 // MARK: - calendar lookup (title a transcript from the overlapping event)
 
 enum CalendarLookup {
@@ -1706,7 +1717,6 @@ final class RecordingEngine {
     @discardableResult
     private func writeTranscript(seg: CompletedSegment, text: String, mixed: URL?) throws -> URL {
         let fm = FileManager.default
-        let nameF = DateFormatter(); nameF.locale = Locale(identifier: "en_US_POSIX"); nameF.dateFormat = "yyyy-MM-dd-HHmm"
         let dayF = DateFormatter(); dayF.locale = Locale(identifier: "en_US_POSIX"); dayF.dateFormat = "yyyy-MM-dd"
         let hmF = DateFormatter(); hmF.locale = Locale(identifier: "en_US_POSIX"); hmF.dateFormat = "HH:mm"
         let monthF = DateFormatter(); monthF.locale = Locale(identifier: "en_US_POSIX"); monthF.dateFormat = "yyyy-MM"
@@ -1721,7 +1731,7 @@ final class RecordingEngine {
         let l10n = TranscriptL10n.current
         let event = cfg.useCalendarTitles ? CalendarLookup.match(start: seg.start, end: end) : nil
         let title = event?.title ?? l10n.autoTitle
-        let base = nameF.string(from: seg.start)
+        let base = transcriptBaseName(start: seg.start, end: end)
         let slug = event.map { "\(base)-\(slugify($0.title))" } ?? base
 
         // keep the mixed WAV per the keepAudio setting (mixed is nil when keepAudio is off)
@@ -5278,6 +5288,12 @@ struct Main {
                   RecordSchedule.from(enabled: false, days: "", hours: "").isActive(at: schedDate("2026-07-05 03:00"), calendar: utc)
                   && RecordSchedule.from(enabled: true, days: "mon-fri", hours: "").isActive(at: schedDate("2026-07-06 03:00"), calendar: utc)
                   && RecordSchedule.from(enabled: true, days: "", hours: "10:00-11:00").isActive(at: schedDate("2026-07-05 10:30"), calendar: utc))
+            // File naming: start + END time, so a mid-hour "Transcribe now" shows the cut point.
+            check("naming: transcript base carries start AND end times",
+                  transcriptBaseName(start: schedDate("2026-07-05 21:00"), end: schedDate("2026-07-05 21:30"),
+                                     timeZone: utc.timeZone) == "2026-07-05-2100-2130"
+                  && transcriptBaseName(start: schedDate("2026-07-05 23:50"), end: schedDate("2026-07-06 00:20"),
+                                        timeZone: utc.timeZone) == "2026-07-05-2350-0020")   // keeps start's date
             // Audio archive tiers: raw → compressed → deleted, with 0 disabling a stage.
             check("audio tiers: raw → compressed → deleted (0 = never/forever)",
                   AudioArchivePolicy(rawDays: 7, totalDays: 90).tier(ageDays: 3) == .raw
