@@ -1628,6 +1628,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func buildMenu() {
         setIcon(recording: false)
         let menu = NSMenu()
+        // Transcribe now keeps the menu OPEN while the status line swaps between
+        // strings of different lengths ("● Transcribing…" → "● No speech —
+        // skipped" → "● Recording · mic + system audio"). An NSMenu re-measures
+        // its width per change, so the open menu visibly jiggles. Pin a minimum
+        // width sized to the longest routine status so text swaps never resize it.
+        let widestStatus = "⚠ Grant System Audio Recording + Microphone to macrec"
+        let statusFont = NSFont.menuFont(ofSize: 0)
+        menu.minimumWidth = (widestStatus as NSString)
+            .size(withAttributes: [.font: statusFont]).width + 36 // item insets
         // About on top (macOS convention), then a divider.
         menu.addItem(item("About macrec", #selector(showAbout), symbol: "info.circle"))
         menu.addItem(.separator())
