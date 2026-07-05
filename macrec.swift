@@ -1634,6 +1634,15 @@ final class RecordingEngine {
         }
         onSegmentResult?("Transcribing…")
         guard let (mixed, text) = Transcriber.transcribe(seg, cfg: cfg) else { return }
+        // A segment can pass the energy gate (keyboard noise, a cough) yet transcribe to NOTHING —
+        // those "auto transcript" shells with an empty body were piling up hourly (user report).
+        // No transcript lines → no file, and the mixed WAV goes too (nothing to reference it).
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if let mixed { try? FileManager.default.removeItem(at: mixed) }
+            elog("engine: segment transcribed to nothing — discarded (mic \(String(format: "%.1f", seg.micVoicedSeconds))s, sys \(String(format: "%.1f", seg.sysVoicedSeconds))s)")
+            onSegmentResult?("No speech — discarded")
+            return
+        }
         do {
             let url = try writeTranscript(seg: seg, text: text, mixed: mixed)
             onTranscriptSaved?("Saved: \(url.lastPathComponent)")
