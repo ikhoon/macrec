@@ -4582,9 +4582,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var schedTimer: Timer?             // ~30 s recording-schedule enforcement
     private var notifyWhenTranscribed = false  // armed by "Transcribe now" — the menu closed, push the outcome
     private var lastTranscriptURL: URL?        // most recent saved transcript (notification click opens it)
-    private let traySpinner = NSProgressIndicator()   // menu-bar spinner while a manual flush transcribes
-    private var trayBusy = false               // spinner owns the tray — setIcon() must not repaint over it
-    private var trayBusyGeneration = 0         // failsafe-timeout token (a new flush invalidates old timers)
+    private var flushBusy = false              // one manual flush at a time; the row spinner shows progress
+    private var flushGeneration = 0            // failsafe-timeout token (a new flush invalidates old timers)
     private var transcribeBtn: NSButton!               // "Transcribe now" row (view-backed: menu stays open)
     private let menuRowSpinner = NSProgressIndicator() // replaces the row's icon while the flush runs
     private var transcribeRowTitle = "Transcribe now"  // flashes the outcome ("No speech found") briefly
@@ -4645,7 +4644,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func setIcon(recording: Bool, voice: Bool = false) {
-        guard !trayBusy else { return }   // the flush spinner owns the tray until the outcome lands
         // Distinct audio-recorder identity: a waveform-with-mic while live, pause when not. While
         // VOICE is being picked up, the glyph tints a LIGHT orange — the recording color, softened
         // (user pick after trying full orange → accent → this: orange family, but lighter).
@@ -4861,10 +4859,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func flushNow() {
-        guard engine != nil, !paused, !trayBusy else { return }   // busy = one flush at a time
+        guard engine != nil, !paused, !flushBusy else { return }   // busy = one flush at a time
         notifyWhenTranscribed = true   // outcome arrives as a push (the menu may be closed by then)
         Notifier.requestAuth()         // no-op after the user answered the first prompt
-        showTraySpinner()              // menu row + tray glyph spin until the outcome lands
+        showFlushSpinner()             // the row's icon slot spins until the outcome lands
         engine?.flushNow()
         refresh("● Transcribing now…")
     }
@@ -4877,11 +4875,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard notifyWhenTranscribed, let o = flushOutcome(for: status) else { return }
         notifyWhenTranscribed = false
         let file = status.hasPrefix("Saved: ") ? lastTranscriptURL?.path : nil
-        let gen = trayBusyGeneration
+        let gen = flushGeneration
         let hold = spinnerHold(elapsed: ProcessInfo.processInfo.systemUptime - spinStartedAt)
         DispatchQueue.main.asyncAfter(deadline: .now() + hold) { [weak self] in
-            guard let self, self.trayBusyGeneration == gen else { return }
-            self.hideTraySpinner()
+            guard let self, self.flushGeneration == gen else { return }
+            self.hideFlushSpinner()
             self.flashTranscribeRow(o.title)   // in-menu answer, e.g. "No speech found"
             Notifier.push(title: o.title, body: o.body, filePath: file)
         }
@@ -4903,30 +4901,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func flashTranscribeRow(_ text: String) {
         transcribeRowTitle = text
         styleTranscribeRow()
-        let gen = trayBusyGeneration
+        let gen = flushGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-            guard let self, self.trayBusyGeneration == gen else { return }   // a newer flush owns the row
+            guard let self, self.flushGeneration == gen else { return }   // a newer flush owns the row
             self.transcribeRowTitle = "Transcribe now"
             self.styleTranscribeRow()
         }
     }
 
-    /// While a manual flush transcribes, progress spins in BOTH places the user might be looking:
-    /// the menu row (the menu stays open on click) and the tray glyph (if they close it).
-    private func showTraySpinner() {
-        guard !trayBusy, let btn = statusItem.button else { return }
-        trayBusy = true
-        trayBusyGeneration += 1
+    /// While a manual flush transcribes, the ROW shows the progress: its icon slot becomes a small
+    /// spinner. The tray glyph stays put — a changing menu-bar icon read as noise (user pick).
+    private func showFlushSpinner() {
+        guard !flushBusy else { return }
+        flushBusy = true
+        flushGeneration += 1
         spinStartedAt = ProcessInfo.processInfo.systemUptime
-        traySpinner.style = .spinning
-        traySpinner.controlSize = .small
-        traySpinner.isIndeterminate = true
-        traySpinner.isDisplayedWhenStopped = false
-        traySpinner.frame = NSRect(x: (btn.bounds.width - 16) / 2, y: (btn.bounds.height - 16) / 2,
-                                   width: 16, height: 16)
-        btn.image = nil
-        btn.addSubview(traySpinner)
-        traySpinner.startAnimation(nil)
         // A transparent placeholder the SAME SIZE as the icon: with image=nil the title slides left
         // into the icon slot and renders UNDER the spinner (user report: "UI broke while spinning").
         let iconSize = transcribeBtn.image?.size ?? NSSize(width: 16, height: 16)
@@ -4934,24 +4923,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         transcribeBtn.isEnabled = false           // no double-flush while one is running
         menuRowSpinner.startAnimation(nil)
         // Failsafe: whisper on a long segment takes minutes, but a lost outcome (engine swapped out
-        // mid-flush) must not leave the tray spinning forever.
-        let gen = trayBusyGeneration
+        // mid-flush) must not leave the row spinning forever.
+        let gen = flushGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 15 * 60) { [weak self] in
-            guard let self, self.trayBusy, self.trayBusyGeneration == gen else { return }
-            elog("tray: flush spinner timed out — restoring the icon")
-            self.hideTraySpinner()
+            guard let self, self.flushBusy, self.flushGeneration == gen else { return }
+            elog("menu: flush spinner timed out — restoring the row")
+            self.hideFlushSpinner()
         }
     }
 
-    private func hideTraySpinner() {
-        guard trayBusy else { return }
-        trayBusy = false
-        traySpinner.stopAnimation(nil)
-        traySpinner.removeFromSuperview()
+    private func hideFlushSpinner() {
+        guard flushBusy else { return }
+        flushBusy = false
         menuRowSpinner.stopAnimation(nil)
         transcribeBtn.image = NSImage(systemSymbolName: "doc.badge.plus", accessibilityDescription: "Transcribe now")
         transcribeBtn.isEnabled = true
-        setIcon(recording: engine != nil && !paused && !schedulePaused)
     }
 
     @objc private func togglePause() {
