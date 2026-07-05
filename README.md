@@ -111,7 +111,7 @@ They also appear in **System Settings → Privacy & Security** (listed as **macr
 
 > Why not Screen Recording? System audio is captured with a **Core Audio process tap** (macOS 14.4+), gated by the dedicated **System Audio Recording Only** permission (`kTCCServiceAudioCapture`) — so macrec never requests Screen Recording and no screen content is ever accessed.
 
-The code-signing **designated requirement** references the certificate + bundle id, so **rebuilds keep the grant** (and the Login Item stays registered). Don't delete/regenerate the cert (back up `~/.config/meeting-recorder/MeetingCaptureSign.p12`). If a grant gets into a bad state, reset it once (bundle id `com.ikhoon.macrec`) and relaunch to re-prompt:
+The code-signing **designated requirement** references the certificate + bundle id, so **rebuilds keep the grant** (and the Login Item stays registered). Don't delete/regenerate the cert — the key lives only in your login keychain (deliberately no file backup; an on-disk key would let local malware sign itself as macrec and inherit the mic/system-audio grants). If it's ever lost, re-run `make-signing-cert.sh` and re-grant once. If a grant gets into a bad state, reset it once (bundle id `com.ikhoon.macrec`) and relaunch to re-prompt:
 ```bash
 tccutil reset AudioCapture com.ikhoon.macrec
 tccutil reset Microphone   com.ikhoon.macrec
