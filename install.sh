@@ -67,16 +67,33 @@ codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$STAGE"
 
 echo "▸ installing → $INSTALL_APP …"
 rm -rf /Applications/MeetingRecorder.app /Applications/Amanu.app 2>/dev/null   # remove pre-rename apps
-rm -rf "$INSTALL_APP"
-cp -R "$STAGE" "$INSTALL_APP"
-codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$INSTALL_APP/Contents/MacOS/macrec"
-codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$INSTALL_APP"
-DR=$(codesign -d -r- "$INSTALL_APP" 2>&1)
+# ATOMIC swap: fully build + sign + verify the bundle NEXT TO the live one (same volume), then two
+# renames. The old rm→cp→codesign flow left /Applications WITHOUT macrec.app for several seconds —
+# any LaunchServices touch in that window (menu click, notification tap) popped a bogus
+# "macrec needs to be downloaded" dialog.
+NEW_APP="/Applications/.macrec-staging.app"
+OLD_APP="/Applications/.macrec-old.app"
+rm -rf "$NEW_APP" "$OLD_APP"
+cp -R "$STAGE" "$NEW_APP"
+# nested binaries first, bundle last — the bundle seal records their hashes, so this order is what
+# makes `codesign -v` come out clean
+codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$NEW_APP/Contents/MacOS/meeting-capture"
+codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$NEW_APP/Contents/MacOS/macrec"
+codesign -f -s "$SIGN_ID" --identifier "$BUNDLE_ID" "$NEW_APP"
+if ! codesign -v "$NEW_APP" 2>/dev/null; then
+  rm -rf "$NEW_APP"
+  echo "❌ 서명 검증 실패 — 기존 설치 유지, 중단."; exit 1
+fi
+DR=$(codesign -d -r- "$NEW_APP" 2>&1)
 echo "  DR: ${DR##*designated => }"
 if print -r -- "$DR" | grep -q "cdhash"; then
-  echo "❌ DR이 여전히 cdhash 기반 — cert 서명 실패. 중단."; exit 1
+  rm -rf "$NEW_APP"
+  echo "❌ DR이 여전히 cdhash 기반 — cert 서명 실패. 기존 설치 유지, 중단."; exit 1
 fi
-echo "  ✅ cert 기반 DR — 이후 rebuild는 권한 유지됨"
+[ -d "$INSTALL_APP" ] && mv "$INSTALL_APP" "$OLD_APP"
+mv "$NEW_APP" "$INSTALL_APP"
+rm -rf "$OLD_APP"
+echo "  ✅ cert 기반 DR — 이후 rebuild는 권한 유지됨 (원자적 교체)"
 # register with LaunchServices so Finder/Launchpad pick up the icon + name
 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister -f "$INSTALL_APP" 2>/dev/null || true
 
