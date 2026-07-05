@@ -1434,6 +1434,13 @@ enum Transcriber {
             try? FileManager.default.removeItem(at: sys16)
         }
         merged.sort { $0.start < $1.start }
+        // Belt to the AEC's braces: the residual the canceller leaves still transcribes — drop mic
+        // lines that are (garbled) copies of a nearby far-end line (see suppressEchoLines).
+        if EchoCanceller.shared.enabled {
+            let before = merged.count
+            merged = suppressEchoLines(merged, mine: mine)
+            if merged.count != before { elog("transcribe: suppressed \(before - merged.count) echo line(s)") }
+        }
         let tf = DateFormatter(); tf.locale = Locale(identifier: "en_US_POSIX"); tf.dateFormat = "HH:mm:ss"
         let text = merged.map { "[\(tf.string(from: seg.start.addingTimeInterval($0.start)))] \($0.who): \($0.text)" }
             .joined(separator: "\n")
@@ -1688,6 +1695,46 @@ final class RecordingEngine {
         try doc.markdown(l10n).write(to: mdURL, atomically: true, encoding: .utf8)
         elog("engine:   → 전사 저장: \(mdURL.path)")
         return mdURL
+    }
+}
+
+// MARK: - transcript-level echo suppression (belt to the AEC's braces)
+//
+// The acoustic canceller attenuates the speaker→mic echo ~15-26 dB, but live engines still transcribe
+// the residual: the far-end shows up again under the MIC speaker as an (often garbled) copy a moment
+// later. Acoustic cancellation can't fully win that fight, so we also suppress at the TRANSCRIPT
+// level: a mic line whose tokens are largely contained in a recent far-end line is an echo, not the
+// user. One-directional (system audio can't contain the user's voice) and length-guarded so genuine
+// short replies ("yes", "그렇죠") are never eaten.
+
+/// Containment similarity of `a` in `b`: fraction of `a`'s unique tokens present in `b` (echo copies
+/// are garbled SUBSETS of the far-end line, so containment beats symmetric Jaccard). Pure + testable.
+func echoSimilarity(_ a: String, _ b: String) -> Double {
+    func toks(_ s: String) -> Set<String> {
+        Set(s.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty })
+    }
+    let ta = toks(a), tb = toks(b)
+    guard !ta.isEmpty, !tb.isEmpty else { return 0 }
+    return Double(ta.intersection(tb).count) / Double(ta.count)
+}
+
+/// Is the MIC text most likely the far-end's echo? ≥ 4 tokens (protects genuine short replies) and
+/// ≥ 80% of its tokens contained in the far-end line.
+func isLikelyEcho(mine: String, theirs: String) -> Bool {
+    let tokens = mine.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+    return tokens.count >= 4 && echoSimilarity(mine, theirs) >= 0.8
+}
+
+/// Drop mic-speaker lines that are echoes of a nearby (±windowSec) far-end line in a merged,
+/// time-sorted transcript. Pure + testable — used by the saved-transcript merge.
+func suppressEchoLines(_ merged: [(start: Double, who: String, text: String)], mine: String,
+                       windowSec: Double = 8) -> [(start: Double, who: String, text: String)] {
+    merged.filter { line in
+        guard line.who == mine else { return true }
+        return !merged.contains { other in
+            other.who != mine && abs(other.start - line.start) <= windowSec
+                && isLikelyEcho(mine: line.text, theirs: other.text)
+        }
     }
 }
 
@@ -3685,6 +3732,22 @@ final class LiveCaptions {
     }
     private func apply(_ speaker: String, _ text: String, _ final: Bool) {
         guard active else { return }
+        // Transcript-level echo suppression (belt to the AEC's braces): a mic line whose text is a
+        // (garbled) copy of a recent far-end line is the speakers leaking back in, not the user.
+        if speaker == mineLabel, EchoCanceller.shared.enabled {
+            let cutoff = Date().addingTimeInterval(-10)
+            let isEcho = lines.contains { $0.speaker != mineLabel && $0.time > cutoff
+                                          && isLikelyEcho(mine: text, theirs: $0.text) }
+            if isEcho {
+                // Drop it — and if this was updating an in-progress mine line that just BECAME an
+                // echo (the garbled copy streams in over a few updates), remove that line too.
+                if let i = lines.lastIndex(where: { $0.speaker == speaker && !$0.final }) {
+                    lines.remove(at: i)
+                    render()
+                }
+                return
+            }
+        }
         // Update this speaker's in-progress (non-final) line, or start a new one.
         if let i = lines.lastIndex(where: { $0.speaker == speaker && !$0.final }) {
             lines[i].text = text; lines[i].final = final
@@ -4681,6 +4744,27 @@ struct Main {
                   parseHintTerms("Kubernetes, gRPC\n# note\n김철수\n\n") == ["Kubernetes", "gRPC", "김철수"])
             check("hints: comment runs to end of line (commas inside don't leak) + inline comment",
                   parseHintTerms("# old, stuff\nAlpha # trailing, note\nBeta") == ["Alpha", "Beta"])
+            // Transcript-level echo suppression — cases lifted from the user's real screenshot.
+            check("echo text: exact copy suppressed",
+                  isLikelyEcho(mine: "Over time, I got better at finding it.",
+                               theirs: "Over time, I got better at finding it."))
+            check("echo text: garbled copy suppressed",   // a garbled mic copy shares ≥80% of its tokens
+                  isLikelyEcho(mine: "I wasn't very very find the award in the beginning, but I",
+                               theirs: "I wasn't very good at finding north in the beginning, but I additioned a fair amount, and so my dad kept asking me, which way is north?"))
+            check("echo text: unrelated line kept",
+                  !isLikelyEcho(mine: "That's like a one of my life.",
+                                theirs: "Not just by how far my life has come since then, but..."))
+            check("echo text: short reply never eaten",
+                  !isLikelyEcho(mine: "Yes.", theirs: "Yes.") && !isLikelyEcho(mine: "네 네 네", theirs: "네 네 네 알겠습니다"))
+            let echoMerged: [(start: Double, who: String, text: String)] = [
+                (10, "상대", "Over time, I got better at finding it."),
+                (12, "나", "Over time, I got better at finding it."),     // echo → dropped
+                (14, "나", "완전히 다른 내 얘기를 길게 하고 있어요"),         // genuine → kept
+                (40, "나", "Over time, I got better at finding it."),     // outside ±8 s → kept
+            ]
+            let echoOut = suppressEchoLines(echoMerged, mine: "나")
+            check("echo text: merged transcript drops only the in-window copy",
+                  echoOut.map { $0.start } == [10, 14, 40])
             check("hints: dedupe (case-insensitive) + priority order",
                   mergeHintTerms(direct: ["Alpha", "Beta"], file: ["alpha", "Gamma"], event: ["Beta", "김철수"])
                   == ["Alpha", "Beta", "Gamma", "김철수"])
