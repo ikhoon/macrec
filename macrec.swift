@@ -4927,7 +4927,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         btn.image = nil
         btn.addSubview(traySpinner)
         traySpinner.startAnimation(nil)
-        transcribeBtn.image = nil                 // the row spinner takes the icon's spot
+        // A transparent placeholder the SAME SIZE as the icon: with image=nil the title slides left
+        // into the icon slot and renders UNDER the spinner (user report: "UI broke while spinning").
+        let iconSize = transcribeBtn.image?.size ?? NSSize(width: 16, height: 16)
+        transcribeBtn.image = NSImage(size: iconSize)     // no representations = draws nothing
         transcribeBtn.isEnabled = false           // no double-flush while one is running
         menuRowSpinner.startAnimation(nil)
         // Failsafe: whisper on a long segment takes minutes, but a lost outcome (engine swapped out
