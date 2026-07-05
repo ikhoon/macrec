@@ -1487,7 +1487,12 @@ final class RecordingEngine {
     /// Current per-source input level (0..1) for the live menu meter — is audio coming in right now?
     func liveLevels() -> (mic: Float, sys: Float) {
         guard running else { return (0, 0) }
-        return (session.rec.micWriter?.recentLevel ?? 0, session.rec.sysWriter?.recentLevel ?? 0)
+        // Writers are swapped/released ON rec.queue at every rotation; reading the refs off-queue
+        // races that swap (review finding: the 1 Hz voice poll could catch the old writer's final
+        // release → over-release). Snapshot on the queue — its work items are short buffer appends,
+        // and nothing on rec.queue ever syncs back to main, so this can't deadlock.
+        let rec = session.rec
+        return rec.queue.sync { (rec.micWriter?.recentLevel ?? 0, rec.sysWriter?.recentLevel ?? 0) }
     }
 
     /// A tap created before "System Audio Recording Only" was granted delivers muted (zero) buffers.
