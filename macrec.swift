@@ -21,6 +21,7 @@ import AppKit
 import EventKit
 import ServiceManagement
 import Security   // Keychain — API keys don't belong in UserDefaults
+import UserNotifications   // completion push after a manual "Transcribe now"
 
 // MARK: - helpers
 
@@ -1481,6 +1482,7 @@ final class RecordingEngine {
     private var recovering = false
     private var suspended = false   // true while the display/system is asleep
     var onTranscriptSaved: ((String) -> Void)?   // (메시지) — UI 상태 갱신용
+    var onTranscriptURL: ((URL) -> Void)?        // 저장된 전사 파일 경로 — 알림 클릭 → 파일 열기
     var onSegmentResult: ((String) -> Void)?      // (메시지) — 발화 없어 버려도 알림
 
     init(cfg: EngineConfig) {
@@ -1697,7 +1699,10 @@ final class RecordingEngine {
             return
         }
         onSegmentResult?("Transcribing…")
-        guard let (mixed, text) = Transcriber.transcribe(seg, cfg: cfg) else { return }
+        guard let (mixed, text) = Transcriber.transcribe(seg, cfg: cfg) else {
+            onSegmentResult?("Transcription failed")   // a waiting "Transcribe now" push must not dangle
+            return
+        }
         // A segment can pass the energy gate (keyboard noise, a cough) yet transcribe to NOTHING —
         // those "auto transcript" shells with an empty body were piling up hourly (user report).
         // No transcript lines → no file, and the mixed WAV goes too (nothing to reference it).
@@ -1709,6 +1714,7 @@ final class RecordingEngine {
         }
         do {
             let url = try writeTranscript(seg: seg, text: text, mixed: mixed)
+            onTranscriptURL?(url)
             onTranscriptSaved?("Saved: \(url.lastPathComponent)")
             if let cmd = postProcessInvocationFromPrefs(transcriptPath: url.path) { runPostProcessCommand(cmd) }
         } catch { elog("engine: writeTranscript: \(error)") }
@@ -4476,53 +4482,40 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
 
 // MARK: - menu-bar app (tray icon)
 
-/// Container for a custom NSMenuItem view that replicates the NATIVE hover behavior a plain view
-/// lacks: the selection-material pill behind the row and an inverted (white) label while hovered.
-/// AppKit draws that for ordinary items only — a `view`-backed item gets nothing, which made the
-/// row feel dead under the mouse (user report). Tracking uses .activeAlways because menu tracking
-/// runs in its own event mode, not the app's normal run loop.
-final class MenuHoverView: NSView {
-    private let highlight = NSVisualEffectView()
-    var onHover: ((Bool) -> Void)?
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        autoresizingMask = [.width]              // stretch with whatever width the menu settles on
-        highlight.material = .selection
-        highlight.state = .active
-        highlight.isEmphasized = true
-        highlight.blendingMode = .behindWindow
-        highlight.wantsLayer = true
-        highlight.layer?.cornerRadius = 4
-        highlight.layer?.cornerCurve = .continuous
-        highlight.isHidden = true
-        highlight.frame = bounds.insetBy(dx: 5, dy: 0)   // native menus inset the pill ~5 pt
-        highlight.autoresizingMask = [.width, .height]
-        addSubview(highlight, positioned: .below, relativeTo: nil)
+/// After a manual "Transcribe now" the menu CLOSES like any native item (user pick over the old
+/// stay-open custom view), so the outcome arrives as a notification instead of an in-menu status.
+/// Maps a segment status to the push it deserves; nil = intermediate ("Transcribing…"), keep waiting.
+func flushOutcome(for status: String) -> (title: String, body: String)? {
+    if status.hasPrefix("Saved: ") {
+        return ("Transcript ready", String(status.dropFirst("Saved: ".count)))
     }
-    required init?(coder: NSCoder) { nil }
-
-    override func updateTrackingAreas() {
-        trackingAreas.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-                                       owner: self, userInfo: nil))
-        super.updateTrackingAreas()
+    if status.hasPrefix("No speech") {
+        return ("No speech found", "Nothing to transcribe — no file was created.")
     }
-
-    override func mouseEntered(with event: NSEvent) { setHover(true) }
-    override func mouseExited(with event: NSEvent) { setHover(false) }
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        setHover(false)   // a menu reopen must never resurrect last time's highlight
+    if status.hasPrefix("Downloading model") {
+        return ("Transcription deferred", "The speech model is still downloading.")
     }
-
-    func setHover(_ inside: Bool) {
-        highlight.isHidden = !inside
-        onHover?(inside)
+    if status.hasPrefix("Transcription failed") {
+        return ("Transcription failed", "whisper couldn't process the segment — see the log.")
     }
+    return nil
+}
 
-    var highlightVisibleForTest: Bool { !highlight.isHidden }
-    var trackingReadyForTest: Bool { updateTrackingAreas(); return !trackingAreas.isEmpty }
+enum Notifier {
+    static func requestAuth() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, err in
+            elog("notify: authorization granted=\(granted)\(err.map { " error=\($0)" } ?? "")")
+        }
+    }
+    /// filePath rides in userInfo; clicking the notification opens it (AppController is the delegate).
+    static func push(title: String, body: String, filePath: String? = nil) {
+        let c = UNMutableNotificationContent()
+        c.title = title; c.body = body; c.sound = .default
+        if let filePath { c.userInfo = ["file": filePath] }
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)
+        ) { err in if let err { elog("notify: add failed: \(err)") } }
+    }
 }
 
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -4532,6 +4525,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                // two capture pipelines never overlap on the shared audio state
     private var voiceTimer: Timer?             // ~1 Hz poll for the voice-activity tray tint
     private var schedTimer: Timer?             // ~30 s recording-schedule enforcement
+    private var notifyWhenTranscribed = false  // armed by "Transcribe now" — the menu closed, push the outcome
+    private var lastTranscriptURL: URL?        // most recent saved transcript (notification click opens it)
     private var schedulePaused = false         // the SCHEDULE stopped the engine (vs the user's `paused`)
     private var scheduleOverrideUntil: Date?   // manual Pause/Resume wins until this boundary passes
     private var startTask: Task<Void, Never>?  // in-flight engine start — stops must wait for it
@@ -4571,6 +4566,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DistributedNotificationCenter.default().addObserver(
             forName: .init("com.ikhoon.macrec.openMenu"), object: nil, queue: .main
         ) { [weak self] _ in self?.openMenu() }
+        UNUserNotificationCenter.current().delegate = self   // click a completion push → open the file
         CalendarLookup.requestAccess()   // one-time Calendar prompt (for titling transcripts)
         setupModelDownload()             // first-run: fetch the large model, show progress in the menu
         LoginItem.autoEnableOnceIfDistributed()   // distributed app: enable 24/7 autostart on first run
@@ -4644,34 +4640,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         modelLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); modelLine.isEnabled = false; modelLine.isHidden = true
         menu.addItem(statusLine); menu.addItem(levelItem); menu.addItem(lastSavedLine); menu.addItem(modelLine)
         menu.addItem(.separator())
-        // Transcribe now — custom-view button so clicking it does NOT dismiss the menu (watch the
-        // live meter + status update in place). Its leading icon aligns with the imaged items below.
-        let tItem = NSMenuItem()
-        let tView = MenuHoverView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
-        let tBtn = NSButton(title: "Transcribe now", target: self, action: #selector(flushNow))
-        tBtn.isBordered = false; tBtn.alignment = .left
-        // A borderless button renders its title in the gray button style, which read as DISABLED
-        // next to the real menu items — force the menu-item look (label color, menu font). And
-        // "waveform" said "speech", not what the click does; "new document" says it: cut here,
-        // write the transcript file now.
-        func styleTranscribeNow(hovered: Bool) {
-            let fg: NSColor = hovered ? .selectedMenuItemTextColor : .labelColor
-            tBtn.attributedTitle = NSAttributedString(
-                string: "Transcribe now",
-                attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: fg])
-            tBtn.contentTintColor = fg
-        }
-        styleTranscribeNow(hovered: false)
-        tView.onHover = { styleTranscribeNow(hovered: $0) }   // white-on-selection like native rows
-        tBtn.image = NSImage(systemSymbolName: "doc.badge.plus", accessibilityDescription: "Transcribe now")
-        tBtn.imagePosition = .imageLeading
-        // AppKit's default image↔title gap matches the standard imaged items; a small left inset
-        // lines the icon up with them. (No leading space in the title — that would leak into the
-        // accessibility label and render inconsistently across fonts.)
-        tBtn.frame = NSRect(x: 14, y: 1, width: 221, height: 20)
-        tBtn.autoresizingMask = [.width]   // keep the click target spanning the stretched row
-        tView.addSubview(tBtn); tItem.view = tView
-        menu.addItem(tItem)
+        // Transcribe now — a NATIVE item (user pick: closing the menu on click feels right, and it
+        // brings back AppKit's own hover/highlight/keyboard handling). The outcome that used to be
+        // watched in the open menu arrives as a notification instead (see flushOutcome/Notifier).
+        menu.addItem(item("Transcribe now", #selector(flushNow), symbol: "doc.badge.plus"))
         toggleItem = item("Pause", #selector(togglePause), symbol: "pause.circle"); menu.addItem(toggleItem)
         if #available(macOS 26, *) {   // real-time caption overlay (on-device SpeechAnalyzer)
             let li = item("Live captions", #selector(toggleLive), symbol: "captions.bubble")
@@ -4756,12 +4728,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startEngine() {
         let eng = RecordingEngine(cfg: EngineConfig.load())   // reload prefs each start so settings apply
         eng.onSegmentResult = { [weak self] msg in
-            DispatchQueue.main.async { if self?.paused == false { self?.statusLine.title = "● \(msg)" } }
+            DispatchQueue.main.async {
+                if self?.paused == false { self?.statusLine.title = "● \(msg)" }
+                self?.pushFlushOutcomeIfNeeded(msg)
+            }
+        }
+        eng.onTranscriptURL = { [weak self] url in
+            DispatchQueue.main.async { self?.lastTranscriptURL = url }   // before onTranscriptSaved (FIFO)
         }
         eng.onTranscriptSaved = { [weak self] msg in
             DispatchQueue.main.async {
                 self?.lastSavedLine.title = "✓ \(msg)"; self?.lastSavedLine.isHidden = false
                 if self?.paused == false { self?.statusLine.title = "● Recording · mic + system audio" }
+                self?.pushFlushOutcomeIfNeeded(msg)
             }
         }
         engine = eng
@@ -4797,8 +4776,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func flushNow() {
         guard engine != nil, !paused else { return }
+        notifyWhenTranscribed = true   // menu just closed — deliver the outcome as a push
+        Notifier.requestAuth()         // no-op after the user answered the first prompt
         engine?.flushNow()
         refresh("● Transcribing now…")
+    }
+
+    /// One push per armed "Transcribe now": the first TERMINAL status (saved / no speech / failed)
+    /// consumes the flag; intermediate ones ("Transcribing…") don't.
+    private func pushFlushOutcomeIfNeeded(_ status: String) {
+        guard notifyWhenTranscribed, let o = flushOutcome(for: status) else { return }
+        notifyWhenTranscribed = false
+        let file = status.hasPrefix("Saved: ") ? lastTranscriptURL?.path : nil
+        Notifier.push(title: o.title, body: o.body, filePath: file)
     }
 
     @objc private func togglePause() {
@@ -4957,6 +4947,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) { stopEngineSync() }
 
     @objc private func quit() { stopEngineSync(); NSApp.terminate(nil) }
+}
+
+extension AppController: UNUserNotificationCenterDelegate {
+    /// Menu-bar agents count as "foreground", which by default swallows banners — show them anyway.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    /// Clicking a "Transcript ready" push opens the saved file.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        if let p = response.notification.request.content.userInfo["file"] as? String {
+            NSWorkspace.shared.open(URL(fileURLWithPath: p))
+        }
+        completionHandler()
+    }
 }
 
 var appController: AppController?   // retained for process lifetime
@@ -5351,22 +5358,17 @@ struct Main {
                   RecordSchedule.from(enabled: false, days: "", hours: "").isActive(at: schedDate("2026-07-05 03:00"), calendar: utc)
                   && RecordSchedule.from(enabled: true, days: "mon-fri", hours: "").isActive(at: schedDate("2026-07-06 03:00"), calendar: utc)
                   && RecordSchedule.from(enabled: true, days: "", hours: "10:00-11:00").isActive(at: schedDate("2026-07-05 10:30"), calendar: utc))
-            // Menu hover: a view-backed item gets NO native highlight — MenuHoverView must provide
-            // the selection pill + notify the label restyle, and reset when the menu reopens.
-            do {
-                let hv = MenuHoverView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
-                var hoverStates: [Bool] = []
-                hv.onHover = { hoverStates.append($0) }
-                let initiallyOff = !hv.highlightVisibleForTest
-                hv.setHover(true)
-                let litAndNotified = hv.highlightVisibleForTest && hoverStates == [true]
-                hv.setHover(false)
-                let offAgain = !hv.highlightVisibleForTest && hoverStates == [true, false]
-                check("menu hover: pill shows on hover, hides after, restyle notified",
-                      initiallyOff && litAndNotified && offAgain)
-                check("menu hover: tracking area installed (mouse enter/exit will arrive)",
-                      hv.trackingReadyForTest)
-            }
+            // Transcribe-now push: terminal statuses notify (menu closes on click now), transient
+            // ones keep waiting — a dangling flag would mis-attribute the NEXT hourly segment.
+            check("flush push: terminal statuses classified, transient ones wait",
+                  flushOutcome(for: "Saved: 2026-07-05-2100-2130.md")! == ("Transcript ready", "2026-07-05-2100-2130.md")
+                  && flushOutcome(for: "No speech — discarded") != nil
+                  && flushOutcome(for: "No speech — skipped") != nil
+                  && flushOutcome(for: "Downloading model — transcription deferred") != nil
+                  && flushOutcome(for: "Transcription failed") != nil
+                  && flushOutcome(for: "Transcribing…") == nil
+                  && flushOutcome(for: "Recording · mic + system audio") == nil
+                  && flushOutcome(for: "Paused (locked/asleep)") == nil)
             // File naming: start + END time, so a mid-hour "Transcribe now" shows the cut point.
             check("naming: transcript base carries start AND end times",
                   transcriptBaseName(start: schedDate("2026-07-05 21:00"), end: schedDate("2026-07-05 21:30"),
