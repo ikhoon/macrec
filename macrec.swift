@@ -1051,7 +1051,11 @@ struct EngineConfig {
             useCalendarTitles: Pref.bool(Pref.cal, "MR_CALENDAR_TITLES", true),
             whisperLang: Pref.str(Pref.lang, "MR_WHISPER_LANG", "auto"),
             keepAudio: Pref.bool(Pref.keepAudio, "MR_KEEP_AUDIO", true),
-            audioRawDays: Pref.int(Pref.audioRawDays, "MR_AUDIO_RAW_DAYS", 7),
+            // Lossy transcoding must be OPT-IN for anyone who configured retention before this
+            // feature existed — an upgrade must never start re-encoding a curated archive on its
+            // own. Fresh installs get the 7-day default; migrated ones start at "Don't compress".
+            audioRawDays: Pref.int(Pref.audioRawDays, "MR_AUDIO_RAW_DAYS",
+                                   Pref.d.object(forKey: Pref.audioRetention) != nil ? 0 : 7),
             audioRetentionDays: Pref.int(Pref.audioRetention, "MR_AUDIO_RETENTION_DAYS", 90),
             transcriptRetentionDays: Pref.int(Pref.txtRetention, "MR_TRANSCRIPT_RETENTION_DAYS", 0),
             excludeBundleIds: excl)
@@ -1628,16 +1632,20 @@ final class RecordingEngine {
         var budget = 12   // bound conversions per sweep (~1 s each) — transcription shares this queue
         for case let u as URL in en {
             let ext = u.pathExtension.lowercased()
+            if u.lastPathComponent.contains(".partial-"), let a = ageDays(u), a > 1 {
+                try? fm.removeItem(at: u); continue   // temp left by a killed sweep
+            }
             guard ext == "wav" || ext == "m4a", let a = ageDays(u) else { continue }
             switch policy.tier(ageDays: a) {
             case .deleted:
                 try? fm.removeItem(at: u); deleted += 1
             case .compressed where ext == "wav" && budget > 0:
+                budget -= 1   // count ATTEMPTS — a batch of corrupt WAVs must not afconvert forever
                 let out = u.deletingPathExtension().appendingPathExtension("m4a")
                 if AudioArchiver.compress(u, to: out) {
                     relinkTranscriptAudio(from: u)
                     try? fm.removeItem(at: u)
-                    archived += 1; budget -= 1
+                    archived += 1
                 }
             default: break
             }
@@ -1654,8 +1662,11 @@ final class RecordingEngine {
         let month = wav.deletingLastPathComponent().lastPathComponent
         let md = cfg.transcriptsDir.appendingPathComponent(month).appendingPathComponent("\(slug).md")
         guard let text = try? String(contentsOf: md, encoding: .utf8), text.contains("\(slug).wav") else { return }
+        let mdate = (try? md.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
         try? text.replacingOccurrences(of: "\(slug).wav", with: "\(slug).m4a")
             .write(to: md, atomically: true, encoding: .utf8)
+        // The rewrite must not reset the transcript's own retention clock.
+        if let mdate { try? FileManager.default.setAttributes([.modificationDate: mdate], ofItemAtPath: md.path) }
     }
 
     private func process(_ seg: CompletedSegment) {
@@ -1777,10 +1788,15 @@ struct AudioArchivePolicy: Equatable {
         let digits = t.prefix { $0.isNumber }
         guard !digits.isEmpty, let n = Int(digits), n >= 0 else { return nil }
         let unit = t.dropFirst(digits.count).trimmingCharacters(in: .whitespaces)
+        // checked multiply: this runs on every Settings keystroke — pasting "…775807 years" must
+        // turn the field red, not trap and kill the recorder mid-meeting.
+        func mul(_ b: Int) -> Int? {
+            let r = n.multipliedReportingOverflow(by: b); return r.overflow ? nil : r.partialValue
+        }
         if unit.isEmpty || unit.hasPrefix("d") { return n }
-        if unit.hasPrefix("w") { return n * 7 }
-        if unit.hasPrefix("mo") { return n * 30 }
-        if unit.hasPrefix("y") { return n * 365 }
+        if unit.hasPrefix("w") { return mul(7) }
+        if unit.hasPrefix("mo") { return mul(30) }
+        if unit.hasPrefix("y") { return mul(365) }
         return nil
     }
 
@@ -1798,7 +1814,9 @@ enum AudioArchiver {
     /// 16 kHz mono rejects higher AAC bitrates (64k fails with '!dat'), so 32k is also the ceiling.
     static func compress(_ wav: URL, to out: URL) -> Bool {
         let fm = FileManager.default
-        let tmp = out.appendingPathExtension("partial")
+        // pid-unique temp: the tray app's sweep and a manual `macrec sweep` can overlap — a shared
+        // temp name would let one process promote the other's still-being-written file.
+        let tmp = out.appendingPathExtension("partial-\(ProcessInfo.processInfo.processIdentifier)")
         try? fm.removeItem(at: tmp)
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/afconvert")
@@ -4950,12 +4968,23 @@ struct Main {
         if args.first == "sweep" {
             var cfg = EngineConfig.load()
             var it = args.dropFirst().makeIterator()
+            // A malformed value must ABORT, not silently proceed with saved settings — this command
+            // irreversibly compresses/deletes whatever library the resolved config points at.
+            func value(_ flag: String) -> String {
+                guard let v = it.next() else { print("sweep: \(flag) needs a value"); exit(2) }
+                return v
+            }
+            func intValue(_ flag: String) -> Int {
+                let v = value(flag)
+                guard let n = Int(v), n >= 0 else { print("sweep: \(flag) needs a non-negative integer, got '\(v)'"); exit(2) }
+                return n
+            }
             while let a = it.next() {
                 switch a {
-                case "--audio-dir":       if let v = it.next() { cfg.audioDir = URL(fileURLWithPath: v) }
-                case "--transcripts-dir": if let v = it.next() { cfg.transcriptsDir = URL(fileURLWithPath: v) }
-                case "--raw-days":        if let v = it.next(), let n = Int(v) { cfg.audioRawDays = n }
-                case "--keep-days":       if let v = it.next(), let n = Int(v) { cfg.audioRetentionDays = n }
+                case "--audio-dir":       cfg.audioDir = URL(fileURLWithPath: value(a))
+                case "--transcripts-dir": cfg.transcriptsDir = URL(fileURLWithPath: value(a))
+                case "--raw-days":        cfg.audioRawDays = intValue(a)
+                case "--keep-days":       cfg.audioRetentionDays = intValue(a)
                 default: print("unknown sweep option: \(a) (see: help)"); exit(2)
                 }
             }
@@ -5266,7 +5295,8 @@ struct Main {
                   && AudioArchivePolicy.parseRetentionDays("Unlimited") == 0
                   && AudioArchivePolicy.parseRetentionDays("Don't compress") == 0
                   && AudioArchivePolicy.parseRetentionDays("soon") == nil
-                  && AudioArchivePolicy.parseRetentionDays("") == nil)
+                  && AudioArchivePolicy.parseRetentionDays("") == nil
+                  && AudioArchivePolicy.parseRetentionDays("9223372036854775807 years") == nil)  // typed live: red, not a trap
             check("audio tiers: titles round-trip through the parser",
                   [7, 90, 180, 365, 730, 0].allSatisfy {
                       AudioArchivePolicy.parseRetentionDays(AudioArchivePolicy.retentionTitle($0)) == $0
