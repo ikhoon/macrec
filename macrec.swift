@@ -788,12 +788,17 @@ enum Pref {
     static let audioDir = "audioDir"                    // separate root for kept .wav (default OUTPUT_ROOT/audio)
     static let customModel = "customModelURL"           // custom model source (URL or local path) — overrides the popup
     static let transcriptLang = "transcriptLang"        // saved-transcript FILE language: ""=system|en|ko|ja (scaffold only)
-    static let postProcessCmd = "postProcessCmd"        // command run after each saved transcript ("" = off)
-    /// Explicit save (even empty = off) beats the MR_POST_PROCESS env.
-    static var postProcessCommand: String {
-        if d.object(forKey: postProcessCmd) != nil { return d.string(forKey: postProcessCmd) ?? "" }
-        return ProcessInfo.processInfo.environment["MR_POST_PROCESS"] ?? ""
+    static let postProcessMode = "postProcessMode"      // off | summary (built-in) | shell (freeform)
+    static let summaryRunner = "summaryRunner"          // automatic summary runner: claude | codex | gemini
+    static let summaryPrompt = "summaryPrompt"          // summary prompt (absent = built-in default)
+    static let summaryOut = "summaryOut"                // summary output dir ("" = next to the transcript)
+    static let postProcessCmd = "postProcessCmd"        // freeform command ("" = off)
+    /// Explicit save (even empty) beats the env — for fields where empty is meaningful.
+    static func explicit(_ key: String, _ env: String) -> String {
+        if d.object(forKey: key) != nil { return d.string(forKey: key) ?? "" }
+        return ProcessInfo.processInfo.environment[env] ?? ""
     }
+    static var postProcessCommand: String { explicit(postProcessCmd, "MR_POST_PROCESS") }
 
     static func dbl(_ key: String, _ env: String, _ def: Double) -> Double {
         if d.object(forKey: key) != nil { return d.double(forKey: key) }
@@ -1613,7 +1618,7 @@ final class RecordingEngine {
         do {
             let url = try writeTranscript(seg: seg, text: text, mixed: mixed)
             onTranscriptSaved?("Saved: \(url.lastPathComponent)")
-            runPostProcessHook(command: Pref.postProcessCommand, transcriptPath: url.path)
+            if let cmd = postProcessInvocationFromPrefs(transcriptPath: url.path) { runPostProcessCommand(cmd) }
         } catch { elog("engine: writeTranscript: \(error)") }
     }
 
@@ -1682,14 +1687,72 @@ final class RecordingEngine {
 /// Fire-and-forget: a slow or hung hook can never block the engine. Output (both streams) is read to
 /// EOF BEFORE waiting on exit — reading after would deadlock once the pipe buffer fills. `completion`
 /// receives the exit status (or -1 when the launch itself failed); used by the selftest.
-func runPostProcessHook(command: String, transcriptPath: String, completion: ((Int32) -> Void)? = nil) {
+/// Shell-quote a single argument for the zsh command line.
+func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+
+enum PostProcessMode: String { case off, summary, shell }
+enum SummaryRunner: String, CaseIterable { case claude, codex, gemini }
+
+/// The built-in summary prompt — the turn-key default (editable in Settings). Answering in the
+/// transcript's own language keeps it correct for mixed ko/en/ja meetings.
+let defaultSummaryPrompt = "Summarize this meeting transcript: key points, decisions made, and action items with owners. Answer in the same language as the transcript."
+
+/// Where the automatic summary lands: "" = next to the transcript as `<name>.summary.md`;
+/// otherwise `<dir>/<name>.summary.md` (tilde expanded). Pure + testable.
+func summaryOutputPath(transcriptPath: String, outDir: String) -> String {
+    let t = URL(fileURLWithPath: transcriptPath)
+    let name = t.deletingPathExtension().lastPathComponent + ".summary.md"
+    let dir = outDir.trimmingCharacters(in: .whitespacesAndNewlines)
+    if dir.isEmpty { return t.deletingLastPathComponent().appendingPathComponent(name).path }
+    return URL(fileURLWithPath: (dir as NSString).expandingTildeInPath).appendingPathComponent(name).path
+}
+
+/// Build the shell invocation for a post-process run — nil when there's nothing to do. Pure + testable.
+/// BUILT-IN (summary): the agent CLI gets the prompt and the transcript on stdin, output redirected to
+/// the summary path. FREEFORM (shell): the user's command with the transcript path appended.
+func postProcessInvocation(mode: PostProcessMode, runner: SummaryRunner, prompt: String, shellCmd: String,
+                           transcriptPath: String, outDir: String) -> String? {
+    switch mode {
+    case .off:
+        return nil
+    case .shell:
+        let c = shellCmd.trimmingCharacters(in: .whitespacesAndNewlines)
+        return c.isEmpty ? nil : c + " " + shq(transcriptPath)
+    case .summary:
+        let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effective = p.isEmpty ? defaultSummaryPrompt : p
+        let out = summaryOutputPath(transcriptPath: transcriptPath, outDir: outDir)
+        switch runner {
+        case .claude: return "claude -p \(shq(effective)) < \(shq(transcriptPath)) > \(shq(out))"
+        case .gemini: return "gemini -p \(shq(effective)) < \(shq(transcriptPath)) > \(shq(out))"
+        // codex exec takes the prompt from stdin with `-`; prepend it to the transcript.
+        case .codex:  return "{ printf '%s\\n\\n' \(shq(effective)); cat \(shq(transcriptPath)); } | codex exec - > \(shq(out))"
+        }
+    }
+}
+
+/// Read the post-process prefs and build the invocation for a just-saved transcript.
+func postProcessInvocationFromPrefs(transcriptPath: String) -> String? {
+    let mode = PostProcessMode(rawValue: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE")) ?? .off
+    let runner = SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude
+    return postProcessInvocation(mode: mode, runner: runner,
+                                 prompt: Pref.explicit(Pref.summaryPrompt, "MR_SUMMARY_PROMPT"),
+                                 shellCmd: Pref.postProcessCommand,
+                                 transcriptPath: transcriptPath,
+                                 outDir: Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT"))
+}
+
+/// Fire-and-forget: a slow or hung command can never block the engine. Runs in a LOGIN shell
+/// (`zsh -lc`) so PATH/brew/rc setup apply (agent CLIs like `claude` just work). Output (both
+/// streams) is read to EOF BEFORE waiting on exit — reading after would deadlock once the pipe
+/// buffer fills. `completion` receives the exit status (or -1 when the launch failed); selftest uses it.
+func runPostProcessCommand(_ command: String, completion: ((Int32) -> Void)? = nil) {
     let cmd = command.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !cmd.isEmpty else { return }
     DispatchQueue.global(qos: .utility).async {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        let quoted = "'" + transcriptPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        p.arguments = ["-lc", cmd + " " + quoted]
+        p.arguments = ["-lc", cmd]
         let out = Pipe(); p.standardOutput = out; p.standardError = out
         do {
             try p.run()
@@ -1718,7 +1781,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let deepgramKeyField = NSSecureTextField()   // cloud live engines — the only off-device features
     private let openaiKeyField = NSSecureTextField()
     private let openaiBaseField = NSTextField()   // OpenAI-compatible proxy/gateway base URL ("" = official)
-    private let postProcessField = NSTextField()  // command run after each saved transcript ("" = off)
+    private let postProcessField = NSTextField()  // freeform post-process command (shell mode)
+    private let ppModePopup = NSPopUpButton()     // Off / Automatic summary (built-in) / Custom command
+    private let ppModeValues = ["off", "summary", "shell"], ppModeTitles = ["Off", "Automatic summary", "Custom command"]
+    private let runnerPopup = NSPopUpButton()     // which agent CLI writes the summary
+    private let runnerValues = ["claude", "codex", "gemini"], runnerTitles = ["Claude CLI", "Codex CLI", "Gemini CLI"]
+    private let promptField = NSTextField()       // summary prompt (pre-filled with the built-in default)
+    private let summaryOutField = NSTextField()   // summary output dir ("" = next to the transcript)
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
     // Calendar titling: a scrollable checkbox list of the user's calendars (none checked = all).
     private var calChecks: [(name: String, box: NSButton)] = []
@@ -1770,7 +1839,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         openaiKeyField.placeholderString = "sk-…"
         openaiBaseField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         postProcessField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
-        postProcessField.placeholderString = "~/bin/summarize-transcript.sh"
+        postProcessField.placeholderString = "~/bin/my-pipeline.sh"
+        for f in [promptField, summaryOutField] {
+            f.translatesAutoresizingMaskIntoConstraints = false
+            f.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        }
+        summaryOutField.placeholderString = "empty = next to the transcript"
+        ppModePopup.addItems(withTitles: ppModeTitles)
+        ppModePopup.target = self; ppModePopup.action = #selector(ppModeChanged)
+        runnerPopup.addItems(withTitles: runnerTitles)
         openaiBaseField.placeholderString = "empty = api.openai.com"
 
         excludeTokens.translatesAutoresizingMaskIntoConstraints = false
@@ -1847,11 +1924,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             fieldCaption("The spoken language whisper transcribes."),                             // 3
             row("Transcript file language:", transcriptLangPopup),                                // 4
             fieldCaption("Headings and labels of the saved markdown file (not the speech)."),     // 5
-            row("Post-process command:", postProcessField),                                       // 6
-            fieldCaption("Runs after each transcript is saved (login shell); the file path is "
-                       + "appended as the last argument. Summarize, translate, pipe to an LLM — "
-                       + "your script decides. Empty = off."),                                    // 7
-        ], notes: [3, 5, 7]))
+            sectionHeader("Post-process"),                                                        // 6
+            row("Mode:", ppModePopup),                                                            // 7
+            fieldCaption("Automatic summary is built in — pick who writes it; or take full "
+                       + "control with a custom command."),                                       // 8
+            row("Summarize with:", runnerPopup),                                                  // 9
+            row("Prompt:", promptField),                                                          // 10
+            fieldCaption("Default asks for key points, decisions, and action items — answered "
+                       + "in the transcript's language."),                                        // 11
+            row("Save summary to:", summaryOutField),                                             // 12
+            fieldCaption("Folder for <name>.summary.md. Empty = next to the transcript."),        // 13
+            row("Custom command:", postProcessField),                                             // 14
+            fieldCaption("Freeform: runs in a login shell with the transcript path appended "
+                       + "as the last argument."),                                                // 15
+        ], headers: [6], notes: [3, 5, 8, 11, 13, 15]))
         tabs.addTabViewItem(tab("Titling", [
             row("", calBtn),
             row("Calendars:", calListCell),
@@ -1916,6 +2002,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         addAppPopup.action = #selector(addApp)
     }
 
+    /// Only the fields the selected mode actually uses are editable — the form reads as one choice.
+    @objc private func ppModeChanged() { updatePostProcessEnabled() }
+    private func updatePostProcessEnabled() {
+        let mode = PostProcessMode(rawValue: ppModeValues[max(0, ppModePopup.indexOfSelectedItem)]) ?? .off
+        for c in [runnerPopup, promptField, summaryOutField] as [NSControl] { c.isEnabled = mode == .summary }
+        postProcessField.isEnabled = mode == .shell
+    }
+
     @objc private func addApp() {
         let i = addAppPopup.indexOfSelectedItem
         guard i > 0, i < runningAppIds.count else { return }
@@ -1978,6 +2072,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         openaiKeyField.stringValue = OpenAILiveTranscriber.storedKey ?? ""
         openaiBaseField.stringValue = OpenAILiveTranscriber.configuredBase   // explicit save (even "") beats env
         postProcessField.stringValue = Pref.postProcessCommand               // same explicit-save semantics
+        ppModePopup.selectItem(at: idx(Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"), ppModeValues))
+        runnerPopup.selectItem(at: idx(Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER"), runnerValues))
+        let savedPrompt = Pref.explicit(Pref.summaryPrompt, "MR_SUMMARY_PROMPT")
+        promptField.stringValue = savedPrompt.isEmpty ? defaultSummaryPrompt : savedPrompt   // show the editable default
+        summaryOutField.stringValue = Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT")
+        updatePostProcessEnabled()
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
         vadBtn.state = c.vadEnabled ? .on : .off
         systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
@@ -2042,6 +2142,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(customModelField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.customModel)
         d.set(openaiBaseField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.openaiBase)
         d.set(postProcessField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.postProcessCmd)
+        d.set(ppModeValues[max(0, ppModePopup.indexOfSelectedItem)], forKey: Pref.postProcessMode)
+        d.set(runnerValues[max(0, runnerPopup.indexOfSelectedItem)], forKey: Pref.summaryRunner)
+        d.set(promptField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryPrompt)
+        d.set(summaryOutField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryOut)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
@@ -3981,22 +4085,43 @@ struct Main {
                   TranscriptL10n.forLanguage("ko").failureNote(model: "m").contains("전사 실패")
                   && TranscriptL10n.forLanguage("fr").section == "## Transcript"
                   && TranscriptL10n.forLanguage(nil).section == "## Transcript")
-            // Post-process hook: really runs the command with the transcript path appended — including a
-            // quoting-hostile path (space + apostrophe), the case that breaks naive shell interpolation.
-            let hookDir = FileManager.default.temporaryDirectory
-            let marker = hookDir.appendingPathComponent("macrec hook's \(UUID().uuidString)")
+            // Post-process invocation builder — the built-in summary templates and the freeform mode.
+            func inv(_ m: PostProcessMode, _ r: SummaryRunner, prompt: String = "P", shell: String = "", out: String = "") -> String? {
+                postProcessInvocation(mode: m, runner: r, prompt: prompt, shellCmd: shell,
+                                      transcriptPath: "/t/a b's.md", outDir: out)
+            }
+            check("post-process: off → nil, shell empty → nil",
+                  inv(.off, .claude) == nil && inv(.shell, .claude) == nil)
+            check("post-process: shell appends quoted path",
+                  inv(.shell, .claude, shell: "./x.sh") == "./x.sh '/t/a b'\\''s.md'")
+            check("post-process: claude summary template",
+                  inv(.summary, .claude) == "claude -p 'P' < '/t/a b'\\''s.md' > '/t/a b'\\''s.summary.md'")
+            check("post-process: gemini summary template",
+                  inv(.summary, .gemini)?.hasPrefix("gemini -p 'P'") == true)
+            check("post-process: codex pipes prompt+transcript via stdin",
+                  inv(.summary, .codex)?.contains("| codex exec -") == true)
+            check("post-process: empty prompt falls back to the built-in default",
+                  inv(.summary, .claude, prompt: " ")?.contains(defaultSummaryPrompt.prefix(25)) == true)
+            check("post-process: summary path derivation (custom dir + tilde)",
+                  summaryOutputPath(transcriptPath: "/t/x.md", outDir: "") == "/t/x.summary.md"
+                  && summaryOutputPath(transcriptPath: "/t/x.md", outDir: "~/sums")
+                     == (("~/sums" as NSString).expandingTildeInPath + "/x.summary.md"))
+            // The runner really executes — quoting-hostile path (space + apostrophe) via the shell mode.
+            let marker = FileManager.default.temporaryDirectory.appendingPathComponent("macrec hook's \(UUID().uuidString)")
+            let markerCmd = postProcessInvocation(mode: .shell, runner: .claude, prompt: "", shellCmd: "touch",
+                                                  transcriptPath: marker.path, outDir: "")
             var hookExit: Int32 = -99
             let hookSem = DispatchSemaphore(value: 0)
-            runPostProcessHook(command: "touch", transcriptPath: marker.path) { code in hookExit = code; hookSem.signal() }
+            runPostProcessCommand(markerCmd ?? "") { code in hookExit = code; hookSem.signal() }
             let hookDone = hookSem.wait(timeout: .now() + 10) == .success
-            check("post-process hook: runs with a quoting-safe path arg",
+            check("post-process: runner executes with a quoting-safe path",
                   hookDone && hookExit == 0 && FileManager.default.fileExists(atPath: marker.path))
             try? FileManager.default.removeItem(at: marker)
             // Empty command = off: completion must never fire.
             var fired = false
-            runPostProcessHook(command: "   ", transcriptPath: "/tmp/x") { _ in fired = true }
+            runPostProcessCommand("   ") { _ in fired = true }
             Thread.sleep(forTimeInterval: 0.2)
-            check("post-process hook: empty command is a no-op", !fired)
+            check("post-process: empty command is a no-op", !fired)
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
             exit(fails == 0 ? 0 : 1)
         }
