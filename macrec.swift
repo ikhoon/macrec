@@ -3705,8 +3705,9 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             chevronLead = lead
             // Y pins to the CLOSE BUTTON (which sits in the title row) — the titlebar container also
             // spans the bottom accessory strip, so its centerY would drop the chevron onto the controls.
-            // The -2 pt trims the symbol's bottom-heavy optical balance against the title text.
-            NSLayoutConstraint.activate([lead, collapseBtn.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor, constant: -2)])
+            // The -1.5 pt trims the symbol's optical balance against the title text (fractional points
+            // land on pixel boundaries on Retina; -2 sat visibly high after the glyph-size change).
+            NSLayoutConstraint.activate([lead, collapseBtn.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor, constant: -1.5)])
             chevronAttached = true
         }
         setTitle(panel.title)   // measure the initial title → position the chevron
