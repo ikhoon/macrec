@@ -1841,6 +1841,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let promptView = NSTextView()         // summary prompt — a real TEXT AREA (prompts are sentences)
     private let promptScroll = NSScrollView()     // its bordered, scrolling host
     private let summaryOutField = NSTextField()   // summary output dir ("" = next to the transcript)
+    private var summaryChooseBtn: NSButton?       // folder picker for the summary output dir
     private let hintsTermsField = NSTextField()   // hint terms (comma/newline separated)
     private let hintsFileField = NSTextField()    // external hints file path
     private let hintsCalBtn = NSButton(checkboxWithTitle: "Add the meeting's title & attendees from Calendar",
@@ -1939,6 +1940,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let dirStack = NSStackView(views: [dirField, chooseBtn]); dirStack.orientation = .horizontal; dirStack.spacing = 6
         let audioChooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseAudioDir))
         let audioStack = NSStackView(views: [audioDirField, audioChooseBtn]); audioStack.orientation = .horizontal; audioStack.spacing = 6
+        summaryChooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseSummaryDir))
+        let summaryStack = NSStackView(views: [summaryOutField, summaryChooseBtn!]); summaryStack.orientation = .horizontal; summaryStack.spacing = 6
 
         // Grouped into tabs (each pane stays short) instead of one long scrolling form.
         func row(_ label: String, _ control: NSView) -> [NSView] { [labeled(label), control] }
@@ -2050,7 +2053,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             row("Prompt:", promptScroll),                                                         // 5
             fieldCaption("Default asks for key points, decisions, and action items — answered "
                        + "in the transcript's language."),                                        // 6
-            row("Save summary to:", summaryOutField),                                             // 7
+            row("Save summary to:", summaryStack),                                                // 7
             fieldCaption("Folder for <name>.summary.md. Empty = next to the transcript."),        // 8
             sectionHeader("Custom command", symbol: "terminal"),                                                      // 9
             row("Command:", postProcessField),                                                    // 10
@@ -2126,6 +2129,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func updatePostProcessEnabled() {
         let mode = PostProcessMode(rawValue: ppModeValues[max(0, ppModePopup.indexOfSelectedItem)]) ?? .off
         for c in [runnerPopup, summaryOutField] as [NSControl] { c.isEnabled = mode == .summary }
+        summaryChooseBtn?.isEnabled = mode == .summary
         promptView.isEditable = mode == .summary
         promptScroll.alphaValue = mode == .summary ? 1 : 0.45   // NSTextView isn't an NSControl — dim to match
         postProcessField.isEnabled = mode == .shell
@@ -2239,6 +2243,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc private func chooseAudioDir() {
         let p = NSOpenPanel(); p.canChooseDirectories = true; p.canChooseFiles = false; p.allowsMultipleSelection = false
         if p.runModal() == .OK, let u = p.url { audioDirField.stringValue = u.path }
+    }
+    @objc private func chooseSummaryDir() {
+        let p = NSOpenPanel(); p.canChooseDirectories = true; p.canChooseFiles = false; p.allowsMultipleSelection = false
+        p.canCreateDirectories = true
+        if p.runModal() == .OK, let u = p.url { summaryOutField.stringValue = u.path }
     }
 
     @objc private func saveAndClose() {
