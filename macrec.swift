@@ -2652,6 +2652,9 @@ final class WhisperLiveTranscriber: LiveTranscribing {
     private let onUpdate: (String, Bool) -> Void
     private let onLocale: ((Locale) -> Void)?
     private let cfg = EngineConfig.load()
+    // Same proper-noun dictionary as the saved transcript; snapshot at engine creation (the overlay
+    // rebuilds engines on any control change, so hints refresh with the meeting).
+    private let hints = transcriptionHints(start: Date(), end: Date())
     private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
     private let wavURL = FileManager.default.temporaryDirectory.appendingPathComponent("macrec-live-\(UUID().uuidString).wav")
     private let q = DispatchQueue(label: "macrec.whisperlive", qos: .userInitiated)
@@ -2762,8 +2765,10 @@ final class WhisperLiveTranscriber: LiveTranscribing {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cfg.whisperCli)
         // -nt: plain text (no timestamps); -bs 1: greedy for latency; half the cores to spare the engine.
-        p.arguments = ["-m", cfg.whisperModel, "-f", wavURL.path, "-l", lang, "-nt", "-np", "-sns",
-                       "-bs", "1", "-t", String(max(4, ProcessInfo.processInfo.activeProcessorCount - 2))]
+        var args = ["-m", cfg.whisperModel, "-f", wavURL.path, "-l", lang, "-nt", "-np", "-sns",
+                    "-bs", "1", "-t", String(max(4, ProcessInfo.processInfo.activeProcessorCount - 2))]
+        if !hints.isEmpty { args += ["--prompt", hints] }   // same proper-noun dictionary as the saved transcript
+        p.arguments = args
         let out = Pipe(); p.standardOutput = out
         p.standardError = FileHandle.nullDevice   // discard stderr — draining a Pipe we never read can deadlock waitUntilExit()
         lock.lock(); proc = p; lock.unlock()
@@ -2831,17 +2836,11 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
         self.label = label; self.locale = locale; self.onLocale = onLocale; self.onUpdate = onUpdate
     }
 
-    func start() {
-        onLocale?(locale)
-        let key = Self.apiKey
-        guard !key.isEmpty else {
-            onUpdate("Deepgram API key not set — Settings → Live (or MR_DEEPGRAM_KEY)", true)
-            elog("deepgram[\(label)]: no API key — engine idle")
-            return
-        }
-        let lang = locale.language.languageCode?.identifier ?? "en"
+    /// The realtime endpoint for a language + hint keywords (each term becomes a `keywords` boost —
+    /// same proper-noun dictionary as the saved transcript; capped for URL sanity). Pure + testable.
+    static func listenURL(lang: String, keywords: [String]) -> URL {
         var comps = URLComponents(string: "wss://api.deepgram.com/v1/listen")!
-        comps.queryItems = [
+        var items: [URLQueryItem] = [
             .init(name: "model", value: "nova-2"),
             .init(name: "language", value: lang),
             .init(name: "encoding", value: "linear16"),
@@ -2852,7 +2851,22 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
             .init(name: "punctuate", value: "true"),
             .init(name: "endpointing", value: "300"),
         ]
-        var req = URLRequest(url: comps.url!)
+        items += keywords.prefix(30).map { URLQueryItem(name: "keywords", value: $0) }
+        comps.queryItems = items
+        return comps.url!
+    }
+
+    func start() {
+        onLocale?(locale)
+        let key = Self.apiKey
+        guard !key.isEmpty else {
+            onUpdate("Deepgram API key not set — Settings → Live (or MR_DEEPGRAM_KEY)", true)
+            elog("deepgram[\(label)]: no API key — engine idle")
+            return
+        }
+        let lang = locale.language.languageCode?.identifier ?? "en"
+        let keywords = parseHintTerms(transcriptionHints(start: Date(), end: Date()))
+        var req = URLRequest(url: Self.listenURL(lang: lang, keywords: keywords))
         req.setValue("Token \(key)", forHTTPHeaderField: "Authorization")
         q.async { [self] in   // all connection state (task/session/pending/lastSentAt/stopped) lives on q
             guard !stopped else { return }   // stop() can land before this block on a quick toggle — don't orphan a socket
@@ -3029,6 +3043,18 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
     }
     static var endpoint: URL { realtimeURL(base: configuredBase) }
 
+    /// The transcription-session config event: pcm16 in, server VAD segmenting turns; a non-empty hints
+    /// dictionary rides the transcription prompt (same proper nouns as the saved transcript). Pure + testable.
+    static func sessionConfig(lang: String, hints: String) -> [String: Any] {
+        var transcription: [String: Any] = ["model": "gpt-4o-transcribe", "language": lang]
+        if !hints.isEmpty { transcription["prompt"] = hints }
+        return ["type": "transcription_session.update", "session": [
+            "input_audio_format": "pcm16",
+            "input_audio_transcription": transcription,
+            "turn_detection": ["type": "server_vad", "silence_duration_ms": 500],
+        ] as [String: Any]]
+    }
+
     init(label: String, locale: Locale, onLocale: ((Locale) -> Void)? = nil,
          onUpdate: @escaping (String, Bool) -> Void) {
         self.label = label; self.locale = locale; self.onLocale = onLocale; self.onUpdate = onUpdate
@@ -3054,12 +3080,9 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
             session = s; task = t
             t.resume()
             receiveLoop(t)
-            // Configure the transcription session: raw pcm16 in, server VAD segmenting turns.
-            let cfg: [String: Any] = ["type": "transcription_session.update", "session": [
-                "input_audio_format": "pcm16",
-                "input_audio_transcription": ["model": "gpt-4o-transcribe", "language": lang],
-                "turn_detection": ["type": "server_vad", "silence_duration_ms": 500],
-            ]]
+            // Configure the transcription session: raw pcm16 in, server VAD segmenting turns. The hints
+            // dictionary rides the transcription prompt (same proper nouns as the saved transcript).
+            let cfg = Self.sessionConfig(lang: lang, hints: transcriptionHints(start: Date(), end: Date()))
             if let d = try? JSONSerialization.data(withJSONObject: cfg), let str = String(data: d, encoding: .utf8) {
                 t.send(.string(str)) { [weak self] err in
                     if let err, let self, !self.stopped { elog("openailive[\(self.label)] config: \(err.localizedDescription)") }
@@ -4280,6 +4303,16 @@ struct Main {
                   == ["Alpha", "Beta", "Gamma", "김철수"])
             check("hints: cap respected",
                   mergeHintTerms(direct: (1...100).map(String.init), file: [], event: []).count == 60)
+            // Live pass-through: Deepgram gets per-term `keywords` boosts; OpenAI gets a transcription prompt.
+            let dgURL = DeepgramLiveTranscriber.listenURL(lang: "ko", keywords: ["Kubernetes", "김철수"]).absoluteString
+            check("hints: deepgram keywords in the listen URL",
+                  dgURL.contains("keywords=Kubernetes") && dgURL.contains("keywords=") && dgURL.contains("language=ko"))
+            let oaCfg = OpenAILiveTranscriber.sessionConfig(lang: "ko", hints: "Kubernetes, 김철수")
+            let oaTr = (oaCfg["session"] as? [String: Any])?["input_audio_transcription"] as? [String: Any]
+            let oaCfgNoHints = OpenAILiveTranscriber.sessionConfig(lang: "ko", hints: "")
+            let oaTrNo = (oaCfgNoHints["session"] as? [String: Any])?["input_audio_transcription"] as? [String: Any]
+            check("hints: openai transcription prompt set only when non-empty",
+                  (oaTr?["prompt"] as? String) == "Kubernetes, 김철수" && oaTrNo?["prompt"] == nil)
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
             exit(fails == 0 ? 0 : 1)
         }
