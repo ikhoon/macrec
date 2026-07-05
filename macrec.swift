@@ -4600,8 +4600,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let tItem = NSMenuItem()
         let tView = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
         let tBtn = NSButton(title: "Transcribe now", target: self, action: #selector(flushNow))
-        tBtn.isBordered = false; tBtn.alignment = .left; tBtn.font = NSFont.menuFont(ofSize: 0)
-        tBtn.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Transcribe now")
+        tBtn.isBordered = false; tBtn.alignment = .left
+        // A borderless button renders its title in the gray button style, which read as DISABLED
+        // next to the real menu items — force the menu-item look (label color, menu font). And
+        // "waveform" said "speech", not what the click does; "new document" says it: cut here,
+        // write the transcript file now.
+        tBtn.attributedTitle = NSAttributedString(
+            string: "Transcribe now",
+            attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: NSColor.labelColor])
+        tBtn.image = NSImage(systemSymbolName: "doc.badge.plus", accessibilityDescription: "Transcribe now")
+        tBtn.contentTintColor = .labelColor
         tBtn.imagePosition = .imageLeading
         // AppKit's default image↔title gap matches the standard imaged items; a small left inset
         // lines the icon up with them. (No leading space in the title — that would leak into the
