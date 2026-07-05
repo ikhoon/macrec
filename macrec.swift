@@ -3636,9 +3636,10 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         // its 32 pt comes back to the captions, and the chevron stays visible to expand again.
         controlsAccessory?.isHidden = collapsed
         let label = collapsed ? "Show caption controls" : "Hide caption controls"
-        // The compact chevron is the "sheet grabber" glyph — reads as a drawer handle, not a plain caret.
-        collapseBtn.image = NSImage(systemSymbolName: collapsed ? "chevron.compact.down" : "chevron.compact.up",
-                                    accessibilityDescription: nil)
+        // The classic chevron pair, sized down a notch (user pick: compact/sheet-grabber read oddly here).
+        let cfg = NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
+        collapseBtn.image = NSImage(systemSymbolName: collapsed ? "chevron.down" : "chevron.up",
+                                    accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
         collapseBtn.setAccessibilityLabel(label)   // VoiceOver reads the BUTTON's label, not the image's
         collapseBtn.toolTip = label
         // Persist only on user toggles: writing during init would CREATE the defaults key on first
