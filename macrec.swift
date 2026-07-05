@@ -1904,7 +1904,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             f.translatesAutoresizingMaskIntoConstraints = false
             f.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         }
-        hintsTermsField.placeholderString = "Alpha, Kubernetes, 김철수, …"
+        hintsTermsField.placeholderString = "Kubernetes, gRPC, 김철수, …"
         hintsFileField.placeholderString = "~/notes/hints.txt"
         // Multiline prompt editor (user feedback: a one-line field is too small for a real prompt).
         promptScroll.translatesAutoresizingMaskIntoConstraints = false
@@ -4265,10 +4265,10 @@ struct Main {
             }
             // Transcription hints: parsing (comma/newline/#comment), case-insensitive dedupe, cap.
             check("hints: parse comma/newline + comments",
-                  parseHintTerms("Alpha, Kubernetes\n# note\n김철수\n\n") == ["Alpha", "Kubernetes", "김철수"])
+                  parseHintTerms("Kubernetes, gRPC\n# note\n김철수\n\n") == ["Kubernetes", "gRPC", "김철수"])
             check("hints: dedupe (case-insensitive) + priority order",
-                  mergeHintTerms(direct: ["Kubernetes", "Beta"], file: ["kubernetes", "gRPC"], event: ["Beta", "김철수"])
-                  == ["Kubernetes", "Beta", "gRPC", "김철수"])
+                  mergeHintTerms(direct: ["Alpha", "Beta"], file: ["alpha", "Gamma"], event: ["Beta", "김철수"])
+                  == ["Alpha", "Beta", "Gamma", "김철수"])
             check("hints: cap respected",
                   mergeHintTerms(direct: (1...100).map(String.init), file: [], event: []).count == 60)
             print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
