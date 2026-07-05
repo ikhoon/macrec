@@ -4518,6 +4518,55 @@ enum Notifier {
     }
 }
 
+/// Container for a custom NSMenuItem view that replicates the NATIVE hover behavior a plain view
+/// lacks: the selection-material pill behind the row and an inverted (white) label while hovered.
+/// AppKit draws that for ordinary items only — a `view`-backed item gets nothing. The view-backed
+/// row exists so clicking "Transcribe now" does NOT dismiss the menu (user pick — watch the row's
+/// spinner in place). Tracking uses .activeAlways because menu tracking runs in its own event mode.
+final class MenuHoverView: NSView {
+    private let highlight = NSVisualEffectView()
+    var onHover: ((Bool) -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        autoresizingMask = [.width]              // stretch with whatever width the menu settles on
+        highlight.material = .selection
+        highlight.state = .active
+        highlight.isEmphasized = true
+        highlight.blendingMode = .behindWindow
+        highlight.wantsLayer = true
+        highlight.layer?.cornerRadius = 4
+        highlight.layer?.cornerCurve = .continuous
+        highlight.isHidden = true
+        highlight.frame = bounds.insetBy(dx: 5, dy: 0)   // native menus inset the pill ~5 pt
+        highlight.autoresizingMask = [.width, .height]
+        addSubview(highlight, positioned: .below, relativeTo: nil)
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) { setHover(true) }
+    override func mouseExited(with event: NSEvent) { setHover(false) }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        setHover(false)   // a menu reopen must never resurrect last time's highlight
+    }
+
+    func setHover(_ inside: Bool) {
+        highlight.isHidden = !inside
+        onHover?(inside)
+    }
+
+    var highlightVisibleForTest: Bool { !highlight.isHidden }
+    var trackingReadyForTest: Bool { updateTrackingAreas(); return !trackingAreas.isEmpty }
+}
+
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var engine: RecordingEngine?
@@ -4530,6 +4579,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let traySpinner = NSProgressIndicator()   // menu-bar spinner while a manual flush transcribes
     private var trayBusy = false               // spinner owns the tray — setIcon() must not repaint over it
     private var trayBusyGeneration = 0         // failsafe-timeout token (a new flush invalidates old timers)
+    private var transcribeBtn: NSButton!               // "Transcribe now" row (view-backed: menu stays open)
+    private let menuRowSpinner = NSProgressIndicator() // replaces the row's icon while the flush runs
     private var schedulePaused = false         // the SCHEDULE stopped the engine (vs the user's `paused`)
     private var scheduleOverrideUntil: Date?   // manual Pause/Resume wins until this boundary passes
     private var startTask: Task<Void, Never>?  // in-flight engine start — stops must wait for it
@@ -4644,10 +4695,38 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         modelLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); modelLine.isEnabled = false; modelLine.isHidden = true
         menu.addItem(statusLine); menu.addItem(levelItem); menu.addItem(lastSavedLine); menu.addItem(modelLine)
         menu.addItem(.separator())
-        // Transcribe now — a NATIVE item (user pick: closing the menu on click feels right, and it
-        // brings back AppKit's own hover/highlight/keyboard handling). The outcome that used to be
-        // watched in the open menu arrives as a notification instead (see flushOutcome/Notifier).
-        menu.addItem(item("Transcribe now", #selector(flushNow), symbol: "doc.badge.plus"))
+        // Transcribe now — view-backed so the click does NOT dismiss the menu (user pick, round 2:
+        // stay open and watch the row's spinner in place). MenuHoverView supplies the native-style
+        // hover pill AppKit withholds from view-backed items; the completion push still fires for
+        // whenever the menu IS closed while a flush runs.
+        let tItem = NSMenuItem()
+        let tView = MenuHoverView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
+        let tBtn = NSButton(title: "Transcribe now", target: self, action: #selector(flushNow))
+        tBtn.isBordered = false; tBtn.alignment = .left
+        // Borderless buttons render the gray "button" text style — force the menu-item look, and
+        // flip to white while the hover pill is showing, like native rows.
+        func styleTranscribeNow(hovered: Bool) {
+            let fg: NSColor = hovered ? .selectedMenuItemTextColor : .labelColor
+            tBtn.attributedTitle = NSAttributedString(
+                string: "Transcribe now",
+                attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: fg])
+            tBtn.contentTintColor = fg
+        }
+        styleTranscribeNow(hovered: false)
+        tView.onHover = { styleTranscribeNow(hovered: $0) }
+        tBtn.image = NSImage(systemSymbolName: "doc.badge.plus", accessibilityDescription: "Transcribe now")
+        tBtn.imagePosition = .imageLeading
+        // AppKit's default image↔title gap matches the standard imaged items; a small left inset
+        // lines the icon up with them.
+        tBtn.frame = NSRect(x: 14, y: 1, width: 221, height: 20)
+        tBtn.autoresizingMask = [.width]
+        menuRowSpinner.style = .spinning
+        menuRowSpinner.controlSize = .small
+        menuRowSpinner.isDisplayedWhenStopped = false
+        menuRowSpinner.frame = NSRect(x: 13, y: 3, width: 16, height: 16)   // sits where the icon was
+        tView.addSubview(tBtn); tView.addSubview(menuRowSpinner); tItem.view = tView
+        transcribeBtn = tBtn
+        menu.addItem(tItem)
         toggleItem = item("Pause", #selector(togglePause), symbol: "pause.circle"); menu.addItem(toggleItem)
         if #available(macOS 26, *) {   // real-time caption overlay (on-device SpeechAnalyzer)
             let li = item("Live captions", #selector(toggleLive), symbol: "captions.bubble")
@@ -4779,10 +4858,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func flushNow() {
-        guard engine != nil, !paused else { return }
-        notifyWhenTranscribed = true   // menu just closed — deliver the outcome as a push
+        guard engine != nil, !paused, !trayBusy else { return }   // busy = one flush at a time
+        notifyWhenTranscribed = true   // outcome arrives as a push (the menu may be closed by then)
         Notifier.requestAuth()         // no-op after the user answered the first prompt
-        showTraySpinner()              // …and show progress right where the user just clicked
+        showTraySpinner()              // menu row + tray glyph spin until the outcome lands
         engine?.flushNow()
         refresh("● Transcribing now…")
     }
@@ -4797,8 +4876,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Notifier.push(title: o.title, body: o.body, filePath: file)
     }
 
-    /// Swap the tray glyph for a small indeterminate spinner while the manual flush transcribes —
-    /// the menu closed on click, so this is the only in-place progress the user can see.
+    /// While a manual flush transcribes, progress spins in BOTH places the user might be looking:
+    /// the menu row (the menu stays open on click) and the tray glyph (if they close it).
     private func showTraySpinner() {
         guard !trayBusy, let btn = statusItem.button else { return }
         trayBusy = true
@@ -4812,6 +4891,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         btn.image = nil
         btn.addSubview(traySpinner)
         traySpinner.startAnimation(nil)
+        transcribeBtn.image = nil                 // the row spinner takes the icon's spot
+        transcribeBtn.isEnabled = false           // no double-flush while one is running
+        menuRowSpinner.startAnimation(nil)
         // Failsafe: whisper on a long segment takes minutes, but a lost outcome (engine swapped out
         // mid-flush) must not leave the tray spinning forever.
         let gen = trayBusyGeneration
@@ -4827,6 +4909,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         trayBusy = false
         traySpinner.stopAnimation(nil)
         traySpinner.removeFromSuperview()
+        menuRowSpinner.stopAnimation(nil)
+        transcribeBtn.image = NSImage(systemSymbolName: "doc.badge.plus", accessibilityDescription: "Transcribe now")
+        transcribeBtn.isEnabled = true
         setIcon(recording: engine != nil && !paused && !schedulePaused)
     }
 
@@ -5397,8 +5482,24 @@ struct Main {
                   RecordSchedule.from(enabled: false, days: "", hours: "").isActive(at: schedDate("2026-07-05 03:00"), calendar: utc)
                   && RecordSchedule.from(enabled: true, days: "mon-fri", hours: "").isActive(at: schedDate("2026-07-06 03:00"), calendar: utc)
                   && RecordSchedule.from(enabled: true, days: "", hours: "10:00-11:00").isActive(at: schedDate("2026-07-05 10:30"), calendar: utc))
-            // Transcribe-now push: terminal statuses notify (menu closes on click now), transient
-            // ones keep waiting — a dangling flag would mis-attribute the NEXT hourly segment.
+            // Menu hover: a view-backed item gets NO native highlight — MenuHoverView must provide
+            // the selection pill + notify the label restyle, and reset when the menu reopens.
+            do {
+                let hv = MenuHoverView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
+                var hoverStates: [Bool] = []
+                hv.onHover = { hoverStates.append($0) }
+                let initiallyOff = !hv.highlightVisibleForTest
+                hv.setHover(true)
+                let litAndNotified = hv.highlightVisibleForTest && hoverStates == [true]
+                hv.setHover(false)
+                let offAgain = !hv.highlightVisibleForTest && hoverStates == [true, false]
+                check("menu hover: pill shows on hover, hides after, restyle notified",
+                      initiallyOff && litAndNotified && offAgain)
+                check("menu hover: tracking area installed (mouse enter/exit will arrive)",
+                      hv.trackingReadyForTest)
+            }
+            // Transcribe-now push: terminal statuses notify (the menu may be closed by then),
+            // transient ones keep waiting — a dangling flag would mis-attribute the NEXT hourly segment.
             check("flush push: terminal statuses classified, transient ones wait",
                   flushOutcome(for: "Saved: 2026-07-05-2100-2130.md")! == ("Transcript ready", "2026-07-05-2100-2130.md")
                   && flushOutcome(for: "No speech — discarded") != nil
