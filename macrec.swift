@@ -3725,6 +3725,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var engine: RecordingEngine?
     private var stopTask: Task<Void, Never>?   // in-flight engine stop (pause) — resume/restart await it so
                                                // two capture pipelines never overlap on the shared audio state
+    private var voiceTimer: Timer?             // ~1 Hz poll for the voice-activity tray tint
+    private var voiceShown = false
+    private var lastVoiceAt: TimeInterval = 0
     private var statusLine: NSMenuItem!
     private var levelItem: NSMenuItem!
     private var lastSavedLine: NSMenuItem!
@@ -3748,6 +3751,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.terminate(nil); return
         }
         buildMenu()
+        let vt = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.pollVoice() }
+        RunLoop.main.add(vt, forMode: .common)   // .common so the tint updates while menus track too
+        voiceTimer = vt
         DistributedNotificationCenter.default().addObserver(
             forName: .init("com.ikhoon.macrec.openMenu"), object: nil, queue: .main
         ) { [weak self] _ in self?.openMenu() }
@@ -3761,22 +3767,41 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func setIcon(recording: Bool) {
-        // Distinct audio-recorder identity: a waveform-with-mic while live, pause when not.
+    private func setIcon(recording: Bool, voice: Bool = false) {
+        // Distinct audio-recorder identity: a waveform-with-mic while live, pause when not. While
+        // VOICE is being picked up, the glyph tints orange (the platform's "recording" color) — the
+        // at-a-glance "it's hearing something" signal.
         let primary = recording ? "waveform.badge.mic" : "pause.circle"
         let fallback = recording ? "waveform" : "pause"
         // Fixed point size so the menu-bar icon never resizes (independent of which symbol).
-        let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+        var cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+        if voice { cfg = cfg.applying(.init(paletteColors: [.systemOrange])) }
         let img = (NSImage(systemSymbolName: primary, accessibilityDescription: "macrec")
             ?? NSImage(systemSymbolName: fallback, accessibilityDescription: "macrec"))?
             .withSymbolConfiguration(cfg)
-        img?.isTemplate = true
+        img?.isTemplate = !voice   // template adapts to the menu bar; the voice tint must keep its color
         statusItem.button?.image = img
         // Hug the glyph's real width (+ a hair) so there's no wide L/R slack — WITHOUT touching pointSize
         // or imagePosition (fixed length keeps the vertical centering that variableLength/imageOnly broke).
         let glyphW = img?.size.width ?? 22
         statusItem.length = ceil(glyphW) + 4
-        elog("icon set (recording=\(recording)), glyphW=\(glyphW), length=\(statusItem.length)")
+        if Pref.bool("trayDebug", "MR_TRAY_DEBUG", false) {
+            elog("icon set (recording=\(recording), voice=\(voice)), glyphW=\(glyphW), length=\(statusItem.length)")
+        }
+    }
+
+    /// Poll the engine's recent input levels (~1 Hz, negligible) and reflect "voice being picked up"
+    /// in the tray glyph. 2 s hysteresis so normal speech pauses don't flicker the icon.
+    private func pollVoice() {
+        guard let eng = engine, !paused else {
+            if voiceShown { voiceShown = false; setIcon(recording: engine != nil && !paused) }
+            return
+        }
+        let (mic, sys) = eng.liveLevels()
+        let now = ProcessInfo.processInfo.systemUptime
+        if max(mic, sys) > 0.02 { lastVoiceAt = now }   // ≈ one meter dot — speech, not room noise
+        let active = now - lastVoiceAt < 2.0
+        if active != voiceShown { voiceShown = active; setIcon(recording: true, voice: active) }
     }
 
     private func item(_ title: String, _ sel: Selector, _ key: String = "", symbol: String = "") -> NSMenuItem {
