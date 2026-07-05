@@ -1692,11 +1692,15 @@ final class RecordingEngine {
 // domain jargon, attendee names stop coming out mangled. Merged from three sources: the Settings terms,
 // an external file (git-manageable), and optionally the overlapping calendar event.
 
-/// Split a hints blob into terms: comma- or newline-separated, trimmed, `#`-comment lines dropped.
+/// Split a hints blob into terms: comma- or newline-separated, trimmed. A `#` starts a comment that
+/// runs to the END OF THE LINE — commas inside a comment must not resurrect its tail as terms
+/// (review finding: "# old, stuff" leaked "stuff" into prompts).
 func parseHintTerms(_ text: String) -> [String] {
-    text.split(whereSeparator: { $0 == "\n" || $0 == "," })
+    text.split(separator: "\n")
+        .map { line in line.firstIndex(of: "#").map { String(line[..<$0]) } ?? String(line) }
+        .flatMap { $0.split(separator: ",") }
         .map { $0.trimmingCharacters(in: .whitespaces) }
-        .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+        .filter { !$0.isEmpty }
 }
 
 /// Merge hint sources in priority order, dedupe case-insensitively, cap the count (whisper's prompt
@@ -2723,9 +2727,10 @@ final class WhisperLiveTranscriber: LiveTranscribing {
     private let onUpdate: (String, Bool) -> Void
     private let onLocale: ((Locale) -> Void)?
     private let cfg = EngineConfig.load()
-    // Same proper-noun dictionary as the saved transcript; snapshot at engine creation (the overlay
-    // rebuilds engines on any control change, so hints refresh with the meeting).
-    private let hints = transcriptionHints(start: Date(), end: Date())
+    // Same proper-noun dictionary as the saved transcript; snapshotted on q at start() (the overlay
+    // builds engines on the MAIN thread, and transcriptionHints does file IO + an EventKit query —
+    // review finding: a slow hints file/calendar froze the whole app). q-confined thereafter.
+    private var hints = ""
     private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
     private let wavURL = FileManager.default.temporaryDirectory.appendingPathComponent("macrec-live-\(UUID().uuidString).wav")
     private let q = DispatchQueue(label: "macrec.whisperlive", qos: .userInitiated)
@@ -2752,6 +2757,10 @@ final class WhisperLiveTranscriber: LiveTranscribing {
 
     func start() {
         onLocale?(locale)   // whisper uses the requested language directly; surface it in the title
+        q.async { [weak self] in   // hints do file IO + EventKit — off the main thread, before the first tick
+            guard let self else { return }
+            self.hints = transcriptionHints(start: Date(), end: Date())
+        }
         let t = DispatchSource.makeTimerSource(queue: q)
         t.schedule(deadline: .now() + tick, repeating: tick)
         t.setEventHandler { [weak self] in self?.transcribeIfReady() }
@@ -2936,11 +2945,13 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
             return
         }
         let lang = locale.language.languageCode?.identifier ?? "en"
-        let keywords = parseHintTerms(transcriptionHints(start: Date(), end: Date()))
-        var req = URLRequest(url: Self.listenURL(lang: lang, keywords: keywords))
-        req.setValue("Token \(key)", forHTTPHeaderField: "Authorization")
         q.async { [self] in   // all connection state (task/session/pending/lastSentAt/stopped) lives on q
             guard !stopped else { return }   // stop() can land before this block on a quick toggle — don't orphan a socket
+            // Hints do file IO + an EventKit query — computed HERE, not on the main thread that
+            // builds engines (review finding: a slow hints file/calendar froze the app).
+            let keywords = parseHintTerms(transcriptionHints(start: Date(), end: Date()))
+            var req = URLRequest(url: Self.listenURL(lang: lang, keywords: keywords))
+            req.setValue("Token \(key)", forHTTPHeaderField: "Authorization")
             let s = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
             let t = s.webSocketTask(with: req)
             session = s; task = t
@@ -3319,13 +3330,22 @@ final class GladiaLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
             return
         }
         let lang = locale.language.languageCode?.identifier ?? ""
-        let vocab = parseHintTerms(transcriptionHints(start: Date(), end: Date()))
-        var req = URLRequest(url: URL(string: "https://api.gladia.io/v2/live")!)
-        req.httpMethod = "POST"
-        req.setValue(key, forHTTPHeaderField: "X-Gladia-Key")
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: Self.initBody(lang: lang, vocabulary: vocab))
         elog("gladialive[\(label)]: requesting session (lang=\(lang.isEmpty ? "auto" : lang))")
+        q.async { [self] in
+            guard !stopped else { return }
+            // Hints do file IO + an EventKit query — computed HERE, not on the main thread that
+            // builds engines (review finding: a slow hints file/calendar froze the app).
+            let vocab = parseHintTerms(transcriptionHints(start: Date(), end: Date()))
+            var req = URLRequest(url: URL(string: "https://api.gladia.io/v2/live")!)
+            req.httpMethod = "POST"
+            req.setValue(key, forHTTPHeaderField: "X-Gladia-Key")
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: Self.initBody(lang: lang, vocabulary: vocab))
+            startSession(req)
+        }
+    }
+
+    private func startSession(_ req: URLRequest) {   // on q
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
             guard let self else { return }
             self.q.async {
@@ -4581,6 +4601,8 @@ struct Main {
             // Transcription hints: parsing (comma/newline/#comment), case-insensitive dedupe, cap.
             check("hints: parse comma/newline + comments",
                   parseHintTerms("Kubernetes, gRPC\n# note\n김철수\n\n") == ["Kubernetes", "gRPC", "김철수"])
+            check("hints: comment runs to end of line (commas inside don't leak) + inline comment",
+                  parseHintTerms("# old, stuff\nAlpha # trailing, note\nBeta") == ["Alpha", "Beta"])
             check("hints: dedupe (case-insensitive) + priority order",
                   mergeHintTerms(direct: ["Alpha", "Beta"], file: ["alpha", "Gamma"], event: ["Beta", "김철수"])
                   == ["Alpha", "Beta", "Gamma", "김철수"])
