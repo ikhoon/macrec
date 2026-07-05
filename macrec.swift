@@ -1925,6 +1925,23 @@ func runPostProcessCommand(_ command: String, completion: ((Int32) -> Void)? = n
 /// forms in a scroll view should start at the top and grow downward.
 final class FlippedDocView: NSView { override var isFlipped: Bool { true } }
 
+/// Caption overlay panel: key-able despite `.nonactivatingPanel` (text selection needs key status),
+/// and — since an LSUIElement app has no Edit menu to route key equivalents — ⌘C/⌘A are handled here.
+final class CaptionPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+           let tv = firstResponder as? NSTextView {
+            switch event.charactersIgnoringModifiers {
+            case "c": tv.copy(nil); return true
+            case "a": tv.selectAll(nil); return true
+            default: break
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 /// Form-row role markers: a row's ROLE travels with its views, so grid styling (header merges, caption
 /// padding) is derived instead of hand-indexed — inserting a row can no longer desync a styling list.
 final class SectionHeaderCell: NSStackView {}   // col 0 → full-width merged section header
@@ -3855,9 +3872,9 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
 
     init(onClose: @escaping () -> Void, onReconfigure: @escaping () -> Void, onRestyle: @escaping () -> Void) {
         self.onClose = onClose; self.onReconfigure = onReconfigure; self.onRestyle = onRestyle
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: 172),   // default fits one more caption line
-                        styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel],
-                        backing: .buffered, defer: false)
+        panel = CaptionPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: 172),   // default fits one more caption line
+                             styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel],
+                             backing: .buffered, defer: false)
         super.init()
         panel.title = "\(Self.titleIcon) macrec live"
         panel.alphaValue = CGFloat(min(1.0, max(0.3, Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 1.0))))
@@ -3865,6 +3882,10 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         panel.level = .floating
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = true
+        // Text selection needs the panel to become key on a text click (nonactivating panels never do
+        // by default → drag-select and ⌘C silently went to the previous app). "OnlyIfNeeded" keeps the
+        // no-focus-steal behavior everywhere except selectable text.
+        panel.becomesKeyOnlyIfNeeded = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.delegate = self
 
@@ -3979,12 +4000,18 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             iv.setContentHuggingPriority(.required, for: .horizontal); return iv
         }
         let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        let copyBtn = NSButton(image: NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)!,
+                               target: self, action: #selector(copyTranscript))
+        copyBtn.isBordered = false; copyBtn.imagePosition = .imageOnly
+        copyBtn.toolTip = "Copy the transcript (selection, or everything)"
+        copyBtn.setAccessibilityLabel("Copy transcript")
+        copyBtn.setContentHuggingPriority(.required, for: .horizontal)
         let bar = NSStackView(views: [
             icon("cpu", "Engine"), enginePopup,
             icon("globe", "Caption language"), langPopup,
             icon("person.2", "Who to transcribe"), sourcePopup,
             icon("character.bubble", "Translate to"), translatePopup,
-            spacer, aMinus, aPlus, tsToggle, opacity])
+            spacer, copyBtn, aMinus, aPlus, tsToggle, opacity])
         bar.orientation = .horizontal; bar.alignment = .centerY; bar.spacing = 5; bar.distribution = .fill
         return bar
     }
@@ -4007,6 +4034,14 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         Pref.d.set(Double(next), forKey: Pref.liveFontSize); onRestyle()
     }
     @objc private func tsToggled(_ s: NSButton) { Pref.d.set(s.state == .on, forKey: Pref.liveTimestamps); onRestyle() }
+    /// Copy the current selection — or the whole transcript when nothing is selected.
+    @objc private func copyTranscript() {
+        let sel = textView.selectedRange()
+        let text = (sel.length > 0 ? (textView.string as NSString).substring(with: sel) : textView.string)
+        guard !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
     @objc private func engineChanged(_ s: NSPopUpButton) {
         let engines = LiveEngine.allCases
         let e = engines[min(max(0, s.indexOfSelectedItem), engines.count - 1)]
