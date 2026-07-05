@@ -797,6 +797,9 @@ enum Pref {
     static let hintsTerms = "hintsTerms"                // transcription hint terms (comma/newline separated)
     static let hintsFile = "hintsFile"                  // external hints file (one term per line, # comments)
     static let hintsCalendar = "hintsCalendar"          // merge the overlapping event's title + attendees
+    static let schedEnabled = "scheduleEnabled"         // record only on a schedule (default: 24/7)
+    static let schedDays = "scheduleDays"               // e.g. "mon-fri" / "mon,wed,fri" / "sat,sun"
+    static let schedHours = "scheduleHours"             // e.g. "10:00-12:00, 13:00-19:00" (gaps = excluded)
     /// Explicit save (even empty) beats the env — for fields where empty is meaningful.
     static func explicit(_ key: String, _ env: String) -> String {
         if d.object(forKey: key) != nil { return d.string(forKey: key) ?? "" }
@@ -1707,6 +1710,77 @@ final class RecordingEngine {
     }
 }
 
+// MARK: - recording schedule (record only Mon–Fri 10:00–19:00, minus lunch — instead of 24/7)
+//
+// Days ("mon-fri", "mon,wed,fri") and hour ranges ("10:00-12:00, 13:00-19:00" — the gap between
+// ranges IS the lunch exclusion). Outside the window the engine is suspended; a manual Pause/Resume
+// overrides the schedule until the next boundary.
+
+struct RecordSchedule: Equatable {
+    var enabled: Bool
+    var weekdays: Set<Int>            // 1=Sun … 7=Sat (Calendar.component(.weekday))
+    var ranges: [(start: Int, end: Int)]   // minutes since midnight, half-open [start, end)
+
+    static func == (a: RecordSchedule, b: RecordSchedule) -> Bool {
+        a.enabled == b.enabled && a.weekdays == b.weekdays
+            && a.ranges.map { $0.start } == b.ranges.map { $0.start }
+            && a.ranges.map { $0.end } == b.ranges.map { $0.end }
+    }
+
+    /// "mon-fri" / "sat-mon" (wraps) / "mon,wed,fri" / "" → empty set. Case-insensitive. Pure + testable.
+    static func parseDays(_ s: String) -> Set<Int> {
+        let names = ["sun": 1, "mon": 2, "tue": 3, "wed": 4, "thu": 5, "fri": 6, "sat": 7]
+        var out = Set<Int>()
+        for part in s.lowercased().split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }) {
+            if let dash = part.firstIndex(of: "-") {
+                guard let a = names[String(part[..<dash]).trimmingCharacters(in: .whitespaces)],
+                      let b = names[String(part[part.index(after: dash)...]).trimmingCharacters(in: .whitespaces)] else { continue }
+                var d = a
+                while true { out.insert(d); if d == b { break }; d = d % 7 + 1 }   // wraps sat-mon
+            } else if let d = names[part] {
+                out.insert(d)
+            }
+        }
+        return out
+    }
+
+    /// "10:00-12:00, 13:00-19:00" → minute ranges; "24:00" allowed as end-of-day. Bad chunks skipped.
+    static func parseRanges(_ s: String) -> [(start: Int, end: Int)] {
+        func minutes(_ t: String) -> Int? {
+            let p = t.split(separator: ":").map { Int($0.trimmingCharacters(in: .whitespaces)) }
+            guard p.count == 2, let h = p[0], let m = p[1], (0...24).contains(h), (0..<60).contains(m),
+                  h < 24 || m == 0 else { return nil }
+            return h * 60 + m
+        }
+        return s.split(separator: ",").compactMap { chunk in
+            let sides = chunk.split(separator: "-", maxSplits: 1).map(String.init)
+            guard sides.count == 2, let a = minutes(sides[0]), let b = minutes(sides[1]), a < b else { return nil }
+            return (a, b)
+        }
+    }
+
+    static func from(enabled: Bool, days: String, hours: String) -> RecordSchedule {
+        RecordSchedule(enabled: enabled, weekdays: parseDays(days), ranges: parseRanges(hours))
+    }
+
+    /// Should recording run at `date`? Disabled schedule = always. An enabled schedule with an EMPTY
+    /// days/ranges field treats that dimension as "every day" / "all hours" (a half-filled form must
+    /// never silently stop all recording).
+    func isActive(at date: Date, calendar: Calendar = .current) -> Bool {
+        guard enabled else { return true }
+        if !weekdays.isEmpty, !weekdays.contains(calendar.component(.weekday, from: date)) { return false }
+        guard !ranges.isEmpty else { return true }
+        let mins = calendar.component(.hour, from: date) * 60 + calendar.component(.minute, from: date)
+        return ranges.contains { mins >= $0.start && mins < $0.end }
+    }
+
+    static var fromPrefs: RecordSchedule {
+        from(enabled: Pref.bool(Pref.schedEnabled, "MR_SCHEDULE", false),
+             days: Pref.explicit(Pref.schedDays, "MR_SCHEDULE_DAYS"),
+             hours: Pref.explicit(Pref.schedHours, "MR_SCHEDULE_HOURS"))
+    }
+}
+
 // MARK: - transcript-level echo suppression (belt to the AEC's braces)
 //
 // The acoustic canceller attenuates the speaker→mic echo ~15-26 dB, but live engines still transcribe
@@ -2001,6 +2075,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var summaryChooseBtn: NSButton?       // folder picker for the summary output dir
     private let hintsTermsField = NSTextField()   // hint terms (comma/newline separated)
     private let hintsFileField = NSTextField()    // external hints file path
+    private let schedBtn = NSButton(checkboxWithTitle: "Record only on a schedule", target: nil, action: nil)
+    private let schedDaysField = NSTextField()    // "mon-fri" / "mon,wed,fri"
+    private let schedHoursField = NSTextField()   // "10:00-12:00, 13:00-19:00" (gap = lunch)
     private let hintsCalBtn = NSButton(checkboxWithTitle: "Add the meeting's title & attendees from Calendar",
                                        target: nil, action: nil)
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
@@ -2071,6 +2148,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         summaryOutField.translatesAutoresizingMaskIntoConstraints = false
         summaryOutField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         summaryOutField.placeholderString = "empty = next to the transcript"
+        for f in [schedDaysField, schedHoursField] {
+            f.translatesAutoresizingMaskIntoConstraints = false
+            f.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        }
+        schedDaysField.placeholderString = "mon-fri"
+        schedHoursField.placeholderString = "10:00-12:00, 13:00-19:00"
         for f in [hintsTermsField, hintsFileField] {
             f.translatesAutoresizingMaskIntoConstraints = false
             f.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
@@ -2211,6 +2294,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             row("", vadBtn),
             row("Excluded apps:", excludeTokens),
             row("Add a running app:", addAppPopup),
+            sectionHeader("Schedule", symbol: "calendar.badge.clock"),
+            row("", schedBtn),
+            row("Days:", schedDaysField),
+            fieldCaption("mon-fri, or a list like mon,wed,fri. Empty = every day."),
+            row("Hours:", schedHoursField),
+            fieldCaption("Ranges like 10:00-12:00, 13:00-19:00 — the gap between ranges is your "
+                       + "lunch break. Empty = all hours. Pause/Resume overrides until the next boundary."),
             // Storage lives here too (user pick: what gets recorded and where it lands is one story).
             sectionHeader("Transcripts", symbol: "doc.text"),
             row("Keep for:", txtRetPopup),
@@ -2409,6 +2499,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         hintsTermsField.stringValue = Pref.explicit(Pref.hintsTerms, "MR_HINTS")
         hintsFileField.stringValue = Pref.explicit(Pref.hintsFile, "MR_HINTS_FILE")
         hintsCalBtn.state = Pref.bool(Pref.hintsCalendar, "MR_HINTS_CALENDAR", false) ? .on : .off
+        schedBtn.state = Pref.bool(Pref.schedEnabled, "MR_SCHEDULE", false) ? .on : .off
+        schedDaysField.stringValue = Pref.explicit(Pref.schedDays, "MR_SCHEDULE_DAYS")
+        schedHoursField.stringValue = Pref.explicit(Pref.schedHours, "MR_SCHEDULE_HOURS")
         // Long paths head-truncate in the field — the tooltip always carries the full value.
         for f in [dirField, audioDirField, customModelField, hintsFileField, promptFileField,
                   summaryOutField, postProcessField] {
@@ -2493,6 +2586,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(hintsTermsField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.hintsTerms)
         d.set(hintsFileField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.hintsFile)
         d.set(hintsCalBtn.state == .on, forKey: Pref.hintsCalendar)
+        d.set(schedBtn.state == .on, forKey: Pref.schedEnabled)
+        d.set(schedDaysField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.schedDays)
+        d.set(schedHoursField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.schedHours)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
@@ -4164,6 +4260,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var stopTask: Task<Void, Never>?   // in-flight engine stop (pause) — resume/restart await it so
                                                // two capture pipelines never overlap on the shared audio state
     private var voiceTimer: Timer?             // ~1 Hz poll for the voice-activity tray tint
+    private var schedTimer: Timer?             // ~30 s recording-schedule enforcement
+    private var schedulePaused = false         // the SCHEDULE stopped the engine (vs the user's `paused`)
+    private var scheduleOverride = false       // manual Pause/Resume wins until the next boundary
+    private var scheduleWasActive = true
     private var voiceShown = false
     private var lastVoiceAt: TimeInterval = 0
     private var statusLine: NSMenuItem!
@@ -4192,6 +4292,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let vt = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.pollVoice() }
         RunLoop.main.add(vt, forMode: .common)   // .common so the tint updates while menus track too
         voiceTimer = vt
+        let st = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async { self?.checkSchedule() }   // timer runs in .common; engine state is main-confined
+        }
+        RunLoop.main.add(st, forMode: .common)
+        schedTimer = st
+        checkSchedule()   // apply the schedule to the just-started engine immediately (e.g. launch at night)
         DistributedNotificationCenter.default().addObserver(
             forName: .init("com.ikhoon.macrec.openMenu"), object: nil, queue: .main
         ) { [weak self] _ in self?.openMenu() }
@@ -4396,23 +4502,56 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func togglePause() {
+        scheduleOverride = true      // a manual choice beats the schedule until the next boundary
+        schedulePaused = false
         if paused {
             paused = false; refresh("Resuming…")
-            // Pause's stop is fire-and-forget (instant UI); a quick resume must WAIT for it, or two
-            // capture pipelines briefly overlap (two mic queues + two taps on the shared audio state).
-            // stopTask stays set until the stop has truly finished — clearing it on read would let a
-            // pause→resume→pause→resume flurry start an engine while the first stop is still in flight.
-            let stopping = stopTask
-            Task {
-                if let stopping { _ = await stopping.value }
-                await MainActor.run {
-                    if self.stopTask == stopping { self.stopTask = nil }
-                    if !self.paused && self.engine == nil { self.startEngine() }
-                }
-            }
+            resumeEngineAfterStop()
         } else {
             paused = true; setIcon(recording: false); refresh("⏸ Paused")
             if let eng = engine { engine = nil; stopTask = Task { await eng.stop() } }
+        }
+    }
+
+    /// Start the engine once any in-flight stop has finished (see togglePause for why waiting matters).
+    private func resumeEngineAfterStop() {
+        // Pause's stop is fire-and-forget (instant UI); a quick resume must WAIT for it, or two
+        // capture pipelines briefly overlap (two mic queues + two taps on the shared audio state).
+        // stopTask stays set until the stop has truly finished — clearing it on read would let a
+        // pause→resume→pause→resume flurry start an engine while the first stop is still in flight.
+        let stopping = stopTask
+        Task {
+            if let stopping { _ = await stopping.value }
+            await MainActor.run {
+                if self.stopTask == stopping { self.stopTask = nil }
+                if !self.paused && !self.schedulePaused && self.engine == nil { self.startEngine() }
+            }
+        }
+    }
+
+    /// Enforce the recording schedule (~30 s tick). A manual Pause/Resume overrides until the next
+    /// schedule BOUNDARY (active↔inactive edge), where the schedule re-asserts itself.
+    private func checkSchedule() {
+        let sched = RecordSchedule.fromPrefs
+        let active = sched.isActive(at: Date())
+        if active != scheduleWasActive { scheduleOverride = false }   // boundary: the schedule wins again
+        scheduleWasActive = active
+        if !sched.enabled || scheduleOverride {
+            if schedulePaused {   // schedule turned off (or overridden) while it held the engine
+                schedulePaused = false
+                if !paused { refresh("Resuming…"); resumeEngineAfterStop() }
+            }
+            return
+        }
+        if !active, !paused, !schedulePaused, engine != nil {
+            schedulePaused = true
+            setIcon(recording: false)
+            refresh("⏸ Off-hours (schedule)")
+            if let eng = engine { engine = nil; stopTask = Task { await eng.stop() } }
+        } else if active, schedulePaused {
+            schedulePaused = false
+            refresh("Resuming…")
+            resumeEngineAfterStop()
         }
     }
 
@@ -4451,6 +4590,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh("Applying settings…")
         setupModelDownload()   // a newly-selected model starts downloading (if not already present)
         let old = engine; engine = nil; paused = false
+        schedulePaused = false; scheduleOverride = false   // a settings save re-baselines the schedule
         let pending = stopTask   // settings saved while paused → that stop may still be in flight; kept set
         Task {                   // until done so an interleaved resume can't slip past it (see togglePause)
             if let pending { _ = await pending.value }
@@ -4458,6 +4598,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             await MainActor.run {
                 if self.stopTask == pending { self.stopTask = nil }
                 if !self.paused && self.engine == nil { self.startEngine() }
+                self.checkSchedule()   // apply a just-edited schedule immediately, not on the next tick
             }
         }
     }
@@ -4829,6 +4970,33 @@ struct Main {
             let echoOut = suppressEchoLines(echoMerged, mine: "나")
             check("echo text: merged transcript drops only the in-window copy",
                   echoOut.map { $0.start } == [10, 14, 40])
+            // Recording schedule: day parsing (ranges incl. wrap), hour ranges (lunch gap), isActive.
+            check("schedule: day parsing",
+                  RecordSchedule.parseDays("mon-fri") == [2, 3, 4, 5, 6]
+                  && RecordSchedule.parseDays("MON, wed,fri") == [2, 4, 6]
+                  && RecordSchedule.parseDays("sat-mon") == [7, 1, 2]      // wraps the week
+                  && RecordSchedule.parseDays("nope, mon") == [2]          // junk skipped
+                  && RecordSchedule.parseDays("") == [])
+            check("schedule: hour-range parsing",
+                  RecordSchedule.parseRanges("10:00-12:00, 13:00-19:00").map { [$0.start, $0.end] } == [[600, 720], [780, 1140]]
+                  && RecordSchedule.parseRanges("23:00-24:00").map { [$0.start, $0.end] } == [[1380, 1440]]
+                  && RecordSchedule.parseRanges("12:00-10:00, garbage, 25:00-26:00").isEmpty)   // inverted/invalid skipped
+            var utc = Calendar(identifier: .gregorian); utc.timeZone = TimeZone(identifier: "UTC")!
+            func schedDate(_ s: String) -> Date {
+                let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX")
+                f.timeZone = utc.timeZone; f.dateFormat = "yyyy-MM-dd HH:mm"; return f.date(from: s)!
+            }
+            let sched = RecordSchedule.from(enabled: true, days: "mon-fri", hours: "10:00-12:00, 13:00-19:00")
+            check("schedule: mon-fri work hours minus lunch",
+                  sched.isActive(at: schedDate("2026-07-06 10:00"), calendar: utc)      // Mon 10:00 → on
+                  && !sched.isActive(at: schedDate("2026-07-06 12:30"), calendar: utc)  // lunch gap → off
+                  && sched.isActive(at: schedDate("2026-07-06 18:59"), calendar: utc)
+                  && !sched.isActive(at: schedDate("2026-07-06 19:00"), calendar: utc)  // end is exclusive
+                  && !sched.isActive(at: schedDate("2026-07-05 11:00"), calendar: utc)) // Sunday → off
+            check("schedule: disabled = always on; half-filled form never stops recording",
+                  RecordSchedule.from(enabled: false, days: "", hours: "").isActive(at: schedDate("2026-07-05 03:00"), calendar: utc)
+                  && RecordSchedule.from(enabled: true, days: "mon-fri", hours: "").isActive(at: schedDate("2026-07-06 03:00"), calendar: utc)
+                  && RecordSchedule.from(enabled: true, days: "", hours: "10:00-11:00").isActive(at: schedDate("2026-07-05 10:30"), calendar: utc))
             check("hints: dedupe (case-insensitive) + priority order",
                   mergeHintTerms(direct: ["Alpha", "Beta"], file: ["alpha", "Gamma"], event: ["Beta", "김철수"])
                   == ["Alpha", "Beta", "Gamma", "김철수"])
