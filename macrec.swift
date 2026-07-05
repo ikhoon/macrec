@@ -4527,6 +4527,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var schedTimer: Timer?             // ~30 s recording-schedule enforcement
     private var notifyWhenTranscribed = false  // armed by "Transcribe now" — the menu closed, push the outcome
     private var lastTranscriptURL: URL?        // most recent saved transcript (notification click opens it)
+    private let traySpinner = NSProgressIndicator()   // menu-bar spinner while a manual flush transcribes
+    private var trayBusy = false               // spinner owns the tray — setIcon() must not repaint over it
+    private var trayBusyGeneration = 0         // failsafe-timeout token (a new flush invalidates old timers)
     private var schedulePaused = false         // the SCHEDULE stopped the engine (vs the user's `paused`)
     private var scheduleOverrideUntil: Date?   // manual Pause/Resume wins until this boundary passes
     private var startTask: Task<Void, Never>?  // in-flight engine start — stops must wait for it
@@ -4582,6 +4585,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func setIcon(recording: Bool, voice: Bool = false) {
+        guard !trayBusy else { return }   // the flush spinner owns the tray until the outcome lands
         // Distinct audio-recorder identity: a waveform-with-mic while live, pause when not. While
         // VOICE is being picked up, the glyph tints a LIGHT orange — the recording color, softened
         // (user pick after trying full orange → accent → this: orange family, but lighter).
@@ -4778,6 +4782,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard engine != nil, !paused else { return }
         notifyWhenTranscribed = true   // menu just closed — deliver the outcome as a push
         Notifier.requestAuth()         // no-op after the user answered the first prompt
+        showTraySpinner()              // …and show progress right where the user just clicked
         engine?.flushNow()
         refresh("● Transcribing now…")
     }
@@ -4787,8 +4792,42 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func pushFlushOutcomeIfNeeded(_ status: String) {
         guard notifyWhenTranscribed, let o = flushOutcome(for: status) else { return }
         notifyWhenTranscribed = false
+        hideTraySpinner()
         let file = status.hasPrefix("Saved: ") ? lastTranscriptURL?.path : nil
         Notifier.push(title: o.title, body: o.body, filePath: file)
+    }
+
+    /// Swap the tray glyph for a small indeterminate spinner while the manual flush transcribes —
+    /// the menu closed on click, so this is the only in-place progress the user can see.
+    private func showTraySpinner() {
+        guard !trayBusy, let btn = statusItem.button else { return }
+        trayBusy = true
+        trayBusyGeneration += 1
+        traySpinner.style = .spinning
+        traySpinner.controlSize = .small
+        traySpinner.isIndeterminate = true
+        traySpinner.isDisplayedWhenStopped = false
+        traySpinner.frame = NSRect(x: (btn.bounds.width - 16) / 2, y: (btn.bounds.height - 16) / 2,
+                                   width: 16, height: 16)
+        btn.image = nil
+        btn.addSubview(traySpinner)
+        traySpinner.startAnimation(nil)
+        // Failsafe: whisper on a long segment takes minutes, but a lost outcome (engine swapped out
+        // mid-flush) must not leave the tray spinning forever.
+        let gen = trayBusyGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15 * 60) { [weak self] in
+            guard let self, self.trayBusy, self.trayBusyGeneration == gen else { return }
+            elog("tray: flush spinner timed out — restoring the icon")
+            self.hideTraySpinner()
+        }
+    }
+
+    private func hideTraySpinner() {
+        guard trayBusy else { return }
+        trayBusy = false
+        traySpinner.stopAnimation(nil)
+        traySpinner.removeFromSuperview()
+        setIcon(recording: engine != nil && !paused && !schedulePaused)
     }
 
     @objc private func togglePause() {
