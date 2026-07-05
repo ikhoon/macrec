@@ -2021,7 +2021,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         w.delegate = self
         buildForm()
         load()
-        w.setContentSize(NSSize(width: 560, height: 520))   // tall enough for the densest tab (Post-process) without scrolling
+        // Size the window to the DENSEST tab's measured content (user ask: no scrolling by default).
+        // Derived, not hardcoded — adding rows can't silently reintroduce the scroll. The scroll pane
+        // stays as the safety net for small screens / manual shrinking.
+        let maxGrid = tabsForTest?.tabViewItems
+            .compactMap { firstGrid(in: $0.view)?.fittingSize }
+            .reduce(NSSize(width: 520, height: 400)) { NSSize(width: max($0.width, $1.width),
+                                                              height: max($0.height, $1.height)) }
+            ?? NSSize(width: 520, height: 400)
+        w.setContentSize(NSSize(width: max(560, maxGrid.width + 80),
+                                height: min(maxGrid.height + 130, (NSScreen.main?.visibleFrame.height ?? 900) - 60)))
         w.center()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -4086,7 +4095,6 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         let labelW = showLabels ? (lines.map { w("\($0.speaker)  ", labelFont) }.max() ?? 0) : 0
         let hasPrefix = showTimestamps || showLabels
         let col = hasPrefix ? tsW + labelW + 8 : 0
-        let tsBaseline = showTimestamps ? (textFont.capHeight - tsFont.capHeight) / 2 : 0   // vertically center the smaller timestamp
         let para = NSMutableParagraphStyle()
         para.firstLineHeadIndent = 0; para.headIndent = col
         para.lineHeightMultiple = 1.1; para.paragraphSpacing = 4
@@ -4099,7 +4107,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             let tint: NSColor = l.mine ? .systemTeal : .systemOrange   // colors the LABEL only (both-speaker mode)
             if showTimestamps {
                 out.append(NSAttributedString(string: "\(tsFormatter.string(from: l.time))  ", attributes: [
-                    .font: tsFont, .foregroundColor: NSColor.secondaryLabelColor, .baselineOffset: tsBaseline, .paragraphStyle: para]))
+                    .font: tsFont, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
             }
             if showLabels {
                 out.append(NSAttributedString(string: "\(l.speaker)  ", attributes: [
