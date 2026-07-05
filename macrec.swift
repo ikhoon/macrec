@@ -1791,7 +1791,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let ppModeValues = ["off", "summary", "shell"], ppModeTitles = ["Off", "Automatic summary", "Custom command"]
     private let runnerPopup = NSPopUpButton()     // which agent CLI writes the summary
     private let runnerValues = ["claude", "codex", "gemini"], runnerTitles = ["Claude CLI", "Codex CLI", "Gemini CLI"]
-    private let promptField = NSTextField()       // summary prompt (pre-filled with the built-in default)
+    private let promptView = NSTextView()         // summary prompt — a real TEXT AREA (prompts are sentences)
+    private let promptScroll = NSScrollView()     // its bordered, scrolling host
     private let summaryOutField = NSTextField()   // summary output dir ("" = next to the transcript)
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
     // Calendar titling: a scrollable checkbox list of the user's calendars (none checked = all).
@@ -1845,11 +1846,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         openaiBaseField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         postProcessField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         postProcessField.placeholderString = "~/bin/my-pipeline.sh"
-        for f in [promptField, summaryOutField] {
-            f.translatesAutoresizingMaskIntoConstraints = false
-            f.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
-        }
+        summaryOutField.translatesAutoresizingMaskIntoConstraints = false
+        summaryOutField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         summaryOutField.placeholderString = "empty = next to the transcript"
+        // Multiline prompt editor (user feedback: a one-line field is too small for a real prompt).
+        promptScroll.translatesAutoresizingMaskIntoConstraints = false
+        promptScroll.hasVerticalScroller = true
+        promptScroll.autohidesScrollers = true
+        promptScroll.borderType = .bezelBorder
+        promptScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        promptScroll.heightAnchor.constraint(equalToConstant: 84).isActive = true
+        promptView.isRichText = false
+        promptView.font = .systemFont(ofSize: 12)
+        promptView.textContainerInset = NSSize(width: 4, height: 6)
+        promptView.autoresizingMask = [.width]
+        promptView.isVerticallyResizable = true
+        promptView.minSize = NSSize(width: 0, height: 0)
+        promptView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        promptView.textContainer?.widthTracksTextView = true
+        promptScroll.documentView = promptView
         ppModePopup.addItems(withTitles: ppModeTitles)
         ppModePopup.target = self; ppModePopup.action = #selector(ppModeChanged)
         runnerPopup.addItems(withTitles: runnerTitles)
@@ -1968,7 +1983,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                        + "control with a custom command."),                                       // 2
             sectionHeader("Automatic summary", symbol: "wand.and.stars"),                                                   // 3
             row("Summarize with:", runnerPopup),                                                  // 4
-            row("Prompt:", promptField),                                                          // 5
+            row("Prompt:", promptScroll),                                                         // 5
             fieldCaption("Default asks for key points, decisions, and action items — answered "
                        + "in the transcript's language."),                                        // 6
             row("Save summary to:", summaryOutField),                                             // 7
@@ -2046,7 +2061,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc private func ppModeChanged() { updatePostProcessEnabled() }
     private func updatePostProcessEnabled() {
         let mode = PostProcessMode(rawValue: ppModeValues[max(0, ppModePopup.indexOfSelectedItem)]) ?? .off
-        for c in [runnerPopup, promptField, summaryOutField] as [NSControl] { c.isEnabled = mode == .summary }
+        for c in [runnerPopup, summaryOutField] as [NSControl] { c.isEnabled = mode == .summary }
+        promptView.isEditable = mode == .summary
+        promptScroll.alphaValue = mode == .summary ? 1 : 0.45   // NSTextView isn't an NSControl — dim to match
         postProcessField.isEnabled = mode == .shell
     }
 
@@ -2115,7 +2132,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ppModePopup.selectItem(at: idx(Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"), ppModeValues))
         runnerPopup.selectItem(at: idx(Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER"), runnerValues))
         let savedPrompt = Pref.explicit(Pref.summaryPrompt, "MR_SUMMARY_PROMPT")
-        promptField.stringValue = savedPrompt.isEmpty ? defaultSummaryPrompt : savedPrompt   // show the editable default
+        promptView.string = savedPrompt.isEmpty ? defaultSummaryPrompt : savedPrompt   // show the editable default
         summaryOutField.stringValue = Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT")
         updatePostProcessEnabled()
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
@@ -2184,7 +2201,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         d.set(postProcessField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.postProcessCmd)
         d.set(ppModeValues[max(0, ppModePopup.indexOfSelectedItem)], forKey: Pref.postProcessMode)
         d.set(runnerValues[max(0, runnerPopup.indexOfSelectedItem)], forKey: Pref.summaryRunner)
-        d.set(promptField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryPrompt)
+        d.set(promptView.string.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryPrompt)
         d.set(summaryOutField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryOut)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
