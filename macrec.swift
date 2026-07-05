@@ -1820,7 +1820,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         w.delegate = self
         buildForm()
         load()
-        w.setContentSize(NSSize(width: 560, height: 440))   // sized to the tabbed panes; buttons pinned bottom
+        w.setContentSize(NSSize(width: 560, height: 520))   // tall enough for the densest tab (Post-process) without scrolling
         w.center()
     }
     required init?(coder: NSCoder) { fatalError() }
