@@ -723,7 +723,7 @@ final class OutputKeeper {
 final class MicCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private let session = AVCaptureSession()
     private let output = AVCaptureAudioDataOutput()
-    private let q = DispatchQueue(label: "meeting-capture.mic")
+    private let q = DispatchQueue(label: "macrec.mic")
     private weak var recorder: Recorder?
 
     // Dropped mic buffers are otherwise INVISIBLE — but they shift the mic/reference alignment the
@@ -737,7 +737,7 @@ final class MicCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         recorder = rec
         if session.inputs.isEmpty {   // configure once; idempotent so suspend→resume just toggles running
             guard let dev = AVCaptureDevice.default(for: .audio) else {
-                throw NSError(domain: "meeting-capture", code: 4, userInfo: [NSLocalizedDescriptionKey: "no default audio input device"])
+                throw NSError(domain: "macrec", code: 4, userInfo: [NSLocalizedDescriptionKey: "no default audio input device"])
             }
             let input = try AVCaptureDeviceInput(device: dev)
             session.beginConfiguration()
@@ -758,16 +758,16 @@ final class MicCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 
 // MARK: - preferences (UserDefaults > env var > built-in default)
 //
-// 설정 UI는 UserDefaults에 쓴다. 헤드리스 `engine` CLI/파워유저는 MR_* env로 override 가능.
-// 우선순위: UserDefaults(키가 있으면) > env > 기본값.
+// The settings UI writes to UserDefaults. The headless `engine` CLI / power users can override via MR_* env vars.
+// Precedence: UserDefaults (if the key exists) > env > built-in default.
 
 enum Pref {
-    // 전용 suite (bundle id와 '달라야' 함 — suiteName==bundleID면 nil 반환/동작 안 함).
-    // launchd가 .app 내부 바이너리를 직접 exec할 때 .standard 도메인이 안 잡히는 문제를 우회.
-    // CLI에서 보려면: `defaults read com.ikhoon.macrec.prefs`
+    // Dedicated suite (MUST differ from the bundle id — suiteName==bundleID returns nil / doesn't work).
+    // Works around .standard domain not resolving when launchd execs the binary inside the .app directly.
+    // To inspect from the CLI: `defaults read com.ikhoon.macrec.prefs`
     static let suiteName = "com.ikhoon.macrec.prefs"
     static let d = UserDefaults(suiteName: suiteName) ?? .standard
-    // 키 상수 (설정 UI와 공유)
+    // Key constants (shared with the settings UI)
     static let segment = "segmentSeconds", voiceMin = "voiceMinSeconds", lang = "whisperLang"
     static let keepAudio = "keepAudio", audioRetention = "audioRetentionDays", txtRetention = "transcriptRetentionDays"
     static let audioRawDays = "audioRawDays"            // days a WAV stays raw before AAC compression (0 = never compress)
@@ -836,7 +836,7 @@ enum Pref {
 /// Resolves whisper-cli / VAD model shipped INSIDE the .app (self-contained distribution).
 /// Returns nil in dev (loose binary) so EngineConfig falls back to brew / ~/whisper-models.
 enum BundledTools {
-    /// The .app bundle URL when running as Contents/MacOS/meeting-capture; nil for a loose CLI binary.
+    /// The .app bundle URL when running as Contents/MacOS/macrec (resolved from the executable path); nil for a loose CLI binary.
     static var appBundleURL: URL? {
         let u = Bundle.main.bundleURL
         return u.pathExtension == "app" ? u : nil
@@ -1022,10 +1022,10 @@ struct EngineConfig {
     var vadEnabled: Bool
     var useCalendarTitles: Bool         // title transcripts from the overlapping calendar event
     var whisperLang: String
-    var keepAudio: Bool                 // false면 전사만 남기고 오디오 삭제
-    var audioRawDays: Int               // WAV 그대로 두는 일수, 이후 AAC 압축 (0 = 압축 안 함)
-    var audioRetentionDays: Int         // 0 = 무제한
-    var transcriptRetentionDays: Int    // 0 = 무제한
+    var keepAudio: Bool                 // false: keep only the transcript and delete the audio
+    var audioRawDays: Int               // days a WAV stays raw before AAC compression (0 = never compress)
+    var audioRetentionDays: Int         // 0 = unlimited
+    var transcriptRetentionDays: Int    // 0 = unlimited
     var excludeBundleIds: [String]
 
     static func load() -> EngineConfig {
@@ -1042,7 +1042,7 @@ struct EngineConfig {
             // (sibling of transcripts), overridable via Settings / MR_AUDIO_DIR.
             audioDir: URL(fileURLWithPath: Pref.str(Pref.audioDir, "MR_AUDIO_DIR",
                                                     tdir.deletingLastPathComponent().appendingPathComponent("audio").path)),
-            workDir: URL(fileURLWithPath: Pref.str("workDir", "MR_WORK_DIR", "/tmp/meeting-recorder-segments")),
+            workDir: URL(fileURLWithPath: Pref.str("workDir", "MR_WORK_DIR", "/tmp/macrec-segments")),
             // Defaults prefer what's bundled in the .app (self-contained); env/UserDefaults still override.
             whisperCli: Pref.str("whisperCli", "MR_WHISPER_CLI", BundledTools.whisperCli ?? "/opt/homebrew/bin/whisper-cli"),
             whisperModel: Pref.str("whisperModel", "MR_WHISPER_GGML", ModelStore.shared.resolvedModelPath),
@@ -1431,7 +1431,7 @@ enum Transcriber {
         } catch { elog("convert16(\(src.lastPathComponent)): \(error)"); return nil }
     }
 
-    /// Transcribe mic ("나") and system ("상대") SEPARATELY, then merge by time into a speaker-labeled
+    /// Transcribe mic ("me") and system ("them") SEPARATELY, then merge by time into a speaker-labeled
     /// transcript. Mixes a kept WAV only when keepAudio. Returns (mixedWav?, text).
     static func transcribe(_ seg: CompletedSegment, cfg: EngineConfig) -> (mixed: URL?, text: String)? {
         var mixed: URL? = nil
@@ -1475,22 +1475,22 @@ enum Transcriber {
 final class RecordingEngine {
     let cfg: EngineConfig
     let session: CaptureSession
-    private let timerQueue = DispatchQueue(label: "meeting-recorder.timer")
-    private let processQueue = DispatchQueue(label: "meeting-recorder.process")  // serial: transcribe one at a time
+    private let timerQueue = DispatchQueue(label: "macrec.timer")
+    private let processQueue = DispatchQueue(label: "macrec.process")  // serial: transcribe one at a time
     private var timer: DispatchSourceTimer?
     private(set) var running = false
     private var recovering = false
     private var suspended = false   // true while the display/system is asleep
-    var onTranscriptSaved: ((String) -> Void)?   // (메시지) — UI 상태 갱신용
-    var onTranscriptURL: ((URL) -> Void)?        // 저장된 전사 파일 경로 — 알림 클릭 → 파일 열기
-    var onSegmentResult: ((String) -> Void)?      // (메시지) — 발화 없어 버려도 알림
+    var onTranscriptSaved: ((String) -> Void)?   // (message) — for refreshing UI state
+    var onTranscriptURL: ((URL) -> Void)?        // path of the saved transcript file — notification click → open file
+    var onSegmentResult: ((String) -> Void)?      // (message) — notify even when dropped for no speech
 
     init(cfg: EngineConfig) {
         self.cfg = cfg
         self.session = CaptureSession(excludeBundleIds: cfg.excludeBundleIds, workDir: cfg.workDir)
     }
 
-    /// 정시 회전을 기다리지 않고 지금까지 녹음분을 즉시 잘라 전사·저장한다 (트레이 "지금 전사").
+    /// Cut what's recorded so far and transcribe/save it immediately, without waiting for the on-the-hour rotation (tray "Transcribe now").
     func flushNow() {
         guard running, let seg = session.rotate() else { return }
         processQueue.async { self.process(seg) }
@@ -1589,12 +1589,12 @@ final class RecordingEngine {
         let dnc = DistributedNotificationCenter.default()
         dnc.addObserver(forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in self?.suspendForSleep() }
         dnc.addObserver(forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in self?.wake() }
-        // 정시 정렬: 첫 회전을 시계 경계(정시, 또는 세그먼트 크기 배수)에 맞춘다.
-        // 예: segment=3600이면 다음 :00, 900이면 다음 :00/:15/:30/:45.
+        // Clock alignment: snap the first rotation to a clock boundary (top of the hour, or a multiple of the segment size).
+        // E.g. segment=3600 → next :00; 900 → next :00/:15/:30/:45.
         let cal = Calendar.current; let nowD = Date()
         let intoHour = Double(cal.component(.minute, from: nowD) * 60 + cal.component(.second, from: nowD))
         let firstDelay = cfg.segmentSeconds - intoHour.truncatingRemainder(dividingBy: cfg.segmentSeconds)
-        elog("engine: first rotation in \(Int(firstDelay))s (정시 정렬), then every \(Int(cfg.segmentSeconds))s")
+        elog("engine: first rotation in \(Int(firstDelay))s (clock-aligned), then every \(Int(cfg.segmentSeconds))s")
         let t = DispatchSource.makeTimerSource(queue: timerQueue)
         t.schedule(deadline: .now() + firstDelay, repeating: cfg.segmentSeconds)
         t.setEventHandler { [weak self] in
@@ -1637,7 +1637,7 @@ final class RecordingEngine {
             for case let u as URL in en where u.pathExtension.lowercased() == "md" {
                 if let a = ageDays(u), a >= Double(cfg.transcriptRetentionDays) { try? fm.removeItem(at: u); n += 1 }
             }
-            if n > 0 { elog("engine: retention — md \(n)개 삭제(>\(cfg.transcriptRetentionDays)일)") }
+            if n > 0 { elog("engine: retention — deleted \(n) md file(s) (>\(cfg.transcriptRetentionDays)d)") }
         }
         let policy = AudioArchivePolicy(rawDays: cfg.audioRawDays, totalDays: cfg.audioRetentionDays)
         guard let en = fm.enumerator(at: cfg.audioDir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
@@ -1664,7 +1664,7 @@ final class RecordingEngine {
             }
         }
         if deleted > 0 || archived > 0 {
-            elog("engine: retention — 오디오 \(deleted)개 삭제, \(archived)개 AAC 압축(raw>\(cfg.audioRawDays)일)")
+            elog("engine: retention — deleted \(deleted) audio file(s), AAC-compressed \(archived) (raw>\(cfg.audioRawDays)d)")
         }
     }
 
@@ -1686,13 +1686,13 @@ final class RecordingEngine {
         elog("engine: segment \(segFormatter().string(from: seg.start)) — voiced mic=\(String(format: "%.1f", seg.micVoicedSeconds))s sys=\(String(format: "%.1f", seg.sysVoicedSeconds))s (micPeak=\(String(format: "%.3f", seg.micPeak)) sysPeak=\(String(format: "%.3f", seg.sysPeak))) dur=\(Int(seg.durationSeconds))s")
         defer { try? FileManager.default.removeItem(at: seg.sysURL); try? FileManager.default.removeItem(at: seg.micURL) }
 
-        // 내 마이크든 상대(시스템)든 누군가 말했으면 전사한다 (듣기만 한 미팅 포함).
+        // Transcribe if anyone spoke — my mic or the other side (system) — including listen-only meetings.
         guard seg.voicedSeconds >= cfg.voiceMinSeconds else {
             elog("engine:   → no speech (\(String(format: "%.1f", seg.voicedSeconds))s < \(Int(cfg.voiceMinSeconds))s), discarding")
             onSegmentResult?("No speech — skipped")
             return
         }
-        // Model not downloaded yet (first run) — defer rather than write a "전사 실패" file.
+        // Model not downloaded yet (first run) — defer rather than write a "transcription failed" file.
         guard FileManager.default.fileExists(atPath: cfg.whisperModel) else {
             elog("engine:   → model not ready (\(cfg.whisperModel)) — deferring transcription")
             onSegmentResult?("Downloading model — transcription deferred")
@@ -1771,7 +1771,7 @@ final class RecordingEngine {
             body: body)
         let mdURL = monthDir.appendingPathComponent("\(slug).md")
         try doc.markdown(l10n).write(to: mdURL, atomically: true, encoding: .utf8)
-        elog("engine:   → 전사 저장: \(mdURL.path)")
+        elog("engine:   → transcript saved: \(mdURL.path)")
         return mdURL
     }
 }
@@ -1967,7 +1967,7 @@ struct RecordSchedule: Equatable {
 // later. Acoustic cancellation can't fully win that fight, so we also suppress at the TRANSCRIPT
 // level: a mic line whose tokens are largely contained in a recent far-end line is an echo, not the
 // user. One-directional (system audio can't contain the user's voice) and length-guarded so genuine
-// short replies ("yes", "그렇죠") are never eaten.
+// short replies ("yes", "right") are never eaten.
 
 /// Containment similarity of `a` in `b`: fraction of `a`'s unique tokens present in `b` (echo copies
 /// are garbled SUBSETS of the far-end line, so containment beats symmetric Jaccard). Pure + testable.
@@ -2372,7 +2372,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             f.translatesAutoresizingMaskIntoConstraints = false
             f.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         }
-        hintsTermsField.placeholderString = "Kubernetes, gRPC, 김철수, …"
+        hintsTermsField.placeholderString = "Kubernetes, gRPC, John Doe, …"
         hintsFileField.placeholderString = "~/notes/hints.txt"
         // PATH-carrying fields: a long path used to truncate at the TAIL, hiding the part that matters
         // (user report on "Save summary to"). Truncate the HEAD instead ("…/notes/summaries"), widen,
@@ -2898,7 +2898,7 @@ enum LoginItem {
 }
 
 /// Localized speaker labels — (mine = the microphone / you, theirs = the other party / system audio)
-/// — for a language code. Falls back to English so non-Korean users don't see 나/상대.
+/// — for a language code. Falls back to English so non-Korean users don't see Korean labels.
 func speakerLabels(forLanguage lang: String?) -> (mine: String, theirs: String) {
     switch lang {
     case "ko": return ("나", "상대")
@@ -2969,7 +2969,7 @@ struct TranscriptL10n {
 
 /// Everything the saved transcript file contains, assembled into markdown by `markdown(_:)`.
 /// Pure + testable — `writeTranscript` only does the IO around it. (The old hardcoded footer
-/// "_자동 생성. 재사용할 지식은 topics/로 정제하세요._" is intentionally GONE: the app has no
+/// ("auto-generated; distill reusable knowledge into topics/") is intentionally GONE: the app has no
 /// business prescribing the user's post-processing workflow.)
 struct TranscriptDoc {
     var title: String
@@ -3013,7 +3013,7 @@ func pickSpeechLocale(requested: Locale, from pool: [Locale]) -> Locale? {
 // MARK: - live transcription (macOS 26 SpeechAnalyzer → real-time caption overlay)
 //
 // Tees the same canon (16 kHz mono) audio the recorder writes into an on-device SpeechAnalyzer per
-// source (mic → 나, system → 상대) for low-latency live captions in a floating panel. whisper-cli on
+// source (mic → "me", system → "them") for low-latency live captions in a floating panel. whisper-cli on
 // segment rotation stays the authoritative, saved transcript — this overlay is an ephemeral view.
 
 @available(macOS 26, *)
@@ -3281,7 +3281,7 @@ final class WhisperLiveTranscriber: LiveTranscribing {
         let now = ProcessInfo.processInfo.systemUptime
         let dur = Double(samples.count) / fmt.sampleRate
         guard dur >= minDur else { return }
-        // Whisper hallucinates ("감사합니다", "Thank you"…) on silence — only run it once the segment holds
+        // Whisper hallucinates ("Thank you", "Thanks for watching"…) on silence — only run it once the segment holds
         // enough real voice; otherwise drop the silence untranscribed.
         if Double(voiced) / fmt.sampleRate < minVoicedSec {
             lock.lock(); seg.removeAll(keepingCapacity: true); startedAt = 0; voicedSamples = 0; lock.unlock()
@@ -3935,7 +3935,7 @@ enum LiveSource: String {
 
 /// Option lists for the live-caption overlay's control bar. These settings live on the overlay itself
 /// (not the Settings window) so changes apply immediately. Index 0 of each is the default. Language
-/// names are endonyms (한국어, 日本語 …) for quick recognition; translation is prefixed with →.
+/// names are endonyms (each language's own name for itself) for quick recognition; translation is prefixed with →.
 enum LiveCaptionOptions {
     static let langValues   = ["", "ko", "ja", "en", "zh-Hans", "es", "fr", "de"]
     static let langTitles   = ["System", "한국어", "日本語", "English", "中文", "Español", "Français", "Deutsch"]
@@ -5138,7 +5138,7 @@ func runMenuBarApp() -> Never {
 
 /// Install a one-shot stop handler for SIGINT/SIGTERM. Returns the source (keep it alive).
 func installStopHandler(_ handler: @escaping () -> Void) {
-    let q = DispatchQueue(label: "meeting-recorder.signal")
+    let q = DispatchQueue(label: "macrec.stop-signal")
     for s in [SIGINT, SIGTERM] {
         signal(s, SIG_IGN)
         let src = DispatchSource.makeSignalSource(signal: s, queue: q)
@@ -5721,7 +5721,7 @@ struct Main {
         var noMic = false
         var keepTemp = false
         var duration: Double?
-        var excludeBundleIds: [String] = []   // 오디오에서 제외할 앱 bundle id (예: Spotify)
+        var excludeBundleIds: [String] = []   // app bundle ids to exclude from the audio (e.g. Spotify)
         var i = 0
         while i < args.count {
             switch args[i] {
@@ -5769,7 +5769,7 @@ struct Main {
 
             // Stop coordination via semaphore + signal sources.
             let sem = DispatchSemaphore(value: 0)
-            let sigQ = DispatchQueue(label: "meeting-capture.signal")
+            let sigQ = DispatchQueue(label: "macrec.signal")
             for s in [SIGINT, SIGTERM] {
                 signal(s, SIG_IGN)
                 let src = DispatchSource.makeSignalSource(signal: s, queue: sigQ)
@@ -5806,11 +5806,11 @@ struct Main {
                 if !noMic { try? FileManager.default.removeItem(at: micURL) }
             }
 
-            elog("meeting-capture: done → \(outPath)")
+            elog("macrec: done → \(outPath)")
             print(outPath)  // stdout = final mixed file path
             exit(0)
         } catch {
-            elog("meeting-capture error: \(error)")
+            elog("macrec error: \(error)")
             try? FileManager.default.removeItem(at: sysURL)
             try? FileManager.default.removeItem(at: micURL)
             exit(1)

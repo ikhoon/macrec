@@ -23,7 +23,7 @@ meeting_source() {
 mkdir -p "$AUDIO_DIR"
 
 # One-time permission registration (non-blocking — must never hang the loop): forces
-# meeting-capture into the Screen Recording + Microphone lists so they can be enabled in Settings.
+# macrec into the Screen Recording + Microphone lists so they can be enabled in Settings.
 "$CAPTURE" register >/dev/null 2>&1 &
 
 log "watcher started (strict=$STRICT_MEETING poll=${POLL}s min_on=${MIN_ON}s min_off=${MIN_OFF}s)"
@@ -60,8 +60,8 @@ while true; do
           if [[ "$("$CAPTURE" perm-status 2>/dev/null)" != "1" ]]; then
             if [[ "$warned_perm" -ne 1 ]]; then
               log "⚠ meeting detected but Screen Recording / Microphone permission not granted — skipping."
-              log "  Enable 'meeting-capture' in System Settings → Privacy & Security (both lists), then:"
-              log "  launchctl kickstart -k gui/$(id -u)/com.ikhoon.meeting-recorder"
+              log "  Enable 'macrec' in System Settings → Privacy & Security (both lists), then:"
+              log "  launchctl kickstart -k gui/$(id -u)/com.ikhoon.macrec"
               warned_perm=1
             fi
             on_count=0
@@ -71,10 +71,10 @@ while true; do
             START_TS=$(date +%Y-%m-%dT%H:%M:%S)
             slug=$(date +%Y-%m-%d-%H%M)-"$SOURCE"
             WAV="$AUDIO_DIR/$slug.wav"
-            # EXCLUDE_APPS(공백 구분 bundle id) → --exclude-app 인자로 (예: Spotify 음악 제외)
+            # EXCLUDE_APPS (space-separated bundle ids) → --exclude-app args (e.g. keep Spotify music out)
             exargs=()
             for b in ${=EXCLUDE_APPS}; do exargs+=(--exclude-app "$b"); done
-            "$CAPTURE" --out "$WAV" $exargs >"/tmp/meeting-capture.path" 2>>"$LOGFILE" &
+            "$CAPTURE" --out "$WAV" $exargs >"/tmp/macrec.path" 2>>"$LOGFILE" &
             RECPID=$!
             recording=1; off_count=0
             log "▶ recording started: $WAV (source=$SOURCE pid=$RECPID)"
@@ -91,7 +91,7 @@ while true; do
         log "■ stopping (mic off ${off_count}s)"
         kill -TERM "$RECPID" 2>/dev/null
         wait "$RECPID" 2>/dev/null
-        final=$(cat /tmp/meeting-capture.path 2>/dev/null)
+        final=$(cat /tmp/macrec.path 2>/dev/null)
         [[ -z "$final" ]] && final="$WAV"
         END_TS=$(date +%Y-%m-%dT%H:%M:%S)
         if [[ -s "$final" ]]; then

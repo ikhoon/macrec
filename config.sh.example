@@ -2,7 +2,7 @@
 #   cp config.sh.example config.sh
 # install.sh copies this automatically if config.sh is missing.
 #
-# The tool lives on its own (~/src/meeting-recorder); its outputs (transcripts/audio) land under
+# The tool lives on its own (~/src/macrec); its outputs (transcripts/audio) land under
 # OUTPUT_ROOT — point that at wherever you keep notes.
 
 # directory these scripts live in (= install location)
@@ -21,9 +21,12 @@ export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
 # keychain → ad-hoc "-" (other machines / CI build without hard-failing).
 # A stable cert keys the TCC grants (mic/system-audio/calendar) to
 # identifier+cert, so rebuilds and upgrades keep them.
+# "ikhoon-dev" is the ONE self-signed cert shared across the mac* tools
+# (maccal / macmail / macrec) — one identity to back up, one TCC story.
+# ("MeetingCaptureSign" was macrec's pre-unification cert.)
 if [ -z "${SIGN_ID:-}" ]; then
-  if security find-identity -p codesigning 2>/dev/null | grep -q '"MeetingCaptureSign"'; then
-    SIGN_ID="MeetingCaptureSign"
+  if security find-identity -p codesigning 2>/dev/null | grep -q '"ikhoon-dev"'; then
+    SIGN_ID="ikhoon-dev"
   else
     SIGN_ID="-"
   fi
@@ -39,7 +42,7 @@ fi
 : ${MEETINGS:="$OUTPUT_ROOT/meetings"}
 : ${AUDIO_DIR:="$OUTPUT_ROOT/audio"}
 : ${INDEX:="$OUTPUT_ROOT/INDEX.md"}
-: ${LOGFILE:="$TOOLS/meeting-recorder.log"}    # log lives with the tool (runtime state)
+: ${LOGFILE:="$TOOLS/macrec.log"}              # log lives with the tool (runtime state)
 
 # --- detection/behavior knobs (override with env) ---
 : ${STRICT_MEETING:=1}   # 1: record only when Zoom/Meet detected; 0: whenever the mic is on
@@ -55,4 +58,4 @@ fi
 : ${SEGMENT_SECONDS:=3600}                        # hourly rotation (s)
 : ${VOICE_MIN_SECONDS:=5}                         # min voiced seconds to transcribe/keep a segment
 : ${TRANSCRIPTS_DIR:="$OUTPUT_ROOT/transcripts"}  # where hourly transcripts land
-: ${WORK_DIR:="/tmp/meeting-recorder-segments"}   # temp segments during rotation (cleaned after)
+: ${WORK_DIR:="/tmp/macrec-segments"}             # temp segments during rotation (cleaned after)

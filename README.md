@@ -34,10 +34,10 @@ Meeting boundaries are intentionally *not* detected — you get clean hourly tra
 
 ```text
   ▎ menu bar ▾                         ┌─ macrec live · en-US ───────────┐
-  ────────────────────────            │ 10:32:41  Me:   그 부분은 다음…   │
-  ⓘ  About macrec                     │ 10:32:45  Them: 네, 리뷰는 목요일 │
-  ● Recording · mic + system          │           ↳ Yes, review on Thu ▍ │
-  🎤 ●●●●○○○○   🔊 ●●●○○○○○           └──────────────────────────────────┘
+  ────────────────────────            │ 10:32:41  Me:   That part next… │
+  ⓘ  About macrec                     │ 10:32:45  Them: Yes, review Thu │
+  ● Recording · mic + system          │           ↳ レビューは木曜です ▍ │
+  🎤 ●●●●○○○○   🔊 ●●●○○○○○           └─────────────────────────────────┘
   ────────────────────────              floating · translucent · draggable
   〰️ Transcribe now                     (Me = blue · Them = green · ↳ = translation)
   ⏸  Pause
@@ -80,7 +80,7 @@ Grab **`macrec.zip`**, unzip, drag **`macrec.app`** to `/Applications`, and laun
 ### B) Build from source (developer machine)
 
 ```bash
-cd ~/src/meeting-recorder
+cd ~/src/macrec
 ./install.sh
 ```
 
@@ -140,11 +140,11 @@ Design notes (each one is a bug we actually hit):
 - **The tap excludes our own process** (and any apps you list, e.g. Spotify), so macrec never records itself and excluded apps stay out of the transcript.
 - **A tap created before the permission is granted delivers silence.** So the engine starts the tap anyway, then watches for the grant and **rebuilds the tap the moment you click Allow** — capture just begins, no manual restart.
 - **Mic is captured via a separate `AVCaptureSession`** on its own path, independent of the system-audio tap.
-- **Speaker→mic echo is cancelled with a real AEC** (opt-in *Reduce mic echo on speakers*): when the far end plays through speakers it leaks into the mic and gets transcribed a second time under `나`. Apple's voice-processing AEC can't help (it only cancels audio the *same* process renders), so macrec feeds the process-tap system audio to a **SpeexDSP** echo canceller as the far-end reference — the echo is subtracted from the mic while your own voice is preserved, even when both sides talk at once. `libspeexdsp` is statically linked, so the app stays self-contained. Set `defaults write com.ikhoon.macrec echoDebug -bool true` to log the canceller's in/out counters for tuning.
+- **Speaker→mic echo is cancelled with a real AEC** (opt-in *Reduce mic echo on speakers*): when the far end plays through speakers it leaks into the mic and gets transcribed a second time under `Me`. Apple's voice-processing AEC can't help (it only cancels audio the *same* process renders), so macrec feeds the process-tap system audio to a **SpeexDSP** echo canceller as the far-end reference — the echo is subtracted from the mic while your own voice is preserved, even when both sides talk at once. `libspeexdsp` is statically linked, so the app stays self-contained. Set `defaults write com.ikhoon.macrec echoDebug -bool true` to log the canceller's in/out counters for tuning.
 - **The app never sets the default output device** — that's left to macOS / tools like SoundSource, so it can't hijack what you're listening to.
 - **VAD (silero) + `--suppress-nst`** skip silence/noise, so transcripts don't fill up with whisper's silence hallucinations ("Thank you", subtitle credits, etc.).
 - **System audio is the digital mix before your DAC**, so transcription quality is unaffected by analog/output-device noise.
-- **Speaker labels**: mic → `나`, system audio → `상대`, merged by timestamp. Transcripts are auto-titled from the overlapping **calendar** event (prefers ones with a Zoom/Meet/Teams link) — across all calendars, or only the ones you pick in Settings.
+- **Speaker labels**: mic → `Me`, system audio → `Them` (localized to the transcript language), merged by timestamp. Transcripts are auto-titled from the overlapping **calendar** event (prefers ones with a Zoom/Meet/Teams link) — across all calendars, or only the ones you pick in Settings.
 
 ## Settings (menu-bar → Settings…)
 

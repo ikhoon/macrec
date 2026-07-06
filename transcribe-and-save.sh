@@ -1,7 +1,7 @@
 #!/bin/zsh
 # transcribe-and-save.sh <audio.wav> <start_iso> <end_iso> <source>
-# whisper.cpp(whisper-cli) + GGML 모델로 전사 → meetings/<date>-<HHMM>-<source>.md 작성, INDEX.md 갱신.
-# (예전엔 MacWhisper의 mw CLI를 썼으나 불안정/멈춤 → 자립형 whisper-cli로 교체.)
+# Transcribe with whisper.cpp (whisper-cli) + a GGML model → write meetings/<date>-<HHMM>-<source>.md, update INDEX.md.
+# (Previously used MacWhisper's mw CLI, but it was flaky/hung → replaced with the standalone whisper-cli.)
 
 source "${0:A:h}/config.sh"
 
@@ -9,7 +9,7 @@ WAV="$1"; START="$2"; END="$3"; SOURCE="${4:-meeting}"
 
 [[ -s "$WAV" ]] || { print -r -- "no audio: $WAV"; exit 1; }
 
-# whisper-cli는 16-bit PCM을 요구한다. 믹스 WAV(float32 16kHz mono)를 afconvert로 변환.
+# whisper-cli requires 16-bit PCM. Convert the mix WAV (float32 16kHz mono) with afconvert.
 PCM="${WAV:r}.pcm16.wav"
 afconvert -f WAVE -d LEI16@16000 -c 1 "$WAV" "$PCM" 2>/dev/null
 
@@ -20,7 +20,7 @@ else
   TXT=""
 fi
 rm -f "$PCM" 2>/dev/null
-[[ -z "${TXT//[[:space:]]/}" ]] && TXT="_(전사 실패 — whisper-cli/모델 확인 또는 오디오가 무음: $WAV)_"
+[[ -z "${TXT//[[:space:]]/}" ]] && TXT="_(transcription failed — check whisper-cli/model, or the audio is silent: $WAV)_"
 
 # --- time fields (BSD date) ---
 DAY=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$START" +%Y-%m-%d 2>/dev/null)
@@ -37,41 +37,41 @@ AUDIO_REL="audio/$(basename "$WAV")"
 # --- optionally drop the audio ---
 if [[ "$KEEP_AUDIO" -ne 1 ]]; then
   rm -f "$WAV" 2>/dev/null
-  AUDIO_LINE="- 오디오: _(보관 안 함)_"
+  AUDIO_LINE="- Audio: _(not kept)_"
 else
-  AUDIO_LINE="- 오디오: [$AUDIO_REL]($AUDIO_REL)"
+  AUDIO_LINE="- Audio: [$AUDIO_REL]($AUDIO_REL)"
 fi
 
 # --- write the meeting note ---
 mkdir -p "$MEETINGS"
 cat > "$MD" <<EOF
-# $DAY $HM_S — (제목 미정 — $SOURCE 미팅)
+# $DAY $HM_S — (untitled — $SOURCE meeting)
 
-> [미팅] whisper-cli 자동 전사. 마이크 사용 감지 → ScreenCaptureKit 녹음(시스템음+마이크).
+> [meeting] Auto-transcribed with whisper-cli. Mic-in-use detected → ScreenCaptureKit recording (system audio + mic).
 
-- 일시: $DAY $HM_S–$HM_E (${MINS}분)
-- 소스: $SOURCE
-- 모델: \`${WHISPER_GGML:t}\` (whisper.cpp)
+- When: $DAY $HM_S–$HM_E (${MINS} min)
+- Source: $SOURCE
+- Model: \`${WHISPER_GGML:t}\` (whisper.cpp)
 $AUDIO_LINE
-- 태그: #meeting #$SOURCE
+- Tags: #meeting #$SOURCE
 
-## 전사 (transcript)
+## Transcript
 
 $TXT
 
 ---
-_제목·요약은 직접 다듬으세요. 재사용할 지식은 \`topics/\`로 정제하고 이 파일을 역참조하세요._
+_Polish the title/summary yourself. Distill reusable knowledge into \`topics/\` and back-reference this file._
 EOF
 
-print -r -- "$(date '+%F %T')  saved: $MD (${MINS}분)"
+print -r -- "$(date '+%F %T')  saved: $MD (${MINS} min)"
 
-# --- update INDEX.md 미팅 table (newest first; drop the placeholder row) ---
+# --- update the INDEX.md meetings table (newest first; drop the placeholder row) ---
 if [[ -f "$INDEX" ]]; then
-  ROW="| $DAY $HM_S | [(제목 미정) $SOURCE 미팅](meetings/$(basename "$MD")) |"
+  ROW="| $DAY $HM_S | [(untitled) $SOURCE meeting](meetings/$(basename "$MD")) |"
   tmp=$(mktemp)
   awk -v row="$ROW" '
-    /^## .* 미팅/ { inmt=1 }
-    /_아직 없음_/ { next }
+    /^## .*[Mm]eeting/ { inmt=1 }
+    /_none yet_/ { next }
     { print }
     inmt && !done && /^\|---/ { print row; done=1 }
   ' "$INDEX" > "$tmp" && mv "$tmp" "$INDEX"
