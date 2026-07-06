@@ -1788,7 +1788,17 @@ final class RecordingEngine {
 
     private func process(_ seg: CompletedSegment) {
         elog("engine: segment \(segFormatter().string(from: seg.start)) — voiced mic=\(String(format: "%.1f", seg.micVoicedSeconds))s sys=\(String(format: "%.1f", seg.sysVoicedSeconds))s (micPeak=\(String(format: "%.3f", seg.micPeak)) sysPeak=\(String(format: "%.3f", seg.sysPeak))) dur=\(Int(seg.durationSeconds))s")
-        defer { try? FileManager.default.removeItem(at: seg.sysURL); try? FileManager.default.removeItem(at: seg.micURL) }
+        // debugKeepTrackAudio: keep the PER-TRACK mic/sys wavs (normally deleted after the mix) in
+        // workDir — transcription-quality A/B work (echo-dedup validation against real meetings)
+        // needs the separated tracks, and the mixed wav can't be un-mixed. Off by default; workDir
+        // lives under /tmp, so leftovers vanish on reboot regardless.
+        let keepTracks = Pref.bool("debugKeepTrackAudio", "MR_DEBUG_KEEP_TRACKS", false)
+        defer {
+            if !keepTracks {
+                try? FileManager.default.removeItem(at: seg.sysURL)
+                try? FileManager.default.removeItem(at: seg.micURL)
+            }
+        }
 
         // 내 마이크든 상대(시스템)든 누군가 말했으면 전사한다 (듣기만 한 미팅 포함).
         guard seg.voicedSeconds >= cfg.voiceMinSeconds else {
