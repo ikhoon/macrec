@@ -17,7 +17,17 @@ export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
 : ${INSTALL_APP:="/Applications/macrec.app"}   # install (run) location — shown in Finder/Applications
 : ${CAPTURE:="$INSTALL_APP/Contents/MacOS/macrec"}  # capture binary (inside .app = stable TCC identity)
 : ${BUNDLE_ID:="com.ikhoon.macrec"}   # fixed — never change (TCC DR identifier)
-: ${SIGN_ID:="MeetingCaptureSign"}             # code-signing cert name (created by make-signing-cert.sh)
+# Code-signing identity: env override → the shared cert when it's in the
+# keychain → ad-hoc "-" (other machines / CI build without hard-failing).
+# A stable cert keys the TCC grants (mic/system-audio/calendar) to
+# identifier+cert, so rebuilds and upgrades keep them.
+if [ -z "${SIGN_ID:-}" ]; then
+  if security find-identity -p codesigning 2>/dev/null | grep -q '"MeetingCaptureSign"'; then
+    SIGN_ID="MeetingCaptureSign"
+  else
+    SIGN_ID="-"
+  fi
+fi
 
 # transcription: whisper.cpp's whisper-cli + GGML models directly
 : ${WHISPER_CLI:="/opt/homebrew/bin/whisper-cli"}
