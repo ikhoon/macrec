@@ -1,13 +1,13 @@
 name: Release
 
 # Push a tag `vX.Y.Z` → build the self-contained, self-signed macrec.app, attach it to a GitHub
-# release, and bump the Homebrew tap formula. Just `git tag v0.2.0 && git push --tags`.
+# release, and bump the Homebrew tap cask. Just `git tag v0.2.0 && git push --tags`.
 #
 # Required repository secrets:
 #   MACREC_SIGNING_P12_BASE64    base64 of ~/.config/meeting-recorder/MeetingCaptureSign.p12
 #                                  (`base64 -i .../MeetingCaptureSign.p12 | pbcopy`)
 #   MACREC_SIGNING_P12_PASSWORD  the p12 export password (default from make-signing-cert.sh: meeting-capture)
-#   HOMEBREW_TAP_TOKEN           a PAT with contents:write on ikhoon/homebrew-tap (to push the formula bump)
+#   HOMEBREW_TAP_TOKEN           a PAT with contents:write on ikhoon/homebrew-tap (to push the cask bump)
 #
 # ⚠ CI MUST reuse the SAME cert the local builds use. The code-signing designated requirement is
 #   `identifier "com.ikhoon.macrec" and certificate root = <that cert>`, so a different cert would
@@ -103,7 +103,7 @@ jobs:
           gh release create "$TAG" --title "macrec $TAG" --generate-notes "$ASSET" \
             || gh release upload "$TAG" "$ASSET" --clobber
 
-      - name: Bump Homebrew tap formula
+      - name: Bump Homebrew tap cask
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
@@ -112,8 +112,8 @@ jobs:
           VERSION="${{ steps.tag.outputs.version }}"
           SHA="${{ steps.asset.outputs.sha256 }}"
           git clone "https://x-access-token:$GH_TOKEN@github.com/ikhoon/homebrew-tap.git" tap
-          f=tap/Formula/macrec.rb
-          sed -i '' -E "s|releases/download/v[0-9.]+/macrec-[0-9.]+-macos-arm64\.zip|releases/download/v$VERSION/macrec-$VERSION-macos-arm64.zip|" "$f"
+          f=tap/Casks/macrec.rb
+          # The cask builds its url from #{version}, so only version + sha256 change.
           sed -i '' -E "s|version \"[0-9.]+\"|version \"$VERSION\"|" "$f"
           sed -i '' -E "s|sha256 \"[0-9a-f]+\"|sha256 \"$SHA\"|" "$f"
           cd tap
