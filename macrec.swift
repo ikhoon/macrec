@@ -22,6 +22,7 @@ import EventKit
 import ServiceManagement
 import Security   // Keychain — API keys don't belong in UserDefaults
 import UserNotifications   // completion push after a manual "Transcribe now"
+import Compression   // zlib ratio — whisper repetition-loop detector (see Transcriber.scrubLines)
 
 // MARK: - helpers
 
@@ -1050,7 +1051,11 @@ struct EngineConfig {
                                BundledTools.vadModel ?? home.appendingPathComponent("whisper-models/ggml-silero-v5.1.2.bin").path),
             vadEnabled: Pref.bool(Pref.vad, "MR_VAD", true),
             useCalendarTitles: Pref.bool(Pref.cal, "MR_CALENDAR_TITLES", true),
-            whisperLang: Pref.str(Pref.lang, "MR_WHISPER_LANG", "auto"),
+            // Default ko, not auto: auto detects ONCE on the first window and pins a wrong guess
+            // for the whole hour (a Korean broadcast decoded as English fed the repetition loop;
+            // English announcements came out as katakana). English-heavy sessions can still switch
+            // the pref — a per-track language is the planned proper fix.
+            whisperLang: Pref.str(Pref.lang, "MR_WHISPER_LANG", "ko"),
             keepAudio: Pref.bool(Pref.keepAudio, "MR_KEEP_AUDIO", true),
             // Lossy transcoding must be OPT-IN for anyone who configured retention before this
             // feature existed — an upgrade must never start re-encoding a curated archive on its
@@ -1383,9 +1388,23 @@ enum Transcriber {
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cfg.whisperCli)
-        var args = ["-m", cfg.whisperModel, "-f", wav16.path, "-l", cfg.whisperLang, "-np", "-sns"]
+        var args = ["-m", cfg.whisperModel, "-f", wav16.path, "-l", cfg.whisperLang, "-np", "-sns",
+                    // Anti-hallucination (whisper.cpp #2286, openai/whisper #679): max-context 0
+                    // stops a degenerate window from feeding the NEXT window's prompt — the
+                    // self-reinforcing repetition loop that junked whole hours of broadcast/BGM
+                    // audio. Raised entropy/logprob thresholds make the decoder retry at higher
+                    // temperature instead of accepting low-entropy loop output; the temperature
+                    // fallback itself stays ON — it is the escape hatch.
+                    "--max-context", "0", "--entropy-thold", "2.6", "--logprob-thold", "-1.25"]
         if cfg.vadEnabled && FileManager.default.fileExists(atPath: cfg.vadModel) {
-            args += ["--vad", "--vad-model", cfg.vadModel]
+            // Tightened VAD: the default threshold (0.5) passed sung vocals into the decoder and
+            // one-burst noises (a cough) transcribed to a word. Longer min-durations drop those;
+            // generous padding keeps soft sentence tails.
+            args += ["--vad", "--vad-model", cfg.vadModel,
+                     "--vad-threshold", "0.55",
+                     "--vad-min-speech-duration-ms", "300",
+                     "--vad-min-silence-duration-ms", "300",
+                     "--vad-speech-pad-ms", "150"]
         }
         if !hints.isEmpty { args += ["--prompt", hints] }   // proper-noun dictionary biases decoding
         p.arguments = args
@@ -1408,6 +1427,61 @@ enum Transcriber {
             if !text.isEmpty { segs.append((h * 3600 + m * 60 + s, text)) }
         }
         return segs
+    }
+
+    // MARK: hallucination scrubbing — whisper fabricates fluent text on music/noise/silence
+    // (its training data paired non-speech audio with video credits), and a degenerate window can
+    // loop one sentence for many minutes. These pure detectors run per TRACK before the merge.
+
+    /// YouTube-outro boilerplate whisper hallucinates on non-speech — seen VERBATIM in our junk
+    /// transcripts (ご視聴ありがとうございました on a quiet living-room hour, etc.).
+    static let hallucinationBoilerplate = [
+        "시청해 주셔서 감사합니다", "시청해주셔서 감사합니다", "구독과 좋아요", "다음 영상에서 만나",
+        "thank you for watching", "thanks for watching", "ご視聴ありがとうございました",
+    ]
+
+    /// Within-line degeneration: "oh, oh, oh, oh…" compresses absurdly well. Ratio of raw UTF-8
+    /// size to zlib-compressed size; real sentences land ~1.2–1.9, loops blow past 2.4.
+    static func compressionRatio(_ s: String) -> Double {
+        let src = Array(s.utf8)
+        guard src.count > 0 else { return 1 }
+        var dst = [UInt8](repeating: 0, count: src.count + 1024)
+        let n = compression_encode_buffer(&dst, dst.count, src, src.count, nil, COMPRESSION_ZLIB)
+        guard n > 0 else { return 1 }
+        return Double(src.count) / Double(n)
+    }
+
+    /// Share of the most frequent word 4-gram — a loop shows one 4-gram dominating. Only
+    /// meaningful with ≥20 grams (≥23 words); shorter lines return 0.
+    static func maxNgramShare(_ s: String, n: Int = 4) -> Double {
+        let words = s.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard words.count >= n + 19 else { return 0 }
+        var counts: [String: Int] = [:]
+        for i in 0...(words.count - n) { counts[words[i..<(i + n)].joined(separator: " "), default: 0] += 1 }
+        return Double(counts.values.max() ?? 0) / Double(words.count - n + 1)
+    }
+
+    static func isHallucinatedLine(_ text: String) -> Bool {
+        let t = text.lowercased()
+        if hallucinationBoilerplate.contains(where: { t.contains($0.lowercased()) }) { return true }
+        if text.utf8.count > 40, compressionRatio(text) > 2.4 { return true }
+        // A phrase-loop's max share ≈ 1/period (an 8-word loop ⇒ ~0.125); varied prose with ≥20
+        // grams sits ≤ ~0.05 (every gram unique). 0.1 splits them with margin on both sides.
+        if maxNgramShare(text) > 0.1 { return true }
+        return false
+    }
+
+    /// Drop hallucinated lines and COLLAPSE consecutive identical lines (the minutes-long loop
+    /// that repeats one sentence hundreds of times keeps its first occurrence only).
+    static func scrubLines(_ lines: [(Double, String)]) -> (kept: [(Double, String)], dropped: Int) {
+        var kept: [(Double, String)] = []
+        var dropped = 0
+        for l in lines {
+            if isHallucinatedLine(l.1) { dropped += 1; continue }
+            if let last = kept.last, last.1 == l.1 { dropped += 1; continue }
+            kept.append(l)
+        }
+        return (kept, dropped)
     }
 
     /// Convert a float32 WAV to 16kHz/16-bit (what whisper-cli expects). Returns the temp file URL.
@@ -1447,14 +1521,20 @@ enum Transcriber {
         let hints = transcriptionHints(start: seg.start, end: seg.start.addingTimeInterval(seg.durationSeconds))
         if !hints.isEmpty { elog("transcribe: hints (\(hints.split(separator: ",").count) terms)") }
         var merged: [(start: Double, who: String, text: String)] = []
+        var scrubbed = 0
         if let mic16 = convert16(seg.micURL) {
-            merged += parse(runWhisper(mic16, cfg, hints: hints)).map { (start: $0.0, who: mine, text: $0.1) }
+            let (kept, dropped) = scrubLines(parse(runWhisper(mic16, cfg, hints: hints)))
+            merged += kept.map { (start: $0.0, who: mine, text: $0.1) }
+            scrubbed += dropped
             try? FileManager.default.removeItem(at: mic16)
         }
         if let sys16 = convert16(seg.sysURL) {
-            merged += parse(runWhisper(sys16, cfg, hints: hints)).map { (start: $0.0, who: theirs, text: $0.1) }
+            let (kept, dropped) = scrubLines(parse(runWhisper(sys16, cfg, hints: hints)))
+            merged += kept.map { (start: $0.0, who: theirs, text: $0.1) }
+            scrubbed += dropped
             try? FileManager.default.removeItem(at: sys16)
         }
+        if scrubbed > 0 { elog("transcribe: scrubbed \(scrubbed) hallucinated/looping lines") }
         merged.sort { $0.start < $1.start }
         // Belt to the AEC's braces: the residual the canceller leaves still transcribes — drop mic
         // lines that are (garbled) copies of a nearby far-end line (see suppressEchoLines).
@@ -5554,6 +5634,32 @@ struct Main {
                                      timeZone: utc.timeZone) == "2026-07-05-2100-2130"
                   && transcriptBaseName(start: schedDate("2026-07-05 23:50"), end: schedDate("2026-07-06 00:20"),
                                         timeZone: utc.timeZone) == "2026-07-05-2350-0020")   // keeps start's date
+            // Hallucination scrubbing — the exact failure classes from our junk transcripts:
+            // a broadcast hour where one sentence repeated for 15 minutes, YouTube-outro
+            // boilerplate on quiet rooms, "oh oh oh…" degeneration. Real speech must survive.
+            check("scrub: boilerplate + within-line loop dropped, real speech kept",
+                  Transcriber.isHallucinatedLine("ご視聴ありがとうございました")
+                  && Transcriber.isHallucinatedLine("시청해 주셔서 감사합니다.")
+                  && Transcriber.isHallucinatedLine("Thanks for watching!")
+                  && Transcriber.isHallucinatedLine("oh, oh, oh, oh, oh, oh, oh, oh, oh, oh, oh, oh, oh, oh, oh, oh")
+                  && !Transcriber.isHallucinatedLine("이번 스프린트에 배포 파이프라인 마이그레이션을 마무리하기로 했습니다.")
+                  && !Transcriber.isHallucinatedLine("네, 네. 알겠습니다.")
+                  && !Transcriber.isHallucinatedLine("Let's start with the deployment status update."))
+            check("scrub: dominant 4-gram loop detected, varied prose passes",
+                  Transcriber.maxNgramShare(Array(repeating: "you should be able to get the ball", count: 8).joined(separator: " ")) > 0.1
+                  && Transcriber.maxNgramShare("the quick brown fox jumps over the lazy dog while the calm river flows past the quiet village near the tall mountain") <= 0.06)
+            do {
+                let loop = Array(repeating: (10.0, "You should be able to get the ball from the right side."), count: 240)
+                let lines = [(5.0, "회의 시작하겠습니다.")] + loop + [(950.0, "다음 주제로 넘어가죠.")]
+                let (kept, dropped) = Transcriber.scrubLines(lines)
+                check("scrub: 240-line repetition loop collapses to one, neighbors survive",
+                      kept.map { $0.1 } == ["회의 시작하겠습니다.",
+                                            "You should be able to get the ball from the right side.",
+                                            "다음 주제로 넘어가죠."] && dropped == 239)
+            }
+            check("scrub: compression ratio separates loops from prose",
+                  Transcriber.compressionRatio(String(repeating: "구독과 좋아요 부탁드립니다 ", count: 12)) > 2.4
+                  && Transcriber.compressionRatio("오늘 논의된 내용은 세 가지였고 각각 담당자가 다음 주까지 정리하기로 했습니다.") < 2.4)
             // Audio archive tiers: raw → compressed → deleted, with 0 disabling a stage.
             check("audio tiers: raw → compressed → deleted (0 = never/forever)",
                   AudioArchivePolicy(rawDays: 7, totalDays: 90).tier(ageDays: 3) == .raw
