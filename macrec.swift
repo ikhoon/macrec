@@ -1389,13 +1389,23 @@ enum Transcriber {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cfg.whisperCli)
         var args = ["-m", cfg.whisperModel, "-f", wav16.path, "-l", cfg.whisperLang, "-np", "-sns",
-                    // Anti-hallucination (whisper.cpp #2286, openai/whisper #679): max-context 0
-                    // stops a degenerate window from feeding the NEXT window's prompt — the
-                    // self-reinforcing repetition loop that junked whole hours of broadcast/BGM
-                    // audio. Raised entropy/logprob thresholds make the decoder retry at higher
-                    // temperature instead of accepting low-entropy loop output; the temperature
-                    // fallback itself stays ON — it is the escape hatch.
-                    "--max-context", "0", "--entropy-thold", "2.6", "--logprob-thold", "-1.25"]
+                    // Anti-hallucination (whisper.cpp #2286, openai/whisper #679): killing the
+                    // rolling text context stops a degenerate window from feeding the NEXT window's
+                    // prompt — the self-reinforcing repetition loop that junked whole hours of
+                    // broadcast/BGM audio. Raised entropy/logprob thresholds make the decoder retry
+                    // at higher temperature instead of accepting low-entropy loop output; the
+                    // temperature fallback itself stays ON — it is the escape hatch.
+                    "--entropy-thold", "2.6", "--logprob-thold", "-1.25"]
+        if hints.isEmpty {
+            args += ["--max-context", "0"]
+        } else {
+            // whisper-cli gates ALL prompt injection on max-context > 0, so a flat 0 would silently
+            // kill the hints. Instead: carry the hints into EVERY window (an upgrade — previously
+            // they only biased the first ~30s) and size max-context to roughly the hint tokens, so
+            // the rolling-context budget left over for loop-feeding stays ~0.
+            let hintTokens = min(224, max(16, hints.utf8.count / 3))
+            args += ["--carry-initial-prompt", "--max-context", String(hintTokens)]
+        }
         if cfg.vadEnabled && FileManager.default.fileExists(atPath: cfg.vadModel) {
             // Tightened VAD: the default threshold (0.5) passed sung vocals into the decoder and
             // one-burst noises (a cough) transcribed to a word. Longer min-durations drop those;
@@ -1441,14 +1451,16 @@ enum Transcriber {
     ]
 
     /// Within-line degeneration: "oh, oh, oh, oh…" compresses absurdly well. Ratio of raw UTF-8
-    /// size to zlib-compressed size; real sentences land ~1.2–1.9, loops blow past 2.4.
+    /// size to compressed size; real sentences land ~1.0–1.5, loops blow past 2.4. Apple's
+    /// COMPRESSION_ZLIB emits raw DEFLATE (no 2-byte header/4-byte adler) — the +6 keeps the ratio
+    /// calibrated to the zlib-framed implementation the 2.4 threshold comes from (openai/whisper).
     static func compressionRatio(_ s: String) -> Double {
         let src = Array(s.utf8)
         guard src.count > 0 else { return 1 }
         var dst = [UInt8](repeating: 0, count: src.count + 1024)
         let n = compression_encode_buffer(&dst, dst.count, src, src.count, nil, COMPRESSION_ZLIB)
         guard n > 0 else { return 1 }
-        return Double(src.count) / Double(n)
+        return Double(src.count) / Double(n + 6)
     }
 
     /// Share of the most frequent word 4-gram — a loop shows one 4-gram dominating. Only
@@ -1462,23 +1474,35 @@ enum Transcriber {
     }
 
     static func isHallucinatedLine(_ text: String) -> Bool {
+        // Boilerplate must BE the line (± a little punctuation), not merely appear in it — a real
+        // sentence that *mentions* "구독과 좋아요" (an A/B-test discussion, a demo ending with
+        // "thank you for watching the demo…") must survive.
         let t = text.lowercased()
-        if hallucinationBoilerplate.contains(where: { t.contains($0.lowercased()) }) { return true }
-        if text.utf8.count > 40, compressionRatio(text) > 2.4 { return true }
-        // A phrase-loop's max share ≈ 1/period (an 8-word loop ⇒ ~0.125); varied prose with ≥20
-        // grams sits ≤ ~0.05 (every gram unique). 0.1 splits them with margin on both sides.
+        if hallucinationBoilerplate.contains(where: { t.contains($0.lowercased()) && text.count <= $0.count + 10 }) {
+            return true
+        }
+        // The 80-byte gate keeps short real repetition alive ("네, 네, 네…" backchannels, chants) —
+        // per-line ratios on tiny strings are noisy, and sub-80-byte junk is cheap collateral.
+        if text.utf8.count > 80, compressionRatio(text) > 2.4 { return true }
+        // A phrase-loop's max share ≈ 1/period — 0.1 catches periods ≤ 9 words; longer-period
+        // loops compress well and are caught by the ratio check above instead.
         if maxNgramShare(text) > 0.1 { return true }
         return false
     }
 
-    /// Drop hallucinated lines and COLLAPSE consecutive identical lines (the minutes-long loop
-    /// that repeats one sentence hundreds of times keeps its first occurrence only).
+    /// Drop hallucinated lines and COLLAPSE identical-line runs (the minutes-long loop that
+    /// repeats one sentence hundreds of times keeps its first occurrence only). The 30 s gap guard
+    /// keeps REAL repeats: two identical backchannels half an hour apart are both kept — loop
+    /// lines arrive seconds apart, so every link in the chain stays inside the window.
     static func scrubLines(_ lines: [(Double, String)]) -> (kept: [(Double, String)], dropped: Int) {
         var kept: [(Double, String)] = []
         var dropped = 0
+        var prevText = ""
+        var prevTime = -1e9
         for l in lines {
+            defer { prevText = l.1; prevTime = l.0 }
             if isHallucinatedLine(l.1) { dropped += 1; continue }
-            if let last = kept.last, last.1 == l.1 { dropped += 1; continue }
+            if l.1 == prevText, l.0 - prevTime < 30 { dropped += 1; continue }
             kept.append(l)
         }
         return (kept, dropped)
@@ -5641,21 +5665,34 @@ struct Main {
                   Transcriber.isHallucinatedLine("ご視聴ありがとうございました")
                   && Transcriber.isHallucinatedLine("시청해 주셔서 감사합니다.")
                   && Transcriber.isHallucinatedLine("Thanks for watching!")
-                  && Transcriber.isHallucinatedLine("oh, oh, oh, oh, oh, oh, oh, oh, oh, oh, oh, oh, oh, oh, oh, oh")
+                  && Transcriber.isHallucinatedLine(Array(repeating: "oh,", count: 28).joined(separator: " "))
                   && !Transcriber.isHallucinatedLine("이번 스프린트에 배포 파이프라인 마이그레이션을 마무리하기로 했습니다.")
                   && !Transcriber.isHallucinatedLine("네, 네. 알겠습니다.")
                   && !Transcriber.isHallucinatedLine("Let's start with the deployment status update."))
+            // Review-verified false-positive victims that MUST survive: short real repetition
+            // (backchannels, chants) under the 80-byte gate; sentences that merely MENTION
+            // boilerplate phrases (anchored match, not contains).
+            check("scrub: real Korean repetition + boilerplate mentions survive",
+                  !Transcriber.isHallucinatedLine("네, 네, 네, 네, 네, 네, 네, 네, 네.")
+                  && !Transcriber.isHallucinatedLine("파이팅 파이팅 파이팅 파이팅 파이팅")
+                  && !Transcriber.isHallucinatedLine("Thank you for watching the demo, any questions before we move on?")
+                  && !Transcriber.isHallucinatedLine("구독과 좋아요 버튼 위치를 바꾸는 A/B 테스트를 해 보죠."))
             check("scrub: dominant 4-gram loop detected, varied prose passes",
                   Transcriber.maxNgramShare(Array(repeating: "you should be able to get the ball", count: 8).joined(separator: " ")) > 0.1
                   && Transcriber.maxNgramShare("the quick brown fox jumps over the lazy dog while the calm river flows past the quiet village near the tall mountain") <= 0.06)
             do {
-                let loop = Array(repeating: (10.0, "You should be able to get the ball from the right side."), count: 240)
+                // The observed 15-minute loop: one sentence every ~3 s for 240 lines. Collapses to
+                // its first occurrence; identical REAL repeats far apart (>30 s) are both kept.
+                let loop = (0..<240).map { (10.0 + Double($0) * 3, "You should be able to get the ball from the right side.") }
                 let lines = [(5.0, "회의 시작하겠습니다.")] + loop + [(950.0, "다음 주제로 넘어가죠.")]
                 let (kept, dropped) = Transcriber.scrubLines(lines)
                 check("scrub: 240-line repetition loop collapses to one, neighbors survive",
                       kept.map { $0.1 } == ["회의 시작하겠습니다.",
                                             "You should be able to get the ball from the right side.",
                                             "다음 주제로 넘어가죠."] && dropped == 239)
+                let farApart = [(10.0, "네."), (500.0, "네.")]
+                check("scrub: identical backchannels far apart both survive",
+                      Transcriber.scrubLines(farApart).kept.count == 2)
             }
             check("scrub: compression ratio separates loops from prose",
                   Transcriber.compressionRatio(String(repeating: "구독과 좋아요 부탁드립니다 ", count: 12)) > 2.4
