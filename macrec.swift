@@ -796,6 +796,10 @@ enum Pref {
     static let summaryPrompt = "summaryPrompt"          // summary prompt (absent = built-in default)
     static let summaryPromptFile = "summaryPromptFile"  // external prompt file — overrides the text when readable
     static let summaryOut = "summaryOut"                // summary output dir ("" = next to the transcript)
+    static let dailyDigest = "dailyDigest"              // L3: write a daily digest of the day's summaries
+    static let dailyDigestTime = "dailyDigestTime"      // "HH:mm" the digest becomes due (default 20:00)
+    static let dailyDigestOut = "dailyDigestOut"        // digest output dir ("" = alongside summaries in ../Daily)
+    static let dailyDigestLastRun = "dailyDigestLastRun"  // "yyyy-MM-dd" marker — one digest per day
     static let postProcessCmd = "postProcessCmd"        // freeform command ("" = off)
     static let hintsTerms = "hintsTerms"                // transcription hint terms (comma/newline separated)
     static let hintsFile = "hintsFile"                  // external hints file (one term per line, # comments)
@@ -2247,6 +2251,75 @@ func effectiveSummaryPrompt(inline: String, filePath: String) -> String {
     return inline
 }
 
+// MARK: L3 — daily digest (see PIPELINE.md; aggregates the day's summaries at a set time)
+
+let defaultDailyDigestPrompt = "These are summaries (or transcripts) of one day's meetings, in "
+    + "chronological order. Write a daily digest: an overview of the day, highlights per meeting, "
+    + "and a combined list of decisions and action items with owners. Answer in the same language "
+    + "as the input."
+
+/// Is the daily digest due? True once `now` passes today's HH:mm deadline and today's digest
+/// hasn't run yet. The last-run marker (not a fired timer) is what makes a slept-through deadline
+/// CATCH UP on wake instead of skipping the day. Pure + testable.
+func dailyDigestDue(now: Date, time: String, lastRun: String, calendar: Calendar = .current) -> Bool {
+    let hm = time.split(separator: ":").compactMap { Int($0) }
+    guard hm.count == 2, (0..<24).contains(hm[0]), (0..<60).contains(hm[1]) else { return false }
+    let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = calendar.timeZone; f.dateFormat = "yyyy-MM-dd"
+    let today = f.string(from: now)
+    guard lastRun != today else { return false }
+    let mins = calendar.component(.hour, from: now) * 60 + calendar.component(.minute, from: now)
+    return mins >= hm[0] * 60 + hm[1]
+}
+
+/// The day's digest inputs: prefer the meeting SUMMARY (compact) and fall back to the transcript
+/// for meetings that don't have one. Inputs are matched by the shared `yyyy-MM-dd-HHmm` basename
+/// prefix (naming is the pipeline's join key) and returned in chronological (name) order.
+func dailyDigestInputs(day: String, transcripts: [String], summaries: [String]) -> [String] {
+    let summaryByBase = Dictionary(uniqueKeysWithValues: summaries.map {
+        (URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent, $0)
+    })
+    return transcripts
+        .filter { URL(fileURLWithPath: $0).lastPathComponent.hasPrefix(day) }
+        .sorted { URL(fileURLWithPath: $0).lastPathComponent < URL(fileURLWithPath: $1).lastPathComponent }
+        .map { summaryByBase[URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent] ?? $0 }
+}
+
+/// Where the digest lands: `<dir>/YYYY-MM/YYYY-MM-DD.md`. "" falls back to a `Daily` folder next
+/// to the summaries dir (or next to the transcripts dir when summaries also default). Pure.
+func dailyDigestOutputPath(day: String, outDir: String, summaryOutDir: String, transcriptsDir: String) -> String {
+    let dir = outDir.trimmingCharacters(in: .whitespacesAndNewlines)
+    let sum = summaryOutDir.trimmingCharacters(in: .whitespacesAndNewlines)
+    let root: URL
+    if !dir.isEmpty {
+        root = URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
+    } else if !sum.isEmpty {
+        root = URL(fileURLWithPath: (sum as NSString).expandingTildeInPath)
+            .deletingLastPathComponent().appendingPathComponent("Daily", isDirectory: true)
+    } else {
+        root = URL(fileURLWithPath: transcriptsDir)
+            .deletingLastPathComponent().appendingPathComponent("Daily", isDirectory: true)
+    }
+    return root.appendingPathComponent(String(day.prefix(7)), isDirectory: true)
+        .appendingPathComponent("\(day).md").path
+}
+
+/// Shell invocation for the digest: cat the day's inputs into the summary runner, atomic promote.
+/// Same runner CLI templates and .partial contract as the per-meeting summary. Pure + testable.
+func dailyDigestInvocation(runner: SummaryRunner, prompt: String, inputs: [String], outPath: String) -> String? {
+    guard !inputs.isEmpty else { return nil }
+    let dir = URL(fileURLWithPath: outPath).deletingLastPathComponent().path
+    let cat = "cat " + inputs.map(shq).joined(separator: " ")
+    let runnerCmd: String
+    switch runner {
+    case .claude: runnerCmd = "\(cat) | claude -p \(shq(prompt))"
+    case .gemini: runnerCmd = "\(cat) | gemini -p \(shq(prompt))"
+    case .codex:  runnerCmd = "{ printf '%s\\n\\n' \(shq(prompt)); \(cat); } | codex exec -"
+    }
+    return "mkdir -p \(shq(dir)) && \(runnerCmd) "
+         + "> \(shq(outPath + ".partial")) && mv \(shq(outPath + ".partial")) \(shq(outPath))"
+}
+
 func postProcessInvocationFromPrefs(transcriptPath: String) -> String? {
     let mode = effectivePostProcessMode(rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
                                         shellCmd: Pref.postProcessCommand)
@@ -2396,6 +2469,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     private let promptFileField = NSTextField()   // external prompt file — overrides the text when readable
     private let promptScroll = NSScrollView()     // its bordered, scrolling host
     private let summaryOutField = NSTextField()   // summary output dir ("" = next to the transcript)
+    private let dailyBtn = NSButton(checkboxWithTitle: "Write a daily digest", target: nil, action: nil)
+    private let dailyTimePicker = NSDatePicker()  // HH:mm the digest becomes due
+    private let dailyOutField = NSTextField()     // digest output dir ("" = Daily/ next to summaries)
     private var summaryChooseBtn: NSButton?       // folder picker for the summary output dir
     private let hintsTermsField = NSTextField()   // hint terms (comma/newline separated)
     private let hintsFileField = NSTextField()    // external hints file path
@@ -2481,6 +2557,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         summaryOutField.translatesAutoresizingMaskIntoConstraints = false
         summaryOutField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         summaryOutField.placeholderString = "empty = next to the transcript"
+        dailyOutField.translatesAutoresizingMaskIntoConstraints = false
+        dailyOutField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        dailyOutField.placeholderString = "empty = Daily folder next to the summaries"
+        dailyTimePicker.datePickerStyle = .textFieldAndStepper
+        dailyTimePicker.datePickerElements = .hourMinute
+        dailyTimePicker.translatesAutoresizingMaskIntoConstraints = false
         for f in [schedDaysField, schedHoursField] {
             f.translatesAutoresizingMaskIntoConstraints = false
             f.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
@@ -2681,7 +2763,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             fieldCaption("Overrides the text above when readable — keep the prompt in your "
                        + "notes repo and iterate without opening Settings."),                     // 8
             row("Save summary to:", summaryStack),                                                // 9
-            fieldCaption("Folder for <name>.summary.md. Empty = next to the transcript."),        // 10
+            fieldCaption("Summaries land in monthly folders (YYYY-MM/<name>.md). "
+                       + "Empty = next to the transcript."),                                      // 10
+            sectionHeader("Daily digest", symbol: "calendar.day.timeline.left"),
+            row("", dailyBtn),
+            row("Write at:", dailyTimePicker),
+            row("Save digest to:", dailyOutField),
+            fieldCaption("Once a day, the day's meeting summaries roll up into "
+                       + "Daily/YYYY-MM/YYYY-MM-DD.md. A slept-through deadline catches up on wake."),
             sectionHeader("Custom command", symbol: "terminal"),                                  // 11
             row("Command:", postProcessField),                                                    // 12
             fieldCaption("Freeform: runs in a login shell with the transcript path appended "
@@ -2838,6 +2927,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         promptView.string = savedPrompt.isEmpty ? defaultSummaryPrompt : savedPrompt   // show the editable default
         promptFileField.stringValue = Pref.explicit(Pref.summaryPromptFile, "MR_SUMMARY_PROMPT_FILE")
         summaryOutField.stringValue = Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT")
+        dailyBtn.state = Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false) ? .on : .off
+        dailyOutField.stringValue = Pref.explicit(Pref.dailyDigestOut, "MR_DAILY_DIGEST_OUT")
+        let hm = Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00").split(separator: ":").compactMap { Int($0) }
+        var tc = DateComponents(); tc.hour = hm.count == 2 ? hm[0] : 20; tc.minute = hm.count == 2 ? hm[1] : 0
+        dailyTimePicker.dateValue = Calendar.current.date(from: tc) ?? Date()
         hintsTermsField.stringValue = Pref.explicit(Pref.hintsTerms, "MR_HINTS")
         hintsFileField.stringValue = Pref.explicit(Pref.hintsFile, "MR_HINTS_FILE")
         hintsCalBtn.state = Pref.bool(Pref.hintsCalendar, "MR_HINTS_CALENDAR", false) ? .on : .off
@@ -2929,6 +3023,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         d.set(promptView.string.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryPrompt)
         d.set(promptFileField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryPromptFile)
         d.set(summaryOutField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryOut)
+        d.set(dailyBtn.state == .on, forKey: Pref.dailyDigest)
+        d.set(dailyOutField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.dailyDigestOut)
+        let tc = Calendar.current.dateComponents([.hour, .minute], from: dailyTimePicker.dateValue)
+        d.set(String(format: "%02d:%02d", tc.hour ?? 20, tc.minute ?? 0), forKey: Pref.dailyDigestTime)
         d.set(hintsTermsField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.hintsTerms)
         d.set(hintsFileField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.hintsFile)
         d.set(hintsCalBtn.state == .on, forKey: Pref.hintsCalendar)
@@ -4741,7 +4839,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RunLoop.main.add(vt, forMode: .common)   // .common so the tint updates while menus track too
         voiceTimer = vt
         let st = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
-            DispatchQueue.main.async { self?.checkSchedule() }   // timer runs in .common; engine state is main-confined
+            DispatchQueue.main.async { self?.checkSchedule(); self?.maybeRunDailyDigest() }   // timer runs in .common; engine state is main-confined
         }
         RunLoop.main.add(st, forMode: .common)
         schedTimer = st
@@ -5100,6 +5198,43 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if self.stopTask == stopping { self.stopTask = nil }
                 if !self.paused && !self.schedulePaused && self.engine == nil { self.startEngine() }
             }
+        }
+    }
+
+    /// L3 of the pipeline (PIPELINE.md): once the configured time passes, digest the day's meeting
+    /// summaries into Daily/YYYY-MM/YYYY-MM-DD.md. Rides the same 30 s tick as the schedule; the
+    /// last-run marker (not a timer) makes a slept-through deadline catch up on wake. The marker is
+    /// set when the run LAUNCHES — a failed run logs and retries tomorrow rather than every 30 s.
+    private func maybeRunDailyDigest() {
+        guard Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false) else { return }
+        let now = Date()
+        let time = Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00")
+        guard dailyDigestDue(now: now, time: time, lastRun: Pref.explicit(Pref.dailyDigestLastRun, "")) else { return }
+        let dayF = DateFormatter(); dayF.locale = Locale(identifier: "en_US_POSIX"); dayF.dateFormat = "yyyy-MM-dd"
+        let day = dayF.string(from: now)
+        Pref.d.set(day, forKey: Pref.dailyDigestLastRun)
+        let cfg = EngineConfig.load()
+        let fm = FileManager.default
+        let month = String(day.prefix(7))
+        let tDir = cfg.transcriptsDir.appendingPathComponent(month)
+        let transcripts = ((try? fm.contentsOfDirectory(atPath: tDir.path)) ?? [])
+            .filter { $0.hasSuffix(".md") }.map { tDir.appendingPathComponent($0).path }
+        let sumPref = Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT")
+        let sDir = sumPref.isEmpty ? tDir.path
+                                   : ((sumPref as NSString).expandingTildeInPath + "/" + month)
+        let summaries = ((try? fm.contentsOfDirectory(atPath: sDir)) ?? [])
+            .filter { $0.hasSuffix(".md") }.map { sDir + "/" + $0 }
+        let inputs = dailyDigestInputs(day: day, transcripts: transcripts, summaries: summaries)
+        guard !inputs.isEmpty else { elog("digest: no meetings on \(day) — skipping"); return }
+        let out = dailyDigestOutputPath(day: day,
+                                        outDir: Pref.explicit(Pref.dailyDigestOut, "MR_DAILY_DIGEST_OUT"),
+                                        summaryOutDir: sumPref, transcriptsDir: cfg.transcriptsDir.path)
+        let runner = SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude
+        guard let cmd = dailyDigestInvocation(runner: runner, prompt: defaultDailyDigestPrompt,
+                                              inputs: inputs, outPath: out) else { return }
+        elog("digest: \(day) — \(inputs.count) inputs → \(out)")
+        runPostProcessCommand(cmd) { status in
+            elog("digest: \(day) finished (exit \(status))")
         }
     }
 
@@ -5670,6 +5805,31 @@ struct Main {
                   && spinnerHold(elapsed: 1.0) == 0
                   && spinnerHold(elapsed: 45) == 0
                   && spinnerHold(elapsed: 0) == 1.0)
+            // L3 daily digest: due-logic (deadline + once-a-day marker = sleep catch-up), input
+            // preference (summary over transcript, matched by basename), path fallbacks, invocation.
+            check("digest: due after deadline, once per day, junk time never fires",
+                  dailyDigestDue(now: schedDate("2026-07-07 20:01"), time: "20:00", lastRun: "", calendar: utc)
+                  && !dailyDigestDue(now: schedDate("2026-07-07 19:59"), time: "20:00", lastRun: "", calendar: utc)
+                  && !dailyDigestDue(now: schedDate("2026-07-07 20:01"), time: "20:00", lastRun: "2026-07-07", calendar: utc)
+                  && dailyDigestDue(now: schedDate("2026-07-08 23:00"), time: "20:00", lastRun: "2026-07-07", calendar: utc)
+                  && !dailyDigestDue(now: schedDate("2026-07-07 20:01"), time: "25:99", lastRun: "", calendar: utc))
+            check("digest: inputs prefer the summary, fall back to the transcript, day-filtered + sorted",
+                  dailyDigestInputs(day: "2026-07-07",
+                                    transcripts: ["/t/2026-07-07-1400.md", "/t/2026-07-06-1000.md", "/t/2026-07-07-1000-standup.md"],
+                                    summaries: ["/s/2026-07-07-1000-standup.md"])
+                  == ["/s/2026-07-07-1000-standup.md", "/t/2026-07-07-1400.md"])
+            check("digest: output path — explicit dir, next-to-summaries fallback, transcripts fallback",
+                  dailyDigestOutputPath(day: "2026-07-07", outDir: "/d", summaryOutDir: "/r/Summaries", transcriptsDir: "/r/Transcripts")
+                  == "/d/2026-07/2026-07-07.md"
+                  && dailyDigestOutputPath(day: "2026-07-07", outDir: "", summaryOutDir: "/r/Summaries", transcriptsDir: "/r/Transcripts")
+                  == "/r/Daily/2026-07/2026-07-07.md"
+                  && dailyDigestOutputPath(day: "2026-07-07", outDir: "", summaryOutDir: "", transcriptsDir: "/r/Transcripts")
+                  == "/r/Daily/2026-07/2026-07-07.md")
+            check("digest: invocation cats inputs into the runner with atomic promote",
+                  dailyDigestInvocation(runner: .claude, prompt: "P", inputs: ["/s/a.md", "/s/b's.md"], outPath: "/d/2026-07/x.md")
+                  == "mkdir -p '/d/2026-07' && cat '/s/a.md' '/s/b'\\''s.md' | claude -p 'P' "
+                   + "> '/d/2026-07/x.md.partial' && mv '/d/2026-07/x.md.partial' '/d/2026-07/x.md'"
+                  && dailyDigestInvocation(runner: .claude, prompt: "P", inputs: [], outPath: "/d/x.md") == nil)
             // File naming: start time only (the end time lived in the name briefly — clutter).
             check("naming: transcript base is the start time only",
                   transcriptBaseName(start: schedDate("2026-07-05 21:00"), timeZone: utc.timeZone) == "2026-07-05-2100"
