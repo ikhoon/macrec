@@ -1305,15 +1305,13 @@ func slugify(_ s: String) -> String {
     return out.isEmpty ? "meeting" : out
 }
 
-/// Transcript/audio file base: start datetime + END time — "2026-07-05-2100-2130". Both endpoints
-/// in the name because "Transcribe now" cuts mid-segment: consecutive files must show where one
-/// stops and the next begins. A segment past midnight keeps the START's date ("…-2350-0020").
-func transcriptBaseName(start: Date, end: Date, timeZone: TimeZone = .current) -> String {
+/// Transcript/audio file base: the START time only — "2026-07-05-2100". The end time briefly
+/// lived in the name too (start-end for mid-hour "Transcribe now" cuts) but read as clutter
+/// (user pick); the header inside the file still carries the full start–end range.
+func transcriptBaseName(start: Date, timeZone: TimeZone = .current) -> String {
     let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = timeZone
     f.dateFormat = "yyyy-MM-dd-HHmm"
-    let g = DateFormatter(); g.locale = Locale(identifier: "en_US_POSIX"); g.timeZone = timeZone
-    g.dateFormat = "HHmm"
-    return "\(f.string(from: start))-\(g.string(from: end))"
+    return f.string(from: start)
 }
 
 // MARK: - calendar lookup (title a transcript from the overlapping event)
@@ -1851,7 +1849,7 @@ final class RecordingEngine {
         let l10n = TranscriptL10n.current
         let event = cfg.useCalendarTitles ? CalendarLookup.match(start: seg.start, end: end) : nil
         let title = event?.title ?? l10n.autoTitle
-        let base = transcriptBaseName(start: seg.start, end: end)
+        let base = transcriptBaseName(start: seg.start)
         let slug = event.map { "\(base)-\(slugify($0.title))" } ?? base
 
         // keep the mixed WAV per the keepAudio setting (mixed is nil when keepAudio is off)
@@ -2177,14 +2175,22 @@ enum SummaryRunner: String, CaseIterable { case claude, codex, gemini }
 /// transcript's own language keeps it correct for mixed ko/en/ja meetings.
 let defaultSummaryPrompt = "Summarize this meeting transcript: key points, decisions made, and action items with owners. Answer in the same language as the transcript."
 
-/// Where the automatic summary lands: "" = next to the transcript as `<name>.summary.md`;
-/// otherwise `<dir>/<name>.summary.md` (tilde expanded). Pure + testable.
+/// Where the automatic summary lands. A dedicated output dir mirrors the transcripts' monthly
+/// layout with the PLAIN transcript name (`<dir>/YYYY-MM/<name>.md` — the folder already says
+/// "summary", and `.summary.md` read as clutter); only the next-to-the-transcript fallback ("")
+/// keeps a short `-sum` marker to avoid colliding with the transcript itself. Pure + testable.
+/// (The invocation mkdir -p's the parent, so the month folder appears on first use.)
 func summaryOutputPath(transcriptPath: String, outDir: String) -> String {
     let t = URL(fileURLWithPath: transcriptPath)
-    let name = t.deletingPathExtension().lastPathComponent + ".summary.md"
+    let base = t.deletingPathExtension().lastPathComponent
     let dir = outDir.trimmingCharacters(in: .whitespacesAndNewlines)
-    if dir.isEmpty { return t.deletingLastPathComponent().appendingPathComponent(name).path }
-    return URL(fileURLWithPath: (dir as NSString).expandingTildeInPath).appendingPathComponent(name).path
+    if dir.isEmpty { return t.deletingLastPathComponent().appendingPathComponent("\(base)-sum.md").path }
+    var root = URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
+    let month = String(base.prefix(7))                                     // "2026-07" from the file name
+    if month.range(of: #"^\d{4}-\d{2}$"#, options: .regularExpression) != nil {
+        root.appendPathComponent(month, isDirectory: true)
+    }
+    return root.appendingPathComponent("\(base).md").path
 }
 
 /// Build the shell invocation for a post-process run — nil when there's nothing to do. Pure + testable.
@@ -5488,8 +5494,8 @@ struct Main {
                   inv(.shell, .claude, shell: "./x.sh") == "./x.sh '/t/a b'\\''s.md'")
             check("post-process: claude summary template (mkdir + .partial promote)",
                   inv(.summary, .claude) == "mkdir -p '/t' && claude -p 'P' < '/t/a b'\\''s.md' "
-                                          + "> '/t/a b'\\''s.summary.md.partial' "
-                                          + "&& mv '/t/a b'\\''s.summary.md.partial' '/t/a b'\\''s.summary.md'")
+                                          + "> '/t/a b'\\''s-sum.md.partial' "
+                                          + "&& mv '/t/a b'\\''s-sum.md.partial' '/t/a b'\\''s-sum.md'")
             check("post-process: gemini summary template",
                   inv(.summary, .gemini)?.contains("gemini -p 'P'") == true)
             check("post-process: codex pipes prompt+transcript via stdin",
@@ -5512,9 +5518,11 @@ struct Main {
             check("post-process: empty prompt falls back to the built-in default",
                   inv(.summary, .claude, prompt: " ")?.contains(defaultSummaryPrompt.prefix(25)) == true)
             check("post-process: summary path derivation (custom dir + tilde)",
-                  summaryOutputPath(transcriptPath: "/t/x.md", outDir: "") == "/t/x.summary.md"
-                  && summaryOutputPath(transcriptPath: "/t/x.md", outDir: "~/sums")
-                     == (("~/sums" as NSString).expandingTildeInPath + "/x.summary.md"))
+                  summaryOutputPath(transcriptPath: "/t/2026-07-07-1000.md", outDir: "") == "/t/2026-07-07-1000-sum.md"
+                  && summaryOutputPath(transcriptPath: "/t/2026-07-07-1000-standup.md", outDir: "~/sums")
+                     == (("~/sums" as NSString).expandingTildeInPath + "/2026-07/2026-07-07-1000-standup.md")
+                  && summaryOutputPath(transcriptPath: "/t/undated-note.md", outDir: "/s")
+                     == "/s/undated-note.md")   // no date prefix → no month folder
             // The runner really executes — quoting-hostile path (space + apostrophe) via the shell mode.
             let marker = FileManager.default.temporaryDirectory.appendingPathComponent("macrec hook's \(UUID().uuidString)")
             let markerCmd = postProcessInvocation(mode: .shell, runner: .claude, prompt: "", shellCmd: "touch",
@@ -5662,12 +5670,10 @@ struct Main {
                   && spinnerHold(elapsed: 1.0) == 0
                   && spinnerHold(elapsed: 45) == 0
                   && spinnerHold(elapsed: 0) == 1.0)
-            // File naming: start + END time, so a mid-hour "Transcribe now" shows the cut point.
-            check("naming: transcript base carries start AND end times",
-                  transcriptBaseName(start: schedDate("2026-07-05 21:00"), end: schedDate("2026-07-05 21:30"),
-                                     timeZone: utc.timeZone) == "2026-07-05-2100-2130"
-                  && transcriptBaseName(start: schedDate("2026-07-05 23:50"), end: schedDate("2026-07-06 00:20"),
-                                        timeZone: utc.timeZone) == "2026-07-05-2350-0020")   // keeps start's date
+            // File naming: start time only (the end time lived in the name briefly — clutter).
+            check("naming: transcript base is the start time only",
+                  transcriptBaseName(start: schedDate("2026-07-05 21:00"), timeZone: utc.timeZone) == "2026-07-05-2100"
+                  && transcriptBaseName(start: schedDate("2026-07-05 23:50"), timeZone: utc.timeZone) == "2026-07-05-2350")
             // Hallucination scrubbing — the exact failure classes from our junk transcripts:
             // a broadcast hour where one sentence repeated for 15 minutes, YouTube-outro
             // boilerplate on quiet rooms, "oh oh oh…" degeneration. Real speech must survive.
