@@ -2422,6 +2422,15 @@ func formRowRoles(_ rows: [[NSView]]) -> (headers: [Int], notes: [Int]) {
     return (headers, notes)
 }
 
+/// Sidebar search: which panes match the query? Case-insensitive substring against every visible
+/// string in the pane (title, labels, captions, button titles) — typing "prompt" surfaces
+/// Post-process. Empty query = all panes, original order. Pure + testable.
+func settingsSearchHits(query: String, index: [[String]]) -> [Int] {
+    let q = query.trimmingCharacters(in: .whitespaces).lowercased()
+    guard !q.isEmpty else { return Array(index.indices) }
+    return index.indices.filter { i in index[i].contains { $0.lowercased().contains(q) } }
+}
+
 final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSComboBoxDelegate {
 
     /// A field the parser can't read must LOOK broken while typing — schedule fields silently
@@ -2448,7 +2457,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         DispatchQueue.main.async { self.recolorRetentionCombos() }   // stringValue updates after this fires
     }
     private let onSave: () -> Void
-    private(set) var tabsForTest: NSTabView?   // selftest hook: every pane must host its grid in a scroll view
+    // Vertical navigation (System Settings style): a sidebar source list + one content pane at a
+    // time, searchable. panesForTest doubles as the selftest hook (every pane must scroll etc.).
+    private(set) var panesForTest: [(title: String, symbol: String, view: NSView, searchText: [String])] = []
+    private let sidebarList = NSTableView()
+    private let sidebarSearch = NSSearchField()
+    private let paneContainer = NSView()
+    private var visiblePaneIndexes: [Int] = []   // sidebar rows → pane indexes (search filters this)
+    private var selectedPane = 0
     private let segPopup = NSPopUpButton(), langPopup = NSPopUpButton()
     private let modelPopup = NSPopUpButton()
     private let txtRetPopup = NSPopUpButton()
@@ -2461,7 +2477,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     private let openaiBaseField = NSTextField()   // OpenAI-compatible proxy/gateway base URL ("" = official)
     private let gladiaKeyField = NSSecureTextField()
     private let postProcessField = NSTextField()  // freeform post-process command (shell mode)
-    private let ppModePopup = NSPopUpButton()     // Off / Automatic summary (built-in) / Custom command
+    private let ppModeSeg = NSSegmentedControl()  // Off / Automatic summary (built-in) / Custom command
     private let ppModeValues = ["off", "summary", "shell"], ppModeTitles = ["Off", "Automatic summary", "Custom command"]
     private let runnerPopup = NSPopUpButton()     // which agent CLI writes the summary
     private let runnerValues = ["claude", "codex", "gemini"], runnerTitles = ["Claude CLI", "Codex CLI", "Gemini CLI"]
@@ -2511,13 +2527,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         // Size the window to the DENSEST tab's measured content (user ask: no scrolling by default).
         // Derived, not hardcoded — adding rows can't silently reintroduce the scroll. The scroll pane
         // stays as the safety net for small screens / manual shrinking.
-        let maxGrid = tabsForTest?.tabViewItems
+        let maxGrid = panesForTest
             .compactMap { firstGrid(in: $0.view)?.fittingSize }
             .reduce(NSSize(width: 520, height: 400)) { NSSize(width: max($0.width, $1.width),
                                                               height: max($0.height, $1.height)) }
-            ?? NSSize(width: 520, height: 400)
-        w.setContentSize(NSSize(width: max(560, maxGrid.width + 80),
-                                height: min(maxGrid.height + 130, (NSScreen.main?.visibleFrame.height ?? 900) - 60)))
+        w.setContentSize(NSSize(width: max(560, maxGrid.width + 80) + 190,   // +sidebar
+                                height: min(maxGrid.height + 110, (NSScreen.main?.visibleFrame.height ?? 900) - 60)))
         w.center()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -2600,8 +2615,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         promptView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         promptView.textContainer?.widthTracksTextView = true
         promptScroll.documentView = promptView
-        ppModePopup.addItems(withTitles: ppModeTitles)
-        ppModePopup.target = self; ppModePopup.action = #selector(ppModeChanged)
+        ppModeSeg.segmentCount = ppModeTitles.count
+        for (i, t) in ppModeTitles.enumerated() { ppModeSeg.setLabel(t, forSegment: i) }
+        ppModeSeg.selectedSegment = 0
+        ppModeSeg.segmentStyle = .texturedRounded
+        ppModeSeg.target = self; ppModeSeg.action = #selector(ppModeChanged)
         runnerPopup.addItems(withTitles: runnerTitles)
         openaiBaseField.placeholderString = "empty = api.openai.com"
 
@@ -2656,7 +2674,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         /// Headers (section titles / full-width intro notes) merge both columns with extra air above;
         /// captions pull tight under the field they describe. Roles are DERIVED from the row's views
         /// (see formRowRoles) — nothing to renumber when rows are inserted.
-        func tab(_ title: String, _ rows: [[NSView]]) -> NSTabViewItem {
+        // Collect every visible string in a pane — the sidebar search matches against these, so
+        // typing "prompt" finds Post-process even though the pane title never says so.
+        func searchText(of rows: [[NSView]]) -> [String] {
+            rows.flatMap { $0 }.flatMap { v -> [String] in
+                var out: [String] = []
+                if let t = v as? NSTextField { out.append(t.stringValue) }
+                if let b = v as? NSButton { out.append(b.title) }
+                for sub in v.subviews {
+                    if let t = sub as? NSTextField { out.append(t.stringValue) }
+                    if let b = sub as? NSButton { out.append(b.title) }
+                }
+                return out
+            }.filter { !$0.isEmpty }
+        }
+
+        func pane(_ title: String, _ symbol: String, _ rows: [[NSView]]) {
             let grid = NSGridView(views: rows)
             grid.translatesAutoresizingMaskIntoConstraints = false
             grid.rowSpacing = 9; grid.columnSpacing = 18
@@ -2681,12 +2714,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             scroll.autohidesScrollers = true
             scroll.drawsBackground = false
             scroll.documentView = doc
-            let pane = NSView(); pane.addSubview(scroll)
+            let paneView = NSView(); paneView.addSubview(scroll)
             NSLayoutConstraint.activate([
-                scroll.topAnchor.constraint(equalTo: pane.topAnchor),
-                scroll.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
-                scroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
-                scroll.bottomAnchor.constraint(equalTo: pane.bottomAnchor),
+                scroll.topAnchor.constraint(equalTo: paneView.topAnchor),
+                scroll.leadingAnchor.constraint(equalTo: paneView.leadingAnchor),
+                scroll.trailingAnchor.constraint(equalTo: paneView.trailingAnchor),
+                scroll.bottomAnchor.constraint(equalTo: paneView.bottomAnchor),
                 doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
                 doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
                 doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
@@ -2695,14 +2728,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
                 grid.leadingAnchor.constraint(greaterThanOrEqualTo: doc.leadingAnchor, constant: 24),
                 grid.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -20),   // content sets doc height → scrolls
             ])
-            let item = NSTabViewItem(); item.label = title; item.view = pane
-            return item
+            panesForTest.append((title: title, symbol: symbol, view: paneView, searchText: [title] + searchText(of: rows)))
         }
-
-        let tabs = NSTabView(); tabs.translatesAutoresizingMaskIntoConstraints = false
-        tabsForTest = tabs
-        tabs.focusRingType = .none   // clicking a tab otherwise shows a blue focus ring on top of the tab highlight ("double blue")
-        tabs.addTabViewItem(tab("Recording", [
+        pane("Recording", "record.circle", [
             row("Segment length (on the hour):", segPopup),
             row("", systemAudioBtn),
             row("", echoBtn),
@@ -2722,8 +2750,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             row("Delete after:", audioRetCombo),
             fieldCaption("Audio older than this is deleted, raw or compressed. Unlimited keeps it forever."),
             row("Save to:", audioStack),
-        ]))
-        tabs.addTabViewItem(tab("Schedule", [
+        ])
+        pane("Schedule", "calendar.badge.clock", [
             row("", schedBtn),
             row("Days:", schedDaysField),
             fieldCaption("mon-fri, or a list like mon,wed,fri. Empty = every day."),
@@ -2733,8 +2761,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
                        + "Unparseable input turns red and is ignored."),
             fieldCaption("Off-hours the tray shows ⏸ Off-hours (schedule). A manual Pause/Resume "
                        + "overrides the schedule until its next boundary."),
-        ]))
-        tabs.addTabViewItem(tab("Transcription", [
+        ])
+        pane("Transcription", "text.quote", [
             row("Model:", modelPopup),                                                            // 0
             row("…or custom model:", customModelField),                                           // 1
             row("Language:", langPopup),                                                          // 2
@@ -2748,10 +2776,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             row("…or hints file:", hintsFileField),                                               // 9
             fieldCaption("One term per line, # comments — merged with the terms above."),         // 10
             row("", hintsCalBtn),                                                                 // 11
-        ]))
-        tabs.addTabViewItem(tab("Post-process", [
+        ])
+        pane("Post-process", "wand.and.stars", [
             sectionNote("Runs after each hourly transcript is saved."),                           // 0
-            row("Mode:", ppModePopup),                                                            // 1
+            row("Mode:", ppModeSeg),                                                              // 1
             fieldCaption("Automatic summary is built in — pick who writes it; or take full "
                        + "control with a custom command."),                                       // 2
             sectionHeader("Automatic summary", symbol: "wand.and.stars"),                                                   // 3
@@ -2775,12 +2803,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             row("Command:", postProcessField),                                                    // 12
             fieldCaption("Freeform: runs in a login shell with the transcript path appended "
                        + "as the last argument."),                                                // 13
-        ]))
-        tabs.addTabViewItem(tab("Titling", [
+        ])
+        pane("Titling", "calendar", [
             row("", calBtn),
             row("Calendars:", calListCell),
-        ]))
-        tabs.addTabViewItem(tab("Live", [
+        ])
+        pane("Live", "captions.bubble", [
             sectionNote("Cloud caption engines stream audio off-device — only while the live overlay "
                       + "runs with that engine selected. Keys are stored in the Keychain, never in "
                       + "preferences or backups. Pick the engine in the overlay's control bar."),    // 0
@@ -2795,27 +2823,98 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             sectionHeader("Gladia", symbol: "waveform.circle"),                                      // 9
             row("API key:", gladiaKeyField),                                                         // 10
             fieldCaption("app.gladia.io — broad language coverage incl. Korean streaming."),         // 11
-        ]))
-        tabs.addTabViewItem(tab("General", [
+        ])
+        pane("General", "gearshape", [
             row("", loginBtn),
-        ]))
+        ])
 
         let saveBtn = NSButton(title: "Save & Apply", target: self, action: #selector(saveAndClose)); saveBtn.keyEquivalent = "\r"
         let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(closeOnly)); cancelBtn.keyEquivalent = "\u{1b}"
         let btns = NSStackView(views: [cancelBtn, saveBtn]); btns.orientation = .horizontal; btns.spacing = 10
         btns.translatesAutoresizingMaskIntoConstraints = false
 
+        // ── vertical navigation: search + source list on the left, one pane on the right ──
+        sidebarSearch.placeholderString = "Search"
+        sidebarSearch.target = self
+        sidebarSearch.action = #selector(searchChanged)
+        sidebarSearch.sendsSearchStringImmediately = true
+        sidebarSearch.translatesAutoresizingMaskIntoConstraints = false
+
+        sidebarList.style = .sourceList
+        sidebarList.headerView = nil
+        sidebarList.rowHeight = 30
+        sidebarList.focusRingType = .none
+        sidebarList.addTableColumn(NSTableColumn(identifier: .init("pane")))
+        sidebarList.dataSource = self
+        sidebarList.delegate = self
+        let sidebarScroll = NSScrollView()
+        sidebarScroll.documentView = sidebarList
+        sidebarScroll.hasVerticalScroller = true
+        sidebarScroll.drawsBackground = false
+        sidebarScroll.translatesAutoresizingMaskIntoConstraints = false
+
+        let sidebar = NSVisualEffectView()
+        sidebar.material = .sidebar
+        sidebar.blendingMode = .behindWindow
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(sidebarSearch); sidebar.addSubview(sidebarScroll)
+
+        paneContainer.translatesAutoresizingMaskIntoConstraints = false
+        visiblePaneIndexes = Array(panesForTest.indices)
+        sidebarList.reloadData()
+
         let content = NSView()
-        content.addSubview(tabs); content.addSubview(btns)
+        content.addSubview(sidebar); content.addSubview(paneContainer); content.addSubview(btns)
         NSLayoutConstraint.activate([
-            tabs.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
-            tabs.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            tabs.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
-            tabs.bottomAnchor.constraint(equalTo: btns.topAnchor, constant: -12),
+            sidebar.topAnchor.constraint(equalTo: content.topAnchor),
+            sidebar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            sidebar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            sidebar.widthAnchor.constraint(equalToConstant: 190),
+            sidebarSearch.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 12),
+            sidebarSearch.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 10),
+            sidebarSearch.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -10),
+            sidebarScroll.topAnchor.constraint(equalTo: sidebarSearch.bottomAnchor, constant: 8),
+            sidebarScroll.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            sidebarScroll.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            sidebarScroll.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
+            paneContainer.topAnchor.constraint(equalTo: content.topAnchor),
+            paneContainer.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            paneContainer.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            paneContainer.bottomAnchor.constraint(equalTo: btns.topAnchor, constant: -8),
             btns.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             btns.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
         window?.contentView = content
+        selectPane(0)
+        sidebarList.selectRowIndexes([0], byExtendingSelection: false)
+    }
+
+    /// Swap the visible pane. The container hosts exactly one pane at a time (same views the old
+    /// tabs held — load()/save() field wiring is untouched).
+    private func selectPane(_ index: Int) {
+        guard panesForTest.indices.contains(index) else { return }
+        selectedPane = index
+        paneContainer.subviews.forEach { $0.removeFromSuperview() }
+        let v = panesForTest[index].view
+        v.translatesAutoresizingMaskIntoConstraints = false
+        paneContainer.addSubview(v)
+        NSLayoutConstraint.activate([
+            v.topAnchor.constraint(equalTo: paneContainer.topAnchor),
+            v.leadingAnchor.constraint(equalTo: paneContainer.leadingAnchor),
+            v.trailingAnchor.constraint(equalTo: paneContainer.trailingAnchor),
+            v.bottomAnchor.constraint(equalTo: paneContainer.bottomAnchor),
+        ])
+    }
+
+    @objc private func searchChanged() {
+        visiblePaneIndexes = settingsSearchHits(query: sidebarSearch.stringValue,
+                                                index: panesForTest.map { $0.searchText })
+        sidebarList.reloadData()
+        // Auto-select the best hit so typing alone lands on the right pane.
+        if let first = visiblePaneIndexes.first {
+            sidebarList.selectRowIndexes([0], byExtendingSelection: false)
+            if selectedPane != first { selectPane(first) }
+        }
     }
 
     /// Fill the "add a running app" popup with currently-running regular apps (name + bundle id).
@@ -2837,7 +2936,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     /// Only the fields the selected mode actually uses are editable — the form reads as one choice.
     @objc private func ppModeChanged() { updatePostProcessEnabled() }
     private func updatePostProcessEnabled() {
-        let mode = PostProcessMode(rawValue: ppModeValues[max(0, ppModePopup.indexOfSelectedItem)]) ?? .off
+        let mode = PostProcessMode(rawValue: ppModeValues[max(0, ppModeSeg.selectedSegment)]) ?? .off
         for c in [runnerPopup, summaryOutField] as [NSControl] { c.isEnabled = mode == .summary }
         summaryChooseBtn?.isEnabled = mode == .summary
         promptFileField.isEnabled = mode == .summary
@@ -2919,9 +3018,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         postProcessField.stringValue = Pref.postProcessCommand               // same explicit-save semantics
         // Show the EFFECTIVE mode (incl. the v1 migration: unset mode + v1 command = Custom command) —
         // displaying Off while a hook is live would let Save silently kill it.
-        ppModePopup.selectItem(at: idx(effectivePostProcessMode(
+        ppModeSeg.selectedSegment = idx(effectivePostProcessMode(
             rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
-            shellCmd: Pref.postProcessCommand).rawValue, ppModeValues))
+            shellCmd: Pref.postProcessCommand).rawValue, ppModeValues)
         runnerPopup.selectItem(at: idx(Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER"), runnerValues))
         let savedPrompt = Pref.explicit(Pref.summaryPrompt, "MR_SUMMARY_PROMPT")
         promptView.string = savedPrompt.isEmpty ? defaultSummaryPrompt : savedPrompt   // show the editable default
@@ -3018,7 +3117,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         d.set(customModelField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.customModel)
         d.set(openaiBaseField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.openaiBase)
         d.set(postProcessField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.postProcessCmd)
-        d.set(ppModeValues[max(0, ppModePopup.indexOfSelectedItem)], forKey: Pref.postProcessMode)
+        d.set(ppModeValues[max(0, ppModeSeg.selectedSegment)], forKey: Pref.postProcessMode)
         d.set(runnerValues[max(0, runnerPopup.indexOfSelectedItem)], forKey: Pref.summaryRunner)
         d.set(promptView.string.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryPrompt)
         d.set(promptFileField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryPromptFile)
@@ -5362,6 +5461,37 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quit() { stopEngineSync(); NSApp.terminate(nil) }
 }
 
+extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
+    func numberOfRows(in tableView: NSTableView) -> Int { visiblePaneIndexes.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let p = panesForTest[visiblePaneIndexes[row]]
+        let cell = NSTableCellView()
+        let icon = NSImageView(image: NSImage(systemSymbolName: p.symbol, accessibilityDescription: p.title) ?? NSImage())
+        icon.contentTintColor = .controlAccentColor
+        let label = NSTextField(labelWithString: p.title)
+        label.font = .systemFont(ofSize: 13)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        label.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(icon); cell.addSubview(label)
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 20),
+            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
+            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -4),
+        ])
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        let row = sidebarList.selectedRow
+        guard row >= 0, visiblePaneIndexes.indices.contains(row) else { return }
+        selectPane(visiblePaneIndexes[row])
+    }
+}
+
 extension AppController: UNUserNotificationCenterDelegate {
     /// Menu-bar agents count as "foreground", which by default swallows banners — show them anyway.
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
@@ -5678,33 +5808,36 @@ struct Main {
             // (Post-process settings were unreachable). Every pane must host its grid in a scroll view,
             // and Post-process must be its own tab. Headless: builds the real form, no window shown.
             let sw = SettingsWindowController(onSave: {})
-            if let tv = sw.tabsForTest {
-                let allScroll = tv.tabViewItems.allSatisfy { item in
-                    item.view?.subviews.contains { ($0 as? NSScrollView)?.documentView != nil } ?? false
+            let panes = sw.panesForTest
+            check("settings: panes built for inspection", !panes.isEmpty)
+            check("settings: every pane scrolls (rows can never be clipped away)",
+                  panes.allSatisfy { p in p.view.subviews.contains { ($0 as? NSScrollView)?.documentView != nil } })
+            check("settings: Post-process and Schedule are their own panes",
+                  panes.contains { $0.title == "Post-process" } && panes.contains { $0.title == "Schedule" })
+            // Layout regression (user-reported: Post-process UI broke): every merged row must be a
+            // marker-typed header/note — a stale hand-kept index list once merged a real field row
+            // ("Save summary to") into a section header, destroying its label+control layout.
+            var intact = true
+            for p in panes {
+                guard let grid = firstGrid(in: p.view) else { intact = false; continue }
+                for r in 0..<grid.numberOfRows {
+                    let c0 = grid.cell(atColumnIndex: 0, rowIndex: r).contentView
+                    let merged = grid.numberOfColumns > 1
+                        && grid.cell(atColumnIndex: 1, rowIndex: r).contentView === c0
+                    let isRoleRow = c0 is SectionHeaderCell || c0 is CaptionCell
+                    if merged && !isRoleRow { intact = false }   // a field row got eaten by a header merge
                 }
-                check("settings: every tab pane scrolls (rows can never be clipped away)", allScroll)
-                check("settings: Post-process is its own tab",
-                      tv.tabViewItems.contains { $0.label == "Post-process" })
-                check("settings: Schedule is its own tab",
-                      tv.tabViewItems.contains { $0.label == "Schedule" })
-                // Layout regression (user-reported: Post-process UI broke): every merged row must be a
-                // marker-typed header/note — a stale hand-kept index list once merged a real field row
-                // ("Save summary to") into a section header, destroying its label+control layout.
-                var intact = true
-                for item in tv.tabViewItems {
-                    guard let grid = firstGrid(in: item.view) else { intact = false; continue }
-                    for r in 0..<grid.numberOfRows {
-                        let c0 = grid.cell(atColumnIndex: 0, rowIndex: r).contentView
-                        let merged = grid.numberOfColumns > 1
-                            && grid.cell(atColumnIndex: 1, rowIndex: r).contentView === c0
-                        let isRoleRow = c0 is SectionHeaderCell || c0 is CaptionCell
-                        if merged && !isRoleRow { intact = false }   // a field row got eaten by a header merge
-                    }
-                }
-                check("settings: only role-marked rows are merged (no field row eaten)", intact)
-            } else {
-                check("settings: tabs built for inspection", false)
             }
+            check("settings: only role-marked rows are merged (no field row eaten)", intact)
+            // Sidebar search: pane content (not just titles) is the index — "prompt" finds
+            // Post-process, junk finds nothing, empty shows everything in order.
+            check("settings: sidebar search matches pane content",
+                  settingsSearchHits(query: "prompt", index: panes.map { $0.searchText })
+                      .contains(panes.firstIndex { $0.title == "Post-process" } ?? -1)
+                  && settingsSearchHits(query: "", index: panes.map { $0.searchText }) == Array(panes.indices)
+                  && settingsSearchHits(query: "zzxqy", index: panes.map { $0.searchText }).isEmpty
+                  && settingsSearchHits(query: "API KEY", index: panes.map { $0.searchText })
+                      .contains(panes.firstIndex { $0.title == "Live" } ?? -1))
             // Role derivation is pure — headers from marker col-0, notes from marker col-1, fields plain.
             let rolesProbe = formRowRoles([[SectionHeaderCell(), NSView()], [NSView(), NSView()],
                                            [NSView(), CaptionCell(labelWithString: "c")],
