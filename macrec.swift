@@ -4711,14 +4711,26 @@ final class LiveCaptions {
         let gen = engineGen
         let lineTime = line.time
         if final {
-            let full = line.text
             lines[index].transFinal = true
+            // The streamed translation (confirmed sentences + last tail) is already on screen.
+            // Re-translating the FULL text here was the longest possible request on a session
+            // that serializes — the NEXT line's first tail queued behind it ("second line is
+            // slow" — user report). Promote what's shown instead; only lines that never got any
+            // streaming translation (e.g. translation just switched on) still pay a full pass.
+            if lines[index].translated != nil {
+                if let tail = lines[index].transTail {
+                    lines[index].transParts.append(tail)   // freeze the volatile tail as the last part
+                    lines[index].transTail = nil
+                }
+                return
+            }
+            let full = line.text
             Task { [weak self] in
                 guard let out = await translator.translate(full) else { return }
                 await MainActor.run {
                     guard let self, self.engineGen == gen,
                           let k = self.lines.lastIndex(where: { $0.time == lineTime }) else { return }
-                    self.lines[k].transParts = [out]   // authoritative full replacement
+                    self.lines[k].transParts = [out]   // authoritative full pass (had nothing streamed)
                     self.lines[k].transTail = nil
                     self.render()
                 }
