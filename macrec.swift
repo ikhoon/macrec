@@ -2137,6 +2137,13 @@ func speechlikeFrames(_ samples: [Float], threshold: Float = 0.02, minRun: Int =
     return total
 }
 
+/// Self-clocking tail scheduler's fire decision — exactly one request in flight, refire only when
+/// the tail actually moved, never after finalization. Pure + testable (the timing regressions
+/// "not real-time" and "second line slow" both lived in this decision).
+func shouldFireTailTranslation(tail: String, lastSent: String, inFlight: Bool, final: Bool) -> Bool {
+    !final && !inFlight && !tail.isEmpty && tail != lastSent
+}
+
 /// Sentences that have COMPLETED inside a growing partial (terminator seen) — the unfinished tail
 /// is excluded. A '.' only terminates when followed by whitespace, so "3.5" never splits and the
 /// final period of a still-streaming line waits for its confirming space. Drives sentence-streamed
@@ -4518,7 +4525,12 @@ final class LiveCaptions {
         var tailLastSent = ""               // tail text of the in-flight/last request (skip if unchanged)
         var tailSentAt: Double = 0          // floor between back-to-back refires
         var translated: String? {
-            let parts = transParts.compactMap { $0 } + (transTail.map { [$0] } ?? [])
+            // IN-ORDER prefix only: sentence translations land async, and rendering part 2 while
+            // part 1 is still in flight would show the translation out of order. The tail always
+            // renders last (it is by definition the newest region).
+            var parts: [String] = []
+            for p in transParts { guard let p else { break }; parts.append(p) }
+            if let t = transTail { parts.append(t) }
             return parts.isEmpty ? nil : parts.joined(separator: " ")
         }
     }
@@ -4776,10 +4788,10 @@ final class LiveCaptions {
 
     private func fireTailTranslation(lineTime: Date, gen: Int) {
         guard let translator, engineGen == gen,
-              let k = lines.lastIndex(where: { $0.time == lineTime }),
-              !lines[k].transFinal, !lines[k].tailInFlight else { return }
+              let k = lines.lastIndex(where: { $0.time == lineTime }) else { return }
         let tail = currentTail(of: lines[k].text, complete: completeSentences(lines[k].text))
-        guard !tail.isEmpty, tail != lines[k].tailLastSent else { return }
+        guard shouldFireTailTranslation(tail: tail, lastSent: lines[k].tailLastSent,
+                                        inFlight: lines[k].tailInFlight, final: lines[k].transFinal) else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let wait = max(0, 0.15 - (now - lines[k].tailSentAt))
         lines[k].tailInFlight = true
@@ -6367,6 +6379,28 @@ struct Main {
                   == "mkdir -p '/d/2026-07' && cat '/s/a.md' '/s/b'\\''s.md' | claude -p 'P' "
                    + "> '/d/2026-07/x.md.partial' && mv '/d/2026-07/x.md.partial' '/d/2026-07/x.md'"
                   && dailyDigestInvocation(runner: .claude, prompt: "P", inputs: [], outPath: "/d/x.md") == nil)
+            // Tail-scheduler decision — both timing regressions ("not real-time" = timer wait,
+            // "second line slow" = firing while another request was in flight) lived here.
+            check("live: tail fire decision (one in flight, only when moved, never after final)",
+                  shouldFireTailTranslation(tail: "새 꼬리", lastSent: "", inFlight: false, final: false)
+                  && !shouldFireTailTranslation(tail: "같음", lastSent: "같음", inFlight: false, final: false)
+                  && !shouldFireTailTranslation(tail: "새 꼬리", lastSent: "옛", inFlight: true, final: false)
+                  && !shouldFireTailTranslation(tail: "새 꼬리", lastSent: "", inFlight: false, final: true)
+                  && !shouldFireTailTranslation(tail: "", lastSent: "옛", inFlight: false, final: false))
+            // Rendering must stay IN ORDER while sentence translations land async: part 2 landing
+            // before part 1 must NOT display until part 1 arrives; the volatile tail renders last.
+            if #available(macOS 26, *) {
+                var cl = LiveCaptions.CapLine(speaker: "나", text: "a. b. c", final: false, time: Date())
+                cl.transParts = [nil, "TWO"]
+                cl.transTail = "tail"
+                let outOfOrderHidden = cl.translated == "tail"        // part 2 waits for part 1
+                cl.transParts = ["ONE", "TWO"]
+                let ordered = cl.translated == "ONE TWO tail"
+                cl.transTail = nil
+                let frozen = cl.translated == "ONE TWO"
+                check("live: translation renders in order (late part 1 gates part 2; tail last)",
+                      outOfOrderHidden && ordered && frozen)
+            }
             // Live translation streams per COMPLETED sentence — the splitter must not fire on
             // decimals or on a trailing period that hasn't been confirmed by a following space.
             check("live: sentence splitter (decimals safe, tail waits, hard punct immediate)",
