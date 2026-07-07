@@ -4514,8 +4514,9 @@ final class LiveCaptions {
         var transRequested = 0              // how many complete sentences have been sent to translate
         var transFinal = false              // the authoritative full-text translation has landed
         var transTail: String? = nil        // live translation of the UNFINISHED tail (volatile)
-        var tailReq: Double = 0             // throttle stamp for tail requests
-        var tailApplied: Double = 0         // ordering stamp — a stale tail result never overwrites a newer one
+        var tailInFlight = false            // ONE tail request at a time — landing refires with the newest tail
+        var tailLastSent = ""               // tail text of the in-flight/last request (skip if unchanged)
+        var tailSentAt: Double = 0          // floor between back-to-back refires
         var translated: String? {
             let parts = transParts.compactMap { $0 } + (transTail.map { [$0] } ?? [])
             return parts.isEmpty ? nil : parts.joined(separator: " ")
@@ -4742,32 +4743,49 @@ final class LiveCaptions {
             }
             lines[index].transRequested = complete.count
         }
-        // Live tail: the words after the last completed sentence translate on a short throttle, so
-        // the translation follows word-by-word (user ask) — only this tail region ever rewrites.
-        let tail: String
-        if let last = complete.last, let r = line.text.range(of: last, options: .backwards) {
-            tail = String(line.text[r.upperBound...]).trimmingCharacters(in: .whitespaces)
-        } else {
-            tail = complete.isEmpty ? line.text : ""
+        // Live tail — SELF-CLOCKING: exactly one request in flight; the moment a result lands it
+        // refires with the newest tail if it moved. Latency = the model's own speed (~0.2-0.4 s),
+        // not a timer (the old 0.5 s throttle read as "not real-time" — user report). A small
+        // 0.15 s floor stops single-keystroke hammering.
+        let tail = currentTail(of: line.text, complete: complete)
+        if tail.isEmpty, lines[index].transTail != nil, complete.count == lines[index].transRequested {
+            lines[index].transTail = nil   // tail fully consumed into confirmed sentences
         }
+        fireTailTranslation(lineTime: lineTime, gen: gen)
+    }
+
+    /// The words after the last completed sentence — the volatile region live translation chases.
+    private func currentTail(of text: String, complete: [String]) -> String {
+        if let last = complete.last, let r = text.range(of: last, options: .backwards) {
+            return String(text[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+        }
+        return complete.isEmpty ? text : ""
+    }
+
+    private func fireTailTranslation(lineTime: Date, gen: Int) {
+        guard let translator, engineGen == gen,
+              let k = lines.lastIndex(where: { $0.time == lineTime }),
+              !lines[k].transFinal, !lines[k].tailInFlight else { return }
+        let tail = currentTail(of: lines[k].text, complete: completeSentences(lines[k].text))
+        guard !tail.isEmpty, tail != lines[k].tailLastSent else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        if !tail.isEmpty, now - lines[index].tailReq >= 0.5 {
-            lines[index].tailReq = now
-            let stamp = now
-            Task { [weak self] in
-                guard let out = await translator.translate(tail) else { return }
-                await MainActor.run {
-                    guard let self, self.engineGen == gen,
-                          let k = self.lines.lastIndex(where: { $0.time == lineTime }),
-                          !self.lines[k].transFinal, stamp > self.lines[k].tailApplied else { return }
-                    self.lines[k].tailApplied = stamp
+        let wait = max(0, 0.15 - (now - lines[k].tailSentAt))
+        lines[k].tailInFlight = true
+        lines[k].tailLastSent = tail
+        lines[k].tailSentAt = now + wait
+        Task { [weak self] in
+            if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
+            let out = await translator.translate(tail)
+            await MainActor.run {
+                guard let self, self.engineGen == gen else { return }
+                guard let k = self.lines.lastIndex(where: { $0.time == lineTime }) else { return }
+                self.lines[k].tailInFlight = false
+                if !self.lines[k].transFinal, let out {
                     self.lines[k].transTail = out
                     self.render()
                 }
+                self.fireTailTranslation(lineTime: lineTime, gen: gen)   // tail moved meanwhile? chase it
             }
-        } else if tail.isEmpty, lines[index].transTail != nil, complete.count == lines[index].transRequested {
-            // Tail fully consumed into confirmed sentences — retire the volatile copy.
-            lines[index].transTail = nil
         }
     }
     // Volatile results arrive many times/sec from BOTH transcribers; rebuilding the whole overlay
