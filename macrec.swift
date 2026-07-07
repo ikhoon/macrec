@@ -156,14 +156,22 @@ final class SourceWriter {
     var recentLevel: Float = 0   // peak of the most recent buffer — for the live menu meter
     var voicedFrames: AVAudioFramePosition = 0   // # samples above the voice threshold
     static let voiceThreshold: Float = 0.02      // ~-34 dBFS — speech-ish floor
+    // Speech-RUN accounting: real speech holds above the threshold for ≥50 ms at a time; electrical
+    // clicks/pops from a dead or misrouted input (the "외장 마이크" jack incident: hours of segments
+    // "voiced" by clicks, every one transcribing to nothing) never form such runs.
+    static let speechRunFrames = 800             // 50 ms @ 16 kHz
+    var speechFrames: AVAudioFramePosition = 0   // samples inside ≥50 ms voiced runs
+    private var voicedRun = 0                    // current contiguous run length
 
     /// Seconds of "voiced" (above-threshold) audio — used to decide if a segment is worth transcribing.
     var voicedSeconds: Double { Double(voicedFrames) / canon.sampleRate }
+    /// Seconds inside sustained (speech-length) voiced runs — near zero for click/pop-only audio.
+    var speechSeconds: Double { Double(speechFrames) / canon.sampleRate }
 
     var stats: String {
         let secs = Double(framesOut) / canon.sampleRate
-        return String(format: "%@: %.1fs peak=%.4f voiced=%.1fs buffersIn=%d convErrors=%d srcRate=%.0f",
-                      url.lastPathComponent, secs, peak, voicedSeconds, buffersIn, convErrors, srcFormat?.sampleRate ?? 0)
+        return String(format: "%@: %.1fs peak=%.4f voiced=%.1fs speech=%.1fs buffersIn=%d convErrors=%d srcRate=%.0f",
+                      url.lastPathComponent, secs, peak, voicedSeconds, speechSeconds, buffersIn, convErrors, srcFormat?.sampleRate ?? 0)
     }
 
     init(url: URL) throws {
@@ -214,7 +222,17 @@ final class SourceWriter {
             for i in 0..<Int(outBuf.frameLength) {
                 let a = abs(p[i])
                 if a > bufMax { bufMax = a }
-                if a > SourceWriter.voiceThreshold { voicedFrames += 1 }
+                if a > SourceWriter.voiceThreshold {
+                    voicedFrames += 1
+                    voicedRun += 1
+                    if voicedRun == SourceWriter.speechRunFrames {
+                        speechFrames += AVAudioFramePosition(voicedRun)   // run qualified — count it all
+                    } else if voicedRun > SourceWriter.speechRunFrames {
+                        speechFrames += 1
+                    }
+                } else {
+                    voicedRun = 0
+                }
             }
             if bufMax > peak { peak = bufMax }
             recentLevel = bufMax   // live meter
@@ -740,6 +758,9 @@ final class MicCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             guard let dev = AVCaptureDevice.default(for: .audio) else {
                 throw NSError(domain: "macrec", code: 4, userInfo: [NSLocalizedDescriptionKey: "no default audio input device"])
             }
+            // The one log line that would have named this incident immediately: hours of dead
+            // segments traced to the default input being a mic-less jack device ("외장 마이크").
+            elog("mic: capturing from '\(dev.localizedName)'")
             let input = try AVCaptureDeviceInput(device: dev)
             session.beginConfiguration()
             if session.canAddInput(input) { session.addInput(input) }
@@ -1084,6 +1105,8 @@ struct CompletedSegment {
     let micURL: URL
     let micVoicedSeconds: Double
     let sysVoicedSeconds: Double
+    let micSpeechSeconds: Double   // voiced time inside sustained (>=50 ms) runs — clicks contribute ~0
+    let sysSpeechSeconds: Double
     let sysPeak: Float
     let micPeak: Float
     let durationSeconds: Double
@@ -1265,6 +1288,7 @@ final class CaptureSession {
             guard let sys = rec.sysWriter, let mic = rec.micWriter else { return }
             done = CompletedSegment(start: segStart, sysURL: sys.url, micURL: mic.url,
                                     micVoicedSeconds: mic.voicedSeconds, sysVoicedSeconds: sys.voicedSeconds,
+                                    micSpeechSeconds: mic.speechSeconds, sysSpeechSeconds: sys.speechSeconds,
                                     sysPeak: sys.peak, micPeak: mic.peak,
                                     durationSeconds: now.timeIntervalSince(segStart))
             if continueRecording {
@@ -1591,6 +1615,7 @@ final class RecordingEngine {
     private(set) var running = false
     private var recovering = false
     private var suspended = false   // true while the display/system is asleep
+    private var warnedDeadMic = false            // one dead-mic push per engine run (not per hour)
     var onTranscriptSaved: ((String) -> Void)?   // (message) — for refreshing UI state
     var onTranscriptURL: ((URL) -> Void)?        // path of the saved transcript file — notification click → open file
     var onSegmentResult: ((String) -> Void)?      // (message) — notify even when dropped for no speech
@@ -1794,6 +1819,18 @@ final class RecordingEngine {
 
     private func process(_ seg: CompletedSegment) {
         elog("engine: segment \(segFormatter().string(from: seg.start)) — voiced mic=\(String(format: "%.1f", seg.micVoicedSeconds))s sys=\(String(format: "%.1f", seg.sysVoicedSeconds))s (micPeak=\(String(format: "%.3f", seg.micPeak)) sysPeak=\(String(format: "%.3f", seg.sysPeak))) dur=\(Int(seg.durationSeconds))s")
+        // Dead/misrouted input detector: the ENERGY gate says the mic was active, but nothing held
+        // above the threshold for speech-length runs — clicks/hum, not a voice. Surface it instead
+        // of silently discarding "no speech" segments for hours (the jack-input incident).
+        if micLooksDead(voiced: seg.micVoicedSeconds, speech: seg.micSpeechSeconds) {
+            elog("engine: MIC WARNING — energy without speech-length runs; input device may be dead/misrouted")
+            onSegmentResult?("Mic looks dead — check the input device (Sound → Input)")
+            if !warnedDeadMic {
+                warnedDeadMic = true
+                Notifier.push(title: "macrec can't hear a voice",
+                              body: "The mic records energy but nothing speech-like. Check System Settings → Sound → Input.")
+            }
+        }
         // debugKeepTrackAudio: keep the PER-TRACK mic/sys wavs (normally deleted after the mix) in
         // workDir — transcription-quality A/B work (echo-dedup validation against real meetings)
         // needs the separated tracks, and the mixed wav can't be un-mixed. Off by default; workDir
@@ -2078,6 +2115,26 @@ struct RecordSchedule: Equatable {
              days: Pref.explicit(Pref.schedDays, "MR_SCHEDULE_DAYS"),
              hours: Pref.explicit(Pref.schedHours, "MR_SCHEDULE_HOURS"))
     }
+}
+
+/// Dead/misrouted-input verdict: plenty of ENERGY-gate "voiced" time but almost none of it in
+/// sustained speech-length runs. Real speech always forms >=50 ms runs; electrical clicks and hum
+/// from a mic-less input never do. Pure + testable.
+func micLooksDead(voiced: Double, speech: Double) -> Bool {
+    voiced >= 5 && speech < 0.5
+}
+
+/// Reference implementation of the writer's speech-run accounting (samples inside >=minRun
+/// contiguous above-threshold runs) — selftests pin the semantics here.
+func speechlikeFrames(_ samples: [Float], threshold: Float = 0.02, minRun: Int = 800) -> Int {
+    var total = 0, run = 0
+    for a in samples.map({ abs($0) }) {
+        if a > threshold {
+            run += 1
+            if run == minRun { total += run } else if run > minRun { total += 1 }
+        } else { run = 0 }
+    }
+    return total
 }
 
 // MARK: - transcript-level echo suppression (belt to the AEC's braces)
@@ -6196,6 +6253,20 @@ struct Main {
             check("naming: transcript base is the start time only",
                   transcriptBaseName(start: schedDate("2026-07-05 21:00"), timeZone: utc.timeZone) == "2026-07-05-2100"
                   && transcriptBaseName(start: schedDate("2026-07-05 23:50"), timeZone: utc.timeZone) == "2026-07-05-2350")
+            // Dead-mic detection — the jack-input incident: hours of segments "voiced" by clicks
+            // (energy-gate trips) while containing zero speech-length runs, all discarded silently.
+            check("mic guard: speech-run accounting (clicks never qualify, speech does)",
+                  speechlikeFrames(Array(repeating: 0.5, count: 799) + [0.0]) == 0        // 49.9 ms — just under
+                  && speechlikeFrames(Array(repeating: 0.5, count: 800)) == 800           // 50 ms run qualifies fully
+                  && speechlikeFrames(Array(repeating: 0.5, count: 1200)) == 1200
+                  && speechlikeFrames((0..<8000).map { $0 % 100 < 8 ? 0.5 : 0.0 }) == 0   // click train
+                  && speechlikeFrames(Array(repeating: 0.5, count: 900) + Array(repeating: 0.0, count: 100)
+                                      + Array(repeating: 0.5, count: 900)) == 1800)       // two syllables
+            check("mic guard: dead-input verdict (energy without speech runs)",
+                  micLooksDead(voiced: 44.1, speech: 0.1)      // the real incident segment
+                  && !micLooksDead(voiced: 22.4, speech: 8.0)  // real speech
+                  && !micLooksDead(voiced: 3.0, speech: 0.0)   // quiet hour — no verdict
+                  && !micLooksDead(voiced: 6.0, speech: 0.6))  // borderline but speech present
             // Hallucination scrubbing — the exact failure classes from our junk transcripts:
             // a broadcast hour where one sentence repeated for 15 minutes, YouTube-outro
             // boilerplate on quiet rooms, "oh oh oh…" degeneration. Real speech must survive.
