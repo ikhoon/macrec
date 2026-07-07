@@ -2490,6 +2490,7 @@ final class CaptionPanel: NSPanel {
 /// padding) is derived instead of hand-indexed — inserting a row can no longer desync a styling list.
 final class SectionHeaderCell: NSStackView {}   // col 0 → full-width merged section header
 final class CaptionCell: NSTextField {}         // col 0 → full-width intro note; col 1 → field caption
+final class ToggleCell: NSStackView {}          // col 0 → full-width, LEFT-aligned boolean row (checkbox)
 
 /// Find the first NSGridView in a view tree (the settings selftest inspects panes through their
 /// scroll-view wrapper).
@@ -2505,7 +2506,7 @@ func firstGrid(in view: NSView?) -> NSGridView? {
 func formRowRoles(_ rows: [[NSView]]) -> (headers: [Int], notes: [Int]) {
     var headers: [Int] = [], notes: [Int] = []
     for (i, r) in rows.enumerated() {
-        if r.first is SectionHeaderCell || r.first is CaptionCell { headers.append(i) }
+        if r.first is SectionHeaderCell || r.first is CaptionCell || r.first is ToggleCell { headers.append(i) }
         else if r.count > 1, r[1] is CaptionCell { notes.append(i) }
     }
     return (headers, notes)
@@ -2671,10 +2672,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         }
         let maxDoc = panesForTest
             .compactMap { docView(in: $0.view)?.fittingSize }
-            .reduce(NSSize(width: 560, height: 420)) { NSSize(width: max($0.width, $1.width),
+            .reduce(NSSize(width: 540, height: 420)) { NSSize(width: max($0.width, $1.width),
                                                               height: max($0.height, $1.height)) }
-        w.setContentSize(NSSize(width: max(600, maxDoc.width) + 190,   // +sidebar
-                                height: min(maxDoc.height + 70, (NSScreen.main?.visibleFrame.height ?? 900) - 60)))
+        // Width fits the widest FORM (no horizontal scroll); height is a MODERATE fixed default —
+        // sizing to the tallest pane made the window huge and the sparse panes (General) look empty.
+        // Tall panes (Recording, Post-process) scroll, like System Settings.
+        w.setContentSize(NSSize(width: max(560, maxDoc.width) + 200,   // +sidebar
+                                height: 560))
         w.center()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -2696,40 +2700,40 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         }
         for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField, gladiaKeyField, postProcessField, promptFileField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
-        dirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
-        audioDirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
-        customModelField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        dirField.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        audioDirField.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        customModelField.widthAnchor.constraint(equalToConstant: 340).isActive = true
         customModelField.placeholderString = "https://…/ggml-model.bin  or  /path/to/model.bin"
-        deepgramKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        deepgramKeyField.widthAnchor.constraint(equalToConstant: 340).isActive = true
         deepgramKeyField.placeholderString = "Deepgram API key"
-        openaiKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        openaiKeyField.widthAnchor.constraint(equalToConstant: 340).isActive = true
         openaiKeyField.placeholderString = "sk-…"
-        openaiBaseField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
-        gladiaKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        openaiBaseField.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        gladiaKeyField.widthAnchor.constraint(equalToConstant: 340).isActive = true
         gladiaKeyField.placeholderString = "Gladia API key"
-        promptFileField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        promptFileField.widthAnchor.constraint(equalToConstant: 340).isActive = true
         promptFileField.placeholderString = "~/notes/summary-prompt.md"
-        postProcessField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        postProcessField.widthAnchor.constraint(equalToConstant: 340).isActive = true
         postProcessField.placeholderString = "~/bin/my-pipeline.sh"
         summaryOutField.translatesAutoresizingMaskIntoConstraints = false
-        summaryOutField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        summaryOutField.widthAnchor.constraint(equalToConstant: 340).isActive = true
         summaryOutField.placeholderString = "empty = next to the transcript"
         dailyOutField.translatesAutoresizingMaskIntoConstraints = false
-        dailyOutField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        dailyOutField.widthAnchor.constraint(equalToConstant: 340).isActive = true
         dailyOutField.placeholderString = "empty = Daily folder next to the summaries"
         dailyTimePicker.datePickerStyle = .textFieldAndStepper
         dailyTimePicker.datePickerElements = .hourMinute
         dailyTimePicker.translatesAutoresizingMaskIntoConstraints = false
         for f in [schedDaysField, schedHoursField] {
             f.translatesAutoresizingMaskIntoConstraints = false
-            f.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+            f.widthAnchor.constraint(equalToConstant: 340).isActive = true
             f.delegate = self   // live red-on-invalid feedback (fail-open would record 24/7 silently)
         }
         schedDaysField.placeholderString = "mon-fri"
         schedHoursField.placeholderString = "10:00-12:00, 13:00-19:00"
         for f in [hintsTermsField, hintsFileField] {
             f.translatesAutoresizingMaskIntoConstraints = false
-            f.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+            f.widthAnchor.constraint(equalToConstant: 340).isActive = true
         }
         hintsTermsField.placeholderString = "Kubernetes, gRPC, John Doe, …"
         hintsFileField.placeholderString = "~/notes/hints.txt"
@@ -2739,14 +2743,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         for f in [dirField, audioDirField, customModelField, hintsFileField, promptFileField,
                   summaryOutField, postProcessField] {
             f.cell?.lineBreakMode = .byTruncatingHead
-            f.widthAnchor.constraint(greaterThanOrEqualToConstant: 380).isActive = true
+            f.widthAnchor.constraint(equalToConstant: 340).isActive = true
         }
         // Multiline prompt editor (user feedback: a one-line field is too small for a real prompt).
         promptScroll.translatesAutoresizingMaskIntoConstraints = false
         promptScroll.hasVerticalScroller = true
         promptScroll.autohidesScrollers = true
         promptScroll.borderType = .bezelBorder
-        promptScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        promptScroll.widthAnchor.constraint(equalToConstant: 340).isActive = true
         promptScroll.heightAnchor.constraint(equalToConstant: 84).isActive = true
         promptView.isRichText = false
         promptView.font = .systemFont(ofSize: 12)
@@ -2762,7 +2766,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         dailyPromptScroll.hasVerticalScroller = true
         dailyPromptScroll.autohidesScrollers = true
         dailyPromptScroll.borderType = .bezelBorder
-        dailyPromptScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        dailyPromptScroll.widthAnchor.constraint(equalToConstant: 340).isActive = true
         dailyPromptScroll.heightAnchor.constraint(equalToConstant: 66).isActive = true
         dailyPromptView.isRichText = false
         dailyPromptView.font = .systemFont(ofSize: 12)
@@ -2774,7 +2778,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         dailyPromptView.textContainer?.widthTracksTextView = true
         dailyPromptScroll.documentView = dailyPromptView
         dailyPromptFileField.translatesAutoresizingMaskIntoConstraints = false
-        dailyPromptFileField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        dailyPromptFileField.widthAnchor.constraint(equalToConstant: 340).isActive = true
         dailyPromptFileField.placeholderString = "empty = the prompt above"
         ppModeSeg.segmentCount = ppModeTitles.count
         for (i, t) in ppModeTitles.enumerated() { ppModeSeg.setLabel(t, forSegment: i) }
@@ -2787,7 +2791,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         excludeTokens.translatesAutoresizingMaskIntoConstraints = false
         excludeTokens.tokenizingCharacterSet = CharacterSet(charactersIn: ", ")
         excludeTokens.placeholderString = "e.g. com.spotify.client"
-        excludeTokens.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
+        excludeTokens.widthAnchor.constraint(equalToConstant: 340).isActive = true
         populateRunningApps()
 
         let calListCell = buildCalendarList()
@@ -2801,34 +2805,32 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         dailyChooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseDailyDir))
         let dailyStack = NSStackView(views: [dailyOutField, dailyChooseBtn!]); dailyStack.orientation = .horizontal; dailyStack.spacing = 6
 
-        // Grouped into tabs (each pane stays short) instead of one long scrolling form.
+        // Row vocabulary. Roles are carried by marker types (SectionHeaderCell / CaptionCell /
+        // ToggleCell) and derived by formRowRoles — hand-maintained index lists went stale the
+        // moment rows were inserted (a field row once shipped merged as a header).
         func row(_ label: String, _ control: NSView) -> [NSView] { [labeled(label), control] }
-        // Section header (semibold + SF Symbol, spans both columns) and field caption (small gray hint
-        // under a field) — the grouping vocabulary for denser tabs. The icon is what makes sections
-        // read as sections at a glance; it matches the TEXT color (user feedback: the accent-blue
-        // version read poorly — tinted icons look like links, and contrast suffered in dark mode).
-        // Row ROLES are carried by marker types (SectionHeaderCell / CaptionCell) and derived by
-        // formRowRoles — the old hand-maintained index lists went stale the moment rows were inserted
-        // (regression: the Post-process tab shipped with a field row merged as a header).
+        // A boolean row: the checkbox spans BOTH columns, LEFT-aligned at the label column start,
+        // so it never floats indented under the control column (adversarial review + user report).
+        func toggle(_ b: NSView) -> [NSView] {
+            let c = ToggleCell(views: [b]); c.orientation = .horizontal; c.alignment = .centerY
+            return [c, NSView()]
+        }
+        // Section header — 15pt semibold, the missing middle rung of the 16→15→13→11 type scale.
+        // No decorative glyph (adversarial review: the tinted symbols read as noise).
         func sectionHeader(_ s: String, symbol: String? = nil) -> [NSView] {
             let l = NSTextField(labelWithString: s)
-            l.font = .systemFont(ofSize: 13, weight: .semibold)
-            var content: [NSView] = [l]
-            if let symbol, let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
-                let iv = NSImageView(image: img)
-                iv.symbolConfiguration = .init(pointSize: 13, weight: .semibold)
-                iv.contentTintColor = .labelColor
-                iv.setContentHuggingPriority(.required, for: .horizontal)
-                content = [iv, l]
-            }
-            let st = SectionHeaderCell(views: content)
+            l.font = .systemFont(ofSize: 15, weight: .semibold)
+            l.textColor = .labelColor
+            let st = SectionHeaderCell(views: [l])
             st.orientation = .horizontal; st.spacing = 6; st.alignment = .centerY
             return [st, NSView()]
         }
+        // Captions are the smallest + dimmest text in the window (11pt tertiary) — a clear step
+        // below field labels, so help text stops competing with controls.
         func captionLabel(_ s: String, width: CGFloat) -> CaptionCell {
             let l = CaptionCell(wrappingLabelWithString: s)
             l.font = .systemFont(ofSize: 11)
-            l.textColor = .secondaryLabelColor
+            l.textColor = .tertiaryLabelColor
             l.preferredMaxLayoutWidth = width
             return l
         }
@@ -2852,72 +2854,36 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             }.filter { !$0.isEmpty }
         }
 
-        // One rounded CARD per section (System Settings style): rows split at SectionHeaderCell
-        // boundaries; the header sits above its card, captions live inside. The subtle dynamic
-        // fill + hairline border give depth in BOTH appearances (dark mode used to be a flat
-        // black wall; light mode a flat white one).
-        let cardFill = NSColor(name: nil) { app in
-            app.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                ? NSColor.white.withAlphaComponent(0.07)
-                : NSColor.black.withAlphaComponent(0.04)
-        }
         func pane(_ title: String, _ symbol: String, _ tint: NSColor, _ rows: [[NSView]]) {
-            var sections: [(header: NSView?, rows: [[NSView]])] = []
-            var current: (header: NSView?, rows: [[NSView]]) = (nil, [])
-            for r in rows {
-                if r.first is SectionHeaderCell {
-                    if current.header != nil || !current.rows.isEmpty { sections.append(current) }
-                    current = (r.first, [])
-                } else { current.rows.append(r) }
+            // ONE NSGridView per pane — the layout that shipped working for months — with a bold
+            // page title above it. The NSBox "card per section" variant floated its grids (NSBox
+            // does not constrain an autolayout contentView) and shipped visually destroyed; the
+            // `settings-snapshot` UI test kit now makes that class of breakage impossible to miss.
+            let grid = NSGridView(views: rows)
+            grid.translatesAutoresizingMaskIntoConstraints = false
+            grid.rowSpacing = 8; grid.columnSpacing = 12
+            grid.column(at: 0).xPlacement = .trailing
+            grid.column(at: 0).width = 200   // CONSTANT label column across all panes → one shared
+                                             // left edge; the control column starts at the same x
+                                             // everywhere (was: auto-sized per pane, a jagged edge).
+            grid.column(at: 1).xPlacement = .leading   // controls hug their width, left-aligned
+                                                       // (no popup stretched to 900pt, no right void)
+            let roles = formRowRoles(rows)
+            for r in roles.headers {   // section headers, intro notes, toggles span both columns, left
+                grid.mergeCells(inHorizontalRange: NSRange(location: 0, length: 2),
+                                verticalRange: NSRange(location: r, length: 1))
+                grid.cell(atColumnIndex: 0, rowIndex: r).xPlacement = .leading
+                if rows[r].first is SectionHeaderCell, r > 0 { grid.row(at: r).topPadding = 18 }   // air above a section
             }
-            if current.header != nil || !current.rows.isEmpty { sections.append(current) }
+            for r in roles.notes { grid.row(at: r).topPadding = -4 }   // caption hugs its field
 
-            let stack = NSStackView()
-            stack.orientation = .vertical
-            stack.alignment = .leading
-            stack.spacing = 8
-            stack.translatesAutoresizingMaskIntoConstraints = false
-            // A big pane title anchors the page (the form used to feel stuck to the top edge).
             let bigTitle = NSTextField(labelWithString: title)
-            bigTitle.font = .systemFont(ofSize: 20, weight: .bold)
-            stack.addArrangedSubview(bigTitle)
-            stack.setCustomSpacing(14, after: bigTitle)
-
-            for s in sections {
-                if let h = s.header {
-                    stack.addArrangedSubview(h)
-                    stack.setCustomSpacing(5, after: h)
-                }
-                guard !s.rows.isEmpty else { continue }
-                let grid = NSGridView(views: s.rows)
-                grid.translatesAutoresizingMaskIntoConstraints = false
-                grid.rowSpacing = 8; grid.columnSpacing = 16
-                grid.column(at: 0).xPlacement = .trailing
-                let roles = formRowRoles(s.rows)
-                for r in roles.headers {   // full-width intro notes (CaptionCell in col 0)
-                    grid.mergeCells(inHorizontalRange: NSRange(location: 0, length: 2),
-                                    verticalRange: NSRange(location: r, length: 1))
-                    grid.cell(atColumnIndex: 0, rowIndex: r).xPlacement = .leading
-                }
-                for r in roles.notes { grid.row(at: r).topPadding = -4 }
-                let card = NSBox()
-                card.boxType = .custom
-                card.titlePosition = .noTitle
-                card.cornerRadius = 10
-                card.borderWidth = 1
-                card.borderColor = NSColor.separatorColor
-                card.fillColor = cardFill
-                card.contentViewMargins = NSSize(width: 14, height: 12)
-                card.contentView = grid
-                card.translatesAutoresizingMaskIntoConstraints = false
-                stack.addArrangedSubview(card)
-                card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-                stack.setCustomSpacing(16, after: card)
-            }
+            bigTitle.font = .systemFont(ofSize: 16, weight: .semibold)   // close to the sidebar weight, not shouty
+            bigTitle.translatesAutoresizingMaskIntoConstraints = false
 
             let doc = FlippedDocView()   // flipped so the form starts at the TOP of the scroll area
             doc.translatesAutoresizingMaskIntoConstraints = false
-            doc.addSubview(stack)
+            doc.addSubview(bigTitle); doc.addSubview(grid)
             let scroll = NSScrollView()
             scroll.translatesAutoresizingMaskIntoConstraints = false
             scroll.hasVerticalScroller = true
@@ -2934,20 +2900,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
                 doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
                 doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
                 doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-                stack.topAnchor.constraint(equalTo: doc.topAnchor, constant: 22),
-                stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 26),
-                stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -26),
-                stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -22),
+                bigTitle.topAnchor.constraint(equalTo: doc.topAnchor, constant: 22),
+                bigTitle.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 26),
+                grid.topAnchor.constraint(equalTo: bigTitle.bottomAnchor, constant: 16),
+                grid.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 26),
+                grid.trailingAnchor.constraint(lessThanOrEqualTo: doc.trailingAnchor, constant: -26),
+                grid.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -22),
             ])
             panesForTest.append((title: title, symbol: symbol, tint: tint, view: paneView,
                                  searchText: [title] + searchText(of: rows)))
         }
         pane("Recording", "record.circle", .systemRed, [
             row("Segment length (on the hour):", segPopup),
-            row("", systemAudioBtn),
-            row("", echoBtn),
+            toggle(systemAudioBtn),
+            toggle(echoBtn),
             row("Min. speech (sec):", voiceField),
-            row("", vadBtn),
+            toggle(vadBtn),
             row("Excluded apps:", excludeTokens),
             row("Add a running app:", addAppPopup),
             // Storage lives here too (user pick: what gets recorded and where it lands is one story).
@@ -2955,7 +2923,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             row("Keep for:", txtRetPopup),
             row("Save to:", dirStack),
             sectionHeader("Audio", symbol: "waveform"),
-            row("", keepAudioBtn),
+            toggle(keepAudioBtn),
             row("Compress after:", audioRawCombo),
             fieldCaption("Recent recordings stay WAV; older ones are archived to AAC (~⅛ the size). "
                        + "Type any period — 45 days, 6 months, 1 year."),
@@ -2964,7 +2932,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             row("Save to:", audioStack),
         ])
         pane("Schedule", "calendar.badge.clock", .systemOrange, [
-            row("", schedBtn),
+            toggle(schedBtn),
             row("Days:", schedDaysField),
             fieldCaption("mon-fri, or a list like mon,wed,fri. Empty = every day."),
             row("Hours:", schedHoursField),
@@ -2987,7 +2955,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
                        + "Biases recognition so proper nouns stop coming out mangled."),          // 8
             row("…or hints file:", hintsFileField),                                               // 9
             fieldCaption("One term per line, # comments — merged with the terms above."),         // 10
-            row("", hintsCalBtn),                                                                 // 11
+            toggle(hintsCalBtn),                                                                 // 11
         ])
         pane("Post-process", "wand.and.stars", .systemIndigo, [
             sectionNote("Runs after each hourly transcript is saved."),                           // 0
@@ -3006,7 +2974,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             fieldCaption("Summaries land in monthly folders (YYYY-MM/<name>.md). "
                        + "Empty = next to the transcript."),                                      // 10
             sectionHeader("Daily digest", symbol: "calendar.day.timeline.left"),
-            row("", dailyBtn),
+            toggle(dailyBtn),
             row("Write at:", dailyTimePicker),
             row("Prompt:", dailyPromptScroll),
             row("…or prompt file:", dailyPromptFileField),
@@ -3019,7 +2987,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
                        + "as the last argument."),                                                // 13
         ])
         pane("Titling", "calendar", .systemGreen, [
-            row("", calBtn),
+            toggle(calBtn),
             row("Calendars:", calListCell),
         ])
         pane("Live", "captions.bubble", .systemTeal, [
@@ -3039,8 +3007,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             fieldCaption("app.gladia.io — broad language coverage incl. Korean streaming."),         // 11
         ])
         pane("General", "gearshape", .systemGray, [
-            row("", loginBtn),
-            row("", updateBtn),
+            toggle(loginBtn),
+            toggle(updateBtn),
             fieldCaption("Silently checks GitHub once a day and notifies only when a new release "
                        + "is out. Check now from the tray menu: Check for Updates…"),
         ])
@@ -3059,8 +3027,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
 
         sidebarList.style = .sourceList
         sidebarList.headerView = nil
-        sidebarList.rowHeight = 30
+        sidebarList.rowHeight = 34   // more breathing room between rows (was cramped)
         sidebarList.focusRingType = .none
+        // Standard accent-tinted rounded source-list selection (was a near-black pill that read
+        // darker than the sidebar itself — an inverted-highlight bug per the design review).
+        sidebarList.selectionHighlightStyle = .sourceList
         sidebarList.addTableColumn(NSTableColumn(identifier: .init("pane")))
         sidebarList.dataSource = self
         sidebarList.delegate = self
@@ -3090,7 +3061,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             sidebar.topAnchor.constraint(equalTo: content.topAnchor),
             sidebar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             sidebar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            sidebar.widthAnchor.constraint(equalToConstant: 190),
+            sidebar.widthAnchor.constraint(equalToConstant: 200),
             sidebarSearch.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 12),
             sidebarSearch.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 10),
             sidebarSearch.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -10),
@@ -3128,6 +3099,91 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             v.trailingAnchor.constraint(equalTo: paneContainer.trailingAnchor),
             v.bottomAnchor.constraint(equalTo: paneContainer.bottomAnchor),
         ])
+    }
+
+    /// UI TEST KIT (see `macrec settings-snapshot`): render every pane to a PNG so a human — or the
+    /// next build — can actually LOOK at the Settings window instead of trusting structural checks.
+    /// Returns the files written. This exists because a "structurally valid" pane (grids present)
+    /// shipped visually broken twice; snapshots make the breakage impossible to miss.
+    func snapshotAllPanes(to dir: URL) -> [URL] {
+        load()
+        guard let win = window, let content = win.contentView else { return [] }
+        win.setContentSize(NSSize(width: 820, height: 620))
+        let appearance = win.effectiveAppearance   // render in the user's real (likely dark) appearance
+        var written: [URL] = []
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for i in panesForTest.indices {
+            sidebarList.selectRowIndexes([i], byExtendingSelection: false)   // drives selectPane via delegate
+            selectPane(i)
+            content.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.08))
+            let bounds = content.bounds
+            guard bounds.width > 1, bounds.height > 1 else { continue }
+            // Composite the whole hierarchy over the window background, in the real appearance:
+            // fill windowBackgroundColor, then draw the view tree. This matches what the user
+            // sees (white labels on a dark pane) — an offscreen PDF alone dropped the background
+            // and made dark-mode labels vanish on a white page.
+            let img = NSImage(size: bounds.size)
+            img.lockFocus()
+            appearance.performAsCurrentDrawingAppearance {
+                NSColor.windowBackgroundColor.setFill()
+                NSRect(origin: .zero, size: bounds.size).fill()
+                if let ctx = NSGraphicsContext.current {
+                    content.displayIgnoringOpacity(bounds, in: ctx)
+                }
+            }
+            img.unlockFocus()
+            guard let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+                  let png = rep.representation(using: .png, properties: [:]) else { continue }
+            let safe = panesForTest[i].title.replacingOccurrences(of: "/", with: "-")
+            let url = dir.appendingPathComponent(String(format: "pane-%d-%@.png", i, safe))
+            try? png.write(to: url)
+            written.append(url)
+        }
+        return written
+    }
+
+    /// AUTOMATED UI REGRESSION TEST (runs in selftest / CI, headless). Lays out every pane at a
+    /// real window size and returns human-readable layout defects: any control collapsed to ~zero
+    /// size, or two controls overlapping. The NSBox "card" redesign floated its grids so controls
+    /// overlapped — this assertion fails the build on exactly that class of breakage, so a broken
+    /// Settings window can never ship "green" again.
+    func paneLayoutIssues() -> [String] {
+        guard let win = window, let content = win.contentView else { return ["settings: no window"] }
+        win.setContentSize(NSSize(width: 820, height: 640))
+        var issues: [String] = []
+        for i in panesForTest.indices {
+            selectPane(i)
+            content.layoutSubtreeIfNeeded()
+            let paneView = panesForTest[i].view
+            let title = panesForTest[i].title
+            var rects: [(String, NSRect)] = []
+            func walk(_ v: NSView) {
+                if v is NSScroller { return }   // overlay scrollbars are chrome (0-wide when hidden, sit over content)
+                if v is NSControl || v is NSTextView {
+                    let f = v.frame
+                    if f.width < 4 || f.height < 4 {
+                        issues.append("\(title): \(type(of: v)) collapsed to \(Int(f.width))×\(Int(f.height))")
+                    }
+                    // NSTextView lives inside a scroll clip: its content frame is taller than the
+                    // visible clip, so its "overlap" with the next row is expected, not a bug —
+                    // record it for the zero-size check but not for overlap.
+                    if !(v is NSTextView) { rects.append(("\(type(of: v))", v.convert(v.bounds, to: paneView))) }
+                }
+                if v is NSTextView { return }   // don't descend into a text view's internals
+                for s in v.subviews { walk(s) }
+            }
+            walk(paneView)
+            for a in 0..<rects.count {
+                for b in (a + 1)..<rects.count {
+                    let o = rects[a].1.intersection(rects[b].1)
+                    if o.width > 6, o.height > 6 {
+                        issues.append("\(title): \(rects[a].0) overlaps \(rects[b].0) by \(Int(o.width))×\(Int(o.height))")
+                    }
+                }
+            }
+        }
+        return issues
     }
 
     @objc private func searchChanged() {
@@ -5860,7 +5916,9 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
         // sidebar stops being a monochrome wall.
         let tile = NSView()
         tile.wantsLayer = true
-        tile.layer?.backgroundColor = p.tint.cgColor
+        // Mute the tile: full system colors read as garish next to a form (user: "too primary";
+        // review: "iOS-springboard gradients, loudest thing in the window"). Flat, ~32% desaturated.
+        tile.layer?.backgroundColor = (p.tint.blended(withFraction: 0.32, of: .gray) ?? p.tint).cgColor
         tile.layer?.cornerRadius = 5
         tile.layer?.cornerCurve = .continuous
         let icon = NSImageView(image: NSImage(systemSymbolName: p.symbol, accessibilityDescription: p.title) ?? NSImage())
@@ -5961,6 +6019,7 @@ func printMacrecHelp() {
       perm-status            exit 0 if System Audio Recording + Microphone are granted
       request-permission     trigger the macOS permission prompts
       mic-status             exit 0 if the default input device is in use right now
+      settings-snapshot [dir] render every Settings pane to a PNG (UI test kit; needs a GUI session)
       sweep                  run one retention/archive pass (WAV→AAC tiers) and exit
                              [--audio-dir D] [--transcripts-dir D] [--raw-days N] [--keep-days N]
       version, --version     print the version and exit
@@ -6016,6 +6075,19 @@ struct Main {
             }
             RecordingEngine(cfg: cfg).runRetentionSweep()
             exit(0)
+        }
+
+        // Subcommand: settings-snapshot <dir> — render every Settings pane to a PNG and exit.
+        // The UI test kit: LOOK at what was built. Needs a GUI session (run locally, not in CI).
+        if args.first == "settings-snapshot" {
+            let dir = URL(fileURLWithPath: args.count > 1 ? args[1] : "/tmp/macrec-settings-shots")
+            let app = NSApplication.shared
+            app.setActivationPolicy(.accessory)
+            let wc = SettingsWindowController(onSave: {})
+            let files = wc.snapshotAllPanes(to: dir)
+            for f in files { print(f.path) }
+            print(files.isEmpty ? "snapshot: FAILED (no panes rendered)" : "snapshot: \(files.count) panes → \(dir.path)")
+            exit(files.isEmpty ? 1 : 0)
         }
 
         // Subcommand: selftest — assertions on pure logic (run in CI). No GUI/permissions needed.
@@ -6214,6 +6286,14 @@ struct Main {
             let panes = sw.panesForTest
             check("settings: panes built for inspection", !panes.isEmpty)
             check("settings: General pane comes first", panes.first?.title == "General")
+            // AUTOMATED UI TEST: lay out every pane at a real size and assert nothing is collapsed
+            // or overlapping. This fails the build on visual breakage (the NSBox "card" redesign
+            // floated its grids so controls overlapped and shipped destroyed — a structural-only
+            // check passed it). Run `macrec settings-snapshot <dir>` to also eyeball the PNGs.
+            let layoutIssues = sw.paneLayoutIssues()
+            if !layoutIssues.isEmpty { for m in layoutIssues.prefix(8) { print("   layout: \(m)") } }
+            check("settings: no pane control is collapsed or overlapping (\(layoutIssues.count) issues)",
+                  layoutIssues.isEmpty)
             check("settings: every pane scrolls (rows can never be clipped away)",
                   panes.allSatisfy { p in p.view.subviews.contains { ($0 as? NSScrollView)?.documentView != nil } })
             check("settings: Post-process and Schedule are their own panes",
@@ -6238,7 +6318,7 @@ struct Main {
                         let c0 = grid.cell(atColumnIndex: 0, rowIndex: r).contentView
                         let merged = grid.numberOfColumns > 1
                             && grid.cell(atColumnIndex: 1, rowIndex: r).contentView === c0
-                        let isRoleRow = c0 is SectionHeaderCell || c0 is CaptionCell
+                        let isRoleRow = c0 is SectionHeaderCell || c0 is CaptionCell || c0 is ToggleCell
                         if merged && !isRoleRow { intact = false }   // a field row got eaten by a header merge
                     }
                 }
