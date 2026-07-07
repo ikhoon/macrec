@@ -4430,8 +4430,6 @@ final class LiveCaptions {
     private var lines: [(speaker: String, text: String, translated: String?, final: Bool, time: Date)] = []
     private var mineLabel = ""   // label used for the mic track (for speaker coloring)
     private var showLabels = true   // false in single-speaker modes (one voice → the label is redundant)
-    private var lastTranslateAt: [String: Double] = [:]   // per-speaker throttle for live translation
-    private let translateThrottle = 0.5
     // Last-applied live config — so reconfigure() can no-op on unchanged values and avoid needless
     // analyzer rebuilds (each rebuild re-pays the ~model warm-up).
     private var curLocaleId = "", curEngine = "", curSource = "", curTranslateId = ""
@@ -4597,25 +4595,24 @@ final class LiveCaptions {
         }
         if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
         render()
-        // Translate the live text too (not just finals), throttled per speaker so it streams along.
-        if let translator, !text.isEmpty {
-            let now = ProcessInfo.processInfo.systemUptime
-            if final || now - (lastTranslateAt[speaker] ?? 0) >= translateThrottle {
-                lastTranslateAt[speaker] = now
-                let gen = engineGen
-                Task { [weak self] in
-                    guard let out = await translator.translate(text) else { return }
-                    await MainActor.run { guard let self, self.engineGen == gen else { return }   // drop stale-generation results
-                        self.setTranslation(speaker, text, out) }
-                }
+        // Translate FINALIZED sentences only. Translating the in-progress partial made the source
+        // line and its translation move at the same time (dizzying — user report), with the
+        // translation always a beat behind the growing source. Now the current line streams source-
+        // only, and the translation attaches ONCE when the sentence completes — then never moves.
+        if final, let translator, !text.isEmpty {
+            let gen = engineGen
+            Task { [weak self] in
+                guard let out = await translator.translate(text) else { return }
+                await MainActor.run { guard let self, self.engineGen == gen else { return }   // drop stale-generation results
+                    self.setTranslation(speaker, text, out) }
             }
         }
     }
     private func setTranslation(_ speaker: String, _ original: String, _ translated: String) {
         guard active else { return }
-        // Prefer the exact source line; else the speaker's current line (volatile text has since moved on).
+        // Prefer the exact source line; else the speaker's newest finalized line still awaiting one.
         let i = lines.lastIndex(where: { $0.speaker == speaker && $0.text == original })
-            ?? lines.lastIndex(where: { $0.speaker == speaker && !$0.final })   // else the current in-progress line
+            ?? lines.lastIndex(where: { $0.speaker == speaker && $0.final && $0.translated == nil })
         guard let i else { return }
         lines[i].translated = translated
         render()
@@ -4914,8 +4911,9 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         para.firstLineHeadIndent = 0; para.headIndent = col
         para.lineHeightMultiple = 1.1; para.paragraphSpacing = 4
         if hasPrefix { para.tabStops = [NSTextTab(textAlignment: .left, location: col)]; para.defaultTabInterval = col }
+        let markFont = NSFont.systemFont(ofSize: max(9, fontSize - 4))   // the arrow is a footnote, not a headline
         let trans = NSMutableParagraphStyle()
-        trans.firstLineHeadIndent = col; trans.headIndent = col + w("↳ ", transFont); trans.lineHeightMultiple = 1.1
+        trans.firstLineHeadIndent = col; trans.headIndent = col + w("↳ ", markFont); trans.lineHeightMultiple = 1.1
         let out = NSMutableAttributedString()
         for (i, l) in lines.enumerated() {
             if i > 0 { out.append(NSAttributedString(string: "\n")) }
@@ -4937,9 +4935,11 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             }
             if let t = l.translated, !t.isEmpty {
                 out.append(NSAttributedString(string: "\n↳ ", attributes: [
-                    .font: transFont, .foregroundColor: NSColor.tertiaryLabelColor, .paragraphStyle: trans]))
-                out.append(NSAttributedString(string: t, attributes: [   // readable, but a touch dimmer than the original → clear hierarchy
-                    .font: transFont, .foregroundColor: NSColor.labelColor.withAlphaComponent(0.8), .paragraphStyle: trans]))
+                    .font: markFont, .foregroundColor: NSColor.tertiaryLabelColor, .paragraphStyle: trans]))
+                // The translation carries the SPEAKER's tint (source text stays neutral) — the two
+                // layers separate at a glance instead of being two near-identical white lines.
+                out.append(NSAttributedString(string: t, attributes: [
+                    .font: transFont, .foregroundColor: tint.withAlphaComponent(0.95), .paragraphStyle: trans]))
             }
         }
         textView.textStorage?.setAttributedString(out)
