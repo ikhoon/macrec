@@ -1,6 +1,6 @@
 #!/bin/zsh
 # make-signing-cert.sh — create a STABLE self-signed code-signing certificate,
-# once. Signing meeting-capture with this cert keeps its TCC grants across
+# once. Signing macrec with this cert keeps its TCC grants across
 # rebuilds (the signature's Designated Requirement becomes identifier +
 # certificate based instead of the per-build cdhash).
 # Idempotent: if an identity with this name already exists, do nothing.
@@ -16,7 +16,7 @@
 # re-run this script and re-grant the permissions once.
 set -e
 
-CERT_NAME="MeetingCaptureSign"
+CERT_NAME="ikhoon-dev"   # shared across the mac* tools
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 # One-shot transport password for the keychain import only; the .p12 it
 # protects lives in a mktemp dir deleted on exit and is never kept.
@@ -38,8 +38,8 @@ distinguished_name=dn
 x509_extensions=v3
 prompt=no
 [dn]
-CN=MeetingCaptureSign
-O=meeting-recorder (local self-signed)
+CN=ikhoon-dev
+O=mac* tools (local self-signed)
 [v3]
 basicConstraints=critical,CA:false
 keyUsage=critical,digitalSignature
