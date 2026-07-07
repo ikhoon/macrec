@@ -2137,6 +2137,27 @@ func speechlikeFrames(_ samples: [Float], threshold: Float = 0.02, minRun: Int =
     return total
 }
 
+/// Sentences that have COMPLETED inside a growing partial (terminator seen) — the unfinished tail
+/// is excluded. A '.' only terminates when followed by whitespace, so "3.5" never splits and the
+/// final period of a still-streaming line waits for its confirming space. Drives sentence-streamed
+/// live translation. Pure + testable.
+func completeSentences(_ text: String) -> [String] {
+    var out: [String] = []
+    var cur = ""
+    let hard: Set<Character> = ["!", "?", "。", "！", "？", "…"]
+    let chars = Array(text)
+    for (i, ch) in chars.enumerated() {
+        cur.append(ch)
+        let ends = hard.contains(ch) || (ch == "." && i + 1 < chars.count && chars[i + 1].isWhitespace)
+        if ends {
+            let t = cur.trimmingCharacters(in: .whitespaces)
+            if !t.isEmpty { out.append(t) }
+            cur = ""
+        }
+    }
+    return out
+}
+
 // MARK: - transcript-level echo suppression (belt to the AEC's braces)
 //
 // The acoustic canceller attenuates the speaker→mic echo ~15-26 dB, but live engines still transcribe
@@ -4484,7 +4505,23 @@ final class LiveCaptions {
     private var sys: (any LiveTranscribing)?
     private var translator: LiveTranslator?   // nil = no live translation
     private var window: LiveCaptionWindow?
-    private var lines: [(speaker: String, text: String, translated: String?, final: Bool, time: Date)] = []
+    struct CapLine {
+        var speaker: String
+        var text: String
+        var final: Bool
+        var time: Date                      // creation time — doubles as the line's identity
+        var transParts: [String?] = []      // per-sentence translations, positional (async-safe)
+        var transRequested = 0              // how many complete sentences have been sent to translate
+        var transFinal = false              // the authoritative full-text translation has landed
+        var transTail: String? = nil        // live translation of the UNFINISHED tail (volatile)
+        var tailReq: Double = 0             // throttle stamp for tail requests
+        var tailApplied: Double = 0         // ordering stamp — a stale tail result never overwrites a newer one
+        var translated: String? {
+            let parts = transParts.compactMap { $0 } + (transTail.map { [$0] } ?? [])
+            return parts.isEmpty ? nil : parts.joined(separator: " ")
+        }
+    }
+    private var lines: [CapLine] = []
     private var mineLabel = ""   // label used for the mic track (for speaker coloring)
     private var showLabels = true   // false in single-speaker modes (one voice → the label is redundant)
     // Last-applied live config — so reconfigure() can no-op on unchanged values and avoid needless
@@ -4644,35 +4681,94 @@ final class LiveCaptions {
                 return
             }
         }
+        // Engines often emit partials with a leading space — trim so lines never render indented.
+        let text = text.trimmingCharacters(in: .whitespaces)
         // Update this speaker's in-progress (non-final) line, or start a new one.
-        if let i = lines.lastIndex(where: { $0.speaker == speaker && !$0.final }) {
-            lines[i].text = text; lines[i].final = final
+        let i: Int
+        if let j = lines.lastIndex(where: { $0.speaker == speaker && !$0.final }) {
+            lines[j].text = text; lines[j].final = final
+            i = j
         } else {
-            lines.append((speaker, text, nil, final, Date()))
+            lines.append(CapLine(speaker: speaker, text: text, final: final, time: Date()))
+            i = lines.count - 1
         }
-        if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
+        let removed = max(0, lines.count - maxLines)
+        if removed > 0 { lines.removeFirst(removed) }
         render()
-        // Translate FINALIZED sentences only. Translating the in-progress partial made the source
-        // line and its translation move at the same time (dizzying — user report), with the
-        // translation always a beat behind the growing source. Now the current line streams source-
-        // only, and the translation attaches ONCE when the sentence completes — then never moves.
-        if final, let translator, !text.isEmpty {
-            let gen = engineGen
-            Task { [weak self] in
-                guard let out = await translator.translate(text) else { return }
-                await MainActor.run { guard let self, self.engineGen == gen else { return }   // drop stale-generation results
-                    self.setTranslation(speaker, text, out) }
-            }
-        }
+        // Sentence-streamed translation: translate each sentence THE MOMENT it completes inside the
+        // growing partial (punctuation boundary) — timely, and the translation line only ever
+        // APPENDS whole sentences, so it never rewrites under the reader (the old partial-retranslate
+        // made both lines move at once; the finals-only attempt landed seconds late — user reports).
+        // Finalization then re-translates the full text ONCE as the authoritative version.
+        translateNewSentences(at: i - removed, final: final)
     }
-    private func setTranslation(_ speaker: String, _ original: String, _ translated: String) {
-        guard active else { return }
-        // Prefer the exact source line; else the speaker's newest finalized line still awaiting one.
-        let i = lines.lastIndex(where: { $0.speaker == speaker && $0.text == original })
-            ?? lines.lastIndex(where: { $0.speaker == speaker && $0.final && $0.translated == nil })
-        guard let i else { return }
-        lines[i].translated = translated
-        render()
+
+    private func translateNewSentences(at index: Int, final: Bool) {
+        guard let translator, lines.indices.contains(index) else { return }
+        let line = lines[index]
+        guard !line.text.isEmpty, !line.transFinal else { return }
+        let gen = engineGen
+        let lineTime = line.time
+        if final {
+            let full = line.text
+            lines[index].transFinal = true
+            Task { [weak self] in
+                guard let out = await translator.translate(full) else { return }
+                await MainActor.run {
+                    guard let self, self.engineGen == gen,
+                          let k = self.lines.lastIndex(where: { $0.time == lineTime }) else { return }
+                    self.lines[k].transParts = [out]   // authoritative full replacement
+                    self.lines[k].transTail = nil
+                    self.render()
+                }
+            }
+            return
+        }
+        let complete = completeSentences(line.text)
+        if complete.count > line.transRequested {
+            for idx in line.transRequested..<complete.count {
+                let sentence = complete[idx]
+                Task { [weak self] in
+                    guard let out = await translator.translate(sentence) else { return }
+                    await MainActor.run {
+                        guard let self, self.engineGen == gen,
+                              let k = self.lines.lastIndex(where: { $0.time == lineTime }),
+                              !self.lines[k].transFinal else { return }
+                        while self.lines[k].transParts.count <= idx { self.lines[k].transParts.append(nil) }
+                        self.lines[k].transParts[idx] = out
+                        self.render()
+                    }
+                }
+            }
+            lines[index].transRequested = complete.count
+        }
+        // Live tail: the words after the last completed sentence translate on a short throttle, so
+        // the translation follows word-by-word (user ask) — only this tail region ever rewrites.
+        let tail: String
+        if let last = complete.last, let r = line.text.range(of: last, options: .backwards) {
+            tail = String(line.text[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+        } else {
+            tail = complete.isEmpty ? line.text : ""
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        if !tail.isEmpty, now - lines[index].tailReq >= 0.5 {
+            lines[index].tailReq = now
+            let stamp = now
+            Task { [weak self] in
+                guard let out = await translator.translate(tail) else { return }
+                await MainActor.run {
+                    guard let self, self.engineGen == gen,
+                          let k = self.lines.lastIndex(where: { $0.time == lineTime }),
+                          !self.lines[k].transFinal, stamp > self.lines[k].tailApplied else { return }
+                    self.lines[k].tailApplied = stamp
+                    self.lines[k].transTail = out
+                    self.render()
+                }
+            }
+        } else if tail.isEmpty, lines[index].transTail != nil, complete.count == lines[index].transRequested {
+            // Tail fully consumed into confirmed sentences — retire the volatile copy.
+            lines[index].transTail = nil
+        }
     }
     // Volatile results arrive many times/sec from BOTH transcribers; rebuilding the whole overlay
     // each time churns the UI thread. Coalesce to ~10 fps (negligible vs the engine's own latency).
@@ -6241,6 +6337,14 @@ struct Main {
                   == "mkdir -p '/d/2026-07' && cat '/s/a.md' '/s/b'\\''s.md' | claude -p 'P' "
                    + "> '/d/2026-07/x.md.partial' && mv '/d/2026-07/x.md.partial' '/d/2026-07/x.md'"
                   && dailyDigestInvocation(runner: .claude, prompt: "P", inputs: [], outPath: "/d/x.md") == nil)
+            // Live translation streams per COMPLETED sentence — the splitter must not fire on
+            // decimals or on a trailing period that hasn't been confirmed by a following space.
+            check("live: sentence splitter (decimals safe, tail waits, hard punct immediate)",
+                  completeSentences("안녕하세요. 오늘 회의는") == ["안녕하세요."]
+                  && completeSentences("3.5 퍼센트입니다. 다음 안건은") == ["3.5 퍼센트입니다."]
+                  && completeSentences("됐나요? 정말요! 네.") == ["됐나요?", "정말요!"]
+                  && completeSentences("아직 문장이 안 끝났") == []
+                  && completeSentences("First point. Second point here") == ["First point."])
             // Update check: dotted-numeric compare (string compare says "0.10" < "0.9").
             check("update: version compare handles multi-digit, v-prefix, unequal lengths",
                   isNewerVersion("v0.6.0", than: "0.5.0")
