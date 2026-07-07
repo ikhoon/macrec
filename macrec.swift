@@ -800,6 +800,8 @@ enum Pref {
     static let dailyDigestTime = "dailyDigestTime"      // "HH:mm" the digest becomes due (default 20:00)
     static let dailyDigestOut = "dailyDigestOut"        // digest output dir ("" = alongside summaries in ../Daily)
     static let dailyDigestLastRun = "dailyDigestLastRun"  // "yyyy-MM-dd" marker — one digest per day
+    static let autoUpdateCheck = "autoUpdateCheck"        // daily background release check (default on)
+    static let updateCheckLastRun = "updateCheckLastRun"  // "yyyy-MM-dd" marker — one check per day
     static let postProcessCmd = "postProcessCmd"        // freeform command ("" = off)
     static let hintsTerms = "hintsTerms"                // transcription hint terms (comma/newline separated)
     static let hintsFile = "hintsFile"                  // external hints file (one term per line, # comments)
@@ -2422,6 +2424,49 @@ func formRowRoles(_ rows: [[NSView]]) -> (headers: [Int], notes: [Int]) {
     return (headers, notes)
 }
 
+// MARK: - update check (Sparkle-style UX, zero dependencies — GitHub Releases is the appcast)
+
+/// Dotted-numeric version compare: "0.10.1" > "0.9.9" (string compare would say otherwise).
+/// Missing components are zero; a leading "v" is tolerated. Pure + testable.
+func isNewerVersion(_ candidate: String, than current: String) -> Bool {
+    func parts(_ s: String) -> [Int] {
+        s.trimmingCharacters(in: .whitespaces).lowercased()
+            .split(separator: ".").map { Int($0.trimmingCharacters(in: CharacterSet(charactersIn: "v "))) ?? 0 }
+    }
+    let a = parts(candidate), b = parts(current)
+    for i in 0..<max(a.count, b.count) {
+        let x = i < a.count ? a[i] : 0, y = i < b.count ? b[i] : 0
+        if x != y { return x > y }
+    }
+    return false
+}
+
+enum UpdateChecker {
+    static let releasesURL = "https://github.com/ikhoon/macrec/releases/latest"
+
+    /// Ask GitHub for the latest release tag. Calls back on the MAIN queue with (tag, url) — nil
+    /// tag = network/parse failure (reported only for manual checks, silent for background ones).
+    static func fetchLatest(_ done: @escaping (String?, String?) -> Void) {
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/ikhoon/macrec/releases/latest")!)
+        req.timeoutInterval = 15
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            var tag: String?, url: String?
+            if let data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                tag = obj["tag_name"] as? String
+                url = obj["html_url"] as? String
+            }
+            DispatchQueue.main.async { done(tag, url) }
+        }.resume()
+    }
+
+    /// Homebrew-cask installs should upgrade through brew (so the cask stays in sync); zip installs
+    /// go to the releases page. Detection = the Caskroom directory existing.
+    static var installedViaBrew: Bool {
+        FileManager.default.fileExists(atPath: "/opt/homebrew/Caskroom/macrec")
+    }
+}
+
 /// Sidebar search: which panes match the query? Case-insensitive substring against every visible
 /// string in the pane (title, labels, captions, button titles) — typing "prompt" surfaces
 /// Post-process. Empty query = all panes, original order. Pure + testable.
@@ -2488,6 +2533,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     private let dailyBtn = NSButton(checkboxWithTitle: "Write a daily digest", target: nil, action: nil)
     private let dailyTimePicker = NSDatePicker()  // HH:mm the digest becomes due
     private let dailyOutField = NSTextField()     // digest output dir ("" = Daily/ next to summaries)
+    private let updateBtn = NSButton(checkboxWithTitle: "Check for updates daily", target: nil, action: nil)
     private var summaryChooseBtn: NSButton?       // folder picker for the summary output dir
     private let hintsTermsField = NSTextField()   // hint terms (comma/newline separated)
     private let hintsFileField = NSTextField()    // external hints file path
@@ -2826,6 +2872,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         ])
         pane("General", "gearshape", [
             row("", loginBtn),
+            row("", updateBtn),
+            fieldCaption("Silently checks GitHub once a day and notifies only when a new release "
+                       + "is out. Check now from the tray menu: Check for Updates…"),
         ])
 
         let saveBtn = NSButton(title: "Save & Apply", target: self, action: #selector(saveAndClose)); saveBtn.keyEquivalent = "\r"
@@ -3027,6 +3076,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         promptFileField.stringValue = Pref.explicit(Pref.summaryPromptFile, "MR_SUMMARY_PROMPT_FILE")
         summaryOutField.stringValue = Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT")
         dailyBtn.state = Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false) ? .on : .off
+        updateBtn.state = Pref.bool(Pref.autoUpdateCheck, "MR_AUTO_UPDATE_CHECK", true) ? .on : .off
         dailyOutField.stringValue = Pref.explicit(Pref.dailyDigestOut, "MR_DAILY_DIGEST_OUT")
         let hm = Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00").split(separator: ":").compactMap { Int($0) }
         var tc = DateComponents(); tc.hour = hm.count == 2 ? hm[0] : 20; tc.minute = hm.count == 2 ? hm[1] : 0
@@ -3123,6 +3173,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         d.set(promptFileField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryPromptFile)
         d.set(summaryOutField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryOut)
         d.set(dailyBtn.state == .on, forKey: Pref.dailyDigest)
+        d.set(updateBtn.state == .on, forKey: Pref.autoUpdateCheck)
         d.set(dailyOutField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.dailyDigestOut)
         let tc = Calendar.current.dateComponents([.hour, .minute], from: dailyTimePicker.dateValue)
         d.set(String(format: "%02d:%02d", tc.hour ?? 20, tc.minute ?? 0), forKey: Pref.dailyDigestTime)
@@ -4938,7 +4989,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RunLoop.main.add(vt, forMode: .common)   // .common so the tint updates while menus track too
         voiceTimer = vt
         let st = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
-            DispatchQueue.main.async { self?.checkSchedule(); self?.maybeRunDailyDigest() }   // timer runs in .common; engine state is main-confined
+            DispatchQueue.main.async { self?.checkSchedule(); self?.maybeRunDailyDigest(); self?.maybeCheckForUpdates() }   // timer runs in .common; engine state is main-confined
         }
         RunLoop.main.add(st, forMode: .common)
         schedTimer = st
@@ -5020,6 +5071,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .size(withAttributes: [.font: statusFont]).width + 36 // item insets
         // About on top (macOS convention), then a divider.
         menu.addItem(item("About macrec", #selector(showAbout), symbol: "info.circle"))
+        menu.addItem(item("Check for Updates…", #selector(checkForUpdates), symbol: "arrow.triangle.2.circlepath"))
         menu.addItem(.separator())
         // Live status rows (disabled — informational; they carry their own inline status glyphs).
         statusLine = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: ""); statusLine.isEnabled = false
@@ -5432,6 +5484,43 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(dir)
     }
 
+    /// Manual check (menu): always reports — new version, up to date, or the failure.
+    @objc private func checkForUpdates() {
+        UpdateChecker.fetchLatest { [weak self] tag, url in
+            guard let tag else {
+                Notifier.push(title: "Update check failed", body: "Couldn't reach GitHub — try again later.")
+                return
+            }
+            if isNewerVersion(tag, than: macrecVersion) {
+                self?.announceUpdate(tag: tag, url: url)
+            } else {
+                Notifier.push(title: "macrec is up to date", body: "v\(macrecVersion) is the latest release.")
+            }
+        }
+    }
+
+    /// Background daily check — rides the 30 s tick with a last-run marker (same catch-up-after-
+    /// sleep semantics as the daily digest). Silent unless something new is actually out.
+    private func maybeCheckForUpdates() {
+        guard Pref.bool(Pref.autoUpdateCheck, "MR_AUTO_UPDATE_CHECK", true) else { return }
+        let dayF = DateFormatter(); dayF.locale = Locale(identifier: "en_US_POSIX"); dayF.dateFormat = "yyyy-MM-dd"
+        let today = dayF.string(from: Date())
+        guard Pref.explicit(Pref.updateCheckLastRun, "") != today else { return }
+        Pref.d.set(today, forKey: Pref.updateCheckLastRun)
+        UpdateChecker.fetchLatest { [weak self] tag, url in
+            guard let tag, isNewerVersion(tag, than: macrecVersion) else { return }
+            self?.announceUpdate(tag: tag, url: url)
+        }
+    }
+
+    private func announceUpdate(tag: String, url: String?) {
+        let how = UpdateChecker.installedViaBrew ? "Run: brew upgrade --cask macrec"
+                                                 : "Click to open the release page."
+        elog("update: \(tag) available (current v\(macrecVersion))")
+        Notifier.push(title: "macrec \(tag) is available", body: how,
+                      filePath: UpdateChecker.installedViaBrew ? nil : (url ?? UpdateChecker.releasesURL))
+    }
+
     @objc private func showAbout() {
         NSApp.activate(ignoringOtherApps: true)
         let para = NSMutableParagraphStyle(); para.alignment = .center
@@ -5503,7 +5592,9 @@ extension AppController: UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         if let p = response.notification.request.content.userInfo["file"] as? String {
-            NSWorkspace.shared.open(URL(fileURLWithPath: p))
+            // The payload is either a transcript file path or (update notifications) a web URL.
+            if p.hasPrefix("http"), let u = URL(string: p) { NSWorkspace.shared.open(u) }
+            else { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
         }
         completionHandler()
     }
@@ -5963,6 +6054,14 @@ struct Main {
                   == "mkdir -p '/d/2026-07' && cat '/s/a.md' '/s/b'\\''s.md' | claude -p 'P' "
                    + "> '/d/2026-07/x.md.partial' && mv '/d/2026-07/x.md.partial' '/d/2026-07/x.md'"
                   && dailyDigestInvocation(runner: .claude, prompt: "P", inputs: [], outPath: "/d/x.md") == nil)
+            // Update check: dotted-numeric compare (string compare says "0.10" < "0.9").
+            check("update: version compare handles multi-digit, v-prefix, unequal lengths",
+                  isNewerVersion("v0.6.0", than: "0.5.0")
+                  && isNewerVersion("0.10.0", than: "0.9.9")
+                  && isNewerVersion("1.0", than: "0.99.99")
+                  && !isNewerVersion("v0.5.0", than: "0.5.0")
+                  && !isNewerVersion("0.5", than: "0.5.0")
+                  && !isNewerVersion("0.4.9", than: "0.5.0"))
             // File naming: start time only (the end time lived in the name briefly — clutter).
             check("naming: transcript base is the start time only",
                   transcriptBaseName(start: schedDate("2026-07-05 21:00"), timeZone: utc.timeZone) == "2026-07-05-2100"
