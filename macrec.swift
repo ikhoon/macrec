@@ -1062,8 +1062,13 @@ struct EngineConfig {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let tdir = URL(fileURLWithPath: Pref.str(Pref.txtDir, "MR_TRANSCRIPTS_DIR",
                                                  home.appendingPathComponent("Documents/macrec/transcripts").path))
-        let excl = Pref.str(Pref.exclude, "MR_EXCLUDE_APPS", "com.spotify.client")
-            .split(whereSeparator: { $0 == " " || $0 == "," }).map(String.init)
+        // `Pref.str` treats a saved empty string as "unset" and falls back to the default — so clearing
+        // the "Never capture" field silently re-excluded Spotify. An explicit empty save means nothing
+        // is excluded; the default only applies when the user has never touched the field.
+        let exclRaw = Pref.d.object(forKey: Pref.exclude) != nil
+            ? (Pref.d.string(forKey: Pref.exclude) ?? "")
+            : (ProcessInfo.processInfo.environment["MR_EXCLUDE_APPS"] ?? "com.spotify.client")
+        let excl = exclRaw.split(whereSeparator: { $0 == " " || $0 == "," }).map(String.init)
         return EngineConfig(
             segmentSeconds: Pref.dbl(Pref.segment, "MR_SEGMENT_SECONDS", 3600),
             voiceMinSeconds: Pref.dbl(Pref.voiceMin, "MR_VOICE_MIN_SECONDS", 5),
@@ -1131,6 +1136,11 @@ final class SystemAudioTap {
     private let ioQueue = DispatchQueue(label: "macrec.systap")
     private let excludeBundleIds: [String]
     private let onBuffer: (AVAudioPCMBuffer) -> Void
+    /// The exclusion set is baked into an immutable `CATapDescription` at tap creation, so it goes stale
+    /// the moment an excluded app launches or relaunches with a new pid. `CaptureSession` compares this
+    /// against a fresh scan to decide whether the tap must be rebuilt. Our own process is always
+    /// excluded and is not part of this comparison.
+    private(set) var matchedExclusions: [AudioObjectID] = []
 
     init(excludeBundleIds: [String], onBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
         self.excludeBundleIds = excludeBundleIds
@@ -1141,10 +1151,14 @@ final class SystemAudioTap {
         stop()   // idempotent
         var exclude: [AudioObjectID] = []
         if let me = Self.processObject(pid: getpid()) { exclude.append(me) }
-        for bid in excludeBundleIds {
-            for app in NSRunningApplication.runningApplications(withBundleIdentifier: bid) {
-                if let o = Self.processObject(pid: app.processIdentifier) { exclude.append(o) }
-            }
+        // Match on Core Audio's own process list: AppKit only knows registered *applications*, never the
+        // helper processes many apps actually play through.
+        let procs = Self.audioProcesses()
+        let matched = matchExcludedProcesses(procs, excludeBundleIds: excludeBundleIds)
+        matchedExclusions = matched
+        exclude.append(contentsOf: matched)
+        for bid in excludeBundleIds where !procs.contains(where: { $0.bundleID == bid }) {
+            elog("engine: exclude '\(bid)' — no audio process with that bundle id right now")
         }
         // stereoGlobalTapButExcludeProcesses = the whole system mix minus these processes; a global
         // tap is unmuted by default (audio stays audible), which is exactly what we want.
@@ -1198,6 +1212,34 @@ final class SystemAudioTap {
         procID = nil
         if aggID != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(aggID); aggID = kAudioObjectUnknown }
         if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID); tapID = kAudioObjectUnknown }
+    }
+
+    /// Every process Core Audio currently tracks as audio-capable, with the bundle id it attributes to
+    /// each. The HAL populates this the moment a process opens an audio client, helpers included.
+    static func audioProcesses() -> [AudioProcessInfo] {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyProcessObjectList,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr,
+              size > 0 else { return [] }
+        var ids = [AudioObjectID](repeating: kAudioObjectUnknown, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids) == noErr
+        else { return [] }
+        return ids.map { AudioProcessInfo(objectID: $0, bundleID: Self.processBundleID($0)) }
+    }
+
+    private static func processBundleID(_ obj: AudioObjectID) -> String? {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioProcessPropertyBundleID,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(MemoryLayout<CFString?>.size)
+        var cf: CFString? = nil
+        let st = withUnsafeMutablePointer(to: &cf) {
+            AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, $0)
+        }
+        guard st == noErr, let s = cf as String?, !s.isEmpty else { return nil }
+        return s
     }
 
     private static func processObject(pid: pid_t) -> AudioObjectID? {
@@ -1273,6 +1315,17 @@ final class CaptureSession {
         catch { elog("engine: tap restart failed: \(error)"); return false }
     }
 
+    /// An excluded app that launches (or relaunches with a new pid) AFTER the tap was created is not
+    /// excluded by it — `CATapDescription` freezes a set of process object IDs. Rebuild the tap only
+    /// when the set it should exclude has actually drifted, so an unrelated app launching costs nothing.
+    func refreshExclusionsIfStale() async {
+        guard let live = tap else { return }
+        let current = matchExcludedProcesses(SystemAudioTap.audioProcesses(), excludeBundleIds: excludeBundleIds)
+        guard tapExclusionIsStale(current: current, live: live.matchedExclusions) else { return }
+        elog("engine: exclusion set changed (\(live.matchedExclusions.count) → \(current.count)) — rebuilding the tap")
+        _ = await restartStream()
+    }
+
     /// Pause capture (mic + system tap) on lock/sleep.
     func suspendStream() async {
         mic.stop()
@@ -1335,6 +1388,25 @@ func slugify(_ s: String) -> String {
     out = out.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
     if out.count > 40 { out = String(out.prefix(40)).trimmingCharacters(in: CharacterSet(charactersIn: "-")) }
     return out.isEmpty ? "meeting" : out
+}
+
+/// One process Core Audio knows about, and the bundle id Core Audio attributes to it.
+struct AudioProcessInfo: Equatable { let objectID: AudioObjectID; let bundleID: String? }
+
+/// The audio processes an exclusion list should silence. Matching happens on Core Audio's own process
+/// list, so a helper process that plays audio under its own bundle id is at least VISIBLE here — the
+/// old AppKit lookup could not see it at all, which is why an "excluded" app kept being recorded.
+/// A process with no bundle id (system mixers, our own tap) is never excluded. Pure + selftested.
+func matchExcludedProcesses(_ processes: [AudioProcessInfo], excludeBundleIds: [String]) -> [AudioObjectID] {
+    let want = Set(excludeBundleIds)
+    return processes.filter { p in p.bundleID.map { want.contains($0) } ?? false }.map(\.objectID)
+}
+
+/// Has the set of processes an exclusion list resolves to drifted from what the live tap was built
+/// with? `CATapDescription`'s exclusion is a frozen set of object IDs, so a relaunched (new pid) or
+/// newly-started excluded app is simply not excluded until the tap is rebuilt. Pure + selftested.
+func tapExclusionIsStale(current: [AudioObjectID], live: [AudioObjectID]) -> Bool {
+    Set(current) != Set(live)
 }
 
 /// Transcript/audio file base: the START time only — "2026-07-05-2100". The end time briefly
@@ -1615,6 +1687,7 @@ final class RecordingEngine {
     private(set) var running = false
     private var recovering = false
     private var suspended = false   // true while the display/system is asleep
+    private var exclusionRefresh: DispatchWorkItem?   // debounces the app-launch exclusion re-scan
     private var warnedDeadMic = false            // one dead-mic push per engine run (not per hour)
     var onTranscriptSaved: ((String) -> Void)?   // (message) — for refreshing UI state
     var onTranscriptURL: ((URL) -> Void)?        // path of the saved transcript file — notification click → open file
@@ -1658,6 +1731,17 @@ final class RecordingEngine {
         // and nothing on rec.queue ever syncs back to main, so this can't deadlock.
         let rec = session.rec
         return rec.queue.sync { (rec.micWriter?.recentLevel ?? 0, rec.sysWriter?.recentLevel ?? 0) }
+    }
+
+    /// Coalesce a burst of launch/quit notifications into one exclusion re-scan.
+    private func scheduleExclusionRefresh() {
+        exclusionRefresh?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.running, !self.suspended else { return }
+            Task { await self.session.refreshExclusionsIfStale() }
+        }
+        exclusionRefresh = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
     /// A tap created before "System Audio Recording Only" was granted delivers muted (zero) buffers.
@@ -1719,6 +1803,14 @@ final class RecordingEngine {
         }
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
             wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.wake() }
+        }
+        // An excluded app launching (or relaunching with a new pid) after the tap was built is NOT
+        // excluded by it — the tap froze a set of process object IDs. Re-scan on launch/quit and rebuild
+        // only when the set actually drifted. Debounced: an app's helper processes appear in a burst.
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.scheduleExclusionRefresh()
+            }
         }
         // Screen lock/unlock (distributed notifications) — pause while locked, too.
         let dnc = DistributedNotificationCenter.default()
