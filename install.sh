@@ -32,7 +32,7 @@ swiftc -swift-version 5 -parse-as-library -O \
   -framework AVFoundation -framework CoreMedia -framework CoreAudio \
   -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech -framework Translation \
   -import-objc-header "$HERE/speex-bridge.h" -I "$SPEEX_PREFIX/include" "$SPEEX_PREFIX/lib/libspeexdsp.a" \
-  "$HERE/macrec.swift" -o "$STAGE_BIN"
+  "$HERE/macrec.swift" "$HERE"/Sources/*.swift -o "$STAGE_BIN"
 
 echo "▸ writing Info.plist + icon…"
 VERSION=$(grep -E '^let macrecVersion = ' "$HERE/macrec.swift" | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')
