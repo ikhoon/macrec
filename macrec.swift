@@ -1496,6 +1496,50 @@ func transcriptStart(segStart: Date, segEnd: Date, eventStart: Date?) -> Date {
     return min(max(e, segStart), segEnd)
 }
 
+/// A calendar event reduced to what titling a recorded segment depends on — a pure stand-in for
+/// `EKEvent` so the choice below is directly testable.
+struct EventCandidate: Equatable {
+    let title: String
+    let start: Date
+    let end: Date
+    let hasLink: Bool   // a Zoom/Meet/Teams/Webex URL sits somewhere on the event
+}
+
+/// Seconds of the recorded segment `[segStart, segEnd]` the event actually covers.
+func eventOverlap(_ e: EventCandidate, segStart: Date, segEnd: Date) -> TimeInterval {
+    max(0, min(e.end, segEnd).timeIntervalSince(max(e.start, segStart)))
+}
+
+/// Can this event plausibly be what the segment recorded? It must overlap at least HALF of whichever
+/// is shorter — itself, or the segment. Any positive overlap used to qualify, so the next meeting
+/// bleeding two minutes into a 62-minute recording could title the whole thing. Half-of-the-shorter
+/// still admits a one-minute tail that lies wholly inside a 90-minute meeting: that IS the meeting.
+func explainsSegment(_ e: EventCandidate, segStart: Date, segEnd: Date) -> Bool {
+    let ov = eventOverlap(e, segStart: segStart, segEnd: segEnd)
+    guard ov > 0 else { return false }   // caught only by the ±padding: it belongs to a neighbour
+    let shorter = min(e.end.timeIntervalSince(e.start), segEnd.timeIntervalSince(segStart))
+    return ov * 2 >= shorter
+}
+
+/// Index of the event that best titles a recorded segment. Among the events that could plausibly BE
+/// the segment, a meeting link decides: it separates a real online meeting from the all-day offsite
+/// and the personal blocks sitting on top of it — a 32-minute "Service Mesh Weekly Sync" should win
+/// over a 58-minute "인버터". Raw overlap cannot make that call, which is why the eligibility floor,
+/// not the ordering, is what keeps a 2-minute sliver from stealing the name. Pure + selftested.
+func bestEventIndex(segStart: Date, segEnd: Date, candidates: [EventCandidate]) -> Int? {
+    func ov(_ e: EventCandidate) -> TimeInterval { eventOverlap(e, segStart: segStart, segEnd: segEnd) }
+    return candidates.indices
+        .filter { explainsSegment(candidates[$0], segStart: segStart, segEnd: segEnd) }
+        .sorted { i, j in
+            let a = candidates[i], b = candidates[j]
+            if a.hasLink != b.hasLink { return a.hasLink }     // an online meeting beats a calendar block
+            if ov(a) != ov(b) { return ov(a) > ov(b) }         // then the one that fills the segment
+            if a.start != b.start { return a.start < b.start } // still tied → earliest, then by title,
+            return a.title < b.title                           // so the pick never depends on EK order
+        }
+        .first
+}
+
 // MARK: - calendar lookup (title a transcript from the overlapping event)
 
 enum CalendarLookup {
@@ -1544,7 +1588,7 @@ enum CalendarLookup {
         return byName.keys.sorted().map { ($0, byName[$0]!) }
     }
 
-    /// Best event overlapping [start, end] — prefers one with a Zoom/Meet/Teams link.
+    /// Best event overlapping [start, end] — the one that fills most of it (see `bestEventIndex`).
     static func match(start: Date, end: Date) -> Match? {
         guard authorized else { return nil }
         let pred = store.predicateForEvents(withStart: start.addingTimeInterval(-300), end: end.addingTimeInterval(60), calendars: selectedCalendars)
@@ -1560,17 +1604,14 @@ enum CalendarLookup {
             }
             return nil
         }
-        func overlap(_ e: EKEvent) -> TimeInterval { max(0, min(e.endDate, end).timeIntervalSince(max(e.startDate, start))) }
 
         // An event caught only by the ±padding has zero true overlap: it belongs to the NEXT segment, and
         // since the event's start stamps the file name, keeping it makes two segments collide.
-        let overlapping = events.filter { overlap($0) > 0 }
-        guard !overlapping.isEmpty else { return nil }
-        let chosen = overlapping.sorted { a, b in
-            let la = link(a) != nil, lb = link(b) != nil
-            if la != lb { return la }                 // events with a meeting link win
-            return overlap(a) > overlap(b)            // else the one overlapping most
-        }.first!
+        let candidates = events.map {
+            EventCandidate(title: $0.title, start: $0.startDate, end: $0.endDate, hasLink: link($0) != nil)
+        }
+        guard let i = bestEventIndex(segStart: start, segEnd: end, candidates: candidates) else { return nil }
+        let chosen = events[i]
         let names = (chosen.attendees ?? []).compactMap { $0.name }.filter { !$0.isEmpty }
         return Match(title: chosen.title, link: link(chosen), attendees: names, start: chosen.startDate)
     }
@@ -8481,6 +8522,38 @@ struct Main {
                   && transcriptBaseName(start: transcriptStart(segStart: segA, segEnd: segAEnd,
                                                                eventStart: schedDate("2026-07-05 21:10")),
                                         timeZone: utc.timeZone) == "2026-07-05-2110")
+            // Naming an hour of audio after a calendar event: the 2026-07-08 15:00–16:02 segment was
+            // titled after an event it shared 2 minutes with, because that event carried a Zoom
+            // URL, while the kickoff that filled 60 of its 62 minutes had none. A link means "online",
+            // not "this is the meeting you recorded"; it may only break a tie.
+            let seg = schedDate("2026-07-08 15:00"), segEnd = schedDate("2026-07-08 16:02")
+            let kickoff = EventCandidate(title: "project kickoff",         // 60 min of the segment
+                                         start: schedDate("2026-07-08 14:00"),
+                                         end: schedDate("2026-07-08 16:00"), hasLink: false)
+            let goalCheck = EventCandidate(title: "goal progress check",     // 2 min
+                                           start: schedDate("2026-07-08 16:00"),
+                                           end: schedDate("2026-07-08 17:00"), hasLink: true)
+            let nextDay = EventCandidate(title: "caught only by the ±padding",  // zero true overlap
+                                         start: schedDate("2026-07-08 16:02"),
+                                         end: schedDate("2026-07-08 17:00"), hasLink: true)
+            func pick(_ cs: [EventCandidate]) -> String? {
+                bestEventIndex(segStart: seg, segEnd: segEnd, candidates: cs).map { cs[$0].title }
+            }
+            // Same-overlap tie: the online meeting wins. Both cover 15:00–16:00 exactly.
+            let inPerson = EventCandidate(title: "in person", start: seg,
+                                          end: schedDate("2026-07-08 16:00"), hasLink: false)
+            let online = EventCandidate(title: "online", start: seg,
+                                        end: schedDate("2026-07-08 16:00"), hasLink: true)
+            check("calendar: the event that FILLS the segment wins; a meeting link only breaks a tie",
+                  pick([goalCheck, kickoff]) == "project kickoff"              // link no longer outranks
+                  && pick([kickoff, goalCheck]) == "project kickoff"           // and order can't flip it
+                  && pick([nextDay]) == nil                                    // zero overlap → no match
+                  && pick([kickoff, nextDay]) == "project kickoff"
+                  && pick([inPerson, online]) == "online"                      // tie → the online one
+                  && pick([online, inPerson]) == "online"
+                  && pick([]) == nil
+                  && eventOverlap(kickoff, segStart: seg, segEnd: segEnd) == 3600
+                  && eventOverlap(goalCheck, segStart: seg, segEnd: segEnd) == 120)
             // Dead-mic detection — the jack-input incident: hours of segments "voiced" by clicks
             // (energy-gate trips) while containing zero speech-length runs, all discarded silently.
             check("mic guard: speech-run accounting (clicks never qualify, speech does)",
