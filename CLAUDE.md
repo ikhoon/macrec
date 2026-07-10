@@ -4,6 +4,11 @@ Single-file macOS menu-bar meeting recorder (`macrec.swift`). Menu-bar (tray) ap
 architected to grow into a full windowed app; recording is table stakes — the value is the
 pipeline above it (transcript → summary → daily digest → knowledge). See `PIPELINE.md`.
 
+**Read `AGENTS.md` too** — the operating rules distilled from maintainer feedback (the quality
+bar, non-negotiable habits, the CS-fundamentals self-check, and the post-implementation
+multi-agent review protocol). It is self-maintained: keep it current as feedback and best
+practices surface, without being asked.
+
 ## The iron rule: after you build it, LOOK at it and TEST it
 
 Never declare a change done from the code alone. Every change goes through, in order:
@@ -25,8 +30,12 @@ Never declare a change done from the code alone. Every change goes through, in o
   window background) — the human-eyeball check. Read the PNGs.
 - `macrec selftest` runs `paneLayoutIssues()` headlessly: lays out every pane and asserts no control
   is collapsed (~0 size) or overlapping. This is the automated, CI-run regression guard.
-- Live-caption / translation overlay changes: exercise the running overlay (they have no snapshot yet
-  — add one if you touch that surface).
+- `macrec caption-snapshot <dir>` captures the live overlay on screen at three opacities. It is a REAL
+  screen capture (`screencapture -l<window>`): a translucent window's material is composited by the
+  window server, so an offscreen render shows a blank slab and would "pass" no matter what. It needs
+  Screen Recording permission for the terminal that runs it — if it fails, it says so rather than
+  writing a misleading PNG.
+- Live-caption / translation changes: also exercise the running overlay.
 
 ## Process
 
@@ -39,3 +48,20 @@ Never declare a change done from the code alone. Every change goes through, in o
   atomically. Don't break the designated requirement.
 - Never `launchctl submit` a one-shot — it relaunches on failure (a debug capture loop once crackled
   system audio until removed).
+
+## Development direction — raising the bar
+
+The recurring failure mode here is *declaring a feature done from the code*, not from using it.
+Every rough edge the maintainer has had to catch — a "Choose…" button whose panel never surfaces,
+a Resume that does nothing after the schedule paused us, a "Check for Updates" with no feedback, a
+Grant-permissions item shown when permission is already granted, a half-built Summaries tab, a
+menu-bar glyph with no identity — traces to the same roots: not driving the actual behavior, and
+weak state-machine / feedback discipline. Software is hard to build and easy to break, so:
+
+- **Fundamentals first.** Complete state machines (handle every state, incl. schedule-paused), no
+  silent failures, UI bound to real state, a regression test per fix. `AGENTS.md §3` is the checklist.
+- **Drive it, don't just build it.** The iron rule above is binding: snapshot AND exercise every
+  control; reach every state. If only the maintainer is finding the bugs, QA didn't happen.
+- **Review before done.** After implementing, run the multi-agent review protocol (`AGENTS.md §4`)
+  — **5 perspectives, whatever the change size** (tokens are the budget) — then fix what it finds.
+- **Quality over cadence.** Ship only what holds up to the above. Releases are earned, not scheduled.
