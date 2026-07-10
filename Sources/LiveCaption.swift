@@ -158,6 +158,109 @@ final class LiveTranslator: LiveTranslating {
     }
 }
 
+/// Selectable live-translation backend. Apple is on-device (macOS 26); DeepL is a cloud service the
+/// user's key unlocks — markedly better for pairs Apple handles poorly (JA→KO, the user's main use).
+/// Extensible: add a case, a title, a readiness probe, and a branch in `rebuildTranslator`.
+enum TranslationProvider: String, CaseIterable {
+    case apple, deepl
+    var title: String {
+        switch self {
+        case .apple: return "Apple (on-device)"
+        case .deepl: return "DeepL ☁"
+        }
+    }
+    /// Can this provider run right now? Apple needs macOS 26; DeepL needs its API key. Offering one that
+    /// can only return nil is a promise the app can't keep — `current` falls back to Apple.
+    var isReady: Bool {
+        switch self {
+        case .apple: if #available(macOS 26, *) { return true } else { return false }
+        case .deepl: return Keychain.exists("deepl") || envKeyPresent("MR_DEEPL_KEY")
+        }
+    }
+    /// The stored provider if it can actually run, else Apple — translation must never be pinned to a
+    /// provider that can only silently show the original text.
+    static var current: TranslationProvider {
+        let stored = TranslationProvider(rawValue: Pref.d.string(forKey: Pref.translateProvider) ?? "") ?? .apple
+        return translationProvider(stored: stored, deeplReady: TranslationProvider.deepl.isReady)
+    }
+}
+
+/// Pure pick: honor the stored provider, but demote DeepL to Apple when its key is absent. Selftested.
+func translationProvider(stored: TranslationProvider, deeplReady: Bool) -> TranslationProvider {
+    (stored == .deepl && !deeplReady) ? .apple : stored
+}
+
+/// Map a BCP-47 language id ("ja", "ko-KR", "en-US") to a DeepL language code: the uppercase primary
+/// subtag, with the regional variant DeepL requires for a few targets (EN→EN-US, PT→PT-PT). An unmapped
+/// code passes through uppercased; DeepL then rejects it and `translate` returns nil. Selftested.
+func deepLLang(_ id: String, isTarget: Bool) -> String {
+    let base = id.split(whereSeparator: { $0 == "-" || $0 == "_" }).first.map { String($0).uppercased() } ?? id.uppercased()
+    guard isTarget else { return base }
+    switch base {
+    case "EN": return "EN-US"
+    case "PT": return "PT-PT"
+    default:   return base
+    }
+}
+
+/// Cloud translation via DeepL — high quality for pairs Apple's on-device model handles poorly (JA→KO).
+/// Source language is AUTO-DETECTED (robust to a mis-set caption language); only the target is fixed.
+/// API key in the Keychain (Settings → Live; `MR_DEEPL_KEY`). Free keys (suffix ":fx") use the api-free
+/// host. Returns nil on any failure, so captions fall back to the original text. No SDK — one POST.
+final class DeepLTranslator: LiveTranslating {
+    private let key: String
+    private let targetLang: String
+    private let endpoint: URL
+    private let session = URLSession(configuration: .default)
+
+    static var storedKey: String? { Keychain.get("deepl") }
+    static var apiKey: String { storedKey ?? ProcessInfo.processInfo.environment["MR_DEEPL_KEY"] ?? "" }
+    /// Free-tier keys end in ":fx" and MUST use the api-free host; everything else is a Pro key.
+    static func endpoint(forKey k: String) -> URL {
+        URL(string: k.hasSuffix(":fx") ? "https://api-free.deepl.com/v2/translate"
+                                       : "https://api.deepl.com/v2/translate")!
+    }
+
+    /// nil when no key is configured — the caller falls back to Apple (or no translation).
+    init?(target: Locale.Language) {
+        let k = Self.apiKey
+        guard !k.isEmpty else { return nil }
+        self.key = k
+        self.targetLang = deepLLang(target.languageCode?.identifier ?? "EN", isTarget: true)
+        self.endpoint = Self.endpoint(forKey: k)
+    }
+
+    func translate(_ text: String) async -> String? {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.setValue("DeepL-Auth-Key \(key)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Self.formBody([("text", text), ("target_lang", targetLang)]).data(using: .utf8)
+        do {
+            let (data, resp) = try await session.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            guard code == 200 else { elog("live: DeepL HTTP \(code)"); return nil }
+            return Self.parse(data)
+        } catch { elog("live: DeepL request failed: \(error)"); return nil }
+    }
+
+    /// x-www-form-urlencoded body — percent-encodes every key and value (caption text can hold & = +).
+    static func formBody(_ pairs: [(String, String)]) -> String {
+        var allowed = CharacterSet.alphanumerics; allowed.insert(charactersIn: "-._~")
+        func enc(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s }
+        return pairs.map { "\(enc($0.0))=\(enc($0.1))" }.joined(separator: "&")
+    }
+
+    /// Parse DeepL's {"translations":[{"text":"…"}]} → the first non-empty translation (internal: selftest).
+    static func parse(_ data: Data) -> String? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let arr = obj["translations"] as? [[String: Any]],
+              let first = arr.first, let t = first["text"] as? String, !t.isEmpty else { return nil }
+        return t
+    }
+}
+
 // MARK: - live transcription engines (pluggable)
 //
 // A live engine consumes fed PCM and calls back with caption text. Two implementations today —
@@ -1129,14 +1232,19 @@ final class LiveCaptions {
         }
     }
 
-    /// (Re)build the translator (nil = off, or target == caption language).
+    /// (Re)build the translator (nil = off, or target == caption language). Provider comes from prefs;
+    /// DeepL falls back to Apple if its key vanished between the readiness check and here.
     private func rebuildTranslator(_ cfg: LiveCfg) {
         engineGen &+= 1   // invalidate any in-flight translate Task started against the previous translator
         translator = nil
-        if !cfg.translateId.isEmpty,
-           Locale(identifier: cfg.translateId).language.languageCode?.identifier != cfg.locale.language.languageCode?.identifier {
-            translator = LiveTranslator(source: cfg.locale.language, target: Locale.Language(identifier: cfg.translateId))
+        guard !cfg.translateId.isEmpty,
+              Locale(identifier: cfg.translateId).language.languageCode?.identifier != cfg.locale.language.languageCode?.identifier
+        else { return }
+        let target = Locale.Language(identifier: cfg.translateId)
+        if TranslationProvider.current == .deepl, let dl = DeepLTranslator(target: target) {
+            translator = dl; elog("live: translator = DeepL (target=\(cfg.translateId))"); return
         }
+        translator = LiveTranslator(source: cfg.locale.language, target: target)
     }
 
     /// Full build of the transcriber(s) + translator from current prefs (warms up the analyzer). Serves

@@ -122,6 +122,34 @@ func runSelftest() -> Never {
             check("openai base: garbage → official", oaURL("ftp://nope") == oaOfficial && oaURL("::::") == oaOfficial)
             check("openai base: gateway query kept, intent deduped", oaURL("https://gw.example/x?intent=foo&team=a") ==
                   "wss://gw.example/x/v1/realtime?team=a&intent=transcription")
+            // Live translation provider: DeepL is honored only with a key, else demote to Apple — the same
+            // "don't offer what can't run" rule the transcription engines follow. Pure decision.
+            check("translate provider: DeepL needs a key, else Apple",
+                  translationProvider(stored: .deepl, deeplReady: true)  == .deepl
+                  && translationProvider(stored: .deepl, deeplReady: false) == .apple   // no key → fall back
+                  && translationProvider(stored: .apple, deeplReady: true)  == .apple)
+            // DeepL language mapping: uppercase primary subtag; targets that DeepL requires a regional
+            // variant for (EN, PT) get one; source keeps the base. (The user's pair is JA→KO.)
+            check("deepl lang: BCP-47 → DeepL code",
+                  deepLLang("ja", isTarget: true) == "JA" && deepLLang("ko-KR", isTarget: true) == "KO"
+                  && deepLLang("en", isTarget: true) == "EN-US" && deepLLang("en", isTarget: false) == "EN"
+                  && deepLLang("pt-BR", isTarget: true) == "PT-PT")
+            // DeepL free vs pro endpoint is decided by the key suffix (":fx" = free tier, different host).
+            check("deepl endpoint: :fx → api-free host, else pro host",
+                  DeepLTranslator.endpoint(forKey: "abc:fx").host == "api-free.deepl.com"
+                  && DeepLTranslator.endpoint(forKey: "abc").host == "api.deepl.com")
+            // DeepL response parsing: first non-empty translation; malformed/empty → nil (captions then
+            // show the original, never a crash or a blank line).
+            func dlParse(_ s: String) -> String? { DeepLTranslator.parse(s.data(using: .utf8)!) }
+            check("deepl parse: translations[0].text, else nil",
+                  dlParse(#"{"translations":[{"detected_source_language":"JA","text":"안녕하세요"}]}"#) == "안녕하세요"
+                  && dlParse(#"{"translations":[]}"#) == nil
+                  && dlParse(#"{"message":"Wrong endpoint"}"#) == nil
+                  && dlParse("not json") == nil)
+            // form body must percent-encode reserved chars so caption text with & = + never breaks the POST.
+            check("deepl form: reserved chars encoded",
+                  DeepLTranslator.formBody([("text", "a & b=c+d"), ("target_lang", "KO")])
+                  == "text=a%20%26%20b%3Dc%2Bd&target_lang=KO")
             // Saved-transcript scaffold localization: language-selected labels, and the old workflow
             // footer must never come back.
             let tDoc = TranscriptDoc(title: "T", day: "2026-07-05", hmStart: "10:00", hmEnd: "11:00", mins: 60,
