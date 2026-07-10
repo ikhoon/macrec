@@ -149,10 +149,14 @@ only `./macrec-stage.app/Contents/MacOS/macrec` (signed by `install.sh`). The te
 
 ## 5. Decisions & preferences the maintainer has stated once — don't ask again
 
-- **Single file.** `macrec.swift` stays one file through stabilization (the build is one
-  `swiftc macrec.swift`). Split only when it clearly pays — windowed-app work, or the file
-  becomes genuinely unworkable — not by line count alone. Splitting a swiftc build is cheap
-  later (`swiftc *.swift`, no SwiftPM), so deferring costs nothing.
+- **Split, one concern per file.** `macrec.swift` was one 8888-line file until the day it made a
+  change set impossible to divide into compiling commits. It is now the CLI entry point plus the
+  low-level primitives, and `Sources/` holds the rest: `Audio`, `Pipeline`, `LiveCaption`,
+  `Settings`, `Tray`, `Selftest`. Still no SwiftPM — the build stays one `swiftc macrec.swift
+  Sources/*.swift`. `Sources/` is what `swift package init` creates, so a later move to SwiftPM
+  needs no rename.
+- **Moving code is not changing code.** A refactor commit must prove it: capture `selftest` output
+  before, and diff it after. Identical or it isn't pure motion. Never mix a fix into a move.
 - **No org/employer identifiers** in code, fixtures, placeholders, or PR text (`CLAUDE.md`).
   `git diff | grep` before `git add`.
 - **Deliberate prior picks** — the always-visible (non-overlay) scrollbar, non-shouty
