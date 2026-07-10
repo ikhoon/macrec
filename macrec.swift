@@ -33,16 +33,39 @@ enum Keychain {
     /// an unsigned build (a bare `swiftc` binary) turns each one into a password prompt.
     private static let lock = NSLock()
     private static var cache: [String: String?] = [:]
+    private static var secretRequests = 0
 
     /// Set by the CLI subcommands that must never touch the user's real credentials (selftest, snapshots).
     nonisolated(unsafe) static var disabled = false
+
+    /// Every request for a SECRET, cached or not. Asking for a secret is what raises the authorization
+    /// prompt; asking whether one exists does not. Code that only needs presence must use `exists`.
+    static var secretRequestsForTest: Int { lock.lock(); defer { lock.unlock() }; return secretRequests }
 
     private static func query(_ account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: "com.ikhoon.macrec",
          kSecAttrAccount as String: account]
     }
+
+    /// Is a credential stored? An attributes-only query never hands the secret back, so it never asks the
+    /// user to authorize anything.
+    static func exists(_ account: String) -> Bool {
+        if disabled { return false }
+        lock.lock()
+        if let hit = cache[account] { lock.unlock(); return hit != nil }
+        lock.unlock()
+        var q = query(account)
+        q[kSecReturnAttributes as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: CFTypeRef?
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        if status != errSecSuccess, status != errSecItemNotFound { elog("keychain: probe '\(account)' failed (\(status))") }
+        return status == errSecSuccess
+    }
+
     static func get(_ account: String) -> String? {
+        lock.lock(); secretRequests += 1; lock.unlock()
         if disabled { return nil }
         lock.lock()
         if let hit = cache[account] { lock.unlock(); return hit }
@@ -3906,9 +3929,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         transcriptLangPopup.selectItem(at: idx(TranscriptL10n.configuredCode, tLangValues))   // explicit save (even "") beats env
         modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
-        deepgramKeyField.stringValue = DeepgramLiveTranscriber.storedKey ?? ""   // migrates legacy prefs too
-        openaiKeyField.stringValue = OpenAILiveTranscriber.storedKey ?? ""
-        gladiaKeyField.stringValue = GladiaLiveTranscriber.storedKey ?? ""
+        // Presence, not the secret. Prefilling the real key made opening Settings an authorization prompt
+        // per engine, for a value the user never asked to see.
+        for (account, field) in [("deepgram", deepgramKeyField), ("openai", openaiKeyField), ("gladia", gladiaKeyField)] {
+            field.stringValue = Keychain.exists(account) ? Self.keyMask : ""
+        }
         openaiBaseField.stringValue = OpenAILiveTranscriber.configuredBase   // explicit save (even "") beats env
         postProcessField.stringValue = Pref.postProcessCommand               // same explicit-save semantics
         // Show the EFFECTIVE mode (incl. the v1 migration: unset mode + v1 command = Custom command) —
@@ -4072,6 +4097,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.8, execute: work)
     }
 
+    /// Shown in a key field when a credential is stored. Never a real key, and never saved back.
+    static let keyMask = "••••••••••••"
+
+    func loadForTest() { load() }
+    var keyFieldsForTest: [String] { [deepgramKeyField, openaiKeyField, gladiaKeyField].map(\.stringValue) }
+
     /// Every pref the recorder reads. Missing one means Save saves it and nothing happens.
     private static let engineKeys = [
         Pref.segment, Pref.lang, Pref.transcriptLang, Pref.model, Pref.customModel, Pref.exclude,
@@ -4114,8 +4145,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         // Keychain first — if a credential write fails, abort BEFORE touching any other setting so
         // the user isn't left with a half-saved state (and no key is silently lost). All-or-nothing:
         // keys saved earlier in the loop are rolled back (best effort) on a later failure.
+        // Only credentials the user actually edited are touched. A field still showing the mask means
+        // "unchanged", so Save never reads or rewrites a key it wasn't given — and never asks the user
+        // to authorize handing the old one back just to save an unrelated setting.
         let creds = [("deepgram", deepgramKeyField, "Deepgram"), ("openai", openaiKeyField, "OpenAI"),
                      ("gladia", gladiaKeyField, "Gladia")]
+            .filter { $0.1.stringValue != Self.keyMask }
         let previousKeys = creds.map { ($0.0, Keychain.get($0.0) ?? "") }
         for (i, cred) in creds.enumerated() {
             let (account, field, name) = cred
@@ -4508,6 +4543,10 @@ protocol LiveTranscribing: AnyObject {
     func stop()
 }
 
+func envKeyPresent(_ name: String) -> Bool {
+    !(ProcessInfo.processInfo.environment[name] ?? "").isEmpty
+}
+
 /// Selectable live engine. Extensible: add a case, a title, and a branch in `makeTranscriber`.
 enum LiveEngine: String, CaseIterable {
     case apple, whisper, deepgram, openai, gladia
@@ -4537,9 +4576,10 @@ enum LiveEngine: String, CaseIterable {
             let c = EngineConfig.load()
             return FileManager.default.isExecutableFile(atPath: c.whisperCli)
                 && FileManager.default.fileExists(atPath: c.whisperModel)
-        case .deepgram: return !DeepgramLiveTranscriber.apiKey.isEmpty
-        case .openai:   return !OpenAILiveTranscriber.apiKey.isEmpty
-        case .gladia:   return !GladiaLiveTranscriber.apiKey.isEmpty
+        // Presence, never the secret: reading a key is an authorization check the user has to answer.
+        case .deepgram: return Keychain.exists("deepgram") || envKeyPresent("MR_DEEPGRAM_KEY")
+        case .openai:   return Keychain.exists("openai") || envKeyPresent("MR_OPENAI_KEY")
+        case .gladia:   return Keychain.exists("gladia") || envKeyPresent("MR_GLADIA_KEY")
         }
     }
     /// The title without the cloud marker — a row that already sits under a vendor header shouldn't
@@ -4599,7 +4639,8 @@ func engineAtPopupIndex(_ index: Int, choices: [LiveEngine]) -> LiveEngine? {
 /// the floor — an empty picker would strand the user with no engine and no way back. Pure + selftested.
 func selectableLiveEngines(_ all: [LiveEngine], ready: (LiveEngine) -> Bool,
                            enabled: (LiveEngine) -> Bool) -> [LiveEngine] {
-    let picked = all.filter { ready($0) && enabled($0) }
+    // `enabled` first: it is a plain pref read, while `ready` probes the Keychain and the filesystem.
+    let picked = all.filter { enabled($0) && ready($0) }
     return picked.isEmpty ? [.apple] : picked
 }
 
@@ -7748,6 +7789,16 @@ struct Main {
             _ = Keychain.get("deepgram"); _ = Keychain.get("deepgram"); _ = Keychain.get("openai")
             check("keychain: the test harness never touches the real Keychain",
                   Keychain.disabled && Keychain.readsForTest == 0 && Keychain.get("deepgram") == nil)
+            // Asking whether an engine is READY must never ask for a SECRET — that is the authorization
+            // prompt. Presence is answered by an attributes-only probe that hands nothing back.
+            let secretsBefore = Keychain.secretRequestsForTest
+            _ = LiveEngine.deepgram.isReady
+            _ = LiveEngine.openai.isReady
+            _ = selectableLiveEngines(LiveEngine.allCases, ready: { $0.isReady }, enabled: { $0.isEnabled })
+            _ = sw.loadForTest()
+            check("keychain: engine readiness and opening Settings request no secrets",
+                  Keychain.secretRequestsForTest == secretsBefore
+                  && sw.keyFieldsForTest.allSatisfy { $0.isEmpty || $0 == SettingsWindowController.keyMask })
             // A switch on + no key used to be silent: the engine simply never showed up in the picker.
             check("live: an engine switched on without its credential is reported, not silently dropped",
                   enginesMissingCredentials(LiveEngine.allCases, enabled: { $0 == .deepgram || $0 == .apple },
