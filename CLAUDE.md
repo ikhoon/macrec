@@ -32,11 +32,15 @@ Never declare a change done from the code alone. Every change goes through, in o
   window background) — the human-eyeball check. Read the PNGs.
 - `macrec selftest` runs `paneLayoutIssues()` headlessly: lays out every pane and asserts no control
   is collapsed (~0 size) or overlapping. This is the automated, CI-run regression guard.
-- `macrec caption-snapshot <dir>` captures the live overlay on screen at three opacities. It is a REAL
-  screen capture (`screencapture -l<window>`): a translucent window's material is composited by the
-  window server, so an offscreen render shows a blank slab and would "pass" no matter what. It needs
-  Screen Recording permission for the terminal that runs it — if it fails, it says so rather than
-  writing a misleading PNG.
+- `macrec caption-snapshot <dir>` renders the overlay onto a checkerboard, in both presentations (log
+  and subtitle) at three opacities including fully transparent — six PNGs, no permission needed. Look
+  at them. It once had to shell out to `screencapture`, because a `.behindWindow` material inside a
+  `.hudWindow` is composited by the window server and an offscreen render came back blank. Neither is
+  in the panel any more. `snapshotIsBlank` still guards that failure: if the render comes back empty it
+  refuses to write a reassuring PNG.
+- **Test subcommands must not change the app.** `selftest` and the three snapshots run with
+  `Keychain.disabled` and a throwaway defaults suite — driving the real UI persists as it goes, and
+  `caption-snapshot` once left the user in subtitle mode at zero opacity.
 - Live-caption / translation changes: also exercise the running overlay.
 
 ## Process

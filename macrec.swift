@@ -218,7 +218,16 @@ enum Pref {
     // Works around .standard domain not resolving when launchd execs the binary inside the .app directly.
     // To inspect from the CLI: `defaults read com.ikhoon.macrec.prefs`
     static let suiteName = "com.ikhoon.macrec.prefs"
-    static let d = UserDefaults(suiteName: suiteName) ?? .standard
+    nonisolated(unsafe) static var d = UserDefaults(suiteName: suiteName) ?? .standard
+
+    /// Point every read and write at a throwaway suite. The test and snapshot subcommands drive the real
+    /// UI, which persists as it goes — `caption-snapshot` left the user in subtitle mode at zero opacity,
+    /// and a later selftest then read that back and failed. A harness must not be able to change the app.
+    static func useEphemeralStoreForTest() {
+        let name = "com.ikhoon.macrec.ephemeral-test"
+        UserDefaults.standard.removePersistentDomain(forName: name)
+        d = UserDefaults(suiteName: name) ?? .standard
+    }
     // Key constants (shared with the settings UI)
     static let segment = "segmentSeconds", voiceMin = "voiceMinSeconds", lang = "whisperLang"
     static let keepAudio = "keepAudio", audioRetention = "audioRetentionDays", txtRetention = "transcriptRetentionDays"
@@ -1126,11 +1135,13 @@ struct Main {
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
 
-        // The test/snapshot subcommands build the real Settings pane and the real overlay, both of which
-        // ask every engine whether it is ready — a Keychain read each. Run them against no credentials at
-        // all: an unsigned dev build would otherwise raise an authorization prompt per read.
+        // The test/snapshot subcommands build the real Settings pane and the real overlay, which read
+        // credentials and write preferences as they go. Give them neither: no Keychain (an unsigned dev
+        // build would raise an authorization prompt per read) and a throwaway defaults suite (the overlay
+        // persisted its opacity and subtitle mode into the user's settings).
         if let a = args.first, ["selftest", "settings-snapshot", "icon-snapshot", "caption-snapshot"].contains(a) {
             Keychain.disabled = true
+            Pref.useEphemeralStoreForTest()
         }
 
         // Subcommands: help / version (accept the common flag spellings too).
@@ -1188,14 +1199,21 @@ struct Main {
             let app = NSApplication.shared
             app.setActivationPolicy(.accessory)
             guard #available(macOS 26, *) else { print("caption-snapshot: needs macOS 26"); exit(1) }
-            let w = LiveCaptionWindow(onClose: {}, onReconfigure: {}, onRestyle: {})
-            let files = w.snapshotOpacities([1.0, 0.6, 0.3], to: dir)
+            // Both presentations, at both extremes: the log view and the subtitle view have different
+            // failure modes, and the transparent end is the one that used to hide the captions entirely.
+            // Writing the pref is safe — Pref.d is a throwaway suite under any test subcommand.
+            var files: [URL] = []
+            for subtitle in [false, true] {
+                Pref.d.set(subtitle, forKey: Pref.liveSubtitle)
+                let w = LiveCaptionWindow(onClose: {}, onReconfigure: {}, onRestyle: {})
+                let sub = dir.appendingPathComponent(subtitle ? "subtitle" : "log")
+                files += w.snapshotOpacities([1.0, 0.6, 0.0], to: sub)
+            }
             for f in files { print(f.path) }
             if files.isEmpty {
-                print("caption-snapshot: FAILED — screencapture could not read the window. Grant Screen "
-                    + "Recording to the terminal you ran this from (System Settings › Privacy & Security "
-                    + "› Screen Recording), then run it again. A translucent window cannot be captured "
-                    + "offscreen: its material is composited by the window server.")
+                print("caption-snapshot: FAILED — the overlay rendered to nothing, so no PNG was written. "
+                    + "Something in the panel is composited by the window server again (a vibrancy material, "
+                    + "or the .hudWindow style mask); an offscreen render cannot see those.")
             } else {
                 print("caption-snapshot: \(files.count) shots → \(dir.path)")
             }
