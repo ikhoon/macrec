@@ -16,7 +16,7 @@ L1  transcript       Transcripts/YYYY-MM/<start>[-title].md    whisper.cpp batch
 L2  meeting summary  Summaries/YYYY-MM/<same name>.md      per-transcript, summary runner CLI
  │                                                         (claude / codex / gemini), event-driven
  ▼
-L3  daily digest     Daily/YYYY-MM/YYYY-MM-DD.md           once a day at a configured time,
+L3  daily digest     <chosen>/YYYY-MM/YYYY-MM-DD.md        once a day at a configured time,
  │                                                         aggregates the day's L2 (falls back to
  │                                                         L1 when a summary is missing)
  ▼

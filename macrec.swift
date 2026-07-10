@@ -28,12 +28,55 @@ import Compression   // zlib ratio — whisper repetition-loop detector (see Tra
 
 /// Minimal Keychain string store for long-lived credentials (generic passwords under this app's service).
 enum Keychain {
+    /// One SecItem read per account per process. `LiveEngine.isReady` is consulted from menu building,
+    /// pane building, the overlay's control bar and every Save — each read is an authorization check, and
+    /// an unsigned build (a bare `swiftc` binary) turns each one into a password prompt.
+    private static let lock = NSLock()
+    private static var cache: [String: String?] = [:]
+    private static var secretRequests = 0
+
+    /// Set by the CLI subcommands that must never touch the user's real credentials (selftest, snapshots).
+    nonisolated(unsafe) static var disabled = false
+
+    /// Every request for a SECRET, cached or not. Asking for a secret is what raises the authorization
+    /// prompt; asking whether one exists does not. Code that only needs presence must use `exists`.
+    static var secretRequestsForTest: Int { lock.lock(); defer { lock.unlock() }; return secretRequests }
+    static func forgetCacheForTest() { lock.lock(); cache.removeAll(); lock.unlock() }
+
     private static func query(_ account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: "com.ikhoon.macrec",
          kSecAttrAccount as String: account]
     }
+
+    /// Is a credential stored? An attributes-only query never hands the secret back, so it never asks the
+    /// user to authorize anything.
+    static func exists(_ account: String) -> Bool {
+        if disabled { return false }
+        lock.lock()
+        if let hit = cache[account] { lock.unlock(); return hit != nil }
+        lock.unlock()
+        var q = query(account)
+        q[kSecReturnAttributes as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: CFTypeRef?
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        if status != errSecSuccess, status != errSecItemNotFound { elog("keychain: probe '\(account)' failed (\(status))") }
+        return status == errSecSuccess
+    }
+
     static func get(_ account: String) -> String? {
+        lock.lock(); secretRequests += 1; lock.unlock()
+        if disabled { return nil }
+        lock.lock()
+        if let hit = cache[account] { lock.unlock(); return hit }
+        lock.unlock()
+        let value = read(account)
+        lock.lock(); cache[account] = value; lock.unlock()
+        return value
+    }
+    private static func read(_ account: String) -> String? {
+        lock.lock(); reads += 1; lock.unlock()
         var q = query(account)
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -47,28 +90,52 @@ enum Keychain {
         guard let d = out as? Data, let s = String(data: d, encoding: .utf8), !s.isEmpty else { return nil }
         return s
     }
-    /// Empty value deletes the item. Update-then-add (never delete-then-add: a failed add would
-    /// silently drop the stored credential); non-success statuses are logged, not swallowed.
+    /// Empty value deletes the item. A non-empty value RECREATES it: macOS binds an item's access
+    /// control list to the process that created it, and `SecItemUpdate` never refreshes that list — so
+    /// an item created once by the wrong binary keeps asking the user to authorize the right one,
+    /// forever. Deleting and re-adding rebinds the ACL to the app doing the save.
+    ///
+    /// The old update-then-add order guarded against a failed add dropping the credential. We hold
+    /// `value` throughout, so a failed add is retried and then reported — it is never silently lost.
     /// Returns whether the operation actually succeeded (callers migrating data must check).
     @discardableResult
     static func set(_ account: String, _ value: String) -> Bool {
+        if disabled { return true }
+        func remember(_ v: String?) { lock.lock(); cache[account] = v; lock.unlock() }
+        func delete() -> OSStatus { SecItemDelete(query(account) as CFDictionary) }
+
         guard !value.isEmpty else {
-            let status = SecItemDelete(query(account) as CFDictionary)
+            let status = delete()
             if status != errSecSuccess && status != errSecItemNotFound { elog("keychain: delete '\(account)' failed (\(status))"); return false }
+            remember(nil)
             return true
         }
-        let data = Data(value.utf8)
-        var status = SecItemUpdate(query(account) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if status == errSecItemNotFound {
-            var q = query(account)
-            q[kSecValueData as String] = data
-            // Credential stays on THIS machine (no backup/migration restore) but is readable after login.
-            q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            status = SecItemAdd(q as CFDictionary, nil)
+        let status = delete()
+        if status != errSecSuccess && status != errSecItemNotFound {
+            elog("keychain: could not clear '\(account)' before rewriting it (\(status))"); return false
         }
-        if status != errSecSuccess { elog("keychain: save '\(account)' failed (\(status))"); return false }
+        var q = query(account)
+        q[kSecValueData as String] = Data(value.utf8)
+        // Credential stays on THIS machine (no backup/migration restore) but is readable after login.
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        var add = SecItemAdd(q as CFDictionary, nil)
+        if add != errSecSuccess {
+            elog("keychain: add '\(account)' failed (\(add)) — retrying once")
+            add = SecItemAdd(q as CFDictionary, nil)
+        }
+        if add != errSecSuccess {
+            elog("keychain: save '\(account)' failed (\(add)); the previous value was removed and NOT restored")
+            remember(nil)
+            return false
+        }
+        remember(value)
         return true
     }
+
+    /// Reads that actually reached the Keychain this process. A flood of authorization prompts is a
+    /// caching bug, not a Keychain quirk.
+    static var readsForTest: Int { lock.lock(); defer { lock.unlock() }; return reads }
+    private static var reads = 0
 }
 
 func elog(_ s: String) {
@@ -157,7 +224,7 @@ final class SourceWriter {
     var voicedFrames: AVAudioFramePosition = 0   // # samples above the voice threshold
     static let voiceThreshold: Float = 0.02      // ~-34 dBFS — speech-ish floor
     // Speech-RUN accounting: real speech holds above the threshold for ≥50 ms at a time; electrical
-    // clicks/pops from a dead or misrouted input (the "외장 마이크" jack incident: hours of segments
+    // clicks/pops from a dead or misrouted input (the mic-less jack incident: hours of segments
     // "voiced" by clicks, every one transcribing to nothing) never form such runs.
     static let speechRunFrames = 800             // 50 ms @ 16 kHz
     var speechFrames: AVAudioFramePosition = 0   // samples inside ≥50 ms voiced runs
@@ -759,7 +826,7 @@ final class MicCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                 throw NSError(domain: "macrec", code: 4, userInfo: [NSLocalizedDescriptionKey: "no default audio input device"])
             }
             // The one log line that would have named this incident immediately: hours of dead
-            // segments traced to the default input being a mic-less jack device ("외장 마이크").
+            // segments traced to the default input being a mic-less external-jack device.
             elog("mic: capturing from '\(dev.localizedName)'")
             let input = try AVCaptureDeviceInput(device: dev)
             session.beginConfiguration()
@@ -796,6 +863,7 @@ enum Pref {
     static let exclude = "excludeApps", txtDir = "transcriptsDir", vad = "vadEnabled", autoStart = "autoStart"
     static let cal = "useCalendarTitles", model = "whisperModelName"
     static let calendars = "calendarNames"              // calendar titles to source event titles from (empty = all)
+    static let liveSubtitle = "liveSubtitle"            // film-subtitle presentation (centred, last lines only)
     static let liveTimestamps = "liveTimestamps"        // show timestamps in the live-caption overlay
     static let captionLang = "liveCaptionLang"          // live-caption transcription locale ("" = system)
     static let translateTo = "liveTranslateTo"          // live-caption translation target ("" = off)
@@ -804,6 +872,7 @@ enum Pref {
     static let liveBarCollapsed = "liveBarCollapsed"    // overlay control strip collapsed (space for captions)
     static let liveSource = "liveSource"                // which speakers to transcribe live: both|other|me
     static let liveEngine = "liveEngine"                // live transcription engine: apple|whisper|deepgram (extensible)
+    static let liveEnginesOn = "liveEnginesOn"          // engines the user switched ON (absent = defaults)
     static let deepgramKey = "deepgramKey"              // LEGACY (pre-Keychain builds) — read once for migration, then removed
     static let openaiBase = "openaiBase"                // OpenAI-compatible base URL ("" = api.openai.com; e.g. a corporate proxy)
     static let autostartOffered = "autostartOffered"   // one-shot: auto-enabled the login item once
@@ -819,7 +888,8 @@ enum Pref {
     static let summaryOut = "summaryOut"                // summary output dir ("" = next to the transcript)
     static let dailyDigest = "dailyDigest"              // L3: write a daily digest of the day's summaries
     static let dailyDigestTime = "dailyDigestTime"      // "HH:mm" the digest becomes due (default 20:00)
-    static let dailyDigestOut = "dailyDigestOut"        // digest output dir ("" = alongside summaries in ../Daily)
+    static let dailyDigestOut = "dailyDigestOut"        // digest output dir ("" = alongside the summaries)
+    static let dailyDigestName = "dailyDigestName"      // digest file-name template ("" = "{date}.md")
     static let dailyPrompt = "dailyDigestPrompt"        // digest prompt (absent = built-in default)
     static let dailyPromptFile = "dailyDigestPromptFile"  // external prompt file — overrides when readable
     static let dailyDigestLastRun = "dailyDigestLastRun"  // "yyyy-MM-dd" marker — one digest per day
@@ -1062,8 +1132,13 @@ struct EngineConfig {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let tdir = URL(fileURLWithPath: Pref.str(Pref.txtDir, "MR_TRANSCRIPTS_DIR",
                                                  home.appendingPathComponent("Documents/macrec/transcripts").path))
-        let excl = Pref.str(Pref.exclude, "MR_EXCLUDE_APPS", "com.spotify.client")
-            .split(whereSeparator: { $0 == " " || $0 == "," }).map(String.init)
+        // `Pref.str` treats a saved empty string as "unset" and falls back to the default — so clearing
+        // the "Never capture" field silently re-excluded Spotify. An explicit empty save means nothing
+        // is excluded; the default only applies when the user has never touched the field.
+        let exclRaw = Pref.d.object(forKey: Pref.exclude) != nil
+            ? (Pref.d.string(forKey: Pref.exclude) ?? "")
+            : (ProcessInfo.processInfo.environment["MR_EXCLUDE_APPS"] ?? "com.spotify.client")
+        let excl = exclRaw.split(whereSeparator: { $0 == " " || $0 == "," }).map(String.init)
         return EngineConfig(
             segmentSeconds: Pref.dbl(Pref.segment, "MR_SEGMENT_SECONDS", 3600),
             voiceMinSeconds: Pref.dbl(Pref.voiceMin, "MR_VOICE_MIN_SECONDS", 5),
@@ -1112,6 +1187,7 @@ struct CompletedSegment {
     let durationSeconds: Double
     /// Either side speaking is worth transcribing (covers listen-only meetings where only sys speaks).
     var voicedSeconds: Double { max(micVoicedSeconds, sysVoicedSeconds) }
+    var speechSeconds: Double { max(micSpeechSeconds, sysSpeechSeconds) }   // sustained speech only (clicks ≈ 0)
 }
 
 func segFormatter() -> DateFormatter {
@@ -1131,6 +1207,11 @@ final class SystemAudioTap {
     private let ioQueue = DispatchQueue(label: "macrec.systap")
     private let excludeBundleIds: [String]
     private let onBuffer: (AVAudioPCMBuffer) -> Void
+    /// The exclusion set is baked into an immutable `CATapDescription` at tap creation, so it goes stale
+    /// the moment an excluded app launches or relaunches with a new pid. `CaptureSession` compares this
+    /// against a fresh scan to decide whether the tap must be rebuilt. Our own process is always
+    /// excluded and is not part of this comparison.
+    private(set) var matchedExclusions: [AudioObjectID] = []
 
     init(excludeBundleIds: [String], onBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
         self.excludeBundleIds = excludeBundleIds
@@ -1141,10 +1222,14 @@ final class SystemAudioTap {
         stop()   // idempotent
         var exclude: [AudioObjectID] = []
         if let me = Self.processObject(pid: getpid()) { exclude.append(me) }
-        for bid in excludeBundleIds {
-            for app in NSRunningApplication.runningApplications(withBundleIdentifier: bid) {
-                if let o = Self.processObject(pid: app.processIdentifier) { exclude.append(o) }
-            }
+        // Match on Core Audio's own process list: AppKit only knows registered *applications*, never the
+        // helper processes many apps actually play through.
+        let procs = Self.audioProcesses()
+        let matched = matchExcludedProcesses(procs, excludeBundleIds: excludeBundleIds)
+        matchedExclusions = matched
+        exclude.append(contentsOf: matched)
+        for bid in excludeBundleIds where !procs.contains(where: { $0.bundleID == bid }) {
+            elog("engine: exclude '\(bid)' — no audio process with that bundle id right now")
         }
         // stereoGlobalTapButExcludeProcesses = the whole system mix minus these processes; a global
         // tap is unmuted by default (audio stays audible), which is exactly what we want.
@@ -1198,6 +1283,34 @@ final class SystemAudioTap {
         procID = nil
         if aggID != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(aggID); aggID = kAudioObjectUnknown }
         if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID); tapID = kAudioObjectUnknown }
+    }
+
+    /// Every process Core Audio currently tracks as audio-capable, with the bundle id it attributes to
+    /// each. The HAL populates this the moment a process opens an audio client, helpers included.
+    static func audioProcesses() -> [AudioProcessInfo] {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyProcessObjectList,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr,
+              size > 0 else { return [] }
+        var ids = [AudioObjectID](repeating: kAudioObjectUnknown, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids) == noErr
+        else { return [] }
+        return ids.map { AudioProcessInfo(objectID: $0, bundleID: Self.processBundleID($0)) }
+    }
+
+    private static func processBundleID(_ obj: AudioObjectID) -> String? {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioProcessPropertyBundleID,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(MemoryLayout<CFString?>.size)
+        var cf: CFString? = nil
+        let st = withUnsafeMutablePointer(to: &cf) {
+            AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, $0)
+        }
+        guard st == noErr, let s = cf as String?, !s.isEmpty else { return nil }
+        return s
     }
 
     private static func processObject(pid: pid_t) -> AudioObjectID? {
@@ -1273,6 +1386,17 @@ final class CaptureSession {
         catch { elog("engine: tap restart failed: \(error)"); return false }
     }
 
+    /// An excluded app that launches (or relaunches with a new pid) AFTER the tap was created is not
+    /// excluded by it — `CATapDescription` freezes a set of process object IDs. Rebuild the tap only
+    /// when the set it should exclude has actually drifted, so an unrelated app launching costs nothing.
+    func refreshExclusionsIfStale() async {
+        guard let live = tap else { return }
+        let current = matchExcludedProcesses(SystemAudioTap.audioProcesses(), excludeBundleIds: excludeBundleIds)
+        guard tapExclusionIsStale(current: current, live: live.matchedExclusions) else { return }
+        elog("engine: exclusion set changed (\(live.matchedExclusions.count) → \(current.count)) — rebuilding the tap")
+        _ = await restartStream()
+    }
+
     /// Pause capture (mic + system tap) on lock/sleep.
     func suspendStream() async {
         mic.stop()
@@ -1337,6 +1461,25 @@ func slugify(_ s: String) -> String {
     return out.isEmpty ? "meeting" : out
 }
 
+/// One process Core Audio knows about, and the bundle id Core Audio attributes to it.
+struct AudioProcessInfo: Equatable { let objectID: AudioObjectID; let bundleID: String? }
+
+/// The audio processes an exclusion list should silence. Matching happens on Core Audio's own process
+/// list, so a helper process that plays audio under its own bundle id is at least VISIBLE here — the
+/// old AppKit lookup could not see it at all, which is why an "excluded" app kept being recorded.
+/// A process with no bundle id (system mixers, our own tap) is never excluded. Pure + selftested.
+func matchExcludedProcesses(_ processes: [AudioProcessInfo], excludeBundleIds: [String]) -> [AudioObjectID] {
+    let want = Set(excludeBundleIds)
+    return processes.filter { p in p.bundleID.map { want.contains($0) } ?? false }.map(\.objectID)
+}
+
+/// Has the set of processes an exclusion list resolves to drifted from what the live tap was built
+/// with? `CATapDescription`'s exclusion is a frozen set of object IDs, so a relaunched (new pid) or
+/// newly-started excluded app is simply not excluded until the tap is rebuilt. Pure + selftested.
+func tapExclusionIsStale(current: [AudioObjectID], live: [AudioObjectID]) -> Bool {
+    Set(current) != Set(live)
+}
+
 /// Transcript/audio file base: the START time only — "2026-07-05-2100". The end time briefly
 /// lived in the name too (start-end for mid-hour "Transcribe now" cuts) but read as clutter
 /// (user pick); the header inside the file still carries the full start–end range.
@@ -1344,6 +1487,57 @@ func transcriptBaseName(start: Date, timeZone: TimeZone = .current) -> String {
     let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = timeZone
     f.dateFormat = "yyyy-MM-dd-HHmm"
     return f.string(from: start)
+}
+
+/// The mapped event's start, clamped to `[segStart, segEnd]` — unclamped, consecutive slices of one
+/// meeting collapse onto the same file name. No event → the segment's own start. Pure + selftested.
+func transcriptStart(segStart: Date, segEnd: Date, eventStart: Date?) -> Date {
+    guard let e = eventStart else { return segStart }
+    return min(max(e, segStart), segEnd)
+}
+
+/// A calendar event reduced to what titling a recorded segment depends on — a pure stand-in for
+/// `EKEvent` so the choice below is directly testable.
+struct EventCandidate: Equatable {
+    let title: String
+    let start: Date
+    let end: Date
+    let hasLink: Bool   // a Zoom/Meet/Teams/Webex URL sits somewhere on the event
+}
+
+/// Seconds of the recorded segment `[segStart, segEnd]` the event actually covers.
+func eventOverlap(_ e: EventCandidate, segStart: Date, segEnd: Date) -> TimeInterval {
+    max(0, min(e.end, segEnd).timeIntervalSince(max(e.start, segStart)))
+}
+
+/// Can this event plausibly be what the segment recorded? It must overlap at least HALF of whichever
+/// is shorter — itself, or the segment. Any positive overlap used to qualify, so the next meeting
+/// bleeding two minutes into a 62-minute recording could title the whole thing. Half-of-the-shorter
+/// still admits a one-minute tail that lies wholly inside a 90-minute meeting: that IS the meeting.
+func explainsSegment(_ e: EventCandidate, segStart: Date, segEnd: Date) -> Bool {
+    let ov = eventOverlap(e, segStart: segStart, segEnd: segEnd)
+    guard ov > 0 else { return false }   // caught only by the ±padding: it belongs to a neighbour
+    let shorter = min(e.end.timeIntervalSince(e.start), segEnd.timeIntervalSince(segStart))
+    return ov * 2 >= shorter
+}
+
+/// Index of the event that best titles a recorded segment. Among the events that could plausibly BE
+/// the segment, a meeting link decides: it separates a real online meeting from the all-day offsite
+/// and the personal blocks sitting on top of it — a 32-minute "Service Mesh Weekly Sync" should win
+/// over a 58-minute "인버터". Raw overlap cannot make that call, which is why the eligibility floor,
+/// not the ordering, is what keeps a 2-minute sliver from stealing the name. Pure + selftested.
+func bestEventIndex(segStart: Date, segEnd: Date, candidates: [EventCandidate]) -> Int? {
+    func ov(_ e: EventCandidate) -> TimeInterval { eventOverlap(e, segStart: segStart, segEnd: segEnd) }
+    return candidates.indices
+        .filter { explainsSegment(candidates[$0], segStart: segStart, segEnd: segEnd) }
+        .sorted { i, j in
+            let a = candidates[i], b = candidates[j]
+            if a.hasLink != b.hasLink { return a.hasLink }     // an online meeting beats a calendar block
+            if ov(a) != ov(b) { return ov(a) > ov(b) }         // then the one that fills the segment
+            if a.start != b.start { return a.start < b.start } // still tied → earliest, then by title,
+            return a.title < b.title                           // so the pick never depends on EK order
+        }
+        .first
 }
 
 // MARK: - calendar lookup (title a transcript from the overlapping event)
@@ -1360,7 +1554,9 @@ enum CalendarLookup {
         }
     }
 
-    struct Match { let title: String; let link: String?; let attendees: [String] }
+    /// `start` is the EVENT's start (not the segment's) — a transcript stamps itself with the meeting's
+    /// time when one maps. See `transcriptStart`.
+    struct Match { let title: String; let link: String?; let attendees: [String]; let start: Date }
 
     /// The event calendars the user chose to source titles from (by title). Empty selection — or a
     /// selection that matches nothing (e.g. a renamed calendar) — means "all calendars" (nil).
@@ -1379,7 +1575,20 @@ enum CalendarLookup {
         return Array(Set(store.calendars(for: .event).map { $0.title })).sorted()
     }
 
-    /// Best event overlapping [start, end] — prefers one with a Zoom/Meet/Teams link.
+    /// Calendars with the color the user assigned them in Calendar.app, so the picker reads like the
+    /// calendar they already know. `EKCalendar.color` is normalized to sRGB before use — a calendar can
+    /// carry a color in another space, and the components are only meaningful once converted (same
+    /// approach as maccal's `hexColor`). Deduped by title (first color wins), sorted by title.
+    static func availableCalendars() -> [(name: String, color: NSColor)] {
+        guard authorized else { return [] }
+        var byName: [String: NSColor] = [:]
+        for c in store.calendars(for: .event) where byName[c.title] == nil {
+            byName[c.title] = c.color?.usingColorSpace(.sRGB) ?? .secondaryLabelColor
+        }
+        return byName.keys.sorted().map { ($0, byName[$0]!) }
+    }
+
+    /// Best event overlapping [start, end] — the one that fills most of it (see `bestEventIndex`).
     static func match(start: Date, end: Date) -> Match? {
         guard authorized else { return nil }
         let pred = store.predicateForEvents(withStart: start.addingTimeInterval(-300), end: end.addingTimeInterval(60), calendars: selectedCalendars)
@@ -1395,15 +1604,16 @@ enum CalendarLookup {
             }
             return nil
         }
-        func overlap(_ e: EKEvent) -> TimeInterval { max(0, min(e.endDate, end).timeIntervalSince(max(e.startDate, start))) }
 
-        let chosen = events.sorted { a, b in
-            let la = link(a) != nil, lb = link(b) != nil
-            if la != lb { return la }                 // events with a meeting link win
-            return overlap(a) > overlap(b)            // else the one overlapping most
-        }.first!
+        // An event caught only by the ±padding has zero true overlap: it belongs to the NEXT segment, and
+        // since the event's start stamps the file name, keeping it makes two segments collide.
+        let candidates = events.map {
+            EventCandidate(title: $0.title, start: $0.startDate, end: $0.endDate, hasLink: link($0) != nil)
+        }
+        guard let i = bestEventIndex(segStart: start, segEnd: end, candidates: candidates) else { return nil }
+        let chosen = events[i]
         let names = (chosen.attendees ?? []).compactMap { $0.name }.filter { !$0.isEmpty }
-        return Match(title: chosen.title, link: link(chosen), attendees: names)
+        return Match(title: chosen.title, link: link(chosen), attendees: names, start: chosen.startDate)
     }
 }
 
@@ -1505,13 +1715,13 @@ enum Transcriber {
 
     static func isHallucinatedLine(_ text: String) -> Bool {
         // Boilerplate must BE the line (± a little punctuation), not merely appear in it — a real
-        // sentence that *mentions* "구독과 좋아요" (an A/B-test discussion, a demo ending with
+        // sentence that *mentions* a boilerplate phrase (an A/B-test discussion, a demo ending with
         // "thank you for watching the demo…") must survive.
         let t = text.lowercased()
         if hallucinationBoilerplate.contains(where: { t.contains($0.lowercased()) && text.count <= $0.count + 10 }) {
             return true
         }
-        // The 80-byte gate keeps short real repetition alive ("네, 네, 네…" backchannels, chants) —
+        // The 80-byte gate keeps short real repetition alive (backchannels, chants) —
         // per-line ratios on tiny strings are noisy, and sub-80-byte junk is cheap collateral.
         if text.utf8.count > 80, compressionRatio(text) > 2.4 { return true }
         // A phrase-loop's max share ≈ 1/period — 0.1 catches periods ≤ 9 words; longer-period
@@ -1615,6 +1825,7 @@ final class RecordingEngine {
     private(set) var running = false
     private var recovering = false
     private var suspended = false   // true while the display/system is asleep
+    private var exclusionRefresh: DispatchWorkItem?   // debounces the app-launch exclusion re-scan
     private var warnedDeadMic = false            // one dead-mic push per engine run (not per hour)
     var onTranscriptSaved: ((String) -> Void)?   // (message) — for refreshing UI state
     var onTranscriptURL: ((URL) -> Void)?        // path of the saved transcript file — notification click → open file
@@ -1658,6 +1869,17 @@ final class RecordingEngine {
         // and nothing on rec.queue ever syncs back to main, so this can't deadlock.
         let rec = session.rec
         return rec.queue.sync { (rec.micWriter?.recentLevel ?? 0, rec.sysWriter?.recentLevel ?? 0) }
+    }
+
+    /// Coalesce a burst of launch/quit notifications into one exclusion re-scan.
+    private func scheduleExclusionRefresh() {
+        exclusionRefresh?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.running, !self.suspended else { return }
+            Task { await self.session.refreshExclusionsIfStale() }
+        }
+        exclusionRefresh = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
     /// A tap created before "System Audio Recording Only" was granted delivers muted (zero) buffers.
@@ -1719,6 +1941,14 @@ final class RecordingEngine {
         }
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
             wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.wake() }
+        }
+        // An excluded app launching (or relaunching with a new pid) after the tap was built is NOT
+        // excluded by it — the tap froze a set of process object IDs. Re-scan on launch/quit and rebuild
+        // only when the set actually drifted. Debounced: an app's helper processes appear in a burst.
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.scheduleExclusionRefresh()
+            }
         }
         // Screen lock/unlock (distributed notifications) — pause while locked, too.
         let dnc = DistributedNotificationCenter.default()
@@ -1849,6 +2079,22 @@ final class RecordingEngine {
             onSegmentResult?("No speech — skipped")
             return
         }
+        // Short-blip filter (user rule): when calendar titling is on, a segment with NO overlapping
+        // meeting and under 3 min of speech isn't worth a file — meetings are always kept. Gate BEFORE
+        // transcription so throwaway blips never reach whisper. (Only when titling is on: without a
+        // calendar we can't tell "no meeting" from "a meeting we couldn't see", so we don't discard.)
+        // ONE calendar query per segment: whisper runs for minutes between the gate and the write, and
+        // two queries can return different answers.
+        let meeting = cfg.useCalendarTitles
+            ? CalendarLookup.match(start: seg.start, end: seg.start.addingTimeInterval(seg.durationSeconds))
+            : nil
+        if cfg.useCalendarTitles {
+            guard shouldKeepTranscript(hasMeeting: meeting != nil, speechSeconds: seg.speechSeconds) else {
+                elog("engine:   → no meeting & speech \(String(format: "%.0f", seg.speechSeconds))s < 180s — discarding")
+                onSegmentResult?("No meeting · short — skipped")
+                return
+            }
+        }
         // Model not downloaded yet (first run) — defer rather than write a "transcription failed" file.
         guard FileManager.default.fileExists(atPath: cfg.whisperModel) else {
             elog("engine:   → model not ready (\(cfg.whisperModel)) — deferring transcription")
@@ -1870,37 +2116,58 @@ final class RecordingEngine {
             return
         }
         do {
-            let url = try writeTranscript(seg: seg, text: text, mixed: mixed)
+            let url = try writeTranscript(seg: seg, text: text, mixed: mixed, event: meeting)
             onTranscriptURL?(url)
             onTranscriptSaved?("Saved: \(url.lastPathComponent)")
-            if let cmd = postProcessInvocationFromPrefs(transcriptPath: url.path) { runPostProcessCommand(cmd) }
+            if let cmd = postProcessInvocationFromPrefs(transcriptPath: url.path) {
+                let file = url.lastPathComponent
+                SummaryStatus.shared.started(file)
+                let mode = effectivePostProcessMode(rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
+                                                    shellCmd: Pref.postProcessCommand)
+                // A shell hook writes nowhere we know, so there is no file to reveal and no partial to reap.
+                let out = postProcessWritesSummaryFile(mode)
+                    ? summaryOutputPath(transcriptPath: url.path, outDir: Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT"))
+                    : nil
+                runPostProcessCommand(cmd) { status in
+                    guard status != 0 else { SummaryStatus.shared.finished(file, at: Date(), output: out); return }
+                    let why = out.flatMap { reapFailedPostProcess(outPath: $0) }
+                    SummaryStatus.shared.failed(file, at: Date(), reason: why)
+                    elog("engine: post-process exited \(status) for \(file)" + (why.map { " — \($0)" } ?? ""))
+                    Notifier.push(title: "Summary failed",
+                                  body: why ?? "The summary command exited with code \(status) — check Settings › Summaries.")
+                }
+            }
         } catch { elog("engine: writeTranscript: \(error)") }
     }
 
     @discardableResult
-    private func writeTranscript(seg: CompletedSegment, text: String, mixed: URL?) throws -> URL {
+    private func writeTranscript(seg: CompletedSegment, text: String, mixed: URL?,
+                                 event: CalendarLookup.Match?) throws -> URL {
         let fm = FileManager.default
         let dayF = DateFormatter(); dayF.locale = Locale(identifier: "en_US_POSIX"); dayF.dateFormat = "yyyy-MM-dd"
         let hmF = DateFormatter(); hmF.locale = Locale(identifier: "en_US_POSIX"); hmF.dateFormat = "HH:mm"
         let monthF = DateFormatter(); monthF.locale = Locale(identifier: "en_US_POSIX"); monthF.dateFormat = "yyyy-MM"
 
-        // Organize transcripts into monthly subfolders: transcripts/YYYY-MM/…  (audio under YYYY-MM/audio/).
-        let monthDir = cfg.transcriptsDir.appendingPathComponent(monthF.string(from: seg.start), isDirectory: true)
-        try fm.createDirectory(at: monthDir, withIntermediateDirectories: true)
         let end = seg.start.addingTimeInterval(seg.durationSeconds)
-        let mins = Int((seg.durationSeconds + 30) / 60)
 
-        // Title the transcript from the overlapping calendar event (prefers ones with a meeting link).
+        // The overlapping calendar event, resolved ONCE by the caller (see `process`).
         let l10n = TranscriptL10n.current
-        let event = cfg.useCalendarTitles ? CalendarLookup.match(start: seg.start, end: end) : nil
         let title = event?.title ?? l10n.autoTitle
-        let base = transcriptBaseName(start: seg.start)
+        // Stamp the file with the MEETING's start when one maps, else the segment's. Name, month
+        // folder and the header's range all derive from this one value so they can never disagree.
+        let stamp = transcriptStart(segStart: seg.start, segEnd: end, eventStart: event?.start)
+        let mins = max(1, Int((end.timeIntervalSince(stamp) + 30) / 60))
+        let base = transcriptBaseName(start: stamp)
         let slug = event.map { "\(base)-\(slugify($0.title))" } ?? base
+
+        // Organize transcripts into monthly subfolders: transcripts/YYYY-MM/…  (audio under YYYY-MM/audio/).
+        let monthDir = cfg.transcriptsDir.appendingPathComponent(monthF.string(from: stamp), isDirectory: true)
+        try fm.createDirectory(at: monthDir, withIntermediateDirectories: true)
 
         // keep the mixed WAV per the keepAudio setting (mixed is nil when keepAudio is off)
         var audioLine = "- \(l10n.audio): \(l10n.audioNotKept)"
         if cfg.keepAudio, let mixed = mixed {
-            let audioMonthDir = cfg.audioDir.appendingPathComponent(monthF.string(from: seg.start), isDirectory: true)
+            let audioMonthDir = cfg.audioDir.appendingPathComponent(monthF.string(from: stamp), isDirectory: true)
             try fm.createDirectory(at: audioMonthDir, withIntermediateDirectories: true)
             let keptAudio = audioMonthDir.appendingPathComponent("\(slug).wav")
             try? fm.removeItem(at: keptAudio)
@@ -1919,7 +2186,7 @@ final class RecordingEngine {
             ? l10n.failureNote(model: cfg.whisperModel) : text
         let doc = TranscriptDoc(
             title: title,
-            day: dayF.string(from: seg.start), hmStart: hmF.string(from: seg.start), hmEnd: hmF.string(from: end),
+            day: dayF.string(from: stamp), hmStart: hmF.string(from: stamp), hmEnd: hmF.string(from: end),
             mins: mins,
             micVoiced: seg.micVoicedSeconds, sysVoiced: seg.sysVoicedSeconds,
             modelName: URL(fileURLWithPath: cfg.whisperModel).lastPathComponent,
@@ -2323,6 +2590,14 @@ func effectivePostProcessMode(rawMode: String, shellCmd: String) -> PostProcessM
     return shellCmd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .off : .shell
 }
 
+/// Whether a completed segment is worth a transcript file. A segment that overlapped a calendar MEETING
+/// is always kept; an ad-hoc recording with no meeting is kept only when there was real speech — at least
+/// `minNonMeetingSeconds` (default 3 min) — so short non-meeting blips (a hallway chat, a passing video)
+/// don't litter the notes (user rule). Pure + selftested.
+func shouldKeepTranscript(hasMeeting: Bool, speechSeconds: Double, minNonMeetingSeconds: Double = 180) -> Bool {
+    hasMeeting || speechSeconds >= minNonMeetingSeconds
+}
+
 /// Read the post-process prefs and build the invocation for a just-saved transcript.
 /// The effective summary prompt: a readable prompt FILE overrides the inline text (same "…or file"
 /// pattern as the hints; keep the prompt in your notes repo and iterate without touching Settings).
@@ -2361,22 +2636,59 @@ func dailyDigestDue(now: Date, time: String, lastRun: String, calendar: Calendar
     return mins >= hm[0] * 60 + hm[1]
 }
 
-/// The day's digest inputs: prefer the meeting SUMMARY (compact) and fall back to the transcript
-/// for meetings that don't have one. Inputs are matched by the shared `yyyy-MM-dd-HHmm` basename
-/// prefix (naming is the pipeline's join key) and returned in chronological (name) order.
-func dailyDigestInputs(day: String, transcripts: [String], summaries: [String]) -> [String] {
-    let summaryByBase = Dictionary(uniqueKeysWithValues: summaries.map {
-        (URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent, $0)
-    })
+/// Should the day be marked done, given how the digest ended? Only a run that produced a file, or one
+/// that can never succeed today (nothing to summarize, a name that would clobber a note), retires the
+/// day. A runner that failed — no login, no network — must be retried on the next tick, or a transient
+/// error at 20:00 silently costs the whole day. Pure + selftested.
+enum DigestOutcome: Equatable { case wrote, nothingToDo, wouldOverwrite, runnerFailed }
+func digestMarksDayDone(_ outcome: DigestOutcome) -> Bool {
+    switch outcome {
+    case .wrote, .nothingToDo, .wouldOverwrite: return true
+    case .runnerFailed:                         return false
+    }
+}
+
+/// The digest's file name from a user template: `{date}` / `{month}`, default `{date}.md`. Separators
+/// are stripped (a `/` would escape the month folder) and the day is forced in — a template without it
+/// resolves to one path for the whole month and the atomic `mv` would eat yesterday. Pure + selftested.
+let dailyDigestNameDefault = "{date}.md"
+func dailyDigestFileName(day: String, template: String = dailyDigestNameDefault) -> String {
+    let t = template.trimmingCharacters(in: .whitespacesAndNewlines)
+    var name = (t.isEmpty ? dailyDigestNameDefault : t)
+        .replacingOccurrences(of: "{date}", with: day)
+        .replacingOccurrences(of: "{month}", with: String(day.prefix(7)))
+        .replacingOccurrences(of: "/", with: "-")
+    if !name.lowercased().hasSuffix(".md") { name += ".md" }
+    if name == ".md" { name = "\(day).md" }
+    // A template with no {date} ("notes.md", or only {month}) resolves to the SAME path every day of
+    // the month, and the digest's atomic promote is an `mv` — yesterday's digest would be overwritten
+    // without a word. The day is not negotiable; the rest of the name is the user's.
+    return name.contains(day) ? name : "\(day)-\(name)"
+}
+
+/// The day's digest inputs: the meeting SUMMARY where one exists, else the transcript, joined on the
+/// shared `yyyy-MM-dd-HHmm` basename and sorted by name. `excluding` is the digest about to be written —
+/// it shares the folder and the day prefix, so without this it feeds on its own output.
+func dailyDigestInputs(day: String, transcripts: [String], summaries: [String], excluding: String = "") -> [String] {
+    let skip = excluding.isEmpty ? "" : URL(fileURLWithPath: excluding).standardizedFileURL.path
+    func kept(_ p: String) -> Bool { skip.isEmpty || URL(fileURLWithPath: p).standardizedFileURL.path != skip }
+    // A summary saved next to its transcript is named `<base>-sum.md` (summaryOutputPath). Keying the
+    // map on the raw basename meant `<base>-sum` never matched `<base>`, so the digest silently fed on
+    // raw transcripts instead of the compact summaries whenever "Save summary to" was left empty.
+    let summaryByBase = Dictionary(summaries.filter(kept).map { p -> (String, String) in
+        let b = URL(fileURLWithPath: p).deletingPathExtension().lastPathComponent
+        return (b.hasSuffix("-sum") ? String(b.dropLast(4)) : b, p)
+    }, uniquingKeysWith: { a, _ in a })
     return transcripts
-        .filter { URL(fileURLWithPath: $0).lastPathComponent.hasPrefix(day) }
+        .filter { kept($0) && URL(fileURLWithPath: $0).lastPathComponent.hasPrefix(day) }
         .sorted { URL(fileURLWithPath: $0).lastPathComponent < URL(fileURLWithPath: $1).lastPathComponent }
         .map { summaryByBase[URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent] ?? $0 }
 }
 
-/// Where the digest lands: `<dir>/YYYY-MM/YYYY-MM-DD.md`. "" falls back to a `Daily` folder next
-/// to the summaries dir (or next to the transcripts dir when summaries also default). Pure.
-func dailyDigestOutputPath(day: String, outDir: String, summaryOutDir: String, transcriptsDir: String) -> String {
+/// Where the digest lands: `<dir>/YYYY-MM/<name>`. "" falls back to the summaries dir (or the
+/// transcripts dir when summaries also default) — the same month folder as the day's notes. Pure.
+func dailyDigestOutputPath(day: String, outDir: String, summaryOutDir: String, transcriptsDir: String,
+                           nameTemplate: String = dailyDigestNameDefault) -> String {
     let dir = outDir.trimmingCharacters(in: .whitespacesAndNewlines)
     let sum = summaryOutDir.trimmingCharacters(in: .whitespacesAndNewlines)
     let root: URL
@@ -2384,13 +2696,11 @@ func dailyDigestOutputPath(day: String, outDir: String, summaryOutDir: String, t
         root = URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
     } else if !sum.isEmpty {
         root = URL(fileURLWithPath: (sum as NSString).expandingTildeInPath)
-            .deletingLastPathComponent().appendingPathComponent("Daily", isDirectory: true)
     } else {
         root = URL(fileURLWithPath: transcriptsDir)
-            .deletingLastPathComponent().appendingPathComponent("Daily", isDirectory: true)
     }
     return root.appendingPathComponent(String(day.prefix(7)), isDirectory: true)
-        .appendingPathComponent("\(day).md").path
+        .appendingPathComponent(dailyDigestFileName(day: day, template: nameTemplate)).path
 }
 
 /// Shell invocation for the digest: cat the day's inputs into the summary runner, atomic promote.
@@ -2407,6 +2717,100 @@ func dailyDigestInvocation(runner: SummaryRunner, prompt: String, inputs: [Strin
     }
     return "mkdir -p \(shq(dir)) && \(runnerCmd) "
          + "> \(shq(outPath + ".partial")) && mv \(shq(outPath + ".partial")) \(shq(outPath))"
+}
+
+/// What post-processing is doing right now. Without this the pipeline is a black box: a summary runs
+/// after a transcript is saved, leaves no trace, and the app looks broken.
+enum SummaryActivity: Equatable {
+    case off
+    case idle
+    case running(String)
+    case done(String, Date)
+    case failed(String, Date, reason: String?)
+}
+
+/// The tray row for post-processing. Pure + selftested.
+func summaryMenuTitle(_ activity: SummaryActivity, hm: (Date) -> String) -> String {
+    switch activity {
+    case .off:                 return "Summaries: off"
+    case .idle:                return "Summary: after the next transcript"
+    case .running(let file):   return "Summary: running… \(file)"
+    case .done(let file, let t):      return "Summary: \(file) · \(hm(t))"
+    case .failed(let file, let t, _): return "Summary FAILED: \(file) · \(hm(t))"
+    }
+}
+
+/// What clicking the summary row does. Enablement and the action come from ONE decision, so a row can
+/// never be clickable and then do nothing — the defect this project keeps reproducing. Pure + selftested.
+enum SummaryRowAction: Equatable {
+    case none
+    case reveal(String)              // the file it produced
+    case explain(String, String?)    // (file, why it failed)
+}
+func summaryRowAction(_ activity: SummaryActivity, lastOutput: String?) -> SummaryRowAction {
+    switch activity {
+    case .failed(let file, _, let reason): return .explain(file, reason)
+    case .done, .idle, .running:
+        guard let out = lastOutput else { return .none }
+        return .reveal(out)
+    case .off: return .none
+    }
+}
+
+/// The tray row for the daily digest. Pure + selftested.
+func digestMenuTitle(enabled: Bool, dueTime: String, lastRun: String, today: String) -> String {
+    guard enabled else { return "Daily digest: off" }
+    if lastRun == today { return "Daily digest: written today" }
+    return "Daily digest: due at \(dueTime)"
+}
+
+/// Last known post-processing activity. Written from the process queue, read on the main thread.
+final class SummaryStatus {
+    static let shared = SummaryStatus()
+    private let lock = NSLock()
+    private var activity: SummaryActivity = .idle
+    private var lastPath: String?
+
+    var current: SummaryActivity { lock.lock(); defer { lock.unlock() }; return activity }
+    var lastOutput: String? { lock.lock(); defer { lock.unlock() }; return lastPath }
+    /// Both halves under ONE lock: reading them separately lets a failure land between the two and the
+    /// row then offers to reveal a file for a run that just failed.
+    var snapshot: (SummaryActivity, String?) { lock.lock(); defer { lock.unlock() }; return (activity, lastPath) }
+
+    func started(_ file: String) { lock.lock(); activity = .running(file); lock.unlock() }
+    func finished(_ file: String, at date: Date, output: String?) {
+        lock.lock(); activity = .done(file, date); lastPath = output; lock.unlock()
+    }
+    func failed(_ file: String, at date: Date, reason: String?) {
+        lock.lock(); activity = .failed(file, date, reason: reason); lock.unlock()
+    }
+    func resetForTest() { lock.lock(); activity = .idle; lastPath = nil; lock.unlock() }
+}
+
+/// Does this mode write a summary file at the summary path? Only the built-in `.summary` mode redirects
+/// into `<out>.partial` and promotes it. A freeform shell hook is handed the transcript and writes
+/// wherever it likes — offering to reveal `<out>` after it runs would open a file that never existed,
+/// and reading `<out>.partial` for a failure reason would find nothing. Pure + selftested.
+func postProcessWritesSummaryFile(_ mode: PostProcessMode) -> Bool { mode == .summary }
+
+/// A summary runner writes its STDOUT to `<out>.partial` and only then promotes it, so when it fails
+/// the reason is inside that file, not on stderr — `claude` exiting 1 with "Not logged in · Please run
+/// /login" left nothing but "exit 1" in the log. On failure, read the reason back and delete the orphan.
+/// Returns the first line worth showing, if any. Pure enough to test: the path is injected.
+@discardableResult
+func reapFailedPostProcess(outPath: String, fs: FileManager = .default) -> String? {
+    let partial = outPath + ".partial"
+    defer { try? fs.removeItem(atPath: partial) }
+    // Read a head, not the file: a runner can stream megabytes before it dies. Lossy decoding, because a
+    // half-written UTF-8 sequence at the cut must not throw the reason away.
+    guard let h = FileHandle(forReadingAtPath: partial) else { return nil }
+    defer { try? h.close() }
+    let head = (try? h.read(upToCount: 8192)) ?? Data()
+    guard !head.isEmpty else { return nil }
+    let text = String(decoding: head, as: UTF8.self)
+    let reason = text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        .first(where: { !$0.isEmpty })
+    return reason.map { String($0.prefix(200)) }
 }
 
 func postProcessInvocationFromPrefs(transcriptPath: String) -> String? {
@@ -2453,6 +2857,8 @@ func runPostProcessCommand(_ command: String, completion: ((Int32) -> Void)? = n
             let data = out.fileHandleForReading.readDataToEndOfFile()   // EOF first, then exit — no pipe deadlock
             p.waitUntilExit()
             killer.cancel()
+            // The command redirects its own stdout into `<out>.partial`, so this pipe is usually empty and
+            // the reason lives in that file — see reapFailedPostProcess, which the callers use on failure.
             let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             elog("post-process: exit \(p.terminationStatus)" + (s.isEmpty ? "" : " — \(s.prefix(400))"))
             completion?(p.terminationStatus)
@@ -2463,11 +2869,124 @@ func runPostProcessCommand(_ command: String, completion: ((Int32) -> Void)? = n
     }
 }
 
-// MARK: - settings window (NSGridView form, persists to UserDefaults)
+// MARK: - settings window (grouped row-card form, persists to UserDefaults)
 
 /// Scroll-document container whose origin is the TOP (AppKit views are bottom-up by default) —
 /// forms in a scroll view should start at the top and grow downward.
 final class FlippedDocView: NSView { override var isFlipped: Bool { true } }
+
+/// A rounded, hairline-bordered settings group. Marker type so the UI selftest can count
+/// "every pane renders at least one section card".
+final class SectionCard: NSView {}
+
+/// A wrapping label that wraps to its ACTUAL laid-out width instead of a fixed guess — so a one-line
+/// description stays one line when the window is wide and only wraps when it truly runs out of room
+/// (user: the "Capture system audio" note wrapped needlessly). Give it leading+trailing and it sizes
+/// its own height correctly at any window width.
+final class WrappingLabel: NSTextField {
+    override func layout() {
+        super.layout()
+        if abs(preferredMaxLayoutWidth - bounds.width) > 0.5 {
+            preferredMaxLayoutWidth = bounds.width
+            invalidateIntrinsicContentSize()
+        }
+    }
+}
+
+/// A secondary wrapping caption (row descriptions, section notes) that self-sizes to its width.
+func wrappingCaption(_ s: String, size: CGFloat = 11, color: NSColor = .secondaryLabelColor) -> WrappingLabel {
+    let l = WrappingLabel(labelWithString: s)
+    l.font = .systemFont(ofSize: size)
+    l.textColor = color
+    l.lineBreakMode = .byWordWrapping
+    l.maximumNumberOfLines = 0
+    l.cell?.wraps = true
+    l.cell?.isScrollable = false
+    l.translatesAutoresizingMaskIntoConstraints = false
+    l.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    return l
+}
+
+/// Should a nested scroll view hand the wheel event to its parent instead of eating it? Yes when its
+/// own content already fits (nothing to scroll), so hovering the pointer over an embedded editor no
+/// longer traps the gesture and the whole pane can still scroll. Pure + unit-tested.
+func nestedScrollPassesThrough(contentHeight: CGFloat, clipHeight: CGFloat) -> Bool {
+    contentHeight <= clipHeight + 0.5
+}
+
+/// A scroll view that forwards vertical wheel events UP to the enclosing pane scroller when its own
+/// content fits (so a prompt/calendar box with the pointer over it doesn't block scrolling the pane —
+/// the pointer over a prompt box used to trap the gesture). When its content genuinely overflows it keeps the
+/// event and scrolls itself.
+final class PassthroughScrollView: NSScrollView {
+    override func scrollWheel(with event: NSEvent) {
+        let contentH = documentView?.bounds.height ?? 0
+        if nestedScrollPassesThrough(contentHeight: contentH, clipHeight: contentView.bounds.height) {
+            nextResponder?.scrollWheel(with: event)   // let the pane scroll
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
+}
+
+/// Sidebar row: a monochrome SF Symbol + label. The icon follows the row's background style —
+/// muted (secondary) normally, white when the row is selected (the accent-filled state) — so the
+/// nav reads as one clean column, not a wall of colored tiles (user + design-review feedback).
+final class SidebarCell: NSTableCellView {
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet { imageView?.contentTintColor = backgroundStyle == .emphasized ? .white : .secondaryLabelColor }
+    }
+}
+
+/// Sidebar selection is app state, not focus state: it must look identical whether or not the table is
+/// first responder. AppKit's own drawing consults focus, so we draw the pill ourselves.
+final class SidebarRowView: NSTableRowView {
+    override var isEmphasized: Bool {
+        get { true }
+        set { }
+    }
+    override var interiorBackgroundStyle: NSView.BackgroundStyle { isSelected ? .emphasized : .normal }
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard isSelected else { return }
+        NSColor.selectedContentBackgroundColor.setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 5, dy: 1), xRadius: 6, yRadius: 6).fill()
+    }
+}
+
+/// Map a key-equivalent to the standard edit-action selector. Pure + unit-tested — ⌘V → `paste:`,
+/// ⌘C → `copy:`, ⌘X → `cut:`, ⌘A → `selectAll:`, ⌘Z → `undo:`, ⌘⇧Z → `redo:`; nil for anything else
+/// (the window then falls through to `super`). Requires the modifiers to match EXACTLY so ⌘⌥V etc.
+/// aren't hijacked.
+func standardEditSelector(key: String?, flags: NSEvent.ModifierFlags) -> Selector? {
+    let k = key?.lowercased()
+    if flags == .command {
+        switch k {
+        case "x": return #selector(NSText.cut(_:))
+        case "c": return #selector(NSText.copy(_:))
+        case "v": return #selector(NSText.paste(_:))
+        case "a": return #selector(NSResponder.selectAll(_:))
+        case "z": return Selector(("undo:"))
+        default:  return nil
+        }
+    }
+    if flags == [.command, .shift], k == "z" { return Selector(("redo:")) }
+    return nil
+}
+
+/// A window that routes the standard edit shortcuts to the responder chain. An LSUIElement app has
+/// no menu bar, so ⌘X/⌘C/⌘V/⌘A/⌘Z never reach a focused text field's field editor — pasting into
+/// the Settings fields silently did nothing (user report). Dispatching the standard action selectors
+/// via `sendAction(to: nil)` lands them on the field editor, which implements them.
+final class EditableWindow: NSWindow {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if let sel = standardEditSelector(key: event.charactersIgnoringModifiers, flags: flags),
+           NSApp.sendAction(sel, to: nil, from: self) {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
 
 /// Caption overlay panel: key-able despite `.nonactivatingPanel` (text selection needs key status),
 /// and — since an LSUIElement app has no Edit menu to route key equivalents — ⌘C/⌘A are handled here.
@@ -2484,32 +3003,6 @@ final class CaptionPanel: NSPanel {
         }
         return super.performKeyEquivalent(with: event)
     }
-}
-
-/// Form-row role markers: a row's ROLE travels with its views, so grid styling (header merges, caption
-/// padding) is derived instead of hand-indexed — inserting a row can no longer desync a styling list.
-final class SectionHeaderCell: NSStackView {}   // col 0 → full-width merged section header
-final class CaptionCell: NSTextField {}         // col 0 → full-width intro note; col 1 → field caption
-final class ToggleCell: NSStackView {}          // col 0 → full-width, LEFT-aligned boolean row (checkbox)
-
-/// Find the first NSGridView in a view tree (the settings selftest inspects panes through their
-/// scroll-view wrapper).
-func firstGrid(in view: NSView?) -> NSGridView? {
-    guard let view else { return nil }
-    if let g = view as? NSGridView { return g }
-    if let sv = view as? NSScrollView { return firstGrid(in: sv.documentView) }
-    for sub in view.subviews { if let g = firstGrid(in: sub) { return g } }
-    return nil
-}
-
-/// Derive (headers, notes) row indices from marker types. Pure + testable (see `macrec selftest`).
-func formRowRoles(_ rows: [[NSView]]) -> (headers: [Int], notes: [Int]) {
-    var headers: [Int] = [], notes: [Int] = []
-    for (i, r) in rows.enumerated() {
-        if r.first is SectionHeaderCell || r.first is CaptionCell || r.first is ToggleCell { headers.append(i) }
-        else if r.count > 1, r[1] is CaptionCell { notes.append(i) }
-    }
-    return (headers, notes)
 }
 
 // MARK: - update check (Sparkle-style UX, zero dependencies — GitHub Releases is the appcast)
@@ -2571,13 +3064,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     /// keep the last saved period. Invalid input turns red and is ignored on save.
     func controlTextDidChange(_ obj: Notification) {
         guard let f = obj.object as? NSTextField else { return }
-        if f === schedDaysField || f === schedHoursField { recolorScheduleFields() }
         if f === audioRawCombo || f === audioRetCombo { recolorRetentionCombos() }
-    }
-
-    fileprivate func recolorScheduleFields() {
-        schedDaysField.textColor = RecordSchedule.daysValid(schedDaysField.stringValue) ? .labelColor : .systemRed
-        schedHoursField.textColor = RecordSchedule.hoursValid(schedHoursField.stringValue) ? .labelColor : .systemRed
     }
 
     fileprivate func recolorRetentionCombos() {
@@ -2598,6 +3085,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     private let paneContainer = NSView()
     private var visiblePaneIndexes: [Int] = []   // sidebar rows → pane indexes (search filters this)
     private var selectedPane = 0
+    private var sectionGroupViews: [String: [NSView]] = [:]   // tag → section views, toggled as tabs
     private let segPopup = NSPopUpButton(), langPopup = NSPopUpButton()
     private let modelPopup = NSPopUpButton()
     private let txtRetPopup = NSPopUpButton()
@@ -2616,33 +3104,42 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     private let runnerValues = ["claude", "codex", "gemini"], runnerTitles = ["Claude CLI", "Codex CLI", "Gemini CLI"]
     private let promptView = NSTextView()         // summary prompt — a real TEXT AREA (prompts are sentences)
     private let promptFileField = NSTextField()   // external prompt file — overrides the text when readable
-    private let promptScroll = NSScrollView()     // its bordered, scrolling host
+    private let promptScroll = PassthroughScrollView()   // its bordered, scrolling host (wheel passes to the pane when it fits)
     private let summaryOutField = NSTextField()   // summary output dir ("" = next to the transcript)
-    private let dailyBtn = NSButton(checkboxWithTitle: "Write a daily digest", target: nil, action: nil)
+    private let dailyBtn = NSSwitch()
     private let dailyTimePicker = NSDatePicker()  // HH:mm the digest becomes due
-    private let dailyOutField = NSTextField()     // digest output dir ("" = Daily/ next to summaries)
-    private let updateBtn = NSButton(checkboxWithTitle: "Check for updates daily", target: nil, action: nil)
+    private let dailyOutField = NSTextField()     // digest output dir ("" = alongside the summaries)
+    private let dailyNameField = NSTextField()    // digest file-name template ("" = "{date}.md")
+    private let updateBtn = NSSwitch()
     private let dailyPromptView = NSTextView()    // digest prompt — same text-area treatment as summary
-    private let dailyPromptScroll = NSScrollView()
+    private let dailyPromptScroll = PassthroughScrollView()
     private let dailyPromptFileField = NSTextField()
-    private var dailyChooseBtn: NSButton?
-    private var summaryChooseBtn: NSButton?       // folder picker for the summary output dir
+    /// One switch per live-caption engine. The overlay's picker offers an engine only when its switch is
+    /// on AND the engine is ready (key present / binary installed) — see `selectableLiveEngines`.
+    private let engineSwitches: [(engine: LiveEngine, box: NSSwitch)] =
+        LiveEngine.allCases.map { ($0, NSSwitch()) }
+    private let savedLabel = NSTextField(labelWithString: "✓ Saved")   // transient confirmation for a non-closing Save
+    private var savedFlash: DispatchWorkItem?
+    private var flashGen = 0                          // fences a stale fade-completion from hiding a newer flash
+    private(set) var footerButtonsForTest: [NSButton] = []
     private let hintsTermsField = NSTextField()   // hint terms (comma/newline separated)
     private let hintsFileField = NSTextField()    // external hints file path
-    private let schedBtn = NSButton(checkboxWithTitle: "Record only on a schedule", target: nil, action: nil)
-    private let schedDaysField = NSTextField()    // "mon-fri" / "mon,wed,fri"
-    private let schedHoursField = NSTextField()   // "10:00-12:00, 13:00-19:00" (gap = lunch)
-    private let hintsCalBtn = NSButton(checkboxWithTitle: "Add the meeting's title & attendees from Calendar",
-                                       target: nil, action: nil)
+    private let schedBtn = NSSwitch()
+    // Schedule is SELECTED, not typed (user, repeatedly): a 7-day multi-select + time-range pickers.
+    private let daysSeg = NSSegmentedControl()          // Mon…Sun, multi-select (.selectAny)
+    private let hoursRangesStack = NSStackView()        // one row per time range (start–end + remove)
+    private weak var hoursControlView: NSView?          // the Hours control (rows + Add) — dimmed when off
+    private let daySegKeys = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    private let hintsCalBtn = NSSwitch()
     private let excludeTokens = NSTokenField()   // multiple bundle ids as tokens
     // Calendar titling: a scrollable checkbox list of the user's calendars (none checked = all).
     private var calChecks: [(name: String, box: NSButton)] = []
-    private let keepAudioBtn = NSButton(checkboxWithTitle: "Keep audio (WAV) too", target: nil, action: nil)
-    private let vadBtn = NSButton(checkboxWithTitle: "Remove noise/silence (VAD)", target: nil, action: nil)
-    private let calBtn = NSButton(checkboxWithTitle: "Title transcripts from calendar events", target: nil, action: nil)
-    private let loginBtn = NSButton(checkboxWithTitle: "Start at login (24/7 recording)", target: nil, action: nil)
-    private let systemAudioBtn = NSButton(checkboxWithTitle: "Capture system audio (other participants)", target: nil, action: nil)
-    private let echoBtn = NSButton(checkboxWithTitle: "Reduce mic echo on speakers (experimental)", target: nil, action: nil)
+    private let keepAudioBtn = NSSwitch()
+    private let vadBtn = NSSwitch()
+    private let calBtn = NSSwitch()
+    private let loginBtn = NSSwitch()
+    private let systemAudioBtn = NSSwitch()
+    private let echoBtn = NSSwitch()
     private var runningAppIds: [String] = []
 
     private let segValues = [900, 1800, 3600, 7200], segTitles = ["15 min", "30 min", "1 hour", "2 hours"]
@@ -2655,35 +3152,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
 
     init(onSave: @escaping () -> Void) {
         self.onSave = onSave
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 580),
-                         styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        let w = EditableWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 580),
+                               styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         w.title = "macrec — Settings"
         super.init(window: w)
         w.delegate = self
         buildForm()
         load()
-        // Size the window to the DENSEST tab's measured content (user ask: no scrolling by default).
-        // Derived, not hardcoded — adding rows can't silently reintroduce the scroll. The scroll pane
-        // stays as the safety net for small screens / manual shrinking.
-        func docView(in v: NSView) -> NSView? {
-            if let sv = v as? NSScrollView { return sv.documentView }
-            for sub in v.subviews { if let d = docView(in: sub) { return d } }
-            return nil
-        }
-        let maxDoc = panesForTest
-            .compactMap { docView(in: $0.view)?.fittingSize }
-            .reduce(NSSize(width: 540, height: 420)) { NSSize(width: max($0.width, $1.width),
-                                                              height: max($0.height, $1.height)) }
-        // Width fits the widest FORM (no horizontal scroll); height is a MODERATE fixed default —
-        // sizing to the tallest pane made the window huge and the sparse panes (General) look empty.
-        // Tall panes (Recording, Post-process) scroll, like System Settings.
-        w.setContentSize(NSSize(width: max(560, maxDoc.width) + 200,   // +sidebar
-                                height: 560))
+        // Fixed comfortable size (sidebar 200 + a 540pt content column). Panes taller than this
+        // scroll, with a permanent scrollbar — no window auto-resizing (user ask).
+        w.setContentSize(NSSize(width: 880, height: 600))
+        selectPane(selectedPane)
         w.center()
     }
     required init?(coder: NSCoder) { fatalError() }
-
-    private func labeled(_ s: String) -> NSTextField { let l = NSTextField(labelWithString: s); l.alignment = .right; return l }
 
     private func buildForm() {
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
@@ -2700,40 +3182,48 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         }
         for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField, gladiaKeyField, postProcessField, promptFileField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
-        dirField.widthAnchor.constraint(equalToConstant: 340).isActive = true
-        audioDirField.widthAnchor.constraint(equalToConstant: 340).isActive = true
-        customModelField.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        dirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        audioDirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        customModelField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         customModelField.placeholderString = "https://…/ggml-model.bin  or  /path/to/model.bin"
-        deepgramKeyField.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        deepgramKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         deepgramKeyField.placeholderString = "Deepgram API key"
-        openaiKeyField.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        openaiKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         openaiKeyField.placeholderString = "sk-…"
-        openaiBaseField.widthAnchor.constraint(equalToConstant: 340).isActive = true
-        gladiaKeyField.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        openaiBaseField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        gladiaKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         gladiaKeyField.placeholderString = "Gladia API key"
-        promptFileField.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        promptFileField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         promptFileField.placeholderString = "~/notes/summary-prompt.md"
-        postProcessField.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        postProcessField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         postProcessField.placeholderString = "~/bin/my-pipeline.sh"
         summaryOutField.translatesAutoresizingMaskIntoConstraints = false
-        summaryOutField.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        summaryOutField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         summaryOutField.placeholderString = "empty = next to the transcript"
         dailyOutField.translatesAutoresizingMaskIntoConstraints = false
-        dailyOutField.widthAnchor.constraint(equalToConstant: 340).isActive = true
-        dailyOutField.placeholderString = "empty = Daily folder next to the summaries"
+        dailyOutField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        dailyOutField.placeholderString = "empty = alongside the summaries"
+        dailyNameField.translatesAutoresizingMaskIntoConstraints = false
+        dailyNameField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        dailyNameField.placeholderString = dailyDigestNameDefault
         dailyTimePicker.datePickerStyle = .textFieldAndStepper
         dailyTimePicker.datePickerElements = .hourMinute
         dailyTimePicker.translatesAutoresizingMaskIntoConstraints = false
-        for f in [schedDaysField, schedHoursField] {
-            f.translatesAutoresizingMaskIntoConstraints = false
-            f.widthAnchor.constraint(equalToConstant: 340).isActive = true
-            f.delegate = self   // live red-on-invalid feedback (fail-open would record 24/7 silently)
-        }
-        schedDaysField.placeholderString = "mon-fri"
-        schedHoursField.placeholderString = "10:00-12:00, 13:00-19:00"
+        schedBtn.target = self; schedBtn.action = #selector(scheduleToggled)
+        // Days: a 7-segment multi-select (Mon…Sun) — click to toggle, no typing, no invalid state.
+        daysSeg.segmentCount = daySegKeys.count
+        daysSeg.trackingMode = .selectAny
+        daysSeg.segmentDistribution = .fillEqually
+        daysSeg.translatesAutoresizingMaskIntoConstraints = false
+        for (i, k) in daySegKeys.enumerated() { daysSeg.setLabel(k.capitalized, forSegment: i) }
+        // Hours: a stack of time-range rows (start–end pickers + remove), plus an Add button below.
+        hoursRangesStack.orientation = .vertical
+        hoursRangesStack.alignment = .leading
+        hoursRangesStack.spacing = 6
+        hoursRangesStack.translatesAutoresizingMaskIntoConstraints = false
         for f in [hintsTermsField, hintsFileField] {
             f.translatesAutoresizingMaskIntoConstraints = false
-            f.widthAnchor.constraint(equalToConstant: 340).isActive = true
+            f.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         }
         hintsTermsField.placeholderString = "Kubernetes, gRPC, John Doe, …"
         hintsFileField.placeholderString = "~/notes/hints.txt"
@@ -2743,14 +3233,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         for f in [dirField, audioDirField, customModelField, hintsFileField, promptFileField,
                   summaryOutField, postProcessField] {
             f.cell?.lineBreakMode = .byTruncatingHead
-            f.widthAnchor.constraint(equalToConstant: 340).isActive = true
+            f.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         }
         // Multiline prompt editor (user feedback: a one-line field is too small for a real prompt).
         promptScroll.translatesAutoresizingMaskIntoConstraints = false
         promptScroll.hasVerticalScroller = true
         promptScroll.autohidesScrollers = true
         promptScroll.borderType = .bezelBorder
-        promptScroll.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        promptScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         promptScroll.heightAnchor.constraint(equalToConstant: 84).isActive = true
         promptView.isRichText = false
         promptView.font = .systemFont(ofSize: 12)
@@ -2766,7 +3256,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         dailyPromptScroll.hasVerticalScroller = true
         dailyPromptScroll.autohidesScrollers = true
         dailyPromptScroll.borderType = .bezelBorder
-        dailyPromptScroll.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        dailyPromptScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         dailyPromptScroll.heightAnchor.constraint(equalToConstant: 66).isActive = true
         dailyPromptView.isRichText = false
         dailyPromptView.font = .systemFont(ofSize: 12)
@@ -2778,7 +3268,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         dailyPromptView.textContainer?.widthTracksTextView = true
         dailyPromptScroll.documentView = dailyPromptView
         dailyPromptFileField.translatesAutoresizingMaskIntoConstraints = false
-        dailyPromptFileField.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        dailyPromptFileField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         dailyPromptFileField.placeholderString = "empty = the prompt above"
         ppModeSeg.segmentCount = ppModeTitles.count
         for (i, t) in ppModeTitles.enumerated() { ppModeSeg.setLabel(t, forSegment: i) }
@@ -2786,109 +3276,244 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         ppModeSeg.segmentStyle = .texturedRounded
         ppModeSeg.target = self; ppModeSeg.action = #selector(ppModeChanged)
         runnerPopup.addItems(withTitles: runnerTitles)
+        // Vendor badges on each runner so the picker reads at a glance (Claude / Codex / Gemini).
+        let runnerBadges = [vendorBadge("sparkle", NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 1)),   // Claude — coral
+                            vendorBadge("chevron.left.forwardslash.chevron.right", NSColor(srgbRed: 0.06, green: 0.64, blue: 0.50, alpha: 1)),  // Codex — OpenAI green
+                            vendorBadge("sparkles", NSColor(srgbRed: 0.26, green: 0.52, blue: 0.96, alpha: 1))]  // Gemini — Google blue
+        for (i, badge) in runnerBadges.enumerated() { runnerPopup.item(at: i)?.image = badge }
         openaiBaseField.placeholderString = "empty = api.openai.com"
 
         excludeTokens.translatesAutoresizingMaskIntoConstraints = false
         excludeTokens.tokenizingCharacterSet = CharacterSet(charactersIn: ", ")
         excludeTokens.placeholderString = "e.g. com.spotify.client"
-        excludeTokens.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        excludeTokens.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         populateRunningApps()
 
         let calListCell = buildCalendarList()
+        let hoursControl = buildHoursControl()
 
-        let chooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseDir))
-        let dirStack = NSStackView(views: [dirField, chooseBtn]); dirStack.orientation = .horizontal; dirStack.spacing = 6
-        let audioChooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseAudioDir))
-        let audioStack = NSStackView(views: [audioDirField, audioChooseBtn]); audioStack.orientation = .horizontal; audioStack.spacing = 6
-        summaryChooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseSummaryDir))
-        let summaryStack = NSStackView(views: [summaryOutField, summaryChooseBtn!]); summaryStack.orientation = .horizontal; summaryStack.spacing = 6
-        dailyChooseBtn = NSButton(title: "Choose…", target: self, action: #selector(chooseDailyDir))
-        let dailyStack = NSStackView(views: [dailyOutField, dailyChooseBtn!]); dailyStack.orientation = .horizontal; dailyStack.spacing = 6
-
-        // Row vocabulary. Roles are carried by marker types (SectionHeaderCell / CaptionCell /
-        // ToggleCell) and derived by formRowRoles — hand-maintained index lists went stale the
-        // moment rows were inserted (a field row once shipped merged as a header).
-        func row(_ label: String, _ control: NSView) -> [NSView] { [labeled(label), control] }
-        // A boolean row: the checkbox spans BOTH columns, LEFT-aligned at the label column start,
-        // so it never floats indented under the control column (adversarial review + user report).
-        func toggle(_ b: NSView) -> [NSView] {
-            let c = ToggleCell(views: [b]); c.orientation = .horizontal; c.alignment = .centerY
-            return [c, NSView()]
+        // One factory for every "path field + Choose…" row, so spacing and hugging can't drift.
+        func pathStack(_ field: NSTextField, _ action: Selector) -> (stack: NSStackView, button: NSButton) {
+            let b = NSButton(title: "Choose…", target: self, action: action)
+            b.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+            field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            let s = NSStackView(views: [field, b])
+            s.orientation = .horizontal; s.spacing = 6; s.distribution = .fill
+            return (s, b)
         }
-        // Section header — 15pt semibold, the missing middle rung of the 16→15→13→11 type scale.
-        // No decorative glyph (adversarial review: the tinted symbols read as noise).
-        func sectionHeader(_ s: String, symbol: String? = nil) -> [NSView] {
-            let l = NSTextField(labelWithString: s)
-            l.font = .systemFont(ofSize: 15, weight: .semibold)
-            l.textColor = .labelColor
-            let st = SectionHeaderCell(views: [l])
-            st.orientation = .horizontal; st.spacing = 6; st.alignment = .centerY
-            return [st, NSView()]
-        }
-        // Captions are the smallest + dimmest text in the window (11pt tertiary) — a clear step
-        // below field labels, so help text stops competing with controls.
-        func captionLabel(_ s: String, width: CGFloat) -> CaptionCell {
-            let l = CaptionCell(wrappingLabelWithString: s)
-            l.font = .systemFont(ofSize: 11)
-            l.textColor = .tertiaryLabelColor
-            l.preferredMaxLayoutWidth = width
-            return l
-        }
-        func fieldCaption(_ s: String) -> [NSView] { [labeled(""), captionLabel(s, width: 340)] }
-        func sectionNote(_ s: String) -> [NSView] { [captionLabel(s, width: 440), NSView()] }   // full-width via role derivation
-        /// Headers (section titles / full-width intro notes) merge both columns with extra air above;
-        /// captions pull tight under the field they describe. Roles are DERIVED from the row's views
-        /// (see formRowRoles) — nothing to renumber when rows are inserted.
-        // Collect every visible string in a pane — the sidebar search matches against these, so
-        // typing "prompt" finds Post-process even though the pane title never says so.
-        func searchText(of rows: [[NSView]]) -> [String] {
-            rows.flatMap { $0 }.flatMap { v -> [String] in
-                var out: [String] = []
-                if let t = v as? NSTextField { out.append(t.stringValue) }
-                if let b = v as? NSButton { out.append(b.title) }
-                for sub in v.subviews {
-                    if let t = sub as? NSTextField { out.append(t.stringValue) }
-                    if let b = sub as? NSButton { out.append(b.title) }
-                }
-                return out
-            }.filter { !$0.isEmpty }
+        let dirStack = pathStack(dirField, #selector(chooseDir)).stack
+        let audioStack = pathStack(audioDirField, #selector(chooseAudioDir)).stack
+        let summaryStack = pathStack(summaryOutField, #selector(chooseSummaryDir)).stack
+        let dailyStack = pathStack(dailyOutField, #selector(chooseDailyDir)).stack
+        let promptFileStack = pathStack(promptFileField, #selector(choosePromptFile)).stack
+        let dailyPromptFileStack = pathStack(dailyPromptFileField, #selector(chooseDailyPromptFile)).stack
+        let hintsFileStack = pathStack(hintsFileField, #selector(chooseHintsFile)).stack
+        // Switches read oversized next to 13pt row text — use the small control size so they sit in
+        // proportion, like System Settings.
+        for s in [systemAudioBtn, echoBtn, vadBtn, keepAudioBtn, schedBtn, dailyBtn, updateBtn, loginBtn, hintsCalBtn, calBtn]
+                 + engineSwitches.map(\.box) {
+            s.controlSize = .small
         }
 
-        func pane(_ title: String, _ symbol: String, _ tint: NSColor, _ rows: [[NSView]]) {
-            // ONE NSGridView per pane — the layout that shipped working for months — with a bold
-            // page title above it. The NSBox "card per section" variant floated its grids (NSBox
-            // does not constrain an autolayout contentView) and shipped visually destroyed; the
-            // `settings-snapshot` UI test kit now makes that class of breakage impossible to miss.
-            let grid = NSGridView(views: rows)
-            grid.translatesAutoresizingMaskIntoConstraints = false
-            grid.rowSpacing = 8; grid.columnSpacing = 12
-            grid.column(at: 0).xPlacement = .trailing
-            grid.column(at: 0).width = 200   // CONSTANT label column across all panes → one shared
-                                             // left edge; the control column starts at the same x
-                                             // everywhere (was: auto-sized per pane, a jagged edge).
-            grid.column(at: 1).xPlacement = .leading   // controls hug their width, left-aligned
-                                                       // (no popup stretched to 900pt, no right void)
-            let roles = formRowRoles(rows)
-            for r in roles.headers {   // section headers, intro notes, toggles span both columns, left
-                grid.mergeCells(inHorizontalRange: NSRange(location: 0, length: 2),
-                                verticalRange: NSRange(location: r, length: 1))
-                grid.cell(atColumnIndex: 0, rowIndex: r).xPlacement = .leading
-                if rows[r].first is SectionHeaderCell, r > 0 { grid.row(at: r).topPadding = 18 }   // air above a section
+        // ── Grouped row-card vocabulary (benchmarked to cmux / iTerm) ──
+        // A pane is a list of Sections; a Section is an optional gray header + an intro note + a
+        // rounded card of Rows. A Row is a title (+ optional description) on the LEFT and one control
+        // on the RIGHT — or, for wide controls (text fields, path pickers, editors), the control
+        // stacked full-width BELOW the title. Roles are explicit here, not derived from view types.
+        struct Row { let name: String; let desc: String?; let control: NSView?; let wide: Bool }
+        struct Section {
+            let header: String?; let note: String?; let rows: [Row]; let group: String?; let icon: NSImage?
+            // `group` tags a section so a control (e.g. the Summaries Mode segment) can show/hide it
+            // as a real tab. nil = always visible. `icon` is an optional vendor badge shown before the header.
+            init(header: String?, note: String?, rows: [Row], group: String? = nil, icon: NSImage? = nil) {
+                self.header = header; self.note = note; self.rows = rows; self.group = group; self.icon = icon
             }
-            for r in roles.notes { grid.row(at: r).topPadding = -4 }   // caption hugs its field
+        }
+        func r(_ name: String, _ control: NSView?, _ desc: String? = nil, wide: Bool = false) -> Row {
+            Row(name: name, desc: desc, control: control, wide: wide)
+        }
+        // A boolean row: the switch is the right-hand control; its old checkbox title becomes the
+        // row title (a switch carries no label of its own).
+        func sw(_ b: NSSwitch, _ name: String, _ desc: String? = nil) -> Row {
+            Row(name: name, desc: desc, control: b, wide: false)
+        }
+
+        // One row view: full-width, self-sizing. Inline layout for compact controls, stacked layout
+        // (control below the text) for wide ones so a 340pt field never fights the title for width.
+        // The description is pinned to its ACTUAL available trailing edge and wraps to that width —
+        // so at a wide window it stays one line instead of wrapping at a fixed 300pt.
+        func rowView(_ row: Row) -> NSView {
+            let host = NSView(); host.translatesAutoresizingMaskIntoConstraints = false
+            let name = NSTextField(labelWithString: row.name)
+            name.font = .systemFont(ofSize: 13)
+            name.textColor = .labelColor
+            name.translatesAutoresizingMaskIntoConstraints = false
+            name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            host.addSubview(name)
+            let desc: WrappingLabel? = row.desc.map { wrappingCaption($0) }
+            if let d = desc { host.addSubview(d) }
+            var cs: [NSLayoutConstraint] = [
+                name.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 14),
+                name.topAnchor.constraint(equalTo: host.topAnchor, constant: 11),
+            ]
+            // The x edge the text (name + desc) may extend to before hitting the control.
+            let textTrailing: NSLayoutXAxisAnchor
+            let textTrailingInset: CGFloat
+
+            if let control = row.control {
+                control.translatesAutoresizingMaskIntoConstraints = false   // every control is autolayout'd here
+                // A row's name is a sibling label, and AppKit never infers a control's name from a view
+                // that merely sits next to it. `NSButton(checkboxWithTitle:)` carried its own title, so
+                // switching to NSSwitch/popups left every setting unlabelled to VoiceOver.
+                if control.accessibilityLabel()?.isEmpty ?? true { control.setAccessibilityLabel(row.name) }
+                host.addSubview(control)
+                if row.wide {
+                    // Title (+desc) on top, control stretched full-width beneath — fields fill the card.
+                    control.setContentHuggingPriority(.defaultLow, for: .horizontal)
+                    textTrailing = host.trailingAnchor; textTrailingInset = -14
+                    let below = desc ?? name
+                    cs += [
+                        control.topAnchor.constraint(equalTo: below.bottomAnchor, constant: 8),
+                        control.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 14),
+                        control.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -14),
+                        control.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -12),
+                    ]
+                } else {
+                    // Title left, control right (centered); the text may extend up to the control.
+                    control.setContentHuggingPriority(.required, for: .horizontal)
+                    control.setContentCompressionResistancePriority(.required, for: .horizontal)
+                    textTrailing = control.leadingAnchor; textTrailingInset = -14
+                    let bottomAnchorView = desc ?? name
+                    cs += [
+                        control.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -14),
+                        control.centerYAnchor.constraint(equalTo: host.centerYAnchor),
+                        bottomAnchorView.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -11),
+                    ]
+                }
+            } else {
+                textTrailing = host.trailingAnchor; textTrailingInset = -14
+                let bottomAnchorView = desc ?? name
+                cs += [bottomAnchorView.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -11)]
+            }
+
+            cs.append(name.trailingAnchor.constraint(lessThanOrEqualTo: textTrailing, constant: textTrailingInset))
+            if let d = desc {
+                cs += [
+                    d.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 14),
+                    d.topAnchor.constraint(equalTo: name.bottomAnchor, constant: 2),
+                    d.trailingAnchor.constraint(equalTo: textTrailing, constant: textTrailingInset),
+                ]
+            }
+            NSLayoutConstraint.activate(cs)
+            return host
+        }
+
+        // A rounded card holding rows separated by hairline dividers (dividers inset from the left,
+        // matching the row text — the System Settings / cmux idiom).
+        func card(_ rows: [Row]) -> SectionCard {
+            let box = SectionCard()
+            box.translatesAutoresizingMaskIntoConstraints = false
+            box.wantsLayer = true
+            box.layer?.cornerRadius = 8
+            box.layer?.cornerCurve = .continuous
+            box.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+            box.layer?.borderWidth = 1
+            box.layer?.borderColor = NSColor.separatorColor.cgColor
+            let stack = NSStackView()
+            stack.orientation = .vertical; stack.spacing = 0; stack.alignment = .leading
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            for (i, row) in rows.enumerated() {
+                if i > 0 {
+                    let div = NSBox(); div.boxType = .separator
+                    div.translatesAutoresizingMaskIntoConstraints = false
+                    stack.addArrangedSubview(div)
+                    div.leadingAnchor.constraint(equalTo: stack.leadingAnchor, constant: 14).isActive = true
+                    div.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
+                }
+                let rv = rowView(row)
+                stack.addArrangedSubview(rv)
+                rv.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
+                rv.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
+            }
+            box.addSubview(stack)
+            NSLayoutConstraint.activate([
+                stack.topAnchor.constraint(equalTo: box.topAnchor),
+                stack.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+                stack.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+                stack.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+            ])
+            return box
+        }
+
+        // Collect every visible string in a pane for the sidebar search index (title + section
+        // headers + notes + each row's name & description).
+        func searchText(of title: String, _ sections: [Section]) -> [String] {
+            var out = [title]
+            for s in sections {
+                if let h = s.header { out.append(h) }
+                if let n = s.note { out.append(n) }
+                for row in s.rows { out.append(row.name); if let d = row.desc { out.append(d) } }
+            }
+            return out.filter { !$0.isEmpty }
+        }
+
+        func pane(_ title: String, _ symbol: String, _ tint: NSColor, _ sections: [Section]) {
+            let outer = NSStackView()
+            outer.orientation = .vertical; outer.alignment = .leading; outer.spacing = 0
+            outer.translatesAutoresizingMaskIntoConstraints = false
 
             let bigTitle = NSTextField(labelWithString: title)
-            bigTitle.font = .systemFont(ofSize: 16, weight: .semibold)   // close to the sidebar weight, not shouty
-            bigTitle.translatesAutoresizingMaskIntoConstraints = false
+            bigTitle.font = .systemFont(ofSize: 15, weight: .semibold)   // modest head — was 20pt, too shouty (user)
+            bigTitle.textColor = .labelColor
+            outer.addArrangedSubview(bigTitle)
+            outer.setCustomSpacing(14, after: bigTitle)
+
+            var fullWidth: [NSView] = []   // views that must stretch to the pane width
+            for (si, s) in sections.enumerated() {
+                var groupViews: [NSView] = []   // header+note+card of this section (for show/hide as a tab)
+                if let h = s.header, h != title {   // skip a header that just echoes the pane title
+                    let hl = NSTextField(labelWithString: h)   // normal case — not shouty all-caps (user)
+                    hl.font = .systemFont(ofSize: 13, weight: .semibold)
+                    hl.textColor = .secondaryLabelColor
+                    let headerView: NSView
+                    if let icon = s.icon {   // vendor badge before the name, for at-a-glance identity
+                        let iv = NSImageView(image: icon)
+                        iv.translatesAutoresizingMaskIntoConstraints = false
+                        iv.widthAnchor.constraint(equalToConstant: 18).isActive = true
+                        iv.heightAnchor.constraint(equalToConstant: 18).isActive = true
+                        let hs = NSStackView(views: [iv, hl]); hs.orientation = .horizontal
+                        hs.spacing = 7; hs.alignment = .centerY
+                        headerView = hs
+                    } else {
+                        headerView = hl
+                    }
+                    outer.addArrangedSubview(headerView)
+                    outer.setCustomSpacing(7, after: headerView)
+                    groupViews.append(headerView)
+                }
+                if let n = s.note {
+                    let nl = wrappingCaption(n)   // self-sizing: fills the pane width, wraps only if needed
+                    outer.addArrangedSubview(nl)
+                    outer.setCustomSpacing(s.rows.isEmpty ? 20 : 8, after: nl)
+                    fullWidth.append(nl); groupViews.append(nl)
+                }
+                if !s.rows.isEmpty {
+                    let c = card(s.rows)
+                    outer.addArrangedSubview(c)
+                    outer.setCustomSpacing(si == sections.count - 1 ? 0 : 20, after: c)
+                    fullWidth.append(c); groupViews.append(c)
+                }
+                if let g = s.group { sectionGroupViews[g, default: []].append(contentsOf: groupViews) }
+            }
 
             let doc = FlippedDocView()   // flipped so the form starts at the TOP of the scroll area
             doc.translatesAutoresizingMaskIntoConstraints = false
-            doc.addSubview(bigTitle); doc.addSubview(grid)
+            doc.addSubview(outer)
             let scroll = NSScrollView()
             scroll.translatesAutoresizingMaskIntoConstraints = false
             scroll.hasVerticalScroller = true
-            scroll.scrollerStyle = .overlay
-            scroll.autohidesScrollers = true
+            scroll.scrollerStyle = .legacy     // a permanent scrollbar (user: always visible, not overlay)
+            scroll.autohidesScrollers = false
             scroll.drawsBackground = false
             scroll.documentView = doc
             let paneView = NSView(); paneView.addSubview(scroll)
@@ -2900,123 +3525,155 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
                 doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
                 doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
                 doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-                bigTitle.topAnchor.constraint(equalTo: doc.topAnchor, constant: 22),
-                bigTitle.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 26),
-                grid.topAnchor.constraint(equalTo: bigTitle.bottomAnchor, constant: 16),
-                grid.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 26),
-                grid.trailingAnchor.constraint(lessThanOrEqualTo: doc.trailingAnchor, constant: -26),
-                grid.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -22),
+                outer.topAnchor.constraint(equalTo: doc.topAnchor, constant: 22),
+                outer.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 26),
+                outer.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -26),
+                outer.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -24),
             ])
+            for v in fullWidth { v.widthAnchor.constraint(equalTo: outer.widthAnchor).isActive = true }
             panesForTest.append((title: title, symbol: symbol, tint: tint, view: paneView,
-                                 searchText: [title] + searchText(of: rows)))
+                                 searchText: searchText(of: title, sections)))
         }
+        // A concise reusable label for the "record around the clock" phrase.
         pane("Recording", "record.circle", .systemRed, [
-            row("Segment length (on the hour):", segPopup),
-            toggle(systemAudioBtn),
-            toggle(echoBtn),
-            row("Min. speech (sec):", voiceField),
-            toggle(vadBtn),
-            row("Excluded apps:", excludeTokens),
-            row("Add a running app:", addAppPopup),
-            // Storage lives here too (user pick: what gets recorded and where it lands is one story).
-            sectionHeader("Transcripts", symbol: "doc.text"),
-            row("Keep for:", txtRetPopup),
-            row("Save to:", dirStack),
-            sectionHeader("Audio", symbol: "waveform"),
-            toggle(keepAudioBtn),
-            row("Compress after:", audioRawCombo),
-            fieldCaption("Recent recordings stay WAV; older ones are archived to AAC (~⅛ the size). "
-                       + "Type any period — 45 days, 6 months, 1 year."),
-            row("Delete after:", audioRetCombo),
-            fieldCaption("Audio older than this is deleted, raw or compressed. Unlimited keeps it forever."),
-            row("Save to:", audioStack),
+            Section(header: "Capture", note: nil, rows: [
+                r("Segment length", segPopup, "Starts a new recording file on the hour."),
+                sw(systemAudioBtn, "Capture system audio", "Record other participants (system output), not only your mic."),
+                sw(echoBtn, "Reduce mic echo", "Experimental — suppress speaker sound leaking back into the mic."),
+                r("Minimum speech", voiceField, "Seconds of speech required before a segment is saved."),
+                sw(vadBtn, "Remove noise & silence", "Voice-activity detection trims dead air from recordings."),
+            ]),
+            Section(header: "Excluded apps", note: nil, rows: [
+                r("Never capture", excludeTokens, "These apps are left out of the recorded system-audio "
+                  + "mix. They keep playing out loud, so your microphone may still pick them up.", wide: true),
+                r("Add a running app", addAppPopup, wide: true),
+            ]),
         ])
         pane("Schedule", "calendar.badge.clock", .systemOrange, [
-            toggle(schedBtn),
-            row("Days:", schedDaysField),
-            fieldCaption("mon-fri, or a list like mon,wed,fri. Empty = every day."),
-            row("Hours:", schedHoursField),
-            fieldCaption("Ranges like 10:00-12:00, 13:00-19:00 — the gap between ranges is your "
-                       + "lunch break. 22:00-06:00 wraps past midnight. Empty = all hours. "
-                       + "Unparseable input turns red and is ignored."),
-            fieldCaption("Off-hours the tray shows ⏸ Off-hours (schedule). A manual Pause/Resume "
-                       + "overrides the schedule until its next boundary."),
+            Section(header: "When to record", note: nil, rows: [
+                sw(schedBtn, "Record only on a schedule", "Off = record around the clock."),
+                r("Days", daysSeg, "Leave all off for every day.", wide: true),
+                r("Hours", hoursControl, "The gap between two ranges is your lunch break; a range that "
+                  + "ends before it starts wraps past midnight. No ranges = all hours.", wide: true),
+            ]),
+            Section(header: nil, note: "Off-hours the tray shows ⏸ Off-hours (schedule). A manual "
+                    + "Pause/Resume overrides the schedule until its next boundary.", rows: []),
+        ])
+        pane("Storage", "archivebox", .systemBrown, [
+            Section(header: "Transcripts", note: nil, rows: [
+                r("Keep for", txtRetPopup),
+                r("Folder", dirStack, wide: true),
+            ]),
+            Section(header: "Audio", note: nil, rows: [
+                sw(keepAudioBtn, "Keep audio (WAV)", "Save the raw recording next to the transcript."),
+                r("Compress after", audioRawCombo, "Recent recordings stay WAV; older ones archive to AAC "
+                  + "(~⅛ the size). Type any period — 45 days, 6 months, 1 year."),
+                r("Delete after", audioRetCombo, "Audio older than this is deleted, raw or compressed. "
+                  + "Unlimited keeps it forever."),
+                r("Folder", audioStack, wide: true),
+            ]),
         ])
         pane("Transcription", "text.quote", .systemPurple, [
-            row("Model:", modelPopup),                                                            // 0
-            row("…or custom model:", customModelField),                                           // 1
-            row("Language:", langPopup),                                                          // 2
-            fieldCaption("The spoken language whisper transcribes."),                             // 3
-            row("Transcript file language:", transcriptLangPopup),                                // 4
-            fieldCaption("Headings and labels of the saved markdown file (not the speech)."),     // 5
-            sectionHeader("Hints", symbol: "character.book.closed"),                              // 6
-            row("Terms:", hintsTermsField),                                                       // 7
-            fieldCaption("Team/product names, jargon, people — comma or newline separated. "
-                       + "Biases recognition so proper nouns stop coming out mangled."),          // 8
-            row("…or hints file:", hintsFileField),                                               // 9
-            fieldCaption("One term per line, # comments — merged with the terms above."),         // 10
-            toggle(hintsCalBtn),                                                                 // 11
+            Section(header: "Model", note: nil, rows: [
+                r("Model", modelPopup),
+                r("Custom model", customModelField, "A URL or path to a ggml model — overrides the picker above.", wide: true),
+                r("Spoken language", langPopup, "The language whisper transcribes."),
+                r("Transcript file language", transcriptLangPopup, "Headings and labels of the saved markdown file (not the speech)."),
+            ]),
+            Section(header: "Hints", note: nil, rows: [
+                r("Terms", hintsTermsField, "Team/product names, jargon, people — comma or newline separated. "
+                  + "Biases recognition so proper nouns stop coming out mangled.", wide: true),
+                r("Hints file", hintsFileStack, "One term per line, # comments — merged with the terms above.", wide: true),
+                sw(hintsCalBtn, "Add title & attendees from Calendar", "Feed the meeting's calendar event in as hints."),
+            ]),
         ])
-        pane("Post-process", "wand.and.stars", .systemIndigo, [
-            sectionNote("Runs after each hourly transcript is saved."),                           // 0
-            row("Mode:", ppModeSeg),                                                              // 1
-            fieldCaption("Automatic summary is built in — pick who writes it; or take full "
-                       + "control with a custom command."),                                       // 2
-            sectionHeader("Automatic summary", symbol: "wand.and.stars"),                                                   // 3
-            row("Summarize with:", runnerPopup),                                                  // 4
-            row("Prompt:", promptScroll),                                                         // 5
-            fieldCaption("Default asks for key points, decisions, and action items — answered "
-                       + "in the transcript's language."),                                        // 6
-            row("…or prompt file:", promptFileField),                                             // 7
-            fieldCaption("Overrides the text above when readable — keep the prompt in your "
-                       + "notes repo and iterate without opening Settings."),                     // 8
-            row("Save summary to:", summaryStack),                                                // 9
-            fieldCaption("Summaries land in monthly folders (YYYY-MM/<name>.md). "
-                       + "Empty = next to the transcript."),                                      // 10
-            sectionHeader("Daily digest", symbol: "calendar.day.timeline.left"),
-            toggle(dailyBtn),
-            row("Write at:", dailyTimePicker),
-            row("Prompt:", dailyPromptScroll),
-            row("…or prompt file:", dailyPromptFileField),
-            row("Save digest to:", dailyStack),
-            fieldCaption("Once a day, the day's meeting summaries roll up into "
-                       + "Daily/YYYY-MM/YYYY-MM-DD.md. A slept-through deadline catches up on wake."),
-            sectionHeader("Custom command", symbol: "terminal"),                                  // 11
-            row("Command:", postProcessField),                                                    // 12
-            fieldCaption("Freeform: runs in a login shell with the transcript path appended "
-                       + "as the last argument."),                                                // 13
+        pane("Titling", "textformat", .systemGreen, [
+            Section(header: "Titling", note: "How each saved transcript is named.", rows: [
+                sw(calBtn, "Title from calendar events", "Name transcripts after the meeting on your calendar."),
+                r("Calendars", calListCell, "Checked calendars are matched; none checked = all of them.", wide: true),
+            ]),
         ])
-        pane("Titling", "calendar", .systemGreen, [
-            toggle(calBtn),
-            row("Calendars:", calListCell),
+        pane("Summaries", "text.append", .systemIndigo, [
+            Section(header: "Post-processing", note: "Runs after each hourly transcript is saved.", rows: [
+                r("Mode", ppModeSeg, "Automatic summary is built in — pick who writes it, or take full "
+                  + "control with a custom command.", wide: true),
+            ]),
+            // Mode is a tab: only the selected mode's sections show (see updatePostProcessEnabled).
+            Section(header: nil, note: "Post-processing is off — transcripts are saved as-is.",
+                    rows: [], group: "pp.off"),
+            Section(header: "Automatic summary", note: nil, rows: [
+                r("Summarize with", runnerPopup),
+                r("Prompt", promptScroll, "Default asks for key points, decisions, and action items — "
+                  + "answered in the transcript's language.", wide: true),
+                r("Prompt file", promptFileStack, "Overrides the text above when readable — keep the prompt "
+                  + "in your notes repo and iterate without opening Settings.", wide: true),
+                r("Save summary to", summaryStack, "Summaries land in monthly folders (YYYY-MM/<name>.md). "
+                  + "Empty = next to the transcript.", wide: true),
+            ], group: "pp.summary"),
+            Section(header: "Daily digest", note: nil, rows: [
+                sw(dailyBtn, "Write a daily digest", "Roll the day's meeting summaries into one file."),
+                r("Write at", dailyTimePicker),
+                r("Prompt", dailyPromptScroll, wide: true),
+                r("Prompt file", dailyPromptFileStack, "Overrides the text above when readable.", wide: true),
+                r("Save digest to", dailyStack, "Once a day, the day's summaries roll up into a monthly "
+                  + "folder (YYYY-MM/) under the folder you pick. Empty = alongside the summaries. "
+                  + "A slept-through deadline catches up on wake.", wide: true),
+                r("File name", dailyNameField, "Tokens: {date} → 2026-07-09, {month} → 2026-07. "
+                  + "Empty uses \(dailyDigestNameDefault).", wide: true),
+            ], group: "pp.summary"),
+            Section(header: "Custom command", note: nil, rows: [
+                r("Command", postProcessField, "Freeform: runs in a login shell with the transcript path "
+                  + "appended as the last argument.", wide: true),
+            ], group: "pp.shell"),
         ])
-        pane("Live", "captions.bubble", .systemTeal, [
-            sectionNote("Cloud caption engines stream audio off-device — only while the live overlay "
-                      + "runs with that engine selected. Keys are stored in the Keychain, never in "
-                      + "preferences or backups. Pick the engine in the overlay's control bar."),    // 0
-            sectionHeader("Deepgram", symbol: "cloud"),                                                             // 1
-            row("API key:", deepgramKeyField),                                                       // 2
-            fieldCaption("Get a key at console.deepgram.com (model: nova-2)."),                      // 3
-            sectionHeader("OpenAI", symbol: "sparkles"),                                                               // 4
-            row("API key:", openaiKeyField),                                                         // 5
-            fieldCaption("platform.openai.com — or a key your gateway accepts (gpt-4o-transcribe)."), // 6
-            row("Base URL:", openaiBaseField),                                                       // 7
-            fieldCaption("OpenAI-compatible gateway / corporate proxy. Leave empty for api.openai.com."), // 8
-            sectionHeader("Gladia", symbol: "waveform.circle"),                                      // 9
-            row("API key:", gladiaKeyField),                                                         // 10
-            fieldCaption("app.gladia.io — broad language coverage incl. Korean streaming."),         // 11
+        // Each engine gets a switch; the overlay's picker lists only engines that are ON and READY.
+        // An engine missing its key says so right here instead of failing later inside the caption area.
+        func engineSwitch(_ e: LiveEngine) -> NSSwitch { engineSwitches.first { $0.engine == e }!.box }
+        // In a vendor section the header already names the engine, so the row says what the switch does;
+        // under "On-device" the row IS the engine's name, because two engines share that header.
+        func engineRow(_ e: LiveEngine, _ desc: String, named: Bool = false) -> Row {
+            sw(engineSwitch(e), named ? e.plainTitle : "Use for live captions",
+               desc + (e.notReadyReason.map { " \($0)" } ?? ""))
+        }
+        pane("Live Captions", "captions.bubble", .systemTeal, [
+            Section(header: nil, note: "Cloud caption engines stream audio off-device — only while the live "
+                    + "overlay runs with that engine selected. Keys are stored in the Keychain, never in "
+                    + "preferences or backups. Pick the engine in the overlay's control bar.", rows: []),
+            Section(header: "On-device", note: nil, rows: [
+                engineRow(.apple, "Apple's on-device recognizer — lowest latency, no network.", named: true),
+                engineRow(.whisper, "whisper.cpp on the same model as the saved transcript — slower, more accurate.", named: true),
+            ]),
+            Section(header: "Deepgram", note: nil, rows: [
+                engineRow(.deepgram, "Streaming cloud recognizer (model: nova-2)."),
+                r("API key", deepgramKeyField, "Get a key at console.deepgram.com (model: nova-2).", wide: true),
+            ], icon: vendorBadge("waveform", NSColor(srgbRed: 0.07, green: 0.80, blue: 0.55, alpha: 1))),
+            Section(header: "OpenAI", note: nil, rows: [
+                engineRow(.openai, "Realtime transcription over a websocket (gpt-4o-transcribe)."),
+                r("API key", openaiKeyField, "platform.openai.com — or a key your gateway accepts (gpt-4o-transcribe).", wide: true),
+                r("Base URL", openaiBaseField, "OpenAI-compatible gateway / corporate proxy. Leave empty for api.openai.com.", wide: true),
+            ], icon: vendorBadge("sparkles", NSColor(srgbRed: 0.06, green: 0.64, blue: 0.50, alpha: 1))),
+            Section(header: "Gladia", note: nil, rows: [
+                engineRow(.gladia, "Streaming cloud recognizer with broad language coverage."),
+                r("API key", gladiaKeyField, "app.gladia.io — broad language coverage incl. Korean streaming.", wide: true),
+            ], icon: vendorBadge("globe", NSColor(srgbRed: 0.42, green: 0.31, blue: 0.95, alpha: 1))),
         ])
         pane("General", "gearshape", .systemGray, [
-            toggle(loginBtn),
-            toggle(updateBtn),
-            fieldCaption("Silently checks GitHub once a day and notifies only when a new release "
-                       + "is out. Check now from the tray menu: Check for Updates…"),
+            Section(header: "General", note: nil, rows: [
+                sw(loginBtn, "Start at login", "Launch macrec on login for around-the-clock recording."),
+                sw(updateBtn, "Check for updates daily", "Silently checks GitHub once a day and notifies only "
+                  + "when a new release is out. Check now from the tray menu → Check for Updates…"),
+            ]),
         ])
 
-        let saveBtn = NSButton(title: "Save & Apply", target: self, action: #selector(saveAndClose)); saveBtn.keyEquivalent = "\r"
-        let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(closeOnly)); cancelBtn.keyEquivalent = "\u{1b}"
-        let btns = NSStackView(views: [cancelBtn, saveBtn]); btns.orientation = .horizontal; btns.spacing = 10
+        // Save applies in place and leaves Settings open, so it must announce itself: the footer flashes.
+        let saveBtn = NSButton(title: "Save", target: self, action: #selector(saveSettings)); saveBtn.keyEquivalent = "\r"
+        let closeBtn = NSButton(title: "Close", target: self, action: #selector(closeOnly)); closeBtn.keyEquivalent = "\u{1b}"
+        savedLabel.font = .systemFont(ofSize: 12)
+        savedLabel.textColor = .secondaryLabelColor
+        savedLabel.isHidden = true
+        let btns = NSStackView(views: [savedLabel, closeBtn, saveBtn]); btns.orientation = .horizontal; btns.spacing = 10
         btns.translatesAutoresizingMaskIntoConstraints = false
+        footerButtonsForTest = [closeBtn, saveBtn]
 
         // ── vertical navigation: search + source list on the left, one pane on the right ──
         sidebarSearch.placeholderString = "Search"
@@ -3029,8 +3686,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         sidebarList.headerView = nil
         sidebarList.rowHeight = 34   // more breathing room between rows (was cramped)
         sidebarList.focusRingType = .none
-        // Standard accent-tinted rounded source-list selection (was a near-black pill that read
-        // darker than the sidebar itself — an inverted-highlight bug per the design review).
+        // Source-list metrics (inset rows, type-select). The selection PILL itself is drawn by
+        // SidebarRowView.drawSelection — the stock source-list drawing dims whenever the table isn't
+        // first responder, which is what made the selection appear to blink blue.
         sidebarList.selectionHighlightStyle = .sourceList
         sidebarList.addTableColumn(NSTableColumn(identifier: .init("pane")))
         sidebarList.dataSource = self
@@ -3049,7 +3707,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
 
         paneContainer.translatesAutoresizingMaskIntoConstraints = false
         // General leads (identity/behavior first), then the recording pipeline in flow order.
-        let paneOrder = ["General", "Recording", "Schedule", "Transcription", "Post-process", "Titling", "Live"]
+        // Pipeline order: identity → capture → when → where → text → title → summary → live mode.
+        let paneOrder = ["General", "Recording", "Schedule", "Storage", "Transcription", "Titling", "Summaries", "Live Captions"]
         panesForTest.sort { (paneOrder.firstIndex(of: $0.title) ?? 99) < (paneOrder.firstIndex(of: $1.title) ?? 99) }
         visiblePaneIndexes = Array(panesForTest.indices)
         sidebarList.reloadData()
@@ -3085,7 +3744,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     }
 
     /// Swap the visible pane. The container hosts exactly one pane at a time (same views the old
-    /// tabs held — load()/save() field wiring is untouched).
+    /// tabs held — load()/save() field wiring is untouched). The window is a FIXED size; a pane taller
+    /// than it scrolls (user ask: default scroll, permanent scrollbar — no auto-resizing window).
     private func selectPane(_ index: Int) {
         guard panesForTest.indices.contains(index) else { return }
         selectedPane = index
@@ -3101,6 +3761,33 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         ])
     }
 
+    /// Count PassthroughScrollViews across every built pane — proves the nested-scroll fix is wired
+    /// into the real view tree (prompt, daily-prompt, calendar), not just the declared field types.
+    var passthroughScrollCountForTest: Int {
+        func count(_ v: NSView) -> Int {
+            (v is PassthroughScrollView ? 1 : 0) + v.subviews.reduce(0) { $0 + count($1) }
+        }
+        return panesForTest.reduce(0) { $0 + count($1.view) }
+    }
+
+    /// Test hooks for the Summaries Mode tab: set the mode and read back whether a section group is
+    /// fully shown (all its views visible). Lets selftest prove the tab swaps sections, not greys them.
+    fileprivate func setPPModeForTest(_ raw: String) {
+        ppModeSeg.selectedSegment = ppModeValues.firstIndex(of: raw) ?? 0
+        updatePostProcessEnabled()
+    }
+    fileprivate func ppGroupVisibleForTest(_ g: String) -> Bool {
+        let vs = sectionGroupViews[g] ?? []
+        return !vs.isEmpty && vs.allSatisfy { !$0.isHidden }
+    }
+
+    /// The scroll document inside a pane view (its fitting height drives the snapshot capture size).
+    private func paneDoc(in v: NSView) -> NSView? {
+        if let sv = v as? NSScrollView { return sv.documentView }
+        for s in v.subviews { if let d = paneDoc(in: s) { return d } }
+        return nil
+    }
+
     /// UI TEST KIT (see `macrec settings-snapshot`): render every pane to a PNG so a human — or the
     /// next build — can actually LOOK at the Settings window instead of trusting structural checks.
     /// Returns the files written. This exists because a "structurally valid" pane (grids present)
@@ -3108,10 +3795,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     func snapshotAllPanes(to dir: URL) -> [URL] {
         load()
         guard let win = window, let content = win.contentView else { return [] }
-        win.setContentSize(NSSize(width: 820, height: 620))
         let appearance = win.effectiveAppearance   // render in the user's real (likely dark) appearance
         var written: [URL] = []
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        win.setContentSize(NSSize(width: 880, height: 600))   // the real, fixed runtime size (faithful)
         for i in panesForTest.indices {
             sidebarList.selectRowIndexes([i], byExtendingSelection: false)   // drives selectPane via delegate
             selectPane(i)
@@ -3150,7 +3837,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     /// Settings window can never ship "green" again.
     func paneLayoutIssues() -> [String] {
         guard let win = window, let content = win.contentView else { return ["settings: no window"] }
-        win.setContentSize(NSSize(width: 820, height: 640))
+        win.setContentSize(NSSize(width: 880, height: 640))
         var issues: [String] = []
         for i in panesForTest.indices {
             selectPane(i)
@@ -3159,6 +3846,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             let title = panesForTest[i].title
             var rects: [(String, NSRect)] = []
             func walk(_ v: NSView) {
+                if v.isHidden { return }         // hidden tab sections (Summaries Mode) aren't laid out — skip
                 if v is NSScroller { return }   // overlay scrollbars are chrome (0-wide when hidden, sit over content)
                 if v is NSControl || v is NSTextView {
                     let f = v.frame
@@ -3215,14 +3903,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
 
     /// Only the fields the selected mode actually uses are editable — the form reads as one choice.
     @objc private func ppModeChanged() { updatePostProcessEnabled() }
+    /// Mode acts as a TAB: it SHOWS only the selected mode's settings (Automatic summary + Daily digest,
+    /// or Custom command) and hides the rest — instead of greying everything out, which read as a
+    /// half-built form. Off shows a one-line note.
     private func updatePostProcessEnabled() {
         let mode = PostProcessMode(rawValue: ppModeValues[max(0, ppModeSeg.selectedSegment)]) ?? .off
-        for c in [runnerPopup, summaryOutField] as [NSControl] { c.isEnabled = mode == .summary }
-        summaryChooseBtn?.isEnabled = mode == .summary
-        promptFileField.isEnabled = mode == .summary
-        promptView.isEditable = mode == .summary
-        promptScroll.alphaValue = mode == .summary ? 1 : 0.45   // NSTextView isn't an NSControl — dim to match
-        postProcessField.isEnabled = mode == .shell
+        setSectionGroup("pp.summary", visible: mode == .summary)
+        setSectionGroup("pp.shell", visible: mode == .shell)
+        setSectionGroup("pp.off", visible: mode == .off)
+        promptView.isEditable = true   // shown only in summary mode now, always editable there
+    }
+
+    /// Show or hide a tagged section group (header + note + card), then relay out. The pane scrolls if
+    /// the visible content overflows.
+    private func setSectionGroup(_ group: String, visible: Bool) {
+        for v in sectionGroupViews[group] ?? [] { v.isHidden = !visible }
+        window?.contentView?.layoutSubtreeIfNeeded()
     }
 
     @objc private func addApp() {
@@ -3234,32 +3930,153 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         addAppPopup.selectItem(at: 0)
     }
 
+    // ── Schedule pickers: select days & time ranges instead of typing them ──
+
+    /// The "Hours" control: the range rows + an "Add time range" button beneath them.
+    private func buildHoursControl() -> NSView {
+        let add = NSButton(title: "  Add time range", target: self, action: #selector(addHourRange))
+        add.image = NSImage(systemSymbolName: "plus.circle.fill", accessibilityDescription: "Add")
+        add.imagePosition = .imageLeading
+        add.bezelStyle = .inline
+        add.controlSize = .small
+        let v = NSStackView(views: [hoursRangesStack, add])
+        v.orientation = .vertical; v.alignment = .leading; v.spacing = 8
+        v.translatesAutoresizingMaskIntoConstraints = false
+        hoursControlView = v
+        return v
+    }
+
+    /// Days & Hours only apply when "Record only on a schedule" is ON — dim/disable them otherwise
+    /// so the pane never looks like it's asking for input it will ignore.
+    @objc private func scheduleToggled() { updateScheduleEnabled() }
+    private func updateScheduleEnabled() {
+        let on = schedBtn.state == .on
+        daysSeg.isEnabled = on
+        func setEnabled(_ v: NSView) {
+            if let c = v as? NSControl { c.isEnabled = on }
+            v.subviews.forEach(setEnabled)
+        }
+        if let h = hoursControlView { setEnabled(h) }
+    }
+
+    /// One time-range row: start–end pickers + a remove button. Minutes-since-midnight in, so load()
+    /// can seed it and the reference date is irrelevant (only hour:minute is read back).
+    private func makeHourRow(startMins: Int, endMins: Int) -> NSStackView {
+        func picker(_ mins: Int) -> NSDatePicker {
+            let p = NSDatePicker()
+            p.datePickerStyle = .textFieldAndStepper
+            p.datePickerElements = .hourMinute
+            p.translatesAutoresizingMaskIntoConstraints = false
+            var comps = DateComponents(); comps.year = 2000; comps.month = 1; comps.day = 1
+            comps.hour = min(23, mins / 60); comps.minute = mins % 60
+            p.dateValue = Calendar.current.date(from: comps) ?? p.dateValue
+            return p
+        }
+        let dash = NSTextField(labelWithString: "–"); dash.textColor = .secondaryLabelColor
+        let remove = NSButton(image: NSImage(systemSymbolName: "minus.circle", accessibilityDescription: "Remove") ?? NSImage(),
+                              target: self, action: #selector(removeHourRange(_:)))
+        remove.isBordered = false
+        remove.contentTintColor = .secondaryLabelColor
+        let row = NSStackView(views: [picker(startMins), dash, picker(endMins), remove])
+        row.orientation = .horizontal; row.spacing = 6; row.alignment = .centerY
+        return row
+    }
+
+    @objc private func addHourRange() {
+        hoursRangesStack.addArrangedSubview(makeHourRow(startMins: 9 * 60, endMins: 18 * 60))
+        refitAfterScheduleChange()
+    }
+
+    @objc private func removeHourRange(_ sender: NSButton) {
+        guard let row = sender.superview as? NSStackView else { return }
+        hoursRangesStack.removeArrangedSubview(row); row.removeFromSuperview()
+        refitAfterScheduleChange()
+    }
+
+    /// The Hours list grew/shrank — relay out (the pane scrolls if it now overflows).
+    private func refitAfterScheduleChange() {
+        window?.contentView?.layoutSubtreeIfNeeded()
+    }
+
+    /// Read the day multi-select back into the parser's comma format ("mon,wed,fri"). Empty = every day.
+    fileprivate func serializeDays() -> String {
+        daySegKeys.enumerated().filter { daysSeg.isSelected(forSegment: $0.offset) }
+            .map { $0.element }.joined(separator: ",")
+    }
+
+    /// Read the time-range rows back into "HH:MM-HH:MM, …". Empty list = all hours.
+    fileprivate func serializeHours() -> String {
+        hoursRangesStack.arrangedSubviews.compactMap { row -> String? in
+            let ps = row.subviews.compactMap { $0 as? NSDatePicker }
+            guard ps.count == 2 else { return nil }
+            func hhmm(_ p: NSDatePicker) -> String {
+                let c = Calendar.current.dateComponents([.hour, .minute], from: p.dateValue)
+                return String(format: "%02d:%02d", c.hour ?? 0, c.minute ?? 0)
+            }
+            return "\(hhmm(ps[0]))-\(hhmm(ps[1]))"
+        }.joined(separator: ", ")
+    }
+
+    /// Seed the pickers from the saved pref strings (parsed via the same RecordSchedule logic the
+    /// engine uses, so what you see is exactly what will record).
+    fileprivate func loadScheduleUI(days: String, hours: String) {
+        let wd = RecordSchedule.parseDays(days)                     // 1=Sun … 7=Sat
+        let keyNum = ["mon": 2, "tue": 3, "wed": 4, "thu": 5, "fri": 6, "sat": 7, "sun": 1]
+        for (i, k) in daySegKeys.enumerated() { daysSeg.setSelected(wd.contains(keyNum[k] ?? 0), forSegment: i) }
+        hoursRangesStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for r in RecordSchedule.parseRanges(hours) {
+            hoursRangesStack.addArrangedSubview(makeHourRow(startMins: r.start, endMins: min(r.end, 1439)))
+        }
+    }
+
     /// Fill the "add a calendar" popup with the user's event calendars (by title). Picking one
     /// appends it to the token field; an empty token field means "use all calendars".
     /// A scrollable checkbox list of the user's event calendars (none checked = all). Keeps every
     /// calendar visible even with many entries or long names.
+    /// "● Calendar name" — the calendar's own color as a leading dot, the way Calendar.app shows it.
+    /// The plain `name` is what gets persisted; this only changes how the row reads.
+    private func calendarCheckboxTitle(name: String, color: NSColor, font: NSFont) -> NSAttributedString {
+        let side: CGFloat = 9
+        let dot = NSImage(size: NSSize(width: side, height: side), flipped: false) { r in
+            color.setFill(); NSBezierPath(ovalIn: r).fill(); return true
+        }
+        let att = NSTextAttachment()
+        att.image = dot
+        att.bounds = NSRect(x: 0, y: (font.capHeight - side) / 2, width: side, height: side)
+        let s = NSMutableAttributedString(attachment: att)
+        s.append(NSAttributedString(string: "  \(name)",
+                                    attributes: [.font: font, .foregroundColor: NSColor.labelColor]))
+        return s
+    }
+
     private func buildCalendarList() -> NSView {
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 4
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.edgeInsets = NSEdgeInsets(top: 6, left: 8, bottom: 6, right: 8)
         calChecks = []
-        let names = CalendarLookup.availableCalendarNames()
-        if names.isEmpty {
+        let cals = CalendarLookup.availableCalendars()
+        if cals.isEmpty {
             let l = NSTextField(labelWithString: "No calendars available (grant Calendar access, then reopen).")
             l.textColor = .secondaryLabelColor; l.font = .systemFont(ofSize: 11)
             stack.addArrangedSubview(l)
         }
-        for name in names {
+        for (name, color) in cals {
             let box = NSButton(checkboxWithTitle: name, target: nil, action: nil)
+            box.attributedTitle = calendarCheckboxTitle(name: name, color: color, font: box.font ?? .systemFont(ofSize: 13))
+            box.setAccessibilityLabel(name)   // the attributed title leads with an image attachment
             stack.addArrangedSubview(box); calChecks.append((name, box))
         }
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        let scroll = PassthroughScrollView()   // wheel passes to the pane when the list fits
+        scroll.hasVerticalScroller = true
+        scroll.scrollerStyle = .overlay        // overlay + autohide: no scrollbar unless the list overflows (user)
+        scroll.autohidesScrollers = true
+        scroll.borderType = .noBorder   // borderless: the card is the container — no box-inside-a-box
+        scroll.drawsBackground = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = stack
-        scroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         // Grow to fit all calendars up to a cap, then scroll (instead of a fixed short box).
-        let naturalH = CGFloat(max(1, names.count)) * 21 + 14
+        let naturalH = CGFloat(max(1, cals.count)) * 22 + 4
         scroll.heightAnchor.constraint(equalToConstant: min(naturalH, 220)).isActive = true
         let clip = scroll.contentView
         NSLayoutConstraint.activate([
@@ -3267,11 +4084,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             stack.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: clip.trailingAnchor),
         ])
-        let hint = NSTextField(labelWithString: "None checked = all calendars")
-        hint.font = .systemFont(ofSize: 10); hint.textColor = .secondaryLabelColor
-        let cell = NSStackView(views: [scroll, hint]); cell.orientation = .vertical
-        cell.alignment = .leading; cell.spacing = 3
-        return cell
+        return scroll
     }
 
     private func idx<T: Equatable>(_ v: T, _ arr: [T]) -> Int { arr.firstIndex(of: v) ?? 0 }
@@ -3291,9 +4104,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         transcriptLangPopup.selectItem(at: idx(TranscriptL10n.configuredCode, tLangValues))   // explicit save (even "") beats env
         modelPopup.selectItem(at: idx(Pref.str(Pref.model, "MR_WHISPER_MODEL", WhisperCatalog.defaultName), modelNames))
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
-        deepgramKeyField.stringValue = DeepgramLiveTranscriber.storedKey ?? ""   // migrates legacy prefs too
-        openaiKeyField.stringValue = OpenAILiveTranscriber.storedKey ?? ""
-        gladiaKeyField.stringValue = GladiaLiveTranscriber.storedKey ?? ""
+        // Presence, not the secret. Prefilling the real key made opening Settings an authorization prompt
+        // per engine, for a value the user never asked to see.
+        for (account, field) in [("deepgram", deepgramKeyField), ("openai", openaiKeyField), ("gladia", gladiaKeyField)] {
+            field.stringValue = Keychain.exists(account) ? Self.keyMask : ""
+        }
         openaiBaseField.stringValue = OpenAILiveTranscriber.configuredBase   // explicit save (even "") beats env
         postProcessField.stringValue = Pref.postProcessCommand               // same explicit-save semantics
         // Show the EFFECTIVE mode (incl. the v1 migration: unset mode + v1 command = Custom command) —
@@ -3312,6 +4127,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         dailyPromptView.string = savedDaily.isEmpty ? defaultDailyDigestPrompt : savedDaily
         dailyPromptFileField.stringValue = Pref.explicit(Pref.dailyPromptFile, "MR_DAILY_DIGEST_PROMPT_FILE")
         dailyOutField.stringValue = Pref.explicit(Pref.dailyDigestOut, "MR_DAILY_DIGEST_OUT")
+        dailyNameField.stringValue = Pref.explicit(Pref.dailyDigestName, "MR_DAILY_DIGEST_NAME")
+        for (engine, box) in engineSwitches { box.state = engine.isEnabled ? .on : .off }
         let hm = Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00").split(separator: ":").compactMap { Int($0) }
         var tc = DateComponents(); tc.hour = hm.count == 2 ? hm[0] : 20; tc.minute = hm.count == 2 ? hm[1] : 0
         dailyTimePicker.dateValue = Calendar.current.date(from: tc) ?? Date()
@@ -3319,9 +4136,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         hintsFileField.stringValue = Pref.explicit(Pref.hintsFile, "MR_HINTS_FILE")
         hintsCalBtn.state = Pref.bool(Pref.hintsCalendar, "MR_HINTS_CALENDAR", false) ? .on : .off
         schedBtn.state = Pref.bool(Pref.schedEnabled, "MR_SCHEDULE", false) ? .on : .off
-        schedDaysField.stringValue = Pref.explicit(Pref.schedDays, "MR_SCHEDULE_DAYS")
-        schedHoursField.stringValue = Pref.explicit(Pref.schedHours, "MR_SCHEDULE_HOURS")
-        recolorScheduleFields()
+        loadScheduleUI(days: Pref.explicit(Pref.schedDays, "MR_SCHEDULE_DAYS"),
+                       hours: Pref.explicit(Pref.schedHours, "MR_SCHEDULE_HOURS"))
+        updateScheduleEnabled()   // dim Days/Hours when the schedule is off
         // Long paths head-truncate in the field — the tooltip always carries the full value.
         for f in [dirField, audioDirField, customModelField, hintsFileField, promptFileField,
                   summaryOutField, postProcessField] {
@@ -3361,32 +4178,154 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         } else { loginBtn.isEnabled = false }
     }
 
-    @objc private func chooseDir() {
-        let p = NSOpenPanel(); p.canChooseDirectories = true; p.canChooseFiles = false; p.allowsMultipleSelection = false
-        if p.runModal() == .OK, let u = p.url { dirField.stringValue = u.path }
-    }
-    @objc private func chooseAudioDir() {
-        let p = NSOpenPanel(); p.canChooseDirectories = true; p.canChooseFiles = false; p.allowsMultipleSelection = false
-        if p.runModal() == .OK, let u = p.url { audioDirField.stringValue = u.path }
-    }
-    @objc private func chooseSummaryDir() {
-        let p = NSOpenPanel(); p.canChooseDirectories = true; p.canChooseFiles = false; p.allowsMultipleSelection = false
-        p.canCreateDirectories = true
-        if p.runModal() == .OK, let u = p.url { summaryOutField.stringValue = u.path }
+    @objc private func chooseDir()        { choosePath(into: dirField, files: false) }
+    @objc private func chooseAudioDir()   { choosePath(into: audioDirField, files: false) }
+    @objc private func chooseSummaryDir() { choosePath(into: summaryOutField, files: false) }
+    @objc private func chooseDailyDir()   { choosePath(into: dailyOutField, files: false) }
+    // A prompt/hints file is picked in Finder like any other path.
+    @objc private func choosePromptFile()      { choosePath(into: promptFileField, files: true) }
+    @objc private func chooseDailyPromptFile() { choosePath(into: dailyPromptFileField, files: true) }
+    @objc private func chooseHintsFile()       { choosePath(into: hintsFileField, files: true) }
+
+    /// The one picker behind every "Choose…" button — a folder picker (`files: false`) or a file
+    /// picker (`files: true`). macrec is a menu-bar (`.accessory`) app, so a bare
+    /// `NSOpenPanel.runModal()` can open behind everything or never take key focus — the "Choose…"
+    /// button then looked dead (user report: Storage "Choose…" did nothing). Presenting the panel as a
+    /// SHEET on the Settings window makes it always surface and stay tied to the window; we fall back
+    /// to activate-then-runModal only if the window is somehow absent. Seeds at the field's current path.
+    private func choosePath(into field: NSTextField, files: Bool) {
+        let p = NSOpenPanel()
+        p.canChooseDirectories = !files
+        p.canChooseFiles = files
+        p.allowsMultipleSelection = false
+        p.canCreateDirectories = !files
+        let cur = (field.stringValue as NSString).expandingTildeInPath
+        if !field.stringValue.isEmpty {
+            // A file field seeds the panel at its enclosing DIRECTORY, with the current file's name in
+            // the name field so it's selected rather than hunted for; handing NSOpenPanel a file path as
+            // `directoryURL` opens the user's home instead.
+            p.directoryURL = files ? URL(fileURLWithPath: cur).deletingLastPathComponent()
+                                   : URL(fileURLWithPath: cur)
+            if files { p.nameFieldStringValue = URL(fileURLWithPath: cur).lastPathComponent }
+        }
+        let apply: (NSApplication.ModalResponse) -> Void = { resp in
+            guard resp == .OK, let u = p.url else { return }
+            field.stringValue = u.path
+            field.toolTip = u.path   // fields head-truncate; the tooltip must track the new value (load() sets it once)
+        }
+        // Present as a sheet on a VISIBLE window; only fall back to runModal when there's none to host
+        // one (headless selftest/snapshot) — a bare runModal on this .accessory app opens behind.
+        if dirPickerPresentation(hasVisibleWindow: window?.isVisible == true) == .sheet, let win = window {
+            p.beginSheetModal(for: win, completionHandler: apply)
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+            apply(p.runModal())
+        }
     }
 
-    @objc private func chooseDailyDir() {
-        let p = NSOpenPanel(); p.canChooseDirectories = true; p.canChooseFiles = false; p.allowsMultipleSelection = false
-        p.canCreateDirectories = true
-        if p.runModal() == .OK, let u = p.url { dailyOutField.stringValue = u.path }
+    /// Every "Choose…" button in the built panes (folder AND file pickers) is bound to a handler this
+    /// controller actually implements — a headless guard against a picker button silently wired to
+    /// nothing / a renamed selector. NOTE: this does NOT prove the panel surfaces (the real bug) — the
+    /// sheet-vs-runModal decision is tested via dirPickerPresentation, and actual surfacing by
+    /// manually driving Settings.
+    /// Switches whose name lives in a sibling label and who therefore announce nothing to VoiceOver.
+    /// Replacing the old `NSButton(checkboxWithTitle:)` rows silently dropped every label.
+    var unlabeledSwitchesForTest: Int {
+        var n = 0
+        func walk(_ v: NSView) {
+            if v is NSSwitch, v.accessibilityLabel()?.isEmpty ?? true { n += 1 }
+            v.subviews.forEach(walk)
+        }
+        for p in panesForTest { walk(p.view) }
+        return n
     }
 
-    @objc private func saveAndClose() {
+    var chooseButtonsWiredForTest: (count: Int, allWired: Bool) {
+        var btns: [NSButton] = []
+        func walk(_ v: NSView) { if let b = v as? NSButton, b.title == "Choose…" { btns.append(b) }; v.subviews.forEach(walk) }
+        for p in panesForTest { walk(p.view) }
+        let allWired = btns.allSatisfy { b in
+            guard let action = b.action, let target = b.target as? NSObject else { return false }
+            return target.responds(to: action)
+        }
+        return (btns.count, allWired)
+    }
+
+    /// Visible confirmation that a Save landed, now that Save no longer closes the window. Re-saving
+    /// restarts the fade rather than letting the first timer hide the label mid-flash.
+    /// `cancel()` can't reach a fade that already started, so a generation counter fences its completion.
+    private func flashSaved() {
+        savedFlash?.cancel()
+        flashGen &+= 1
+        let gen = flashGen
+        savedLabel.isHidden = false
+        savedLabel.alphaValue = 1
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, gen == self.flashGen else { return }
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.35; self.savedLabel.animator().alphaValue = 0 },
+                                                 completionHandler: { [weak self] in
+                guard let self, gen == self.flashGen else { return }
+                self.savedLabel.isHidden = true
+            })
+        }
+        savedFlash = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8, execute: work)
+    }
+
+    /// Shown in a key field when a credential is stored. Never a real key, and never saved back.
+    static let keyMask = "••••••••••••"
+
+    func loadForTest() { load() }
+    var keyFieldsForTest: [String] { [deepgramKeyField, openaiKeyField, gladiaKeyField].map(\.stringValue) }
+
+    /// Every pref the recorder reads. Missing one means Save saves it and nothing happens.
+    private static let engineKeys = [
+        Pref.segment, Pref.lang, Pref.transcriptLang, Pref.model, Pref.customModel, Pref.exclude,
+        Pref.txtDir, Pref.audioDir, Pref.keepAudio, Pref.vad, Pref.systemAudio, Pref.echoReduce,
+        Pref.cal, Pref.calendars, Pref.voiceMin, Pref.hintsTerms, Pref.hintsFile, Pref.hintsCalendar,
+        Pref.audioRawDays, Pref.audioRetention, Pref.txtRetention,
+        // The schedule belongs here: `restartEngine()` is what clears `schedulePaused` and re-baselines
+        // the schedule, so leaving these out meant switching "Record only on a schedule" OFF saved the
+        // pref and left the engine parked off-hours, with no way to get recording back from Settings.
+        Pref.schedEnabled, Pref.schedDays, Pref.schedHours,
+    ]
+    /// A switch turned on for an engine with no key silently did nothing: the engine just never appeared
+    /// in the overlay's picker. Say so at the moment the user saves it.
+    private func warnAboutEnginesMissingCredentials() {
+        let missing = enginesMissingCredentials(LiveEngine.allCases, enabled: { $0.isEnabled }, ready: { $0.isReady })
+        guard !missing.isEmpty else { return }
+        let names = missing.map(\.plainTitle).joined(separator: ", ")
+        let a = NSAlert()
+        a.messageText = missing.count == 1 ? "\(names) has no API key" : "Some engines have no API key"
+        a.informativeText = "\(names) stayed switched on but won't appear in the overlay's engine picker "
+            + "until the key is filled in. Everything else was saved."
+        a.alertStyle = .warning
+        if dirPickerPresentation(hasVisibleWindow: window?.isVisible == true) == .sheet, let win = window {
+            a.beginSheetModal(for: win, completionHandler: nil)
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+            a.runModal()
+        }
+    }
+
+    static var engineKeysForTest: [String] { engineKeys }
+    private func engineSettingsDigest() -> String {
+        engineFingerprint(Dictionary(uniqueKeysWithValues: Self.engineKeys.map {
+            ($0, Pref.d.object(forKey: $0).map { String(describing: $0) } ?? "∅")
+        }))
+    }
+
+    @objc private func saveSettings() {
+        let engineBefore = engineSettingsDigest()
         // Keychain first — if a credential write fails, abort BEFORE touching any other setting so
         // the user isn't left with a half-saved state (and no key is silently lost). All-or-nothing:
         // keys saved earlier in the loop are rolled back (best effort) on a later failure.
+        // Only credentials the user actually edited are touched. A field still showing the mask means
+        // "unchanged", so Save never reads or rewrites a key it wasn't given — and never asks the user
+        // to authorize handing the old one back just to save an unrelated setting.
         let creds = [("deepgram", deepgramKeyField, "Deepgram"), ("openai", openaiKeyField, "OpenAI"),
                      ("gladia", gladiaKeyField, "Gladia")]
+            .filter { $0.1.stringValue != Self.keyMask }
         let previousKeys = creds.map { ($0.0, Keychain.get($0.0) ?? "") }
         for (i, cred) in creds.enumerated() {
             let (account, field, name) = cred
@@ -3418,14 +4357,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         d.set(dp == defaultDailyDigestPrompt ? "" : dp, forKey: Pref.dailyPrompt)   // default stays editable, not stored
         d.set(dailyPromptFileField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.dailyPromptFile)
         d.set(dailyOutField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.dailyDigestOut)
+        d.set(dailyNameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.dailyDigestName)
+        // Persist the ON list: a cloud engine we add later must not become enabled behind the user's back.
+        d.set(engineSwitches.filter { $0.box.state == .on }.map { $0.engine.rawValue }, forKey: Pref.liveEnginesOn)
         let tc = Calendar.current.dateComponents([.hour, .minute], from: dailyTimePicker.dateValue)
         d.set(String(format: "%02d:%02d", tc.hour ?? 20, tc.minute ?? 0), forKey: Pref.dailyDigestTime)
         d.set(hintsTermsField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.hintsTerms)
         d.set(hintsFileField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.hintsFile)
         d.set(hintsCalBtn.state == .on, forKey: Pref.hintsCalendar)
         d.set(schedBtn.state == .on, forKey: Pref.schedEnabled)
-        d.set(schedDaysField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.schedDays)
-        d.set(schedHoursField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.schedHours)
+        d.set(serializeDays(), forKey: Pref.schedDays)
+        d.set(serializeHours(), forKey: Pref.schedHours)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
@@ -3449,8 +4391,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         if #available(macOS 13, *), !LoginItem.managedByLaunchAgent {
             if LoginItem.setEnabled(loginBtn.state == .on) == .requiresApproval { LoginItem.openSettings() }
         }
-        window?.close()
-        onSave()
+        if #available(macOS 26, *) { LiveCaptions.shared.settingsSaved() }
+        warnAboutEnginesMissingCredentials()
+        // `stop()` discards the in-progress segment, and Return in any field now fires Save.
+        if engineSettingsDigest() != engineBefore { onSave() }
+        flashSaved()
     }
     @objc private func closeOnly() { window?.close() }
 }
@@ -3773,10 +4718,20 @@ protocol LiveTranscribing: AnyObject {
     func stop()
 }
 
+func envKeyPresent(_ name: String) -> Bool {
+    !(ProcessInfo.processInfo.environment[name] ?? "").isEmpty
+}
+
 /// Selectable live engine. Extensible: add a case, a title, and a branch in `makeTranscriber`.
 enum LiveEngine: String, CaseIterable {
     case apple, whisper, deepgram, openai, gladia
-    static var current: LiveEngine { LiveEngine(rawValue: Pref.d.string(forKey: Pref.liveEngine) ?? "") ?? .apple }
+    /// The engine in use — but only if it is still selectable. A key deleted from the Keychain, or an
+    /// engine switched off in Settings, must not leave the overlay pinned to an engine that can only
+    /// print an error where the captions should be.
+    static var current: LiveEngine {
+        let stored = LiveEngine(rawValue: Pref.d.string(forKey: Pref.liveEngine) ?? "") ?? .apple
+        return stored.isSelectable ? stored : .apple
+    }
     var title: String {
         switch self {
         case .apple:    return "Apple"
@@ -3786,6 +4741,82 @@ enum LiveEngine: String, CaseIterable {
         case .gladia:   return "Gladia ☁"
         }
     }
+    /// Can this engine actually run right now? A cloud engine needs its API key; whisper needs its
+    /// binary and model. Offering one that can only answer "API key not set" is a promise the app
+    /// cannot keep (AGENTS.md §2.8) — Deepgram sat in the picker with no credential for exactly that reason.
+    var isReady: Bool {
+        switch self {
+        case .apple:    return true
+        case .whisper:
+            let c = EngineConfig.load()
+            return FileManager.default.isExecutableFile(atPath: c.whisperCli)
+                && FileManager.default.fileExists(atPath: c.whisperModel)
+        // Presence, never the secret: reading a key is an authorization check the user has to answer.
+        case .deepgram: return Keychain.exists("deepgram") || envKeyPresent("MR_DEEPGRAM_KEY")
+        case .openai:   return Keychain.exists("openai") || envKeyPresent("MR_OPENAI_KEY")
+        case .gladia:   return Keychain.exists("gladia") || envKeyPresent("MR_GLADIA_KEY")
+        }
+    }
+    /// The title without the cloud marker — a row that already sits under a vendor header shouldn't
+    /// repeat the glyph, and "Apple ☁" would be a lie.
+    var plainTitle: String { title.replacingOccurrences(of: " ☁", with: "") }
+    /// On-device engines are on out of the box; a CLOUD engine streams meeting audio off-device, so it
+    /// stays off until the user turns it on deliberately. Opt-in, never opt-out, for anything that
+    /// leaves the machine.
+    var onByDefault: Bool { self == .apple || self == .whisper }
+    /// The user's per-engine switch (Settings › Live Captions). No stored list yet = the defaults.
+    var isEnabled: Bool {
+        liveEngineEnabled(self, storedOn: Pref.d.stringArray(forKey: Pref.liveEnginesOn),
+                          selectedEngine: Pref.d.string(forKey: Pref.liveEngine))
+    }
+    var isSelectable: Bool { isReady && isEnabled }
+    /// Why an engine can't be offered — shown next to its switch so the setting isn't a mystery.
+    var notReadyReason: String? {
+        guard !isReady else { return nil }
+        return self == .whisper ? "whisper-cli or its model isn't installed yet."
+                                : "Add the API key below to use this engine."
+    }
+}
+
+/// A stable digest of the settings the RECORDING engine consumes. Restarting the engine throws away
+/// the in-progress segment (`RecordingEngine.stop()` deletes the trailing partial), so a Save that
+/// changed nothing the engine cares about must not restart it. This matters far more now that Save
+/// keeps the window open: Return in any text field triggers Save, and a segment can be up to 2 hours.
+/// Pure over the values, so a selftest can prove which keys do and don't trigger a restart.
+func engineFingerprint(_ values: [String: String]) -> String {
+    values.keys.sorted().map { "\($0)=\(values[$0]!)" }.joined(separator: "\u{1}")
+}
+
+/// Is this engine switched on? With no stored list (every install that predates the switches) the
+/// defaults apply — PLUS whatever engine the user had already chosen. Cloud engines becoming opt-in
+/// must not silently downgrade someone who was already running Deepgram to Apple behind their back.
+/// Pure + selftested.
+func liveEngineEnabled(_ e: LiveEngine, storedOn: [String]?, selectedEngine: String?) -> Bool {
+    if let on = storedOn { return on.contains(e.rawValue) }
+    return e.onByDefault || e.rawValue == selectedEngine
+}
+
+/// Engines the user switched on that cannot run for want of a credential. Pure + selftested.
+func enginesMissingCredentials(_ engines: [LiveEngine], enabled: (LiveEngine) -> Bool,
+                               ready: (LiveEngine) -> Bool) -> [LiveEngine] {
+    engines.filter { enabled($0) && !ready($0) }
+}
+
+/// The engine a popup index refers to. It indexes the FILTERED list the popup was built from — reading
+/// `LiveEngine.allCases[index]` selected the wrong engine the moment any engine was left out of the
+/// menu. Pure + selftested.
+func engineAtPopupIndex(_ index: Int, choices: [LiveEngine]) -> LiveEngine? {
+    guard !choices.isEmpty else { return nil }
+    return choices[min(max(0, index), choices.count - 1)]
+}
+
+/// The engines the overlay's picker may offer: switched on by the user AND actually runnable. Apple is
+/// the floor — an empty picker would strand the user with no engine and no way back. Pure + selftested.
+func selectableLiveEngines(_ all: [LiveEngine], ready: (LiveEngine) -> Bool,
+                           enabled: (LiveEngine) -> Bool) -> [LiveEngine] {
+    // `enabled` first: it is a plain pref read, while `ready` probes the Keychain and the filesystem.
+    let picked = all.filter { enabled($0) && ready($0) }
+    return picked.isEmpty ? [.apple] : picked
 }
 
 /// whisper.cpp live engine: accumulates fed audio into a 16 kHz mono segment, and every ~2 s re-runs
@@ -3975,6 +5006,7 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
     /// sole stored credential).
     static var storedKey: String? {
         if let k = Keychain.get("deepgram") { return k }
+        guard !Keychain.disabled else { return nil }   // never migrate (and never delete the legacy pref) in tests
         if let k = Pref.d.string(forKey: Pref.deepgramKey), !k.isEmpty {
             if Keychain.set("deepgram", k) { Pref.d.removeObject(forKey: Pref.deepgramKey) }
             return k
@@ -4603,6 +5635,14 @@ final class LiveCaptions {
     /// Menu toggle (main thread).
     func toggle() { active ? stop() : start() }
 
+    /// Settings were saved: the engine picker and the engine itself must reflect them without the user
+    /// closing and reopening the overlay (an engine switched off stayed in the menu until then).
+    func settingsSaved() {
+        guard active else { return }
+        window?.reloadEngineChoices()
+        reconfigure()
+    }
+
     func start() {
         guard !active else { return }
         active = true; lines = []; renderScheduled = false   // clear any coalescing state left by a prior session
@@ -4896,12 +5936,61 @@ final class LiveCaptions {
     }
 }
 
+/// The overlay's opacity slider moves the BACKDROP only, never the captions. Fading the whole window
+/// (`panel.alphaValue`) fades its children too, so at the low end the very text the overlay exists to
+/// show disappeared along with the background. The range bottoms out at ZERO — a fully transparent
+/// backdrop is the closed-caption look, captions floating over whatever is behind them — which is safe
+/// precisely because the text keeps its own contrast (see the halo in `render`). Pure + selftested.
+let captionOpacityRange: ClosedRange<Double> = 0.0...1.0
+func captionBackdropAlpha(_ pref: Double) -> CGFloat {
+    CGFloat(min(captionOpacityRange.upperBound, max(captionOpacityRange.lowerBound, pref)))
+}
+
+/// What a subtitle actually shows. A film subtitle is not a transcript log: it is the last thing said,
+/// centred, with the translation carrying the line and the original demoted to a whisper above it. When
+/// there is no translation the original IS the subtitle. Pure + selftested.
+func subtitleLine(original: String, translated: String?) -> (main: String, secondary: String?) {
+    guard let t = translated?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else {
+        return (original, nil)
+    }
+    return (t, original.isEmpty ? nil : original)
+}
+
+/// Subtitles are read at a glance from across the room: bigger than the log's body text, and never
+/// smaller than legible. Pure + selftested.
+func subtitleFontSize(_ base: CGFloat) -> CGFloat { max(18, base + 6) }
+
+/// How many lines a subtitle shows. A film shows one utterance, two lines at most — a scrolling wall of
+/// history is the thing that makes an overlay read as a log. Pure + selftested.
+let subtitleMaxLines = 2
+
+/// The window outline exists so a transparent LOG still reads as a window you can grab. A subtitle is
+/// not a window — a rectangle drawn around a film subtitle is exactly what breaks the illusion.
+/// Pure + selftested.
+func captionEdgeVisible(subtitle: Bool) -> Bool { !subtitle }
+
+/// Do the captions have to carry their own contrast? Only when the backdrop is too faint to provide it.
+/// A backplate behind text that already sits on a solid panel would just be a darker box on a dark box.
+/// Pure + selftested.
+func captionTextNeedsBackplate(backdropAlpha: CGFloat) -> Bool { backdropAlpha < 0.6 }
+
+/// A view that is seen but never touched — it sits over the captions purely to draw the outline, so it
+/// must not swallow clicks, text selection, or the window drag.
+final class NonInteractiveView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 /// Floating always-on-top panel showing the live captions. A compact control bar along the top holds
 /// the live settings (language, who to transcribe, translation, text size, timestamps) so changes take
-/// effect immediately; opacity is the drag slider along the bottom. Nothing lives in the Settings window.
+/// effect immediately; opacity is a drag slider on that bar. Nothing lives in the Settings window.
 @available(macOS 26, *)
 final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     private let panel: NSPanel
+    /// The only thing the opacity slider fades. Layer-backed, not an NSVisualEffectView: the window
+    /// server composites a `.behindWindow` material and ignores the view's alpha.
+    private let backdrop = NSView()
+    /// A faint outline that does NOT fade with the backdrop, so a transparent log still reads as a window.
+    private let edge = NonInteractiveView()
     private let textView = NSTextView()
     private let onClose: () -> Void
     private let onReconfigure: () -> Void   // language / source / translation changed → rebuild the engine
@@ -4909,9 +5998,12 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     private var suppressCloseCallback = false
     private let langPopup = NSPopUpButton(), sourcePopup = NSPopUpButton(), translatePopup = NSPopUpButton()
     private let tsToggle = NSButton(checkboxWithTitle: "Time", target: nil, action: nil)
+    private let subToggle = NSButton(checkboxWithTitle: "Subtitle", target: nil, action: nil)
     private var controlsAccessory: NSTitlebarAccessoryViewController?   // the full control strip (collapsible)
     private let collapseBtn = NSButton()                                // chevron RIGHT NEXT TO the title text
     private var chevronLead: NSLayoutConstraint?                        // titlebar.centerX + titleWidth/2 + gap
+    private var engineChoices: [LiveEngine] = []                        // exactly what the engine popup lists
+    private let enginePopup = NSPopUpButton()                           // rebuilt when Settings change
     private static let titleIcon = "🎙️"           // beautifies the "macrec live" title
 
     @objc private func toggleControlBar() {
@@ -4944,12 +6036,22 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
 
     init(onClose: @escaping () -> Void, onReconfigure: @escaping () -> Void, onRestyle: @escaping () -> Void) {
         self.onClose = onClose; self.onReconfigure = onReconfigure; self.onRestyle = onRestyle
+        // NOT `.hudWindow`: that style inserts a full-window NSVisualEffectView as the theme frame's
+        // bottom-most subview, under everything we own. It kept painting its dark material no matter
+        // what the opacity slider did, so the overlay could never go fully transparent. We draw our own
+        // dark fill (`backdrop`) instead and force the dark appearance so the titlebar still matches.
         panel = CaptionPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: 172),   // default fits one more caption line
-                             styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel],
+                             styleMask: [.titled, .closable, .resizable, .utilityWindow, .nonactivatingPanel],
                              backing: .buffered, defer: false)
+        panel.appearance = NSAppearance(named: .darkAqua)
         super.init()
         panel.title = "\(Self.titleIcon) macrec live"
-        panel.alphaValue = CGFloat(min(1.0, max(0.3, Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 1.0))))
+        // The window itself is ALWAYS fully opaque — see captionBackdropAlpha. Its content area draws
+        // nothing (clear + non-opaque), so the only thing behind the captions is `backdrop`, whose
+        // alpha the slider moves. Fading the window would fade the captions with it.
+        panel.alphaValue = 1
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.hidesOnDeactivate = false
@@ -5008,6 +6110,14 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
 
         // --- captions (scrollable text) fill the whole content (opacity moved up to the control bar) ---
         let content = panel.contentView!
+        backdrop.frame = content.bounds
+        backdrop.autoresizingMask = [.width, .height]
+        backdrop.wantsLayer = true
+        // The HUD panel's own dark fill, reproduced so we own its alpha. Pure black reads too heavy
+        // against a bright screen at full opacity, so this matches the panel chrome's tone.
+        backdrop.layer?.backgroundColor = NSColor(white: 0.10, alpha: 1).cgColor
+        backdrop.alphaValue = captionBackdropAlpha(Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 1.0))
+        content.addSubview(backdrop)
         let scroll = NSScrollView(frame: content.bounds)
         scroll.autoresizingMask = [.width, .height]
         scroll.hasVerticalScroller = true
@@ -5028,7 +6138,79 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         textView.drawsBackground = false
         textView.textContainerInset = NSSize(width: 10, height: 8)
         scroll.documentView = textView
-        content.addSubview(scroll)
+        content.addSubview(scroll, positioned: .above, relativeTo: backdrop)
+
+        // The outline goes on TOP so it isn't covered by the captions, and never fades with the
+        // backdrop. It ignores the mouse (NonInteractiveView) so text selection and dragging still work.
+        edge.frame = content.bounds
+        edge.autoresizingMask = [.width, .height]
+        edge.wantsLayer = true
+        edge.layer?.borderWidth = 1
+        edge.layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
+        content.addSubview(edge, positioned: .above, relativeTo: scroll)
+    }
+
+    /// Reads back what the opacity slider actually moved — the captions must never be the thing that fades.
+    var captionAlphasForTest: (window: CGFloat, backdrop: CGFloat, text: CGFloat) {
+        (panel.alphaValue, backdrop.alphaValue, textView.alphaValue)
+    }
+    func setOpacityForTest(_ v: Double) { applyOpacity(v) }
+
+    /// Nothing may paint behind the backdrop that the opacity slider cannot reach.
+    var nothingPaintsBehindBackdropForTest: Bool {
+        guard let frame = panel.contentView?.superview else { return false }
+        return !frame.subviews.contains { $0 is NSVisualEffectView }
+    }
+
+    /// Does the backdrop actually PAINT? Asserting its alpha alone was a false all-clear.
+    var backdropPaintsForTest: Bool {
+        guard let content = panel.contentView, backdrop.wantsLayer,
+              let fill = backdrop.layer?.backgroundColor, fill.alpha == 1,
+              let bi = content.subviews.firstIndex(of: backdrop),
+              let ti = content.subviews.firstIndex(where: { $0 is NSScrollView }) else { return false }
+        return bi < ti && backdrop.frame.size == content.bounds.size
+    }
+
+    /// The outline stays put and stays untouchable no matter where the opacity slider sits.
+    var edgeSurvivesForTest: (visible: Bool, ignoresMouse: Bool) {
+        let border = edge.layer.map { $0.borderWidth > 0 && ($0.borderColor?.alpha ?? 0) > 0 } ?? false
+        return (border && edge.alphaValue == 1 && !edge.isHidden,
+                edge.hitTest(NSPoint(x: 5, y: 5)) == nil)
+    }
+
+    /// UI TEST KIT (`macrec caption-snapshot <dir>`): show the overlay for real and capture the composited
+    /// window at several opacities. The one thing to LOOK for: the background fades, the captions never do.
+    ///
+    /// It has to be a REAL screen capture. An offscreen `cacheDisplay` of this panel renders a blank
+    /// white slab — a `.behindWindow` NSVisualEffectView is composited by the window server, not by the
+    /// view's own drawing — so an offscreen snapshot would "pass" no matter what the opacity slider did.
+    /// `screencapture -l<windowNumber>` grabs what the user actually sees. It needs the *calling*
+    /// terminal's Screen Recording permission; without it the file never appears and we say so.
+    func snapshotOpacities(_ values: [Double], to dir: URL) -> [URL] {
+        var written: [URL] = []
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        render([(speaker: "me", text: "会議を始めましょう。", translated: "회의를 시작합시다.",
+                 time: Date(timeIntervalSince1970: 0), mine: true, inProgress: false),
+                (speaker: "them", text: "資料は共有済みです。", translated: "자료는 이미 공유했습니다.",
+                 time: Date(timeIntervalSince1970: 4), mine: false, inProgress: true)],
+               showTimestamps: true, fontSize: 14, showLabels: true)
+        show()
+        panel.orderFrontRegardless()
+        for v in values {
+            applyOpacity(v)
+            panel.contentView?.layoutSubtreeIfNeeded()
+            panel.displayIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.4))   // let the compositor settle
+            let url = dir.appendingPathComponent(String(format: "overlay-opacity-%.2f.png", v))
+            try? FileManager.default.removeItem(at: url)
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            p.arguments = ["-x", "-o", "-l\(panel.windowNumber)", url.path]
+            try? p.run(); p.waitUntilExit()
+            if FileManager.default.fileExists(atPath: url.path) { written.append(url) }
+        }
+        panel.orderOut(nil)
+        return written
     }
 
     /// Build the top control bar. Each control writes its Pref and fires the matching callback so the
@@ -5054,14 +6236,21 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         tsToggle.controlSize = .small; tsToggle.font = .systemFont(ofSize: 11); tsToggle.toolTip = "Show timestamps"
         tsToggle.state = Pref.bool(Pref.liveTimestamps, "MR_LIVE_TIMESTAMPS", true) ? .on : .off
         tsToggle.target = self; tsToggle.action = #selector(tsToggled(_:))
-        // Engine select box — Apple (fast) vs Whisper (accurate / better Korean).
-        let enginePopup = NSPopUpButton()
-        fill(enginePopup, LiveEngine.allCases.map { $0.title }, LiveEngine.allCases.firstIndex(of: .current) ?? 0,
-             "Engine — Apple: fast · Whisper: accurate (better Korean)", #selector(engineChanged(_:)))
+        subToggle.controlSize = .small; subToggle.font = .systemFont(ofSize: 11)
+        subToggle.toolTip = "Subtitle view — the last line, centred, translation first"
+        subToggle.state = Pref.bool(Pref.liveSubtitle, "MR_LIVE_SUBTITLE", false) ? .on : .off
+        subToggle.target = self; subToggle.action = #selector(subtitleToggled(_:))
+        tsToggle.isEnabled = subToggle.state == .off
+        // Engine select box — only engines that are switched on AND have what they need to run.
+        engineChoices = selectableLiveEngines(LiveEngine.allCases, ready: { $0.isReady }, enabled: { $0.isEnabled })
+        fill(enginePopup, engineChoices.map { $0.title }, engineChoices.firstIndex(of: .current) ?? 0,
+             "Engine — Apple: fast · Whisper: accurate. Add a key in Settings to unlock the cloud engines.",
+             #selector(engineChanged(_:)))
         // Opacity drag slider, now on the top bar (was a bottom strip).
-        let opacity = NSSlider(value: Double(panel.alphaValue), minValue: 0.3, maxValue: 1.0,
+        let opacity = NSSlider(value: Double(captionBackdropAlpha(Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 1.0))),
+                               minValue: captionOpacityRange.lowerBound, maxValue: captionOpacityRange.upperBound,
                                target: self, action: #selector(opacityChanged(_:)))
-        opacity.controlSize = .mini; opacity.toolTip = "Overlay opacity"
+        opacity.controlSize = .mini; opacity.toolTip = "Background opacity (captions stay readable)"
         opacity.translatesAutoresizingMaskIntoConstraints = false
         opacity.widthAnchor.constraint(equalToConstant: 72).isActive = true
         // A small leading icon per select box says what it controls, without text-label clutter.
@@ -5083,7 +6272,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             icon("globe", "Caption language"), langPopup,
             icon("person.2", "Who to transcribe"), sourcePopup,
             icon("character.bubble", "Translate to"), translatePopup,
-            spacer, copyBtn, aMinus, aPlus, tsToggle, opacity])
+            spacer, copyBtn, aMinus, aPlus, subToggle, tsToggle, opacity])
         bar.orientation = .horizontal; bar.alignment = .centerY; bar.spacing = 5; bar.distribution = .fill
         return bar
     }
@@ -5106,6 +6295,11 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         Pref.d.set(Double(next), forKey: Pref.liveFontSize); onRestyle()
     }
     @objc private func tsToggled(_ s: NSButton) { Pref.d.set(s.state == .on, forKey: Pref.liveTimestamps); onRestyle() }
+    @objc private func subtitleToggled(_ s: NSButton) {
+        Pref.d.set(s.state == .on, forKey: Pref.liveSubtitle)
+        tsToggle.isEnabled = s.state == .off   // a subtitle has no timestamps; don't offer a dead switch
+        onRestyle()
+    }
     /// Copy the current selection — or the whole transcript when nothing is selected.
     @objc private func copyTranscript() {
         let sel = textView.selectedRange()
@@ -5114,15 +6308,27 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }
+    /// Settings changed while the overlay is open: an engine switched off (or a key just added) has to
+    /// show up in the picker NOW — it was built once, at window creation, and never revisited.
+    func reloadEngineChoices() {
+        engineChoices = selectableLiveEngines(LiveEngine.allCases, ready: { $0.isReady }, enabled: { $0.isEnabled })
+        enginePopup.removeAllItems()
+        enginePopup.addItems(withTitles: engineChoices.map { $0.title })
+        enginePopup.selectItem(at: engineChoices.firstIndex(of: .current) ?? 0)
+    }
+    var engineChoicesForTest: [LiveEngine] { engineChoices }
+
     @objc private func engineChanged(_ s: NSPopUpButton) {
-        let engines = LiveEngine.allCases
-        let e = engines[min(max(0, s.indexOfSelectedItem), engines.count - 1)]
+        guard let e = engineAtPopupIndex(s.indexOfSelectedItem, choices: engineChoices) else { return }
         Pref.d.set(e.rawValue, forKey: Pref.liveEngine); onReconfigure()
     }
 
-    @objc private func opacityChanged(_ s: NSSlider) {
-        panel.alphaValue = CGFloat(s.doubleValue)
-        Pref.d.set(s.doubleValue, forKey: Pref.liveOpacity)
+    @objc private func opacityChanged(_ s: NSSlider) { applyOpacity(s.doubleValue) }
+
+    private func applyOpacity(_ v: Double) {
+        backdrop.alphaValue = captionBackdropAlpha(v)   // background only — captions stay fully opaque
+        Pref.d.set(v, forKey: Pref.liveOpacity)
+        onRestyle()   // the captions' outline depends on the backdrop — re-render at the new opacity
     }
 
     func show() {
@@ -5146,6 +6352,42 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     /// them) on a bold label; a single speaker drops the label and uses the primary color. All text starts
     /// at one shared column via a tab stop, and wrapped lines hang-indent to that same column — so line 2+
     /// aligns flush under the text regardless of the timestamp/label prefix width.
+    /// Film-subtitle presentation: the last utterance, centred, translation leading and the original
+    /// demoted above it. Contrast lives BEHIND the glyphs (a plate) — never in them: a blurred halo
+    /// smears the strokes and a `strokeWidth` outline reads as a heavier font weight.
+    private func renderSubtitle(_ lines: [(speaker: String, text: String, translated: String?, time: Date, mine: Bool, inProgress: Bool)],
+                                fontSize: CGFloat) {
+        let size = subtitleFontSize(fontSize)
+        let mainFont = NSFont.systemFont(ofSize: size, weight: .semibold)
+        let subFont = NSFont.systemFont(ofSize: max(11, size - 6), weight: .regular)
+        let para = NSMutableParagraphStyle()
+        para.alignment = .center
+        para.lineHeightMultiple = 1.15
+        para.paragraphSpacing = 6
+        // No plate: a `.backgroundColor` run paints a hard rectangle per line. Contrast goes behind the
+        // glyphs, never into them — a `strokeWidth` outline reads as a heavier font weight.
+        let halo = NSShadow()
+        halo.shadowColor = NSColor.black.withAlphaComponent(0.85)
+        halo.shadowBlurRadius = 2
+        halo.shadowOffset = NSSize(width: 0, height: -1)
+
+        let out = NSMutableAttributedString()
+        for (i, l) in lines.suffix(subtitleMaxLines).enumerated() {
+            if i > 0 { out.append(NSAttributedString(string: "\n")) }
+            let (main, secondary) = subtitleLine(original: l.text, translated: l.translated)
+            if let secondary {
+                out.append(NSAttributedString(string: secondary + "\n", attributes: [
+                    .font: subFont, .foregroundColor: NSColor.secondaryLabelColor,
+                    .shadow: halo, .paragraphStyle: para]))
+            }
+            out.append(NSAttributedString(string: main, attributes: [
+                .font: mainFont, .foregroundColor: NSColor.labelColor,
+                .shadow: halo, .paragraphStyle: para]))
+        }
+        textView.textStorage?.setAttributedString(out)
+        textView.scrollToEndOfDocument(nil)
+    }
+
     func render(_ lines: [(speaker: String, text: String, translated: String?, time: Date, mine: Bool, inProgress: Bool)],
                 showTimestamps: Bool, fontSize: CGFloat, showLabels: Bool) {
         let tsFont = NSFont.monospacedDigitSystemFont(ofSize: max(9, fontSize - 3), weight: .regular)
@@ -5156,6 +6398,13 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         // Shared text column = timestamp width (constant, monospaced) + widest speaker label + a gap.
         let tsW = showTimestamps ? w("00:00:00  ", tsFont) : 0
         let labelW = showLabels ? (lines.map { w("\($0.speaker)  ", labelFont) }.max() ?? 0) : 0
+        // A subtitle is not the log with its chrome off: timestamps and labels go regardless of toggles.
+        let subtitleMode = Pref.bool(Pref.liveSubtitle, "MR_LIVE_SUBTITLE", false)
+        edge.isHidden = !captionEdgeVisible(subtitle: subtitleMode)
+        if subtitleMode {
+            renderSubtitle(lines, fontSize: fontSize)
+            return
+        }
         let hasPrefix = showTimestamps || showLabels
         let col = hasPrefix ? tsW + labelW + 8 : 0
         let para = NSMutableParagraphStyle()
@@ -5193,6 +6442,15 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
                     .font: transFont, .foregroundColor: tint.withAlphaComponent(0.95), .paragraphStyle: trans]))
             }
         }
+        // Over a see-through backdrop the captions sit on whatever is behind the window — light slides,
+        // white documents — and vanish. The two treatments that DON'T work: a blurred halo smears the
+        // thin strokes, and a negative `strokeWidth` outlines the glyphs, which reads as a heavier
+        // weight. Neither may touch the letterforms. So put the contrast BEHIND them, as broadcast
+        // captions do: a dark plate hugging the text, drawn only when the backdrop can't do the job.
+        if captionTextNeedsBackplate(backdropAlpha: captionBackdropAlpha(Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 1.0))) {
+            out.addAttribute(.backgroundColor, value: NSColor.black.withAlphaComponent(0.55),
+                             range: NSRange(location: 0, length: out.length))
+        }
         textView.textStorage?.setAttributedString(out)
         textView.scrollToEndOfDocument(nil)
     }
@@ -5219,6 +6477,10 @@ func flushOutcome(for status: String) -> (title: String, body: String)? {
     if status.hasPrefix("Transcription failed") {
         return ("Transcription failed", "whisper couldn't process the segment — see the log.")
     }
+    // Terminal too: an unclassified status leaves the flush flag armed to steal the next segment's push.
+    if status.hasPrefix("No meeting") {
+        return ("Nothing to transcribe", "No meeting overlapped this segment and it was too short to keep.")
+    }
     return nil
 }
 
@@ -5235,10 +6497,13 @@ enum Notifier {
         }
     }
     /// filePath rides in userInfo; clicking the notification opens it (AppController is the delegate).
-    static func push(title: String, body: String, filePath: String? = nil) {
+    static func push(title: String, body: String, filePath: String? = nil, openURL: URL? = nil) {
         let c = UNMutableNotificationContent()
         c.title = title; c.body = body; c.sound = .default
-        if let filePath { c.userInfo = ["file": filePath] }
+        var info: [String: String] = [:]
+        if let filePath { info["file"] = filePath }               // a local path — opened as a file on click
+        if let openURL { info["url"] = openURL.absoluteString }   // a web link — kept DISTINCT so a URL is never opened as a path
+        if !info.isEmpty { c.userInfo = info }
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)
         ) { err in if let err { elog("notify: add failed: \(err)") } }
@@ -5294,7 +6559,110 @@ final class MenuHoverView: NSView {
     var trackingReadyForTest: Bool { updateTrackingAreas(); return !trackingAreas.isEmpty }
 }
 
-final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
+/// "WE stopped the engine" — the user paused (`paused`) OR the schedule parked it off-hours
+/// (`schedulePaused`). Clicking Resume in either state resumes/overrides and records now. This is the
+/// ONE decision behind the tray toggle: its label, its enablement, and what a click does all route
+/// through here, so they can't disagree (the schedule-paused Resume no-op was two of them
+/// disagreeing — the click branch resumed only `if paused`). Pure + selftested.
+func togglePauseShouldResume(paused: Bool, schedulePaused: Bool) -> Bool { paused || schedulePaused }
+
+/// Whether the tray's Pause/Resume item should be clickable: enabled while stopped-by-us (so Resume
+/// works, incl. off-hours) or while an engine is recording (so Pause works). Only true idle greys it
+/// out. Pure.
+func pauseItemEnabled(paused: Bool, schedulePaused: Bool, hasEngine: Bool) -> Bool {
+    togglePauseShouldResume(paused: paused, schedulePaused: schedulePaused) || hasEngine
+}
+
+/// The two CAPTURE grants that gate recording are satisfied (System Audio + Microphone). Neutral
+/// predicate shared by `allPermissionsGranted()` and the "Grant permissions…" hide logic — Calendar is
+/// optional (titling) and deliberately excluded so a user who declined it isn't nagged. Pure + selftested.
+func captureGrantsSatisfied(audioGranted: Bool, micGranted: Bool) -> Bool { audioGranted && micGranted }
+
+/// A directory picker on a menu-bar (`.accessory`) app must present as a SHEET on a VISIBLE window,
+/// or a bare `runModal()` opens behind everything (the "Choose… did nothing" bug). Fall back to
+/// activate-then-runModal only when there's no visible window to host a sheet. Pure + selftested.
+enum DirPickerPresentation: Equatable { case sheet, activateAndRunModal }
+func dirPickerPresentation(hasVisibleWindow: Bool) -> DirPickerPresentation {
+    hasVisibleWindow ? .sheet : .activateAndRunModal
+}
+
+/// The clickable URL for the "update available" alert, or nil for no button. Homebrew installs get no
+/// button (they upgrade via `brew`). Otherwise the release URL — but ONLY if it is https (never let a
+/// surprise API payload open a `file:` / `javascript:` / custom-scheme URL), falling back to the
+/// hardcoded https releases page when the API url is missing/blank/unsafe. Pure + selftested.
+func updateAlertOpenURL(installedViaBrew: Bool, htmlURL: String?, releasesURL: String) -> URL? {
+    guard !installedViaBrew else { return nil }
+    for s in [htmlURL, releasesURL] {
+        if let s, let u = URL(string: s), u.scheme?.lowercased() == "https" { return u }
+    }
+    return nil
+}
+
+/// A small rounded-tile vendor badge (solid brand color + white SF Symbol) for Settings section headers
+/// and picker items — at-a-glance identity for each engine/runner. NOT a trademarked logo: a
+/// self-contained, self-signed app can't embed those, so this is a tasteful brand-colored mark instead.
+func vendorBadge(_ symbol: String, _ color: NSColor, side: CGFloat = 18) -> NSImage {
+    let glyphCfg = NSImage.SymbolConfiguration(pointSize: side * 0.56, weight: .semibold)
+        .applying(NSImage.SymbolConfiguration(paletteColors: [.white]))
+    let glyph = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(glyphCfg)
+    let img = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+        let body = rect.insetBy(dx: 0.5, dy: 0.5)
+        NSGraphicsContext.current?.saveGraphicsState()
+        NSBezierPath(roundedRect: body, xRadius: body.width * 0.28, yRadius: body.width * 0.28).addClip()
+        color.setFill(); body.fill()
+        NSGraphicsContext.current?.restoreGraphicsState()
+        if let glyph {
+            let g = glyph.size
+            glyph.draw(in: NSRect(x: (side - g.width)/2, y: (side - g.height)/2, width: g.width, height: g.height))
+        }
+        return true
+    }
+    img.isTemplate = false
+    return img
+}
+
+/// macrec's menu-bar mark: the waveform-with-mic glyph (the old "transcribe" tray icon the user likes)
+/// as a menu-bar TEMPLATE so it adapts to the light/dark menu bar — no colored tile (user: drop the blue
+/// background). Voice tints it light orange; paused/idle dims the same mark (maccal-style) so it reads
+/// inactive. Rendered at the glyph's NATURAL aspect (waveform-mic is wider than tall — a square box clipped it).
+func brandMarkImage(side: CGFloat, recording: Bool, voice: Bool) -> NSImage {
+    let lightOrange = NSColor.systemOrange.blended(withFraction: 0.35, of: .white) ?? .systemOrange
+    let glyphCfg = NSImage.SymbolConfiguration(pointSize: side * 0.78, weight: .regular)
+        .applying(NSImage.SymbolConfiguration(paletteColors: [voice ? lightOrange : .white]))
+    let glyph = NSImage(systemSymbolName: "waveform.badge.mic", accessibilityDescription: "macrec")?
+        .withSymbolConfiguration(glyphCfg)
+    let sz = glyph?.size ?? NSSize(width: side, height: side)   // natural aspect, not forced square
+    let img = NSImage(size: sz, flipped: false) { rect in
+        // paused/idle draws the same mark at 45% so it reads inactive (maccal-style). `fraction` is the
+        // reliable opacity knob for NSImage.draw (cgContext.setAlpha didn't take).
+        glyph?.draw(in: rect, from: .zero, operation: .sourceOver, fraction: recording ? 1.0 : 0.45)
+        return true
+    }
+    img.isTemplate = !voice   // template adapts to the light/dark menu bar; the voice tint keeps its color
+    return img
+}
+
+/// Headless guard: the brand mark actually draws (not an all-transparent image — the "shipped visually
+/// destroyed" class of bug). Renders to an offscreen bitmap and checks a meaningful fraction is opaque.
+func brandMarkHasContent(recording: Bool, voice: Bool) -> Bool {
+    let side: CGFloat = 18, scale = 4
+    let px = Int(side) * scale
+    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return false }
+    rep.size = NSSize(width: side, height: side)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    brandMarkImage(side: side, recording: recording, voice: voice).draw(in: NSRect(x: 0, y: 0, width: side, height: side))
+    NSGraphicsContext.restoreGraphicsState()
+    var opaque = 0
+    for y in 0..<rep.pixelsHigh { for x in 0..<rep.pixelsWide {
+        if (rep.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.1 { opaque += 1 }
+    }}
+    return opaque > px * px / 10   // ≥ ~10% drawn
+}
+
+final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var engine: RecordingEngine?
     private var stopTask: Task<Void, Never>?   // in-flight engine stop (pause) — resume/restart await it so
@@ -5321,8 +6689,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var modelLine: NSMenuItem!
     private var toggleItem: NSMenuItem!
     private var liveItem: NSMenuItem?   // "Live captions" toggle (macOS 26+)
+    private var summaryLine: NSMenuItem!   // what post-processing is doing, refreshed when the menu opens
+    private var digestLine: NSMenuItem!
+    private var pendingSummaryAction: SummaryRowAction = .none
+    private var digestInFlight = false   // the 30 s tick must not launch a second digest
+    private var grantItem: NSMenuItem?  // "Grant permissions…" — shown ONLY while a permission is missing
     private var paused = false
     private var didAutoPrompt = false   // only auto-open the permission prompts/Settings once per launch
+    private var checkingForUpdates = false   // a manual update check is in flight — don't stack modal alerts
     private var settingsWC: SettingsWindowController?
     private var levelTimer: Timer?
 
@@ -5365,28 +6739,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func setIcon(recording: Bool, voice: Bool = false) {
-        // Distinct audio-recorder identity: a waveform-with-mic while live, pause when not. While
-        // VOICE is being picked up, the glyph tints a LIGHT orange — the recording color, softened
-        // (user pick after trying full orange → accent → this: orange family, but lighter).
-        let primary = recording ? "waveform.badge.mic" : "pause.circle"
-        let fallback = recording ? "waveform" : "pause"
-        // Fixed point size so the menu-bar icon never resizes (independent of which symbol).
-        var cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
-        if voice {
-            let lightOrange = NSColor.systemOrange.blended(withFraction: 0.35, of: .white) ?? .systemOrange
-            cfg = cfg.applying(.init(paletteColors: [lightOrange]))
-        }
-        let img = (NSImage(systemSymbolName: primary, accessibilityDescription: "macrec")
-            ?? NSImage(systemSymbolName: fallback, accessibilityDescription: "macrec"))?
-            .withSymbolConfiguration(cfg)
-        img?.isTemplate = !voice   // template adapts to the menu bar; the voice tint must keep its color
+        // The macrec menu-bar mark (waveform-mic glyph, template) — adapts to light/dark, no colored tile
+        // (user: drop the blue background). Voice tints light orange; paused/idle dims it (maccal-style).
+        let img = brandMarkImage(side: 18, recording: recording, voice: voice)
         statusItem.button?.image = img
-        // Hug the glyph's real width (+ a hair) so there's no wide L/R slack — WITHOUT touching pointSize
-        // or imagePosition (fixed length keeps the vertical centering that variableLength/imageOnly broke).
-        let glyphW = img?.size.width ?? 22
-        statusItem.length = ceil(glyphW) + 4
+        statusItem.length = ceil(img.size.width) + 4
         if Pref.bool("trayDebug", "MR_TRAY_DEBUG", false) {
-            elog("icon set (recording=\(recording), voice=\(voice)), glyphW=\(glyphW), length=\(statusItem.length)")
+            elog("icon set (recording=\(recording), voice=\(voice)), length=\(statusItem.length)")
         }
     }
 
@@ -5410,6 +6769,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return i
     }
 
+    /// The two CAPTURE grants that gate recording are in place (System Audio + Microphone) — used to
+    /// hide "Grant permissions…" when there's nothing recording-critical left to grant (re-checked each
+    /// menu open, so allowing them elsewhere clears it). Calendar is optional and intentionally excluded.
+    private func allPermissionsGranted() -> Bool {
+        captureGrantsSatisfied(audioGranted: audioCaptureAuthorized(), micGranted: micAuthorized())
+    }
+
+    /// Grey out "Pause" when nothing is recording to pause (off-hours / idle); the menu re-validates
+    /// each time it opens. "Resume" (paused) stays enabled. Other items are unaffected.
+    /// The menu auto-enables its items, so AppKit calls this AFTER menuWillOpen and it has the last word.
+    /// Setting `isEnabled` directly on a target/action row is silently undone here.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem === toggleItem { return pauseItemEnabled(paused: paused, schedulePaused: schedulePaused, hasEngine: engine != nil) }
+        if menuItem === summaryLine { return pendingSummaryAction != .none }
+        return true
+    }
+
     private func buildMenu() {
         setIcon(recording: false)
         let menu = NSMenu()
@@ -5431,7 +6807,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         levelItem = NSMenuItem(title: "🎤 —   🔊 —", action: nil, keyEquivalent: ""); levelItem.isEnabled = false
         lastSavedLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); lastSavedLine.isEnabled = false; lastSavedLine.isHidden = true
         modelLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); modelLine.isEnabled = false; modelLine.isHidden = true
+        // Post-processing used to leave no trace at all, so a working pipeline read as a broken one.
+        summaryLine = NSMenuItem(title: "", action: #selector(revealLastSummary), keyEquivalent: "")
+        summaryLine.target = self
+        digestLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); digestLine.isEnabled = false
         menu.addItem(statusLine); menu.addItem(levelItem); menu.addItem(lastSavedLine); menu.addItem(modelLine)
+        menu.addItem(summaryLine); menu.addItem(digestLine)
         menu.addItem(.separator())
         // Transcribe now — view-backed so the click does NOT dismiss the menu (user pick, round 2:
         // stay open and watch the row's spinner in place). MenuHoverView supplies the native-style
@@ -5466,7 +6847,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             liveItem = li; menu.addItem(li)
         }
         menu.addItem(.separator())
-        menu.addItem(item("Grant permissions…", #selector(grantPermissions), symbol: "hand.raised"))
+        let grant = item("Grant permissions…", #selector(grantPermissions), symbol: "hand.raised")
+        grant.isHidden = allPermissionsGranted()   // only surfaces when audio or mic is still missing
+        grantItem = grant
+        menu.addItem(grant)
         menu.addItem(item("Settings…", #selector(openSettings), ",", symbol: "gearshape"))
         menu.addItem(item("Open transcripts folder", #selector(openTranscripts), "o", symbol: "folder"))
         menu.addItem(.separator())
@@ -5476,6 +6860,61 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // Live input meter — only updates while the menu is open (cheap, and answers "is it working?").
+    /// The summary/digest rows, re-derived from prefs and live status every time the menu opens.
+    private func refreshPostProcessRows() {
+        let mode = effectivePostProcessMode(rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
+                                            shellCmd: Pref.postProcessCommand)
+        let (live, lastOut) = SummaryStatus.shared.snapshot
+        let activity: SummaryActivity = mode == .off ? .off : live
+        let hm = DateFormatter(); hm.locale = Locale(identifier: "en_US_POSIX"); hm.dateFormat = "HH:mm"
+        summaryLine.title = summaryMenuTitle(activity) { hm.string(from: $0) }
+        // Enablement is decided ONCE, in validateMenuItem, from this same action — assigning isEnabled
+        // here would be overwritten by AppKit's validation pass.
+        pendingSummaryAction = summaryRowAction(activity, lastOutput: lastOut)
+
+        let day = DateFormatter(); day.locale = Locale(identifier: "en_US_POSIX"); day.dateFormat = "yyyy-MM-dd"
+        digestLine.title = digestMenuTitle(enabled: Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false),
+                                           dueTime: Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00"),
+                                           lastRun: Pref.explicit(Pref.dailyDigestLastRun, ""),
+                                           today: day.string(from: Date()))
+    }
+
+    /// Drives the REAL buildMenu + menuWillOpen and reports the two post-process rows. A deleted call to
+    /// `refreshPostProcessRows` or a renamed selector then leaves the rows frozen and turns the selftest
+    /// red — asserting that a function merely EXISTS proves nothing about it being wired.
+    func postProcessRowsAfterMenuOpenForTest() -> (summary: String, digest: String, enabled: Bool)? {
+        buildMenu()
+        guard let menu = statusItem.menu else { return nil }
+        menuWillOpen(menu)
+        // The menu auto-enables its items: AppKit re-validates every target/action item AFTER
+        // menuWillOpen, so reading `isEnabled` here without an update() pass reads back the value we
+        // just assigned, not the one the user sees. Drive the real validation.
+        menu.update()
+        menu.cancelTracking()
+        guard let s = summaryLine, let d = digestLine else { return nil }
+        return (s.title, d.title, s.isEnabled)
+    }
+
+    /// Clicking the summary row: reveal what it wrote, or explain why it didn't. Never nothing.
+    @objc private func revealLastSummary() {
+        switch pendingSummaryAction {
+        case .none:
+            break
+        case .reveal(let path):
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        case .explain(let file, let reason):
+            NSApp.activate(ignoringOtherApps: true)
+            let a = NSAlert()
+            a.messageText = "Summary failed for \(file)"
+            a.informativeText = reason ?? "The summary runner exited with an error and wrote nothing. "
+                + "Check the runner in Settings › Summaries."
+            a.alertStyle = .warning
+            a.addButton(withTitle: "Open Settings")
+            a.addButton(withTitle: "Close").keyEquivalent = "\u{1b}"
+            if a.runModal() == .alertFirstButtonReturn { openSettings() }
+        }
+    }
+
     func menuWillOpen(_ menu: NSMenu) {
         // Opt-in tray diagnostics (`defaults write com.ikhoon.macrec.prefs trayDebug -bool true`): the
         // menu anchors to the status button's WINDOW — if it ever opens detached (screen edge, the
@@ -5494,6 +6933,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateLevels()
         // Reflect the live-captions state in case it was turned off by closing the floating panel.
         if #available(macOS 26, *) { liveItem?.state = LiveCaptions.shared.active ? .on : .off }
+        // Hide "Grant permissions…" once both grants are in place (re-checked each open — the user may
+        // have just allowed them in System Settings). It reappears if a grant is ever revoked.
+        grantItem?.isHidden = allPermissionsGranted()
+        refreshPostProcessRows()
         let t = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in self?.updateLevels() }
         RunLoop.main.add(t, forMode: .eventTracking)   // fires while the menu is tracking
         levelTimer = t
@@ -5514,8 +6957,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refresh(_ status: String) {
         statusLine?.title = status
-        toggleItem?.title = paused ? "Resume" : "Pause"
-        toggleItem?.image = NSImage(systemSymbolName: paused ? "play.circle" : "pause.circle", accessibilityDescription: nil)
+        // Label + icon route through the SAME decision as the click and the enablement, so they can't
+        // disagree (see togglePauseShouldResume).
+        let stoppedByUs = togglePauseShouldResume(paused: paused, schedulePaused: schedulePaused)
+        toggleItem?.title = stoppedByUs ? "Resume" : "Pause"
+        toggleItem?.image = NSImage(systemSymbolName: stoppedByUs ? "play.circle" : "pause.circle", accessibilityDescription: nil)
     }
 
     /// First-run model download (the large model is too big to bundle). Surfaces progress in the menu;
@@ -5675,8 +7121,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // A manual choice beats the schedule until the next boundary — stored as the boundary's
         // TIMESTAMP so it still expires when the Mac slept across it (nil = schedule never flips).
         scheduleOverrideUntil = RecordSchedule.fromPrefs.nextBoundary(after: Date())
+        // Resume covers BOTH states WE own: a manual pause and a schedule-parked (off-hours) engine.
+        // The bug: schedule-pause (paused == false) fell through to the else and manually PAUSED
+        // instead of resuming. Same decision the label/enablement use — capture before clearing.
+        let wasStopped = togglePauseShouldResume(paused: paused, schedulePaused: schedulePaused)
         schedulePaused = false
-        if paused {
+        if wasStopped {
             paused = false; refresh("Resuming…")
             resumeEngineAfterStop()
         } else {
@@ -5716,7 +7166,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard dailyDigestDue(now: now, time: time, lastRun: Pref.explicit(Pref.dailyDigestLastRun, "")) else { return }
         let dayF = DateFormatter(); dayF.locale = Locale(identifier: "en_US_POSIX"); dayF.dateFormat = "yyyy-MM-dd"
         let day = dayF.string(from: now)
-        Pref.d.set(day, forKey: Pref.dailyDigestLastRun)
+        // The 30 s tick must not launch a second digest, but a FAILED one has to retry — so the in-flight
+        // guard is in memory and the persistent "done" marker is written only once the runner succeeds.
+        // Writing the marker up front meant a login error at 20:00 silently cost the whole day.
+        guard !digestInFlight else { return }
+        digestInFlight = true
+        // Every early return below must clear the flag, or the digest never runs again this process.
+        var launched = false
+        defer { if !launched { digestInFlight = false } }
         let cfg = EngineConfig.load()
         let fm = FileManager.default
         let month = String(day.prefix(7))
@@ -5728,20 +7185,52 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                    : ((sumPref as NSString).expandingTildeInPath + "/" + month)
         let summaries = ((try? fm.contentsOfDirectory(atPath: sDir)) ?? [])
             .filter { $0.hasSuffix(".md") }.map { sDir + "/" + $0 }
-        let inputs = dailyDigestInputs(day: day, transcripts: transcripts, summaries: summaries)
-        guard !inputs.isEmpty else { elog("digest: no meetings on \(day) — skipping"); return }
+        // The digest is promoted with `mv`, which overwrites whatever sits at the destination. A name
+        // template that resolves onto an existing transcript/summary would silently destroy it.
+        let existingNotes = Set(transcripts.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
         let out = dailyDigestOutputPath(day: day,
                                         outDir: Pref.explicit(Pref.dailyDigestOut, "MR_DAILY_DIGEST_OUT"),
-                                        summaryOutDir: sumPref, transcriptsDir: cfg.transcriptsDir.path)
+                                        summaryOutDir: sumPref, transcriptsDir: cfg.transcriptsDir.path,
+                                        nameTemplate: Pref.explicit(Pref.dailyDigestName, "MR_DAILY_DIGEST_NAME"))
+        func retire(_ outcome: DigestOutcome) {
+            if digestMarksDayDone(outcome) { Pref.d.set(day, forKey: Pref.dailyDigestLastRun) }
+        }
+        guard !existingNotes.contains(URL(fileURLWithPath: out).standardizedFileURL.path) else {
+            elog("digest: \(out) is an existing transcript — refusing to overwrite it")
+            retire(.wouldOverwrite)   // retrying changes nothing until the user edits the name
+            Notifier.push(title: "Daily digest skipped",
+                          body: "The file name resolves onto an existing note (\(URL(fileURLWithPath: out).lastPathComponent)). "
+                              + "Change it in Settings › Summaries › File name.")
+            return
+        }
+        // Exclude the digest itself: it lands in a folder we just scanned and shares the day prefix.
+        let inputs = dailyDigestInputs(day: day, transcripts: transcripts, summaries: summaries, excluding: out)
+        guard !inputs.isEmpty else { elog("digest: no meetings on \(day) — skipping"); retire(.nothingToDo); return }
         let runner = SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude
         let inline = effectiveSummaryPrompt(inline: Pref.explicit(Pref.dailyPrompt, "MR_DAILY_DIGEST_PROMPT"),
                                             filePath: Pref.explicit(Pref.dailyPromptFile, "MR_DAILY_DIGEST_PROMPT_FILE"))
         let prompt = inline.isEmpty ? defaultDailyDigestPrompt : inline
         guard let cmd = dailyDigestInvocation(runner: runner, prompt: prompt,
-                                              inputs: inputs, outPath: out) else { return }
+                                              inputs: inputs, outPath: out) else { retire(.nothingToDo); return }
         elog("digest: \(day) — \(inputs.count) inputs → \(out)")
-        runPostProcessCommand(cmd) { status in
-            elog("digest: \(day) finished (exit \(status))")
+        SummaryStatus.shared.started("daily digest \(day)")
+        launched = true
+        runPostProcessCommand(cmd) { [weak self] status in
+            if status == 0 {
+                // Only a SUCCESSFUL run retires the day; a failure retries on the next tick.
+                elog("digest: \(day) finished (exit 0)")
+                if digestMarksDayDone(.wrote) { Pref.d.set(day, forKey: Pref.dailyDigestLastRun) }
+                SummaryStatus.shared.finished("daily digest \(day)", at: Date(), output: out)
+                Notifier.push(title: "Daily digest ready", body: "\(day) — \(inputs.count) meetings", filePath: out)
+            } else {
+                let why = reapFailedPostProcess(outPath: out)
+                // The reason belongs in the LOG too, not only in a notification the user may miss.
+                elog("digest: \(day) failed (exit \(status))" + (why.map { " — \($0)" } ?? " — no output"))
+                SummaryStatus.shared.failed("daily digest \(day)", at: Date(), reason: why)
+                Notifier.push(title: "Daily digest failed",
+                              body: why ?? "The summary command exited with code \(status) — check Settings › Summaries.")
+            }
+            DispatchQueue.main.async { self?.digestInFlight = false }
         }
     }
 
@@ -5840,19 +7329,45 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(dir)
     }
 
-    /// Manual check (menu): always reports — new version, up to date, or the failure.
+    /// Manual check (menu): ALWAYS gives visible in-app feedback — an alert for up-to-date / newer /
+    /// failure — not only a notification (which the user may have silenced, so the menu looked dead).
     @objc private func checkForUpdates() {
-        UpdateChecker.fetchLatest { [weak self] tag, url in
+        guard !checkingForUpdates else { return }   // one modal at a time — a re-click must not stack alerts
+        checkingForUpdates = true
+        UpdateChecker.fetchLatest { [weak self] tag, url in   // fetchLatest already calls back on the main queue
+            guard let self else { return }
+            self.checkingForUpdates = false
             guard let tag else {
-                Notifier.push(title: "Update check failed", body: "Couldn't reach GitHub — try again later.")
+                self.showUpdateAlert(title: "Update check failed",
+                                     text: "Couldn't reach GitHub. Check your connection and try again.", style: .warning)
                 return
             }
             if isNewerVersion(tag, than: macrecVersion) {
-                self?.announceUpdate(tag: tag, url: url)
+                let openURL = updateAlertOpenURL(installedViaBrew: UpdateChecker.installedViaBrew,
+                                                 htmlURL: url, releasesURL: UpdateChecker.releasesURL)
+                self.showUpdateAlert(title: "macrec \(tag) is available",
+                                     text: UpdateChecker.installedViaBrew ? "Run `brew upgrade --cask macrec` to update."
+                                                                          : "Open the release page to download it.",
+                                     openURL: openURL)
             } else {
-                Notifier.push(title: "macrec is up to date", body: "v\(macrecVersion) is the latest release.")
+                self.showUpdateAlert(title: "You're up to date",
+                                     text: "macrec v\(macrecVersion) is the latest release.")
             }
         }
+    }
+
+    /// A visible, focus-stealing result for a user-initiated update check. macrec is `.accessory`, so
+    /// activate first or the alert can open behind everything (the "no reaction" the user saw). With an
+    /// `openURL` it offers Open (default/Return) + Cancel (Esc); otherwise a lone OK.
+    private func showUpdateAlert(title: String, text: String, openURL: URL? = nil, style: NSAlert.Style = .informational) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert(); a.messageText = title; a.informativeText = text; a.alertStyle = style
+        if openURL != nil {
+            a.addButton(withTitle: "Open")                              // first button = default, bound to Return
+            a.addButton(withTitle: "Cancel").keyEquivalent = "\u{1b}"   // Esc dismisses without opening a browser
+        }
+        let resp = a.runModal()
+        if let openURL, resp == .alertFirstButtonReturn { NSWorkspace.shared.open(openURL) }
     }
 
     /// Background daily check — rides the 30 s tick with a last-run marker (same catch-up-after-
@@ -5870,11 +7385,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func announceUpdate(tag: String, url: String?) {
+        // Sanitize the click target through the SAME https-only gate the manual alert uses (nil for
+        // brew → no click target) — the notification path must not open a file:/custom-scheme URL either.
+        let open = updateAlertOpenURL(installedViaBrew: UpdateChecker.installedViaBrew,
+                                      htmlURL: url, releasesURL: UpdateChecker.releasesURL)
         let how = UpdateChecker.installedViaBrew ? "Run: brew upgrade --cask macrec"
                                                  : "Click to open the release page."
         elog("update: \(tag) available (current v\(macrecVersion))")
-        Notifier.push(title: "macrec \(tag) is available", body: how,
-                      filePath: UpdateChecker.installedViaBrew ? nil : (url ?? UpdateChecker.releasesURL))
+        Notifier.push(title: "macrec \(tag) is available", body: how, openURL: open)
     }
 
     @objc private func showAbout() {
@@ -5911,38 +7429,32 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let p = panesForTest[visiblePaneIndexes[row]]
-        let cell = NSTableCellView()
-        // System Settings-style colored icon tile: white symbol on the pane's own color — the
-        // sidebar stops being a monochrome wall.
-        let tile = NSView()
-        tile.wantsLayer = true
-        // Mute the tile: full system colors read as garish next to a form (user: "too primary";
-        // review: "iOS-springboard gradients, loudest thing in the window"). Flat, ~32% desaturated.
-        tile.layer?.backgroundColor = (p.tint.blended(withFraction: 0.32, of: .gray) ?? p.tint).cgColor
-        tile.layer?.cornerRadius = 5
-        tile.layer?.cornerCurve = .continuous
+        let cell = SidebarCell()
+        // Monochrome SF Symbol + label — a clean nav column. SidebarCell tints the icon white when
+        // the row is selected (accent fill); muted secondary otherwise.
         let icon = NSImageView(image: NSImage(systemSymbolName: p.symbol, accessibilityDescription: p.title) ?? NSImage())
-        icon.symbolConfiguration = .init(pointSize: 11, weight: .semibold)
-        icon.contentTintColor = .white
+        icon.symbolConfiguration = .init(pointSize: 14, weight: .regular)
+        icon.contentTintColor = .secondaryLabelColor
         let label = NSTextField(labelWithString: p.title)
         label.font = .systemFont(ofSize: 13)
-        tile.translatesAutoresizingMaskIntoConstraints = false
         icon.translatesAutoresizingMaskIntoConstraints = false
         label.translatesAutoresizingMaskIntoConstraints = false
-        cell.addSubview(tile); tile.addSubview(icon); cell.addSubview(label)
+        cell.imageView = icon      // outlet wiring lets the source-list style manage selection colors
+        cell.textField = label
+        cell.addSubview(icon); cell.addSubview(label)
         NSLayoutConstraint.activate([
-            tile.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-            tile.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            tile.widthAnchor.constraint(equalToConstant: 21),
-            tile.heightAnchor.constraint(equalToConstant: 21),
-            icon.centerXAnchor.constraint(equalTo: tile.centerXAnchor),
-            icon.centerYAnchor.constraint(equalTo: tile.centerYAnchor),
-            label.leadingAnchor.constraint(equalTo: tile.trailingAnchor, constant: 8),
+            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+            icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 20),
+            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
             label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            label.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -4),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -6),
         ])
         return cell
     }
+
+    /// Keeps the selected pane accent-filled regardless of where keyboard focus sits — see SidebarRowView.
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { SidebarRowView() }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         let row = sidebarList.selectedRow
@@ -5961,10 +7473,14 @@ extension AppController: UNUserNotificationCenterDelegate {
     /// Clicking a "Transcript ready" push opens the saved file.
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        if let p = response.notification.request.content.userInfo["file"] as? String {
-            // The payload is either a transcript file path or (update notifications) a web URL.
-            if p.hasPrefix("http"), let u = URL(string: p) { NSWorkspace.shared.open(u) }
-            else { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
+        let info = response.notification.request.content.userInfo
+        // Web links ride under "url" (https-only — sanitized at push time, re-checked here); local
+        // transcript paths ride under "file". Keeping them distinct means a URL is never opened as a
+        // file path, nor a path as a URL (the old shared "file" key + hasPrefix("http") did both).
+        if let s = info["url"] as? String, let u = URL(string: s), u.scheme?.lowercased() == "https" {
+            NSWorkspace.shared.open(u)
+        } else if let p = info["file"] as? String {
+            NSWorkspace.shared.open(URL(fileURLWithPath: p))
         }
         completionHandler()
     }
@@ -6020,6 +7536,8 @@ func printMacrecHelp() {
       request-permission     trigger the macOS permission prompts
       mic-status             exit 0 if the default input device is in use right now
       settings-snapshot [dir] render every Settings pane to a PNG (UI test kit; needs a GUI session)
+      icon-snapshot [dir]     render the menu-bar brand mark (recording/voice/paused) to PNGs
+      caption-snapshot [dir]  render the live caption overlay at 3 opacities (UI test kit)
       sweep                  run one retention/archive pass (WAV→AAC tiers) and exit
                              [--audio-dir D] [--transcripts-dir D] [--raw-days N] [--keep-days N]
       version, --version     print the version and exit
@@ -6041,6 +7559,13 @@ func printMacrecHelp() {
 struct Main {
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
+
+        // The test/snapshot subcommands build the real Settings pane and the real overlay, both of which
+        // ask every engine whether it is ready — a Keychain read each. Run them against no credentials at
+        // all: an unsigned dev build would otherwise raise an authorization prompt per read.
+        if let a = args.first, ["selftest", "settings-snapshot", "icon-snapshot", "caption-snapshot"].contains(a) {
+            Keychain.disabled = true
+        }
 
         // Subcommands: help / version (accept the common flag spellings too).
         if let a = args.first, ["help", "--help", "-h"].contains(a) { printMacrecHelp(); exit(0) }
@@ -6088,6 +7613,57 @@ struct Main {
             for f in files { print(f.path) }
             print(files.isEmpty ? "snapshot: FAILED (no panes rendered)" : "snapshot: \(files.count) panes → \(dir.path)")
             exit(files.isEmpty ? 1 : 0)
+        }
+
+        // Subcommand: caption-snapshot — render the live overlay at several opacities over a checkerboard.
+        // The one thing to LOOK for: the background fades, the captions never do.
+        if args.first == "caption-snapshot" {
+            let dir = URL(fileURLWithPath: args.count > 1 ? args[1] : "/tmp/macrec-caption-shots")
+            let app = NSApplication.shared
+            app.setActivationPolicy(.accessory)
+            guard #available(macOS 26, *) else { print("caption-snapshot: needs macOS 26"); exit(1) }
+            let w = LiveCaptionWindow(onClose: {}, onReconfigure: {}, onRestyle: {})
+            let files = w.snapshotOpacities([1.0, 0.6, 0.3], to: dir)
+            for f in files { print(f.path) }
+            if files.isEmpty {
+                print("caption-snapshot: FAILED — screencapture could not read the window. Grant Screen "
+                    + "Recording to the terminal you ran this from (System Settings › Privacy & Security "
+                    + "› Screen Recording), then run it again. A translucent window cannot be captured "
+                    + "offscreen: its material is composited by the window server.")
+            } else {
+                print("caption-snapshot: \(files.count) shots → \(dir.path)")
+            }
+            exit(files.isEmpty ? 1 : 0)
+        }
+
+        // Subcommand: icon-snapshot — render the menu-bar brand mark's states to PNGs on a gray backdrop
+        // (the tray icon has no other snapshot; UI test kit per CLAUDE.md). LOOK at these after any change.
+        if args.first == "icon-snapshot" {
+            let dir = URL(fileURLWithPath: args.count > 1 ? args[1] : "/tmp/macrec-icon-shots")
+            _ = NSApplication.shared
+            NSApplication.shared.setActivationPolicy(.accessory)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let states: [(String, Bool, Bool)] = [("recording-voice", true, true), ("recording-quiet", true, false), ("paused", false, false)]
+            let side: CGFloat = 18, scale = 10, pad: CGFloat = 6
+            var wrote = 0
+            for (name, rec, voice) in states {
+                let mark = brandMarkImage(side: side, recording: rec, voice: voice)
+                let w = mark.size.width + pad * 2, h = mark.size.height + pad * 2   // fit the glyph's natural aspect
+                guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(w) * scale, pixelsHigh: Int(h) * scale,
+                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { continue }
+                rep.size = NSSize(width: w, height: h)
+                NSGraphicsContext.saveGraphicsState()
+                NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+                NSColor(white: 0.16, alpha: 1).setFill(); NSRect(x: 0, y: 0, width: w, height: h).fill()   // menu-bar-ish backdrop
+                mark.draw(in: NSRect(x: pad, y: pad, width: mark.size.width, height: mark.size.height))
+                NSGraphicsContext.restoreGraphicsState()
+                if let png = rep.representation(using: .png, properties: [:]) {
+                    let u = dir.appendingPathComponent("icon-\(name).png"); try? png.write(to: u); print(u.path); wrote += 1
+                }
+            }
+            print(wrote == 0 ? "icon-snapshot: FAILED" : "icon-snapshot: \(wrote) states → \(dir.path)")
+            exit(wrote == 0 ? 1 : 0)
         }
 
         // Subcommand: selftest — assertions on pure logic (run in CI). No GUI/permissions needed.
@@ -6296,50 +7872,340 @@ struct Main {
                   layoutIssues.isEmpty)
             check("settings: every pane scrolls (rows can never be clipped away)",
                   panes.allSatisfy { p in p.view.subviews.contains { ($0 as? NSScrollView)?.documentView != nil } })
-            check("settings: Post-process and Schedule are their own panes",
-                  panes.contains { $0.title == "Post-process" } && panes.contains { $0.title == "Schedule" })
-            // Layout regression (user-reported: Post-process UI broke): every merged row must be a
-            // marker-typed header/note — a stale hand-kept index list once merged a real field row
-            // ("Save summary to") into a section header, destroying its label+control layout.
-            func allGrids(in view: NSView) -> [NSGridView] {
-                var out: [NSGridView] = []
-                if let g = view as? NSGridView { out.append(g) }
-                if let sv = view as? NSScrollView, let d = sv.documentView { out += allGrids(in: d) }
-                for sub in view.subviews { out += allGrids(in: sub) }
+            check("settings: Summaries and Schedule are their own panes",
+                  panes.contains { $0.title == "Summaries" } && panes.contains { $0.title == "Schedule" })
+            check("settings: Recording split into Recording + Storage panes",
+                  panes.contains { $0.title == "Recording" } && panes.contains { $0.title == "Storage" })
+            // Grouped row-card structure: every pane renders at least one rounded SectionCard, and
+            // no card is empty (a section with no rows would draw a stray hairline box).
+            func allCards(in view: NSView) -> [SectionCard] {
+                var out: [SectionCard] = []
+                if let c = view as? SectionCard { out.append(c) }
+                if let sv = view as? NSScrollView, let d = sv.documentView { out += allCards(in: d) }
+                for sub in view.subviews { out += allCards(in: sub) }
                 return out
             }
-            var intact = true
-            var gridCount = 0
+            var cardCount = 0
+            var everyPaneHasCard = true
+            var noEmptyCard = true
             for p in panes {
-                let grids = allGrids(in: p.view)
-                gridCount += grids.count
-                for grid in grids {
-                    for r in 0..<grid.numberOfRows {
-                        let c0 = grid.cell(atColumnIndex: 0, rowIndex: r).contentView
-                        let merged = grid.numberOfColumns > 1
-                            && grid.cell(atColumnIndex: 1, rowIndex: r).contentView === c0
-                        let isRoleRow = c0 is SectionHeaderCell || c0 is CaptionCell || c0 is ToggleCell
-                        if merged && !isRoleRow { intact = false }   // a field row got eaten by a header merge
-                    }
+                let cards = allCards(in: p.view)
+                cardCount += cards.count
+                if cards.isEmpty { everyPaneHasCard = false }
+                for c in cards {
+                    // A card wraps a single vertical stack of rows; an empty stack = a bug.
+                    let rows = (c.subviews.first as? NSStackView)?.arrangedSubviews ?? []
+                    if rows.isEmpty { noEmptyCard = false }
                 }
             }
-            check("settings: every pane renders at least one section card", gridCount >= panes.count)
-            check("settings: only role-marked rows are merged (no field row eaten)", intact)
+            check("settings: every pane renders at least one section card",
+                  cardCount >= panes.count && everyPaneHasCard)
+            check("settings: no section card is empty", noEmptyCard)
             // Sidebar search: pane content (not just titles) is the index — "prompt" finds
-            // Post-process, junk finds nothing, empty shows everything in order.
+            // Summaries, junk finds nothing, empty shows everything in order.
             check("settings: sidebar search matches pane content",
                   settingsSearchHits(query: "prompt", index: panes.map { $0.searchText })
-                      .contains(panes.firstIndex { $0.title == "Post-process" } ?? -1)
+                      .contains(panes.firstIndex { $0.title == "Summaries" } ?? -1)
                   && settingsSearchHits(query: "", index: panes.map { $0.searchText }) == Array(panes.indices)
                   && settingsSearchHits(query: "zzxqy", index: panes.map { $0.searchText }).isEmpty
                   && settingsSearchHits(query: "API KEY", index: panes.map { $0.searchText })
-                      .contains(panes.firstIndex { $0.title == "Live" } ?? -1))
-            // Role derivation is pure — headers from marker col-0, notes from marker col-1, fields plain.
-            let rolesProbe = formRowRoles([[SectionHeaderCell(), NSView()], [NSView(), NSView()],
-                                           [NSView(), CaptionCell(labelWithString: "c")],
-                                           [CaptionCell(labelWithString: "n"), NSView()]])
-            check("settings: form row roles derived from markers",
-                  rolesProbe.headers == [0, 3] && rolesProbe.notes == [2])
+                      .contains(panes.firstIndex { $0.title == "Live Captions" } ?? -1))
+            // Edit shortcuts in the Settings window (LSUIElement app has no Edit menu — ⌘V into a
+            // field once did nothing, user-reported). The window routes these action selectors to
+            // the field editor; the mapping is pure and checked here.
+            check("settings: ⌘V/⌘C/⌘X/⌘A map to the standard edit actions",
+                  standardEditSelector(key: "v", flags: .command) == #selector(NSText.paste(_:))
+                  && standardEditSelector(key: "c", flags: .command) == #selector(NSText.copy(_:))
+                  && standardEditSelector(key: "x", flags: .command) == #selector(NSText.cut(_:))
+                  && standardEditSelector(key: "a", flags: .command) == #selector(NSResponder.selectAll(_:)))
+            check("settings: ⌘Z undo, ⌘⇧Z redo, plain V ignored, ⌘⌥V not hijacked",
+                  standardEditSelector(key: "z", flags: .command) == Selector(("undo:"))
+                  && standardEditSelector(key: "z", flags: [.command, .shift]) == Selector(("redo:"))
+                  && standardEditSelector(key: "v", flags: []) == nil
+                  && standardEditSelector(key: "v", flags: [.command, .option]) == nil)
+            // Schedule pickers (days multi-select + time-range rows) must round-trip through the SAME
+            // string prefs the engine parses — seed the UI, read it back, and confirm it parses to the
+            // identical RecordSchedule (no meaning lost when we swapped text fields for pickers).
+            sw.loadScheduleUI(days: "mon,wed,fri", hours: "10:00-12:00, 13:00-19:00")
+            let rtDays = sw.serializeDays(), rtHours = sw.serializeHours()
+            check("settings: schedule pickers round-trip to the engine's format",
+                  RecordSchedule.parseDays(rtDays) == RecordSchedule.parseDays("mon,wed,fri")
+                  && RecordSchedule.parseRanges(rtHours).map { [$0.start, $0.end] }
+                     == RecordSchedule.parseRanges("10:00-12:00, 13:00-19:00").map { [$0.start, $0.end] })
+            sw.loadScheduleUI(days: "", hours: "")   // empty = every day / all hours
+            check("settings: empty schedule serializes empty (every day, all hours)",
+                  sw.serializeDays().isEmpty && sw.serializeHours().isEmpty)
+            // Nested-scroll passthrough: the pane must still scroll with the pointer over a prompt box.
+            // A prompt/calendar box
+            // whose content FITS must hand the wheel to the pane; one that OVERFLOWS keeps it to scroll
+            // itself. The prompt editor is ~84pt tall — text that fits passes through, long text doesn't.
+            check("settings: nested scroll passes wheel to pane when its content fits",
+                  nestedScrollPassesThrough(contentHeight: 84, clipHeight: 84)          // exact fit → pass
+                  && nestedScrollPassesThrough(contentHeight: 40, clipHeight: 84)       // smaller → pass
+                  && !nestedScrollPassesThrough(contentHeight: 400, clipHeight: 84)     // overflow → keep
+                  && !nestedScrollPassesThrough(contentHeight: 85, clipHeight: 84))     // just over → keep
+            // The embedded editors/lists are actually PassthroughScrollViews in the built tree (prompt,
+            // daily-prompt, calendar) — so the fix is wired, not just declared.
+            check("settings: embedded editors use the passthrough scroll view",
+                  sw.passthroughScrollCountForTest >= 2)
+            // Tray Pause/Resume enablement: Pause greys out when nothing is recording (off-hours/idle);
+            // Resume stays clickable while paused.
+            check("tray: Pause enabled recording; Resume enabled when paused OR schedule-paused; greyed only when truly idle",
+                  pauseItemEnabled(paused: false, schedulePaused: false, hasEngine: true)       // recording → can Pause
+                  && !pauseItemEnabled(paused: false, schedulePaused: false, hasEngine: false)  // truly idle → greyed
+                  && pauseItemEnabled(paused: true, schedulePaused: false, hasEngine: false)    // manual pause → can Resume
+                  && pauseItemEnabled(paused: false, schedulePaused: true, hasEngine: false)    // schedule off-hours → can Resume (the fix)
+                  && pauseItemEnabled(paused: true, schedulePaused: true, hasEngine: true))
+            // Every "Choose…" folder button is bound to a handler the controller implements — guards
+            // against a picker wired to nothing / a renamed selector (user: Storage "Choose…" did nothing).
+            let chooseWired = sw.chooseButtonsWiredForTest
+            check("settings: every Choose… button is wired to a real handler (\(chooseWired.count) found)",
+                  chooseWired.count >= 7 && chooseWired.allWired)
+            // An NSSwitch carries no title, so its row name has to be attached as an accessibility label
+            // or VoiceOver reads an anonymous button where a named setting used to be.
+            check("settings: every switch announces its setting name to VoiceOver",
+                  sw.unlabeledSwitchesForTest == 0)
+            // The footer: "Save" (default) applies in place, "Close" (Esc) leaves. Guards the wiring —
+            // a renamed selector here silently turns Save into a dead button.
+            let footer = sw.footerButtonsForTest
+            check("settings: footer is Close + Save, both wired (Save no longer closes the window)",
+                  footer.map(\.title) == ["Close", "Save"]
+                  && footer.allSatisfy { b in (b.target as? NSObject)?.responds(to: b.action ?? Selector("")) == true }
+                  && footer.last?.keyEquivalent == "\r" && footer.first?.keyEquivalent == "\u{1b}")
+            // The overlay's engine picker must never offer an engine that can't run: Deepgram sat in the
+            // list with no API key and answered a click with an error line where captions belong.
+            // Apple is the floor — switching everything off must not leave an empty picker.
+            let noKeys: (LiveEngine) -> Bool = { $0 == .apple || $0 == .whisper }
+            check("live: the engine picker offers only engines that are ON and READY (never empty)",
+                  selectableLiveEngines(LiveEngine.allCases, ready: noKeys, enabled: { _ in true }) == [.apple, .whisper]
+                  && selectableLiveEngines(LiveEngine.allCases, ready: { _ in true },
+                                           enabled: { $0 != .apple }) == [.whisper, .deepgram, .openai, .gladia]
+                  && selectableLiveEngines(LiveEngine.allCases, ready: noKeys,
+                                           enabled: { $0 != .apple && $0 != .whisper }) == [.apple]
+                  && selectableLiveEngines(LiveEngine.allCases, ready: { _ in false }, enabled: { _ in false }) == [.apple])
+            // The opacity slider fades the BACKGROUND. Fading the window faded the captions with it —
+            // at 0.3 the overlay showed nothing at all, which is the one thing it exists to show.
+            // Zero is a legal, useful setting — the closed-caption look. Only out-of-range values clamp.
+            // Contrast goes BEHIND the glyphs, never into them: a halo smeared them, a stroke thickened
+            // them. And only when the backdrop is too faint to carry the contrast itself.
+            // A subtitle leads with the TRANSLATION — that is the line you read; the original is a
+            // whisper above it. With nothing to translate, the original is the subtitle.
+            check("live: a subtitle leads with the translation and demotes the original",
+                  subtitleLine(original: "会議を始めましょう。", translated: "회의를 시작합시다.")
+                  == ("회의를 시작합시다.", "会議を始めましょう。")
+                  && subtitleLine(original: "Let's begin.", translated: nil) == ("Let's begin.", nil)
+                  && subtitleLine(original: "Let's begin.", translated: "  ") == ("Let's begin.", nil)
+                  && subtitleLine(original: "", translated: "회의") == ("회의", nil))
+            // Read at a glance, not squinted at; and a film shows one utterance, not a scrolling wall.
+            check("live: a subtitle is larger than the log's body text and shows at most two lines",
+                  subtitleFontSize(14) == 20 && subtitleFontSize(9) == 18 && subtitleMaxLines == 2)
+            // A transparent LOG keeps an outline so it still reads as a grabbable window; a subtitle must
+            // not have one — a rectangle drawn around a film subtitle is what breaks the illusion.
+            check("live: the window outline is drawn for the log view and never for a subtitle",
+                  captionEdgeVisible(subtitle: false) && !captionEdgeVisible(subtitle: true))
+            check("live: captions get a backplate only when the backdrop is too faint to carry contrast",
+                  captionTextNeedsBackplate(backdropAlpha: 0.0)
+                  && captionTextNeedsBackplate(backdropAlpha: 0.55)
+                  && !captionTextNeedsBackplate(backdropAlpha: 0.6)
+                  && !captionTextNeedsBackplate(backdropAlpha: 1.0))
+            check("live: overlay opacity spans a fully transparent backdrop to a fully opaque one",
+                  captionBackdropAlpha(0.0) == 0.0 && captionBackdropAlpha(1.0) == 1.0
+                  && captionBackdropAlpha(0.3) == 0.3
+                  && captionBackdropAlpha(-1) == 0.0 && captionBackdropAlpha(9.9) == 1.0)
+            // Drive the real window: at the slider's low end ONLY the backdrop may be translucent.
+            // Window alpha would multiply into every subview, which is exactly how the captions vanished.
+            if #available(macOS 26, *) {
+                let cw = LiveCaptionWindow(onClose: {}, onReconfigure: {}, onRestyle: {})
+                let before = cw.captionAlphasForTest
+                cw.setOpacityForTest(0.0)   // the extreme: background gone, captions must not follow it
+                let after = cw.captionAlphasForTest
+                check("live: at a fully transparent backdrop the window and the captions stay opaque",
+                      before.window == 1 && before.text == 1
+                      && after.window == 1 && after.text == 1 && after.backdrop == 0.0)
+                // The alpha assertion above passed while the overlay rendered as an EMPTY see-through
+                // window (a .behindWindow material ignores the view's alpha). Assert the fill exists.
+                check("live: the overlay backdrop actually paints, sized to the content, beneath the captions",
+                      cw.backdropPaintsForTest)
+                // …and nothing paints BEHIND it that the slider can't reach: `.hudWindow` slipped its own
+                // full-window material into the theme frame, so the overlay never went fully transparent.
+                check("live: no window-chrome material sits behind the backdrop (fully transparent is reachable)",
+                      cw.nothingPaintsBehindBackdropForTest)
+                // With the background gone the panel loses every edge; the outline must not fade with it,
+                // and must not steal the clicks that select text or drag the window.
+                let e = cw.edgeSurvivesForTest
+                check("live: the outline survives a fully transparent backdrop and never eats the mouse",
+                      e.visible && e.ignoresMouse)
+                // The picker was built once at window creation: an engine switched off in Settings stayed
+                // in the menu until the overlay was reopened. Assert it re-reads the ON list — never that
+                // a particular engine is installed. `isReady` probes the filesystem and the Keychain, and
+                // CI has neither whisper-cli nor its model, so pinning `[.whisper]` made this machine-dependent.
+                // Assert it RE-READS the ON list. Which engines are *ready* depends on the machine —
+                // `isReady` probes the filesystem, the Keychain and MR_*_KEY env vars — so the only thing
+                // this can pin is that a saved change is picked up without reopening the overlay. What
+                // gets picked from a given (ready, enabled) pair is `selectableLiveEngines`, tested purely.
+                Pref.d.set([LiveEngine.apple.rawValue], forKey: Pref.liveEnginesOn)
+                cw.reloadEngineChoices()
+                let appleOnly = cw.engineChoicesForTest
+                Pref.d.set(LiveEngine.allCases.map(\.rawValue), forKey: Pref.liveEnginesOn)
+                cw.reloadEngineChoices()
+                let allOn = cw.engineChoicesForTest
+                Pref.d.removeObject(forKey: Pref.liveEnginesOn)
+                check("live: reloadEngineChoices re-reads Settings instead of staying frozen at window creation",
+                      appleOnly == [.apple]                       // the ON list narrows the menu…
+                      && allOn.count >= appleOnly.count           // …and widening it re-reads, not caches
+                      && allOn.first == .apple                    // order follows allCases, apple first
+                      && !allOn.isEmpty)                          // never strands the user
+            }
+            // The harness must never read the user's real credentials, and every read is an authorization
+            // check — an unsigned dev build turns each one into a password prompt.
+            _ = Keychain.get("deepgram"); _ = Keychain.get("deepgram"); _ = Keychain.get("openai")
+            check("keychain: the test harness never touches the real Keychain",
+                  Keychain.disabled && Keychain.readsForTest == 0 && Keychain.get("deepgram") == nil)
+            // Asking whether an engine is READY must never ask for a SECRET — that is the authorization
+            // prompt. Presence is answered by an attributes-only probe that hands nothing back.
+            let secretsBefore = Keychain.secretRequestsForTest
+            _ = LiveEngine.deepgram.isReady
+            _ = LiveEngine.openai.isReady
+            _ = selectableLiveEngines(LiveEngine.allCases, ready: { $0.isReady }, enabled: { $0.isEnabled })
+            _ = sw.loadForTest()
+            check("keychain: engine readiness and opening Settings request no secrets",
+                  Keychain.secretRequestsForTest == secretsBefore
+                  && sw.keyFieldsForTest.allSatisfy { $0.isEmpty || $0 == SettingsWindowController.keyMask })
+            // MR_KEYCHAIN_ROUNDTRIP=1 drives the REAL Keychain against a throwaway account. It writes,
+            // reads back, overwrites and deletes — proving `set` recreates the item (SecItemUpdate leaves
+            // the creating process's ACL in place, which is how a credential ends up asking the wrong
+            // binary for permission forever). Off by default: the harness must not touch credentials.
+            if ProcessInfo.processInfo.environment["MR_KEYCHAIN_ROUNDTRIP"] == "1" {
+                let acct = "selftest-roundtrip"
+                Keychain.disabled = false
+                Keychain.forgetCacheForTest()
+                _ = Keychain.set(acct, "")                       // start clean
+                let absent = !Keychain.exists(acct) && Keychain.get(acct) == nil
+                let wrote = Keychain.set(acct, "first")
+                Keychain.forgetCacheForTest()
+                let readBack = Keychain.get(acct) == "first" && Keychain.exists(acct)
+                let rewrote = Keychain.set(acct, "second")
+                Keychain.forgetCacheForTest()
+                let reread = Keychain.get(acct) == "second"
+                _ = Keychain.set(acct, "")
+                Keychain.forgetCacheForTest()
+                let gone = !Keychain.exists(acct)
+                Keychain.disabled = true
+                check("keychain: real round-trip — write, read, recreate on overwrite, delete",
+                      absent && wrote && readBack && rewrote && reread && gone)
+            }
+            // A switch on + no key used to be silent: the engine simply never showed up in the picker.
+            check("live: an engine switched on without its credential is reported, not silently dropped",
+                  enginesMissingCredentials(LiveEngine.allCases, enabled: { $0 == .deepgram || $0 == .apple },
+                                            ready: { $0 == .apple }) == [.deepgram]
+                  && enginesMissingCredentials(LiveEngine.allCases, enabled: { _ in true }, ready: { _ in true }).isEmpty
+                  && enginesMissingCredentials(LiveEngine.allCases, enabled: { _ in false }, ready: { _ in false }).isEmpty)
+            // Indexing allCases picked the wrong engine as soon as one was filtered out of the menu.
+            check("live: a popup index maps into the FILTERED list, never into allCases",
+                  engineAtPopupIndex(1, choices: [.whisper, .deepgram, .openai, .gladia]) == .deepgram
+                  && engineAtPopupIndex(0, choices: [.deepgram]) == .deepgram
+                  && engineAtPopupIndex(99, choices: [.apple, .whisper]) == .whisper   // clamped, not a crash
+                  && engineAtPopupIndex(0, choices: []) == nil)
+            // Turning cloud engines off by default must not silently downgrade someone already on one.
+            check("live: an absent ON-list keeps on-device engines and grandfathers the engine already in use",
+                  liveEngineEnabled(.apple, storedOn: nil, selectedEngine: nil)
+                  && liveEngineEnabled(.whisper, storedOn: nil, selectedEngine: nil)
+                  && !liveEngineEnabled(.deepgram, storedOn: nil, selectedEngine: nil)
+                  && liveEngineEnabled(.deepgram, storedOn: nil, selectedEngine: "deepgram")   // the upgrade path
+                  && liveEngineEnabled(.deepgram, storedOn: ["deepgram"], selectedEngine: nil)
+                  && !liveEngineEnabled(.apple, storedOn: ["deepgram"], selectedEngine: "apple"))
+            // ⌘V into a Settings field only works because the window is an EditableWindow — an LSUIElement
+            // app has no Edit menu, so a plain NSWindow drops the key equivalent on the floor.
+            check("settings: the window is an EditableWindow (⌘V/⌘C/⌘X/⌘A reach the field editor)",
+                  sw.window is EditableWindow)
+            // Restarting the recorder discards the in-progress segment. Save must only do that when a
+            // setting the recorder actually reads changed — Return in any text field fires Save now.
+            let fpA = engineFingerprint(["voiceMin": "5", "exclude": "com.spotify.client"])
+            check("settings: the engine fingerprint changes iff an engine-affecting pref changed",
+                  fpA == engineFingerprint(["exclude": "com.spotify.client", "voiceMin": "5"])   // order-independent
+                  && fpA != engineFingerprint(["voiceMin": "3", "exclude": "com.spotify.client"])
+                  && !SettingsWindowController.engineKeysForTest.contains(Pref.liveEnginesOn)
+                  && !SettingsWindowController.engineKeysForTest.contains(Pref.dailyDigestName))
+            // Every pref that must make Save restart the recorder. Omitting one means the setting saves
+            // and nothing happens — turning the schedule OFF left the engine parked off-hours, because
+            // only restartEngine() clears `schedulePaused` and re-baselines the schedule.
+            let mustRestart = [Pref.schedEnabled, Pref.schedDays, Pref.schedHours, Pref.segment, Pref.model,
+                               Pref.customModel, Pref.lang, Pref.exclude, Pref.txtDir, Pref.audioDir,
+                               Pref.systemAudio, Pref.echoReduce, Pref.vad, Pref.keepAudio, Pref.voiceMin,
+                               Pref.cal, Pref.calendars, Pref.hintsTerms, Pref.hintsFile, Pref.hintsCalendar]
+            check("settings: every recorder-affecting pref (schedule included) forces an engine restart on Save",
+                  mustRestart.allSatisfy { SettingsWindowController.engineKeysForTest.contains($0) })
+            // System-audio exclusion: match on Core Audio's own process list, so a helper process that
+            // plays under its own bundle id is at least VISIBLE (AppKit's app lookup never saw it), and
+            // notice when a relaunch (new object id) has made the live tap's frozen exclusion set stale.
+            let procs = [AudioProcessInfo(objectID: 501, bundleID: "com.spotify.client"),
+                         AudioProcessInfo(objectID: 502, bundleID: "com.spotify.client.helper"),
+                         AudioProcessInfo(objectID: 503, bundleID: nil)]
+            check("audio: exclusion matches Core Audio's bundle ids; unattributed processes are never excluded",
+                  matchExcludedProcesses(procs, excludeBundleIds: ["com.spotify.client"]) == [501]
+                  && matchExcludedProcesses(procs, excludeBundleIds: ["com.spotify.client", "com.spotify.client.helper"]) == [501, 502]
+                  && matchExcludedProcesses(procs, excludeBundleIds: []).isEmpty)
+            check("audio: a relaunched excluded app (new object id) makes the live tap's exclusion stale",
+                  tapExclusionIsStale(current: [222], live: [111])          // relaunch — the reported bug
+                  && tapExclusionIsStale(current: [111], live: [])          // launched after the tap was built
+                  && !tapExclusionIsStale(current: [111, 222], live: [222, 111]))   // same set, any order
+            // Sidebar selection is app state, not focus state: the accent pill must survive AppKit
+            // clearing isEmphasized when focus moves to a text field (it looked like a random blue blink).
+            let sidebarRow = SidebarRowView()
+            sidebarRow.isEmphasized = false
+            check("settings: sidebar selection stays accent-filled when the table loses focus",
+                  sidebarRow.isEmphasized)
+            // Click/label/enablement all route through togglePauseShouldResume — test the REAL decision
+            // the bug lived in (togglePause resumed only `if paused`, ignoring schedule-pause).
+            check("tray: schedule-paused resumes on click (the bug), manual-pause resumes, idle does not",
+                  togglePauseShouldResume(paused: false, schedulePaused: true)      // off-hours → Resume (the fix)
+                  && togglePauseShouldResume(paused: true, schedulePaused: false)   // manual pause → Resume
+                  && !togglePauseShouldResume(paused: false, schedulePaused: false))// recording/idle → Pause
+            // Grant item hides only once BOTH capture grants are in (calendar excluded on purpose).
+            check("tray: Grant permissions hidden only when audio AND mic granted",
+                  captureGrantsSatisfied(audioGranted: true, micGranted: true)
+                  && !captureGrantsSatisfied(audioGranted: false, micGranted: true)
+                  && !captureGrantsSatisfied(audioGranted: true, micGranted: false))
+            // Choose… presents as a SHEET on a visible window (bare runModal opens behind on an
+            // .accessory app — the "Choose did nothing" bug); no visible window → activate + runModal.
+            check("settings: dir picker uses a sheet iff there is a visible window",
+                  dirPickerPresentation(hasVisibleWindow: true) == .sheet
+                  && dirPickerPresentation(hasVisibleWindow: false) == .activateAndRunModal)
+            // Update-alert Open URL: none for brew; https release URL otherwise; a non-https scheme or a
+            // blank/missing API url falls back to the https releases page — never opens an unsafe scheme.
+            check("update alert: brew→no button; https htmlURL→that exact link; http/non-https/blank→https releases fallback; unsafe releases→nil",
+                  updateAlertOpenURL(installedViaBrew: true, htmlURL: "https://x/y", releasesURL: UpdateChecker.releasesURL) == nil
+                  && updateAlertOpenURL(installedViaBrew: false, htmlURL: "https://github.com/ikhoon/macrec/releases/tag/v9", releasesURL: UpdateChecker.releasesURL)?.absoluteString == "https://github.com/ikhoon/macrec/releases/tag/v9"
+                  && updateAlertOpenURL(installedViaBrew: false, htmlURL: "http://x/y", releasesURL: UpdateChecker.releasesURL)?.absoluteString == UpdateChecker.releasesURL
+                  && updateAlertOpenURL(installedViaBrew: false, htmlURL: "javascript:alert(1)", releasesURL: UpdateChecker.releasesURL)?.absoluteString == UpdateChecker.releasesURL
+                  && updateAlertOpenURL(installedViaBrew: false, htmlURL: "", releasesURL: UpdateChecker.releasesURL)?.absoluteString == UpdateChecker.releasesURL
+                  && updateAlertOpenURL(installedViaBrew: false, htmlURL: nil, releasesURL: "file:///etc/passwd") == nil)
+            // The menu-bar brand mark actually draws in every state (not an all-transparent image — the
+            // "structurally valid but visually destroyed" class of bug). LOOK via `macrec icon-snapshot`.
+            check("tray icon: brand mark renders content (recording, recording+voice, paused)",
+                  brandMarkHasContent(recording: true, voice: true)
+                  && brandMarkHasContent(recording: true, voice: false)
+                  && brandMarkHasContent(recording: false, voice: false))
+            // Short-blip filter: no overlapping meeting + under 3 min of speech → no file (user rule).
+            check("keep transcript: meeting always kept; no meeting needs ≥3 min speech",
+                  shouldKeepTranscript(hasMeeting: true, speechSeconds: 5)
+                  && shouldKeepTranscript(hasMeeting: false, speechSeconds: 180)
+                  && shouldKeepTranscript(hasMeeting: false, speechSeconds: 240)
+                  && !shouldKeepTranscript(hasMeeting: false, speechSeconds: 179)
+                  && !shouldKeepTranscript(hasMeeting: false, speechSeconds: 0))
+            // Summaries Mode is a real TAB — it SHOWS only the selected mode's sections (not readonly
+            // greying). Switch each mode and confirm only that group is visible.
+            sw.setPPModeForTest("summary")
+            check("summaries tab: Automatic summary shown, Custom command + off hidden",
+                  sw.ppGroupVisibleForTest("pp.summary")
+                  && !sw.ppGroupVisibleForTest("pp.shell") && !sw.ppGroupVisibleForTest("pp.off"))
+            sw.setPPModeForTest("shell")
+            check("summaries tab: Custom command shown, Automatic summary hidden",
+                  sw.ppGroupVisibleForTest("pp.shell") && !sw.ppGroupVisibleForTest("pp.summary"))
+            sw.setPPModeForTest("off")
+            check("summaries tab: off note shown, both mode sections hidden",
+                  sw.ppGroupVisibleForTest("pp.off")
+                  && !sw.ppGroupVisibleForTest("pp.summary") && !sw.ppGroupVisibleForTest("pp.shell"))
             // Transcription hints: parsing (comma/newline/#comment), case-insensitive dedupe, cap.
             check("hints: parse comma/newline + comments",
                   parseHintTerms("Kubernetes, gRPC\n# note\n김철수\n\n") == ["Kubernetes", "gRPC", "김철수"])
@@ -6420,12 +8286,133 @@ struct Main {
             }
             // Transcribe-now push: terminal statuses notify (the menu may be closed by then),
             // transient ones keep waiting — a dangling flag would mis-attribute the NEXT hourly segment.
+            // Post-processing was invisible: it ran, left nothing behind, and the app read as broken.
+            let stamp = schedDate("2026-07-07 12:03")
+            let hm: (Date) -> String = { d in let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX")
+                                             f.timeZone = utc.timeZone; f.dateFormat = "HH:mm"; return f.string(from: d) }
+            check("tray: the summary row names the state, the file and when it happened",
+                  summaryMenuTitle(.off, hm: hm) == "Summaries: off"
+                  && summaryMenuTitle(.idle, hm: hm) == "Summary: after the next transcript"
+                  && summaryMenuTitle(.running("a.md"), hm: hm) == "Summary: running… a.md"
+                  && summaryMenuTitle(.done("a.md", stamp), hm: hm) == "Summary: a.md · 12:03"
+                  && summaryMenuTitle(.failed("a.md", stamp, reason: "Not logged in"), hm: hm)
+                     == "Summary FAILED: a.md · 12:03")
+            // A row that is clickable must DO something. Enablement and the click read one decision, so
+            // they cannot disagree — clicking a failure explains it, never nothing.
+            // A freeform shell hook writes nowhere we know: nothing to reveal, no partial to reap.
+            check("summary: only the built-in summary mode writes a file we can reveal or reap",
+                  postProcessWritesSummaryFile(.summary)
+                  && !postProcessWritesSummaryFile(.shell)
+                  && !postProcessWritesSummaryFile(.off)
+                  && summaryRowAction(.done("a.md", stamp), lastOutput: nil) == .none)   // shell mode
+            check("tray: the summary row's click always has an outcome, and a failure explains itself",
+                  summaryRowAction(.failed("a.md", stamp, reason: "Not logged in · Please run /login"), lastOutput: nil)
+                  == .explain("a.md", "Not logged in · Please run /login")
+                  && summaryRowAction(.failed("a.md", stamp, reason: nil), lastOutput: "/s/old.md")
+                  == .explain("a.md", nil)                        // failure wins over a stale old file
+                  && summaryRowAction(.done("a.md", stamp), lastOutput: "/s/a.md") == .reveal("/s/a.md")
+                  && summaryRowAction(.idle, lastOutput: nil) == .none
+                  && summaryRowAction(.off, lastOutput: "/s/a.md") == .none)
+            // The runner writes STDOUT to `<out>.partial` and only then promotes it, so its error message
+            // lands INSIDE that file, never on stderr. `claude` exiting 1 with "Not logged in" left only
+            // "exit 1" in the log, and the orphaned .partial piled up in the notes vault for days.
+            let tmp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("macrec-reap-\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            let outPath = tmp.appendingPathComponent("2026-07-10-1030-standup.md").path
+            try? "Not logged in · Please run /login\n".write(toFile: outPath + ".partial", atomically: true, encoding: .utf8)
+            let reason = reapFailedPostProcess(outPath: outPath)
+            let orphanGone = !FileManager.default.fileExists(atPath: outPath + ".partial")
+            let noReason = reapFailedPostProcess(outPath: tmp.appendingPathComponent("absent.md").path)
+            // Blank leading lines must not be mistaken for "no reason"; a runner that streamed megabytes
+            // before dying must not be slurped whole; invalid UTF-8 must not throw the reason away.
+            let blankPath = tmp.appendingPathComponent("blank.md").path
+            try? "\n\n   \nreal reason here\n".write(toFile: blankPath + ".partial", atomically: true, encoding: .utf8)
+            let skipsBlanks = reapFailedPostProcess(outPath: blankPath) == "real reason here"
+            let emptyPath = tmp.appendingPathComponent("empty.md").path
+            try? "".write(toFile: emptyPath + ".partial", atomically: true, encoding: .utf8)
+            let emptyIsNil = reapFailedPostProcess(outPath: emptyPath) == nil
+            let emptyGone = !FileManager.default.fileExists(atPath: emptyPath + ".partial")
+            let hugePath = tmp.appendingPathComponent("huge.md").path
+            try? ("error first\n" + String(repeating: "x", count: 5_000_000))
+                .write(toFile: hugePath + ".partial", atomically: true, encoding: .utf8)
+            let hugeOK = reapFailedPostProcess(outPath: hugePath) == "error first"
+            let badPath = tmp.appendingPathComponent("bad.md").path
+            try? Data([0xFF, 0xFE, 0x0A] + Array("boom".utf8)).write(to: URL(fileURLWithPath: badPath + ".partial"))
+            let badOK = reapFailedPostProcess(outPath: badPath) != nil   // lossy decode, not a crash or nil
+            try? FileManager.default.removeItem(at: tmp)
+            check("summary: a failed runner's reason is read back from its .partial, which is then removed",
+                  reason == "Not logged in · Please run /login" && orphanGone && noReason == nil
+                  && skipsBlanks && emptyIsNil && emptyGone && hugeOK && badOK)
+            // The marker used to be stamped BEFORE the run. A login error at 20:00 then marked the day
+            // done, and the digest never retried — exactly what happened on 2026-07-09 and 07-10.
+            check("digest: only a run that wrote a file (or can never succeed today) retires the day",
+                  digestMarksDayDone(.wrote)
+                  && digestMarksDayDone(.nothingToDo)      // no meetings — retrying finds none either
+                  && digestMarksDayDone(.wouldOverwrite)   // the name collides until the user changes it
+                  && !digestMarksDayDone(.runnerFailed))   // no login / no network — retry on the next tick
+            check("tray: the digest row says off, due, or already written today",
+                  digestMenuTitle(enabled: false, dueTime: "20:00", lastRun: "", today: "2026-07-07")
+                  == "Daily digest: off"
+                  && digestMenuTitle(enabled: true, dueTime: "20:00", lastRun: "", today: "2026-07-07")
+                  == "Daily digest: due at 20:00"
+                  && digestMenuTitle(enabled: true, dueTime: "20:00", lastRun: "2026-07-07", today: "2026-07-07")
+                  == "Daily digest: written today"
+                  && digestMenuTitle(enabled: true, dueTime: "20:00", lastRun: "2026-07-06", today: "2026-07-07")
+                  == "Daily digest: due at 20:00")
+            // A summary that ran must be reachable: the row is only clickable once it produced a file.
+            SummaryStatus.shared.resetForTest()
+            let noOutput = SummaryStatus.shared.lastOutput == nil && SummaryStatus.shared.current == .idle
+            SummaryStatus.shared.started("a.md")
+            let running = SummaryStatus.shared.current == .running("a.md")
+            SummaryStatus.shared.finished("a.md", at: stamp, output: "/s/a.md")
+            check("tray: summary status tracks running → done and remembers the file it wrote",
+                  noOutput && running
+                  && SummaryStatus.shared.current == .done("a.md", stamp)
+                  && SummaryStatus.shared.lastOutput == "/s/a.md")
+            // The row reads BOTH halves under one lock. Reading them separately let a failure land between
+            // the two, so the row offered to reveal a file for the run that had just failed.
+            SummaryStatus.shared.failed("b.md", at: stamp, reason: "boom")
+            let (act, out) = SummaryStatus.shared.snapshot
+            check("tray: a failure carries its reason all the way to the row's click",
+                  summaryRowAction(act, lastOutput: out) == .explain("b.md", "boom")
+                  && out == "/s/a.md"                       // a stale success path is still remembered…
+                  && summaryRowAction(act, lastOutput: out) != .reveal("/s/a.md"))   // …but never offered
+            SummaryStatus.shared.resetForTest()
+            // The row is a control, and a control wired to nothing looks perfect until you click it.
+            check("tray: the summary row's reveal action is implemented",
+                  AppController.instancesRespond(to: Selector(("revealLastSummary"))))
+            // …and menuWillOpen must actually REFRESH those rows. Drive the real menu: a deleted
+            // refreshPostProcessRows() call would leave both titles empty, and this check red.
+            // Pin the mode: with no saved pref (a fresh machine, and CI) the effective mode is .off and the
+            // row reads "Summaries: off", which says nothing about whether menuWillOpen refreshed it.
+            let savedMode = Pref.d.object(forKey: Pref.postProcessMode)
+            Pref.d.set(PostProcessMode.summary.rawValue, forKey: Pref.postProcessMode)
+            SummaryStatus.shared.resetForTest()
+            SummaryStatus.shared.failed("z.md", at: stamp, reason: "runner exploded")
+            let rows = AppController().postProcessRowsAfterMenuOpenForTest()
+            check("tray: opening the menu refreshes the post-process rows from live status",
+                  rows != nil
+                  && rows!.summary.contains("z.md")               // the live failure, not the built-in empty title
+                  && rows!.digest.hasPrefix("Daily digest"))
+            if let savedMode { Pref.d.set(savedMode, forKey: Pref.postProcessMode) }
+            else { Pref.d.removeObject(forKey: Pref.postProcessMode) }
+            // A row with nothing to show must be GREY after AppKit's validation pass, not merely after
+            // our own `isEnabled = false`. The menu auto-enables items, so validateMenuItem has the last
+            // word — assigning isEnabled and reading it straight back was a test asserting itself.
+            SummaryStatus.shared.resetForTest()   // .idle, no output → the row can do nothing
+            let idleRows = AppController().postProcessRowsAfterMenuOpenForTest()
+            check("tray: a summary row with nothing to reveal is disabled after AppKit re-validates it",
+                  idleRows != nil && idleRows!.enabled == false)
             check("flush push: terminal statuses classified, transient ones wait",
                   flushOutcome(for: "Saved: 2026-07-05-2100-2130.md")! == ("Transcript ready", "2026-07-05-2100-2130.md")
                   && flushOutcome(for: "No speech — discarded") != nil
                   && flushOutcome(for: "No speech — skipped") != nil
                   && flushOutcome(for: "Downloading model — transcription deferred") != nil
                   && flushOutcome(for: "Transcription failed") != nil
+                  // Every status `process` can END on must classify, or "Transcribe now" hangs on its
+                  // spinner and the still-armed flag steals the next segment's notification.
+                  && flushOutcome(for: "No meeting · short — skipped") != nil
                   && flushOutcome(for: "Transcribing…") == nil
                   && flushOutcome(for: "Recording · mic + system audio") == nil
                   && flushOutcome(for: "Paused (locked/asleep)") == nil)
@@ -6447,13 +8434,47 @@ struct Main {
                                     transcripts: ["/t/2026-07-07-1400.md", "/t/2026-07-06-1000.md", "/t/2026-07-07-1000-standup.md"],
                                     summaries: ["/s/2026-07-07-1000-standup.md"])
                   == ["/s/2026-07-07-1000-standup.md", "/t/2026-07-07-1400.md"])
-            check("digest: output path — explicit dir, next-to-summaries fallback, transcripts fallback",
+            // A digest lands in the SAME month folder as the day's notes, and `2026-07-07.md` carries the
+            // very day-prefix the input filter matches — without the exclusion it would feed itself its
+            // own previous output. Compared by standardized path (`/t/./x.md` is the same file as `/t/x.md`).
+            check("digest: the digest we're about to write is never one of its own inputs",
+                  dailyDigestInputs(day: "2026-07-07",
+                                    transcripts: ["/t/2026-07/./2026-07-07.md", "/t/2026-07/2026-07-07-1000-standup.md"],
+                                    summaries: ["/t/2026-07/2026-07-07.md"],
+                                    excluding: "/t/2026-07/2026-07-07.md")
+                  == ["/t/2026-07/2026-07-07-1000-standup.md"])
+            // The name is the user's to choose: default is a bare date, tokens expand, a missing
+            // extension is added, and a blank or `/`-bearing template can't produce a nameless file
+            // or escape the month folder.
+            check("digest: file name comes from a user template, defaults to {date}.md",
+                  dailyDigestFileName(day: "2026-07-07") == "2026-07-07.md"
+                  && dailyDigestFileName(day: "2026-07-07", template: "") == "2026-07-07.md"
+                  && dailyDigestFileName(day: "2026-07-07", template: "{date}-daily") == "2026-07-07-daily.md"
+                  && dailyDigestFileName(day: "2026-07-07", template: ".md") == "2026-07-07.md"
+                  && dailyDigestFileName(day: "2026-07-07", template: "../{date}.md") == "..-2026-07-07.md")
+            // A template with no {date} resolved to one path for the whole month, and the digest is
+            // promoted with `mv` — every day silently overwrote the day before.
+            check("digest: a name without {date} still gets the day, so days can't overwrite each other",
+                  dailyDigestFileName(day: "2026-07-07", template: "notes.md") == "2026-07-07-notes.md"
+                  && dailyDigestFileName(day: "2026-07-07", template: "digest-{month}.md") == "2026-07-07-digest-2026-07.md")
+            // A summary saved next to its transcript is `<base>-sum.md`; keying on the raw basename meant
+            // the digest never found it and quietly fed on the raw transcript instead.
+            check("digest: a `-sum` summary next to its transcript is matched to that transcript",
+                  dailyDigestInputs(day: "2026-07-07",
+                                    transcripts: ["/t/2026-07-07-1000-standup.md"],
+                                    summaries: ["/t/2026-07-07-1000-standup-sum.md"])
+                  == ["/t/2026-07-07-1000-standup-sum.md"])
+            // No `Daily/` tree any more — we only ever create the month folder under the dir the user
+            // picked; choosing where that folder lives is the user's job, not ours.
+            check("digest: output path — <picked dir>/YYYY-MM/<name>, no injected Daily folder",
                   dailyDigestOutputPath(day: "2026-07-07", outDir: "/d", summaryOutDir: "/r/Summaries", transcriptsDir: "/r/Transcripts")
                   == "/d/2026-07/2026-07-07.md"
                   && dailyDigestOutputPath(day: "2026-07-07", outDir: "", summaryOutDir: "/r/Summaries", transcriptsDir: "/r/Transcripts")
-                  == "/r/Daily/2026-07/2026-07-07.md"
+                  == "/r/Summaries/2026-07/2026-07-07.md"
                   && dailyDigestOutputPath(day: "2026-07-07", outDir: "", summaryOutDir: "", transcriptsDir: "/r/Transcripts")
-                  == "/r/Daily/2026-07/2026-07-07.md")
+                  == "/r/Transcripts/2026-07/2026-07-07.md"
+                  && dailyDigestOutputPath(day: "2026-07-07", outDir: "/d", summaryOutDir: "", transcriptsDir: "/r/T",
+                                           nameTemplate: "{date}-daily.md") == "/d/2026-07/2026-07-07-daily.md")
             check("digest: invocation cats inputs into the runner with atomic promote",
                   dailyDigestInvocation(runner: .claude, prompt: "P", inputs: ["/s/a.md", "/s/b's.md"], outPath: "/d/2026-07/x.md")
                   == "mkdir -p '/d/2026-07' && cat '/s/a.md' '/s/b'\\''s.md' | claude -p 'P' "
@@ -6501,6 +8522,54 @@ struct Main {
             check("naming: transcript base is the start time only",
                   transcriptBaseName(start: schedDate("2026-07-05 21:00"), timeZone: utc.timeZone) == "2026-07-05-2100"
                   && transcriptBaseName(start: schedDate("2026-07-05 23:50"), timeZone: utc.timeZone) == "2026-07-05-2350")
+            // A mapped meeting stamps the transcript with the MEETING's start, clamped to the recorded
+            // window: a 21:10 meeting inside the 21:00 rotation slice files as 21:10, while the second
+            // hour of a 20:30 meeting still files as 21:00 — otherwise both slices of one long meeting
+            // would claim 20:30, collapse onto the same name, and the later one would overwrite the first.
+            let segA = schedDate("2026-07-05 21:00"), segAEnd = schedDate("2026-07-05 22:00")
+            check("naming: a mapped calendar event stamps its own start, clamped to the recorded window",
+                  transcriptStart(segStart: segA, segEnd: segAEnd, eventStart: nil) == segA
+                  && transcriptStart(segStart: segA, segEnd: segAEnd,
+                                     eventStart: schedDate("2026-07-05 21:10")) == schedDate("2026-07-05 21:10")
+                  && transcriptStart(segStart: segA, segEnd: segAEnd,
+                                     eventStart: schedDate("2026-07-05 20:30")) == segA          // continuation slice
+                  && transcriptStart(segStart: segA, segEnd: segAEnd,
+                                     eventStart: schedDate("2026-07-05 22:30")) == segAEnd       // matched on the +60s window
+                  && transcriptBaseName(start: transcriptStart(segStart: segA, segEnd: segAEnd,
+                                                               eventStart: schedDate("2026-07-05 21:10")),
+                                        timeZone: utc.timeZone) == "2026-07-05-2110")
+            // Naming an hour of audio after a calendar event: the 2026-07-08 15:00–16:02 segment was
+            // titled after an event it shared 2 minutes with, because that event carried a Zoom
+            // URL, while the kickoff that filled 60 of its 62 minutes had none. A link means "online",
+            // not "this is the meeting you recorded"; it may only break a tie.
+            let seg = schedDate("2026-07-08 15:00"), segEnd = schedDate("2026-07-08 16:02")
+            let kickoff = EventCandidate(title: "project kickoff",         // 60 min of the segment
+                                         start: schedDate("2026-07-08 14:00"),
+                                         end: schedDate("2026-07-08 16:00"), hasLink: false)
+            let goalCheck = EventCandidate(title: "goal progress check",     // 2 min
+                                           start: schedDate("2026-07-08 16:00"),
+                                           end: schedDate("2026-07-08 17:00"), hasLink: true)
+            let nextDay = EventCandidate(title: "caught only by the ±padding",  // zero true overlap
+                                         start: schedDate("2026-07-08 16:02"),
+                                         end: schedDate("2026-07-08 17:00"), hasLink: true)
+            func pick(_ cs: [EventCandidate]) -> String? {
+                bestEventIndex(segStart: seg, segEnd: segEnd, candidates: cs).map { cs[$0].title }
+            }
+            // Same-overlap tie: the online meeting wins. Both cover 15:00–16:00 exactly.
+            let inPerson = EventCandidate(title: "in person", start: seg,
+                                          end: schedDate("2026-07-08 16:00"), hasLink: false)
+            let online = EventCandidate(title: "online", start: seg,
+                                        end: schedDate("2026-07-08 16:00"), hasLink: true)
+            check("calendar: the event that FILLS the segment wins; a meeting link only breaks a tie",
+                  pick([goalCheck, kickoff]) == "project kickoff"              // link no longer outranks
+                  && pick([kickoff, goalCheck]) == "project kickoff"           // and order can't flip it
+                  && pick([nextDay]) == nil                                    // zero overlap → no match
+                  && pick([kickoff, nextDay]) == "project kickoff"
+                  && pick([inPerson, online]) == "online"                      // tie → the online one
+                  && pick([online, inPerson]) == "online"
+                  && pick([]) == nil
+                  && eventOverlap(kickoff, segStart: seg, segEnd: segEnd) == 3600
+                  && eventOverlap(goalCheck, segStart: seg, segEnd: segEnd) == 120)
             // Dead-mic detection — the jack-input incident: hours of segments "voiced" by clicks
             // (energy-gate trips) while containing zero speech-length runs, all discarded silently.
             check("mic guard: speech-run accounting (clicks never qualify, speech does)",

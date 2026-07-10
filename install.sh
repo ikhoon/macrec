@@ -137,6 +137,11 @@ echo "▸ (re)loading agent…"
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 # bootout is async — wait until the old job is fully gone, else bootstrap races → EIO(5).
 for i in {1..12}; do launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break; sleep 0.5; done
+# Kill any lingering instance bootout didn't (a manually-launched copy, or one launchd no longer
+# tracks). Otherwise the fresh job below sees it and single-instance logic makes the NEW launch quit —
+# so the just-installed binary never runs. (A stale 2-hour-old process once kept serving the old
+# menu-bar icon across several installs until it was force-killed — user: "반영 안 되었네?".)
+pkill -9 -f 'macrec.app/Contents/MacOS/macrec' 2>/dev/null || true
 launchctl enable "$DOMAIN/$LABEL" 2>/dev/null || true
 launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null \
   || { sleep 2; launchctl bootstrap "$DOMAIN" "$PLIST"; }
