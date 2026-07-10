@@ -1143,6 +1143,7 @@ struct CompletedSegment {
     let durationSeconds: Double
     /// Either side speaking is worth transcribing (covers listen-only meetings where only sys speaks).
     var voicedSeconds: Double { max(micVoicedSeconds, sysVoicedSeconds) }
+    var speechSeconds: Double { max(micSpeechSeconds, sysSpeechSeconds) }   // sustained speech only (clicks ≈ 0)
 }
 
 func segFormatter() -> DateFormatter {
@@ -1444,6 +1445,13 @@ func transcriptBaseName(start: Date, timeZone: TimeZone = .current) -> String {
     return f.string(from: start)
 }
 
+/// The mapped event's start, clamped to `[segStart, segEnd]` — unclamped, consecutive slices of one
+/// meeting collapse onto the same file name. No event → the segment's own start. Pure + selftested.
+func transcriptStart(segStart: Date, segEnd: Date, eventStart: Date?) -> Date {
+    guard let e = eventStart else { return segStart }
+    return min(max(e, segStart), segEnd)
+}
+
 // MARK: - calendar lookup (title a transcript from the overlapping event)
 
 enum CalendarLookup {
@@ -1458,7 +1466,9 @@ enum CalendarLookup {
         }
     }
 
-    struct Match { let title: String; let link: String?; let attendees: [String] }
+    /// `start` is the EVENT's start (not the segment's) — a transcript stamps itself with the meeting's
+    /// time when one maps. See `transcriptStart`.
+    struct Match { let title: String; let link: String?; let attendees: [String]; let start: Date }
 
     /// The event calendars the user chose to source titles from (by title). Empty selection — or a
     /// selection that matches nothing (e.g. a renamed calendar) — means "all calendars" (nil).
@@ -1495,13 +1505,17 @@ enum CalendarLookup {
         }
         func overlap(_ e: EKEvent) -> TimeInterval { max(0, min(e.endDate, end).timeIntervalSince(max(e.startDate, start))) }
 
-        let chosen = events.sorted { a, b in
+        // An event caught only by the ±padding has zero true overlap: it belongs to the NEXT segment, and
+        // since the event's start stamps the file name, keeping it makes two segments collide.
+        let overlapping = events.filter { overlap($0) > 0 }
+        guard !overlapping.isEmpty else { return nil }
+        let chosen = overlapping.sorted { a, b in
             let la = link(a) != nil, lb = link(b) != nil
             if la != lb { return la }                 // events with a meeting link win
             return overlap(a) > overlap(b)            // else the one overlapping most
         }.first!
         let names = (chosen.attendees ?? []).compactMap { $0.name }.filter { !$0.isEmpty }
-        return Match(title: chosen.title, link: link(chosen), attendees: names)
+        return Match(title: chosen.title, link: link(chosen), attendees: names, start: chosen.startDate)
     }
 }
 
@@ -1967,6 +1981,22 @@ final class RecordingEngine {
             onSegmentResult?("No speech — skipped")
             return
         }
+        // Short-blip filter (user rule): when calendar titling is on, a segment with NO overlapping
+        // meeting and under 3 min of speech isn't worth a file — meetings are always kept. Gate BEFORE
+        // transcription so throwaway blips never reach whisper. (Only when titling is on: without a
+        // calendar we can't tell "no meeting" from "a meeting we couldn't see", so we don't discard.)
+        // ONE calendar query per segment: whisper runs for minutes between the gate and the write, and
+        // two queries can return different answers.
+        let meeting = cfg.useCalendarTitles
+            ? CalendarLookup.match(start: seg.start, end: seg.start.addingTimeInterval(seg.durationSeconds))
+            : nil
+        if cfg.useCalendarTitles {
+            guard shouldKeepTranscript(hasMeeting: meeting != nil, speechSeconds: seg.speechSeconds) else {
+                elog("engine:   → no meeting & speech \(String(format: "%.0f", seg.speechSeconds))s < 180s — discarding")
+                onSegmentResult?("No meeting · short — skipped")
+                return
+            }
+        }
         // Model not downloaded yet (first run) — defer rather than write a "transcription failed" file.
         guard FileManager.default.fileExists(atPath: cfg.whisperModel) else {
             elog("engine:   → model not ready (\(cfg.whisperModel)) — deferring transcription")
@@ -1988,37 +2018,48 @@ final class RecordingEngine {
             return
         }
         do {
-            let url = try writeTranscript(seg: seg, text: text, mixed: mixed)
+            let url = try writeTranscript(seg: seg, text: text, mixed: mixed, event: meeting)
             onTranscriptURL?(url)
             onTranscriptSaved?("Saved: \(url.lastPathComponent)")
-            if let cmd = postProcessInvocationFromPrefs(transcriptPath: url.path) { runPostProcessCommand(cmd) }
+            if let cmd = postProcessInvocationFromPrefs(transcriptPath: url.path) {
+                runPostProcessCommand(cmd) { status in
+                    guard status != 0 else { return }   // a failing summary runner must never fail silently
+                    elog("engine: post-process exited \(status) for \(url.lastPathComponent)")
+                    Notifier.push(title: "Summary failed",
+                                  body: "The summary command exited with code \(status) — check the runner in Settings › Summaries.")
+                }
+            }
         } catch { elog("engine: writeTranscript: \(error)") }
     }
 
     @discardableResult
-    private func writeTranscript(seg: CompletedSegment, text: String, mixed: URL?) throws -> URL {
+    private func writeTranscript(seg: CompletedSegment, text: String, mixed: URL?,
+                                 event: CalendarLookup.Match?) throws -> URL {
         let fm = FileManager.default
         let dayF = DateFormatter(); dayF.locale = Locale(identifier: "en_US_POSIX"); dayF.dateFormat = "yyyy-MM-dd"
         let hmF = DateFormatter(); hmF.locale = Locale(identifier: "en_US_POSIX"); hmF.dateFormat = "HH:mm"
         let monthF = DateFormatter(); monthF.locale = Locale(identifier: "en_US_POSIX"); monthF.dateFormat = "yyyy-MM"
 
-        // Organize transcripts into monthly subfolders: transcripts/YYYY-MM/…  (audio under YYYY-MM/audio/).
-        let monthDir = cfg.transcriptsDir.appendingPathComponent(monthF.string(from: seg.start), isDirectory: true)
-        try fm.createDirectory(at: monthDir, withIntermediateDirectories: true)
         let end = seg.start.addingTimeInterval(seg.durationSeconds)
-        let mins = Int((seg.durationSeconds + 30) / 60)
 
-        // Title the transcript from the overlapping calendar event (prefers ones with a meeting link).
+        // The overlapping calendar event, resolved ONCE by the caller (see `process`).
         let l10n = TranscriptL10n.current
-        let event = cfg.useCalendarTitles ? CalendarLookup.match(start: seg.start, end: end) : nil
         let title = event?.title ?? l10n.autoTitle
-        let base = transcriptBaseName(start: seg.start)
+        // Stamp the file with the MEETING's start when one maps, else the segment's. Name, month
+        // folder and the header's range all derive from this one value so they can never disagree.
+        let stamp = transcriptStart(segStart: seg.start, segEnd: end, eventStart: event?.start)
+        let mins = max(1, Int((end.timeIntervalSince(stamp) + 30) / 60))
+        let base = transcriptBaseName(start: stamp)
         let slug = event.map { "\(base)-\(slugify($0.title))" } ?? base
+
+        // Organize transcripts into monthly subfolders: transcripts/YYYY-MM/…  (audio under YYYY-MM/audio/).
+        let monthDir = cfg.transcriptsDir.appendingPathComponent(monthF.string(from: stamp), isDirectory: true)
+        try fm.createDirectory(at: monthDir, withIntermediateDirectories: true)
 
         // keep the mixed WAV per the keepAudio setting (mixed is nil when keepAudio is off)
         var audioLine = "- \(l10n.audio): \(l10n.audioNotKept)"
         if cfg.keepAudio, let mixed = mixed {
-            let audioMonthDir = cfg.audioDir.appendingPathComponent(monthF.string(from: seg.start), isDirectory: true)
+            let audioMonthDir = cfg.audioDir.appendingPathComponent(monthF.string(from: stamp), isDirectory: true)
             try fm.createDirectory(at: audioMonthDir, withIntermediateDirectories: true)
             let keptAudio = audioMonthDir.appendingPathComponent("\(slug).wav")
             try? fm.removeItem(at: keptAudio)
@@ -2037,7 +2078,7 @@ final class RecordingEngine {
             ? l10n.failureNote(model: cfg.whisperModel) : text
         let doc = TranscriptDoc(
             title: title,
-            day: dayF.string(from: seg.start), hmStart: hmF.string(from: seg.start), hmEnd: hmF.string(from: end),
+            day: dayF.string(from: stamp), hmStart: hmF.string(from: stamp), hmEnd: hmF.string(from: end),
             mins: mins,
             micVoiced: seg.micVoicedSeconds, sysVoiced: seg.sysVoicedSeconds,
             modelName: URL(fileURLWithPath: cfg.whisperModel).lastPathComponent,
@@ -2439,6 +2480,14 @@ func postProcessInvocation(mode: PostProcessMode, runner: SummaryRunner, prompt:
 func effectivePostProcessMode(rawMode: String, shellCmd: String) -> PostProcessMode {
     if let m = PostProcessMode(rawValue: rawMode) { return m }
     return shellCmd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .off : .shell
+}
+
+/// Whether a completed segment is worth a transcript file. A segment that overlapped a calendar MEETING
+/// is always kept; an ad-hoc recording with no meeting is kept only when there was real speech — at least
+/// `minNonMeetingSeconds` (default 3 min) — so short non-meeting blips (a hallway chat, a passing video)
+/// don't litter the notes (user rule). Pure + selftested.
+func shouldKeepTranscript(hasMeeting: Bool, speechSeconds: Double, minNonMeetingSeconds: Double = 180) -> Bool {
+    hasMeeting || speechSeconds >= minNonMeetingSeconds
 }
 
 /// Read the post-process prefs and build the invocation for a just-saved transcript.
@@ -5338,6 +5387,10 @@ func flushOutcome(for status: String) -> (title: String, body: String)? {
     if status.hasPrefix("Transcription failed") {
         return ("Transcription failed", "whisper couldn't process the segment — see the log.")
     }
+    // Terminal too: an unclassified status leaves the flush flag armed to steal the next segment's push.
+    if status.hasPrefix("No meeting") {
+        return ("Nothing to transcribe", "No meeting overlapped this segment and it was too short to keep.")
+    }
     return nil
 }
 
@@ -6555,6 +6608,9 @@ struct Main {
                   && flushOutcome(for: "No speech — skipped") != nil
                   && flushOutcome(for: "Downloading model — transcription deferred") != nil
                   && flushOutcome(for: "Transcription failed") != nil
+                  // Every status `process` can END on must classify, or "Transcribe now" hangs on its
+                  // spinner and the still-armed flag steals the next segment's notification.
+                  && flushOutcome(for: "No meeting · short — skipped") != nil
                   && flushOutcome(for: "Transcribing…") == nil
                   && flushOutcome(for: "Recording · mic + system audio") == nil
                   && flushOutcome(for: "Paused (locked/asleep)") == nil)
@@ -6630,6 +6686,22 @@ struct Main {
             check("naming: transcript base is the start time only",
                   transcriptBaseName(start: schedDate("2026-07-05 21:00"), timeZone: utc.timeZone) == "2026-07-05-2100"
                   && transcriptBaseName(start: schedDate("2026-07-05 23:50"), timeZone: utc.timeZone) == "2026-07-05-2350")
+            // A mapped meeting stamps the transcript with the MEETING's start, clamped to the recorded
+            // window: a 21:10 meeting inside the 21:00 rotation slice files as 21:10, while the second
+            // hour of a 20:30 meeting still files as 21:00 — otherwise both slices of one long meeting
+            // would claim 20:30, collapse onto the same name, and the later one would overwrite the first.
+            let segA = schedDate("2026-07-05 21:00"), segAEnd = schedDate("2026-07-05 22:00")
+            check("naming: a mapped calendar event stamps its own start, clamped to the recorded window",
+                  transcriptStart(segStart: segA, segEnd: segAEnd, eventStart: nil) == segA
+                  && transcriptStart(segStart: segA, segEnd: segAEnd,
+                                     eventStart: schedDate("2026-07-05 21:10")) == schedDate("2026-07-05 21:10")
+                  && transcriptStart(segStart: segA, segEnd: segAEnd,
+                                     eventStart: schedDate("2026-07-05 20:30")) == segA          // continuation slice
+                  && transcriptStart(segStart: segA, segEnd: segAEnd,
+                                     eventStart: schedDate("2026-07-05 22:30")) == segAEnd       // matched on the +60s window
+                  && transcriptBaseName(start: transcriptStart(segStart: segA, segEnd: segAEnd,
+                                                               eventStart: schedDate("2026-07-05 21:10")),
+                                        timeZone: utc.timeZone) == "2026-07-05-2110")
             // Dead-mic detection — the jack-input incident: hours of segments "voiced" by clicks
             // (energy-gate trips) while containing zero speech-length runs, all discarded silently.
             check("mic guard: speech-run accounting (clicks never qualify, speech does)",
