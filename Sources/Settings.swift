@@ -156,6 +156,16 @@ func isNewerVersion(_ candidate: String, than current: String) -> Bool {
 }
 
 
+/// The title bar and footer a pane's document height doesn't account for.
+let snapshotChromeHeight: CGFloat = 96
+
+/// How tall to make the window when snapshotting a pane: enough to show the whole pane, never shorter
+/// than the runtime size (a short pane must still look like the real window), and capped so a runaway
+/// document can't produce a PNG nobody will open. Pure + selftested.
+func snapshotContentHeight(runtime: CGFloat, document: CGFloat, cap: CGFloat = 4000) -> CGFloat {
+    min(max(runtime, document), cap)
+}
+
 final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSComboBoxDelegate {
 
     /// A field the parser can't read must LOOK broken while typing — schedule fields silently
@@ -899,11 +909,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         let appearance = win.effectiveAppearance   // render in the user's real (likely dark) appearance
         var written: [URL] = []
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        win.setContentSize(NSSize(width: 880, height: 600))   // the real, fixed runtime size (faithful)
+        let runtimeSize = NSSize(width: 880, height: 600)      // the real, fixed runtime size
         for i in panesForTest.indices {
+            win.setContentSize(runtimeSize)
             sidebarList.selectRowIndexes([i], byExtendingSelection: false)   // drives selectPane via delegate
             selectPane(i)
             content.layoutSubtreeIfNeeded()
+            // Grow the window to the pane's full document height, so a snapshot shows the WHOLE pane.
+            // Rendering `content.bounds` at the runtime size cropped everything past the fold: the
+            // bottom of Summaries and the entire Gladia section had never been looked at by anyone.
+            if let doc = paneDoc(in: paneContainer) {
+                let full = snapshotContentHeight(runtime: runtimeSize.height,
+                                                 document: doc.fittingSize.height + snapshotChromeHeight)
+                if full > runtimeSize.height {
+                    win.setContentSize(NSSize(width: runtimeSize.width, height: full))
+                    content.layoutSubtreeIfNeeded()
+                }
+            }
             RunLoop.current.run(until: Date().addingTimeInterval(0.08))
             let bounds = content.bounds
             guard bounds.width > 1, bounds.height > 1 else { continue }

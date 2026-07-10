@@ -368,6 +368,19 @@ func runSelftest() -> Never {
                 // window (a .behindWindow material ignores the view's alpha). Assert the fill exists.
                 check("live: the overlay backdrop actually paints, sized to the content, beneath the captions",
                       cw.backdropPaintsForTest)
+                // caption-snapshot renders offscreen. That only tells the truth while nothing in the panel
+                // is composited by the window server — so assert the render is not blank, and that the
+                // blank-detector would have caught the old failure.
+                cw.renderSampleCaptions()
+                cw.setOpacityForTest(0.0)   // the transparent end, where the captions used to disappear
+                let shot = cw.renderContentForTest()
+                let emptyRep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 40, pixelsHigh: 40,
+                                               bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                               isPlanar: false, colorSpaceName: .deviceRGB,
+                                               bytesPerRow: 0, bitsPerPixel: 0)!
+                check("live: the overlay renders offscreen with visible captions, and a blank render is caught",
+                      shot != nil && !snapshotIsBlank(shot!)
+                      && snapshotIsBlank(emptyRep))   // the guard that stops a reassuring, empty PNG
                 // …and nothing paints BEHIND it that the slider can't reach: `.hudWindow` slipped its own
                 // full-window material into the theme frame, so the overlay never went fully transparent.
                 check("live: no window-chrome material sits behind the backdrop (fully transparent is reachable)",
@@ -398,6 +411,26 @@ func runSelftest() -> Never {
                       && allOn.first == .apple                    // order follows allCases, apple first
                       && !allOn.isEmpty)                          // never strands the user
             }
+            // The harness drives the real UI, which persists as it goes: `caption-snapshot` left the user
+            // in subtitle mode at zero opacity, and the next selftest read that back and failed. A test
+            // subcommand must not be able to change the app's settings.
+            // A pane taller than the window used to be cropped at the fold — the bottom of Summaries and
+            // the whole Gladia section had never been rendered. The window grows to the document height,
+            // floored at the runtime size and capped so a runaway pane can't produce an unopenable PNG.
+            check("settings: a snapshot grows to the pane's full height, floored and capped",
+                  snapshotContentHeight(runtime: 600, document: 900) == 900       // taller pane → grow
+                  && snapshotContentHeight(runtime: 600, document: 400) == 600    // short pane → runtime floor
+                  && snapshotContentHeight(runtime: 600, document: 9999) == 4000) // runaway → capped
+            check("prefs: the test harness writes to a throwaway suite, never the user's",
+                  Pref.suiteName == "com.ikhoon.macrec.prefs"     // the real one, still named here…
+                  && Pref.d.value(forKey: "__probe__") == nil)    // …but not the store the harness holds
+            Pref.d.set("dirty", forKey: "__probe__")
+            let realStore = UserDefaults(suiteName: Pref.suiteName)
+            check("prefs: a write from the harness never reaches the user's suite",
+                  Pref.d.string(forKey: "__probe__") == "dirty"
+                  && realStore?.string(forKey: "__probe__") == nil)
+            Pref.d.removeObject(forKey: "__probe__")
+
             // The harness must never read the user's real credentials, and every read is an authorization
             // check — an unsigned dev build turns each one into a password prompt.
             _ = Keychain.get("deepgram"); _ = Keychain.get("deepgram"); _ = Keychain.get("openai")

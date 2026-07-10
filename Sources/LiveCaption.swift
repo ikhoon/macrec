@@ -1416,6 +1416,21 @@ func captionEdgeVisible(subtitle: Bool) -> Bool { !subtitle }
 /// Pure + selftested.
 func captionTextNeedsBackplate(backdropAlpha: CGFloat) -> Bool { backdropAlpha < 0.6 }
 
+/// Did the overlay render to nothing? An offscreen render of a window-server-composited surface returns
+/// an empty bitmap, and a harness that writes that PNG "verifies" every bug there is. A real overlay has
+/// a backdrop AND bright caption glyphs — checking only for "some pixels" would pass a caption-less slab.
+func snapshotIsBlank(_ rep: NSBitmapImageRep, brightPixelsNeeded: Int = 40) -> Bool {
+    var bright = 0
+    for x in stride(from: 0, to: rep.pixelsWide, by: 3) {
+        for y in stride(from: 0, to: rep.pixelsHigh, by: 3) {
+            guard let c = rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+            if c.alphaComponent > 0.5 && c.brightnessComponent > 0.6 { bright += 1 }
+            if bright >= brightPixelsNeeded { return false }
+        }
+    }
+    return true
+}
+
 /// A view that is seen but never touched — it sits over the captions purely to draw the outline, so it
 /// must not swallow clicks, text selection, or the window drag.
 final class NonInteractiveView: NSView {
@@ -1620,39 +1635,89 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
                 edge.hitTest(NSPoint(x: 5, y: 5)) == nil)
     }
 
-    /// UI TEST KIT (`macrec caption-snapshot <dir>`): show the overlay for real and capture the composited
-    /// window at several opacities. The one thing to LOOK for: the background fades, the captions never do.
+    /// UI TEST KIT (`macrec caption-snapshot <dir>`): render the overlay at several opacities onto a
+    /// checkerboard. The one thing to LOOK for: the background fades, the captions never do.
     ///
-    /// It has to be a REAL screen capture. An offscreen `cacheDisplay` of this panel renders a blank
-    /// white slab — a `.behindWindow` NSVisualEffectView is composited by the window server, not by the
-    /// view's own drawing — so an offscreen snapshot would "pass" no matter what the opacity slider did.
-    /// `screencapture -l<windowNumber>` grabs what the user actually sees. It needs the *calling*
-    /// terminal's Screen Recording permission; without it the file never appears and we say so.
+    /// This used to shell out to `screencapture`, because the backdrop was a `.behindWindow`
+    /// NSVisualEffectView inside a `.hudWindow` — both composited by the window server, so an offscreen
+    /// render returned a blank slab and would have "passed" whatever the slider did. Neither is here any
+    /// more: the backdrop is a layer-backed fill the app draws itself, so `cacheDisplay` sees the truth
+    /// and no Screen Recording permission is needed. `snapshotIsBlank` guards the old failure mode —
+    /// a harness that cannot see the thing must fail, not write a reassuring PNG.
     func snapshotOpacities(_ values: [Double], to dir: URL) -> [URL] {
         var written: [URL] = []
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        renderSampleCaptions()
+        show()
+        panel.orderFrontRegardless()
+        guard let content = panel.contentView else { return [] }
+        for v in values {
+            applyOpacity(v)
+            content.layoutSubtreeIfNeeded()
+            panel.displayIfNeeded()
+            guard let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) else { continue }
+            content.cacheDisplay(in: content.bounds, to: rep)
+            guard !snapshotIsBlank(rep) else {
+                elog("caption-snapshot: the overlay rendered to nothing at opacity \(v) — refusing to write a blank PNG")
+                continue
+            }
+            // `rep.draw(in:)` composites with `.copy`: its transparent pixels overwrite the checkerboard
+            // with black, and the overlay then looks opaque at every opacity. Go through NSImage so the
+            // draw is `.sourceOver` and the backdrop's alpha actually shows the board through it.
+            let layer = NSImage(size: content.bounds.size)
+            layer.addRepresentation(rep)
+            let shot = NSImage(size: content.bounds.size)
+            shot.lockFocus()
+            drawCheckerboard(in: content.bounds)   // transparency is only visible against something
+            layer.draw(in: NSRect(origin: .zero, size: content.bounds.size),
+                       from: .zero, operation: .sourceOver, fraction: 1)
+            shot.unlockFocus()
+            guard let tiff = shot.tiffRepresentation, let bmp = NSBitmapImageRep(data: tiff),
+                  let png = bmp.representation(using: .png, properties: [:]) else { continue }
+            let url = dir.appendingPathComponent(String(format: "overlay-opacity-%.2f.png", v))
+            try? png.write(to: url)
+            written.append(url)
+        }
+        panel.orderOut(nil)
+        return written
+    }
+
+    /// The same offscreen render `caption-snapshot` writes, handed back for inspection.
+    func renderContentForTest() -> NSBitmapImageRep? {
+        guard let content = panel.contentView else { return nil }
+        content.layoutSubtreeIfNeeded()
+        panel.displayIfNeeded()
+        guard let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) else { return nil }
+        content.cacheDisplay(in: content.bounds, to: rep)
+        return rep
+    }
+
+    /// Two lines of Japanese with Korean translations — the ja→ko case this overlay exists for.
+    func renderSampleCaptions() {
         render([(speaker: "me", text: "会議を始めましょう。", translated: "회의를 시작합시다.",
                  time: Date(timeIntervalSince1970: 0), mine: true, inProgress: false),
                 (speaker: "them", text: "資料は共有済みです。", translated: "자료는 이미 공유했습니다.",
                  time: Date(timeIntervalSince1970: 4), mine: false, inProgress: true)],
                showTimestamps: true, fontSize: 14, showLabels: true)
-        show()
-        panel.orderFrontRegardless()
-        for v in values {
-            applyOpacity(v)
-            panel.contentView?.layoutSubtreeIfNeeded()
-            panel.displayIfNeeded()
-            RunLoop.current.run(until: Date().addingTimeInterval(0.4))   // let the compositor settle
-            let url = dir.appendingPathComponent(String(format: "overlay-opacity-%.2f.png", v))
-            try? FileManager.default.removeItem(at: url)
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-            p.arguments = ["-x", "-o", "-l\(panel.windowNumber)", url.path]
-            try? p.run(); p.waitUntilExit()
-            if FileManager.default.fileExists(atPath: url.path) { written.append(url) }
+    }
+
+    /// A light/dark checker, in fixed sRGB. A dynamic system colour resolves against the current
+    /// appearance, and `NSImage.lockFocus` has none — every tile came out the same pink. The pale tile is
+    /// deliberately near-white: a caption that vanishes on a bright background is the failure to look for.
+    private func drawCheckerboard(in rect: NSRect) {
+        let light = NSColor(srgbRed: 0.93, green: 0.93, blue: 0.95, alpha: 1)
+        let dark = NSColor(srgbRed: 0.42, green: 0.45, blue: 0.52, alpha: 1)
+        let tile: CGFloat = 16
+        var y: CGFloat = 0
+        while y < rect.height {
+            var x: CGFloat = 0
+            while x < rect.width {
+                ((Int(x / tile) + Int(y / tile)) % 2 == 0 ? light : dark).setFill()
+                NSRect(x: x, y: y, width: tile, height: tile).fill()
+                x += tile
+            }
+            y += tile
         }
-        panel.orderOut(nil)
-        return written
     }
 
     /// Build the top control bar. Each control writes its Pref and fires the matching callback so the
@@ -1806,8 +1871,12 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         para.alignment = .center
         para.lineHeightMultiple = 1.15
         para.paragraphSpacing = 6
-        // No plate: a `.backgroundColor` run paints a hard rectangle per line. Contrast goes behind the
-        // glyphs, never into them — a `strokeWidth` outline reads as a heavier font weight.
+        // Contrast goes behind the glyphs, never into them — a `strokeWidth` outline reads as a heavier
+        // font weight. A shadow alone is not enough: against a bright window the captions all but vanish
+        // (seen in `caption-snapshot`). Centred text makes a `.backgroundColor` run hug the line, which is
+        // the black band broadcast subtitles use — and it only appears when the backdrop can't do the job.
+        let plate = captionTextNeedsBackplate(backdropAlpha: captionBackdropAlpha(Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 1.0)))
+            ? NSColor.black.withAlphaComponent(0.6) : NSColor.clear
         let halo = NSShadow()
         halo.shadowColor = NSColor.black.withAlphaComponent(0.85)
         halo.shadowBlurRadius = 2
@@ -1820,11 +1889,11 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             if let secondary {
                 out.append(NSAttributedString(string: secondary + "\n", attributes: [
                     .font: subFont, .foregroundColor: NSColor.secondaryLabelColor,
-                    .shadow: halo, .paragraphStyle: para]))
+                    .backgroundColor: plate, .shadow: halo, .paragraphStyle: para]))
             }
             out.append(NSAttributedString(string: main, attributes: [
                 .font: mainFont, .foregroundColor: NSColor.labelColor,
-                .shadow: halo, .paragraphStyle: para]))
+                .backgroundColor: plate, .shadow: halo, .paragraphStyle: para]))
         }
         textView.textStorage?.setAttributedString(out)
         textView.scrollToEndOfDocument(nil)
