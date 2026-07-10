@@ -1,6 +1,8 @@
 # macrec — dev rules for Claude
 
-Single-file macOS menu-bar meeting recorder (`macrec.swift`). Menu-bar (tray) app today,
+macOS menu-bar meeting recorder. `macrec.swift` is the CLI entry point and the low-level primitives;
+`Sources/` holds one concern per file — `Audio`, `Pipeline`, `LiveCaption`, `Settings`, `Tray`,
+`Selftest`. The build stays one `swiftc macrec.swift Sources/*.swift` (no SwiftPM). Menu-bar (tray) app today,
 architected to grow into a full windowed app; recording is table stakes — the value is the
 pipeline above it (transcript → summary → daily digest → knowledge). See `PIPELINE.md`.
 

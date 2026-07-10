@@ -6,9 +6,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ["macrec.swift", "**/*.sh", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", ".github/workflows/ci.yml"]
   pull_request:
-    paths: ["macrec.swift", "**/*.sh", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
             -framework AVFoundation -framework CoreMedia -framework CoreAudio \
             -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech -framework Translation \
             -import-objc-header speex-bridge.h -I "$SPEEX_PREFIX/include" "$SPEEX_PREFIX/lib/libspeexdsp.a" \
-            macrec.swift -o "$RUNNER_TEMP/macrec"
+            macrec.swift Sources/*.swift -o "$RUNNER_TEMP/macrec"
 
       - name: Guard — no ScreenCaptureKit + speexdsp is statically linked
         run: |
