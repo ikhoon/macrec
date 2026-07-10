@@ -35,8 +35,7 @@ swiftc -swift-version 5 -parse-as-library -O \
   "$HERE/macrec.swift" "$HERE"/Sources/*.swift -o "$STAGE_BIN"
 
 echo "▸ writing Info.plist + icon…"
-VERSION=$(grep -E '^let macrecVersion = ' "$HERE/macrec.swift" | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')
-[[ -n "$VERSION" ]] || { echo "❌ failed to parse macrecVersion"; exit 1; }
+VERSION=$("$HERE/version.sh") || exit 1   # single source of truth (also exercised by CI)
 [[ -f "$HERE/AppIcon.icns" ]] && cp "$HERE/AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
 cat > "$STAGE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

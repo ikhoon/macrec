@@ -20,6 +20,15 @@ jobs:
       - name: Toolchain
         run: swift --version && sw_vers
 
+      # install.sh/package.sh compute the .app version via version.sh; CI compiles with a DIFFERENT,
+      # direct swiftc call, so a packaging-only break (like #88 moving `let macrecVersion` out of
+      # macrec.swift) compiled + selftested green here yet broke every real install. Run the shared
+      # parser so that class of break fails CI instead of a user's `./install.sh`.
+      - name: Guard — install.sh/package.sh can resolve the app version
+        run: |
+          v=$(./version.sh) || { echo "::error::version.sh failed — install.sh/package.sh version parse is broken"; exit 1; }
+          echo "✅ version resolves to $v (shared by install.sh, package.sh, and this job)"
+
       - name: Install speexdsp (AEC — statically linked into the binary)
         run: brew install speexdsp
 
