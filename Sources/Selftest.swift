@@ -414,6 +414,13 @@ func runSelftest() -> Never {
             // The harness drives the real UI, which persists as it goes: `caption-snapshot` left the user
             // in subtitle mode at zero opacity, and the next selftest read that back and failed. A test
             // subcommand must not be able to change the app's settings.
+            // A pane taller than the window used to be cropped at the fold — the bottom of Summaries and
+            // the whole Gladia section had never been rendered. The window grows to the document height,
+            // floored at the runtime size and capped so a runaway pane can't produce an unopenable PNG.
+            check("settings: a snapshot grows to the pane's full height, floored and capped",
+                  snapshotContentHeight(runtime: 600, document: 900) == 900       // taller pane → grow
+                  && snapshotContentHeight(runtime: 600, document: 400) == 600    // short pane → runtime floor
+                  && snapshotContentHeight(runtime: 600, document: 9999) == 4000) // runaway → capped
             check("prefs: the test harness writes to a throwaway suite, never the user's",
                   Pref.suiteName == "com.ikhoon.macrec.prefs"     // the real one, still named here…
                   && Pref.d.value(forKey: "__probe__") == nil)    // …but not the store the harness holds
