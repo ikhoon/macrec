@@ -2085,10 +2085,11 @@ final class RecordingEngine {
                                             outDir: Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT"))
                 runPostProcessCommand(cmd) { status in
                     guard status != 0 else { SummaryStatus.shared.finished(file, at: Date(), output: out); return }
-                    SummaryStatus.shared.failed(file, at: Date())
-                    elog("engine: post-process exited \(status) for \(file)")
+                    let why = reapFailedPostProcess(outPath: out)
+                    SummaryStatus.shared.failed(file, at: Date(), reason: why)
+                    elog("engine: post-process exited \(status) for \(file)" + (why.map { " — \($0)" } ?? ""))
                     Notifier.push(title: "Summary failed",
-                                  body: "The summary command exited with code \(status) — check the runner in Settings › Summaries.")
+                                  body: why ?? "The summary command exited with code \(status) — check Settings › Summaries.")
                 }
             }
         } catch { elog("engine: writeTranscript: \(error)") }
@@ -2668,7 +2669,7 @@ enum SummaryActivity: Equatable {
     case idle
     case running(String)
     case done(String, Date)
-    case failed(String, Date)
+    case failed(String, Date, reason: String?)
 }
 
 /// The tray row for post-processing. Pure + selftested.
@@ -2677,8 +2678,25 @@ func summaryMenuTitle(_ activity: SummaryActivity, hm: (Date) -> String) -> Stri
     case .off:                 return "Summaries: off"
     case .idle:                return "Summary: after the next transcript"
     case .running(let file):   return "Summary: running… \(file)"
-    case .done(let file, let t):   return "Summary: \(file) · \(hm(t))"
-    case .failed(let file, let t): return "Summary FAILED: \(file) · \(hm(t))"
+    case .done(let file, let t):      return "Summary: \(file) · \(hm(t))"
+    case .failed(let file, let t, _): return "Summary FAILED: \(file) · \(hm(t))"
+    }
+}
+
+/// What clicking the summary row does. Enablement and the action come from ONE decision, so a row can
+/// never be clickable and then do nothing — the defect this project keeps reproducing. Pure + selftested.
+enum SummaryRowAction: Equatable {
+    case none
+    case reveal(String)              // the file it produced
+    case explain(String, String?)    // (file, why it failed)
+}
+func summaryRowAction(_ activity: SummaryActivity, lastOutput: String?) -> SummaryRowAction {
+    switch activity {
+    case .failed(let file, _, let reason): return .explain(file, reason)
+    case .done, .idle, .running:
+        guard let out = lastOutput else { return .none }
+        return .reveal(out)
+    case .off: return .none
     }
 }
 
@@ -2703,8 +2721,25 @@ final class SummaryStatus {
     func finished(_ file: String, at date: Date, output: String?) {
         lock.lock(); activity = .done(file, date); lastPath = output; lock.unlock()
     }
-    func failed(_ file: String, at date: Date) { lock.lock(); activity = .failed(file, date); lock.unlock() }
+    func failed(_ file: String, at date: Date, reason: String?) {
+        lock.lock(); activity = .failed(file, date, reason: reason); lock.unlock()
+    }
     func resetForTest() { lock.lock(); activity = .idle; lastPath = nil; lock.unlock() }
+}
+
+/// A summary runner writes its STDOUT to `<out>.partial` and only then promotes it, so when it fails
+/// the reason is inside that file, not on stderr — `claude` exiting 1 with "Not logged in · Please run
+/// /login" left nothing but "exit 1" in the log. On failure, read the reason back and delete the orphan.
+/// Returns the first line worth showing, if any. Pure enough to test: the path is injected.
+@discardableResult
+func reapFailedPostProcess(outPath: String, fs: FileManager = .default) -> String? {
+    let partial = outPath + ".partial"
+    defer { try? fs.removeItem(atPath: partial) }
+    guard let data = fs.contents(atPath: partial),
+          let text = String(data: data, encoding: .utf8) else { return nil }
+    let reason = text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        .first(where: { !$0.isEmpty })
+    return reason.map { String($0.prefix(200)) }
 }
 
 func postProcessInvocationFromPrefs(transcriptPath: String) -> String? {
@@ -6583,6 +6618,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private var liveItem: NSMenuItem?   // "Live captions" toggle (macOS 26+)
     private var summaryLine: NSMenuItem!   // what post-processing is doing, refreshed when the menu opens
     private var digestLine: NSMenuItem!
+    private var pendingSummaryAction: SummaryRowAction = .none
     private var grantItem: NSMenuItem?  // "Grant permissions…" — shown ONLY while a permission is missing
     private var paused = false
     private var didAutoPrompt = false   // only auto-open the permission prompts/Settings once per launch
@@ -6754,7 +6790,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         let activity: SummaryActivity = mode == .off ? .off : SummaryStatus.shared.current
         let hm = DateFormatter(); hm.locale = Locale(identifier: "en_US_POSIX"); hm.dateFormat = "HH:mm"
         summaryLine.title = summaryMenuTitle(activity) { hm.string(from: $0) }
-        summaryLine.isEnabled = SummaryStatus.shared.lastOutput != nil
+        pendingSummaryAction = summaryRowAction(activity, lastOutput: SummaryStatus.shared.lastOutput)
+        summaryLine.isEnabled = pendingSummaryAction != .none   // enablement and the click are one decision
 
         let day = DateFormatter(); day.locale = Locale(identifier: "en_US_POSIX"); day.dateFormat = "yyyy-MM-dd"
         digestLine.title = digestMenuTitle(enabled: Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false),
@@ -6763,10 +6800,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
                                            today: day.string(from: Date()))
     }
 
-    /// Clicking the summary row reveals the file it produced — the one thing the user wants from it.
+    /// Clicking the summary row: reveal what it wrote, or explain why it didn't. Never nothing.
     @objc private func revealLastSummary() {
-        guard let path = SummaryStatus.shared.lastOutput else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        switch pendingSummaryAction {
+        case .none:
+            break
+        case .reveal(let path):
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        case .explain(let file, let reason):
+            NSApp.activate(ignoringOtherApps: true)
+            let a = NSAlert()
+            a.messageText = "Summary failed for \(file)"
+            a.informativeText = reason ?? "The summary runner exited with an error and wrote nothing. "
+                + "Check the runner in Settings › Summaries."
+            a.alertStyle = .warning
+            a.addButton(withTitle: "Open Settings")
+            a.addButton(withTitle: "Close").keyEquivalent = "\u{1b}"
+            if a.runModal() == .alertFirstButtonReturn { openSettings() }
+        }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -7059,16 +7110,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         SummaryStatus.shared.started("daily digest \(day)")
         runPostProcessCommand(cmd) { status in
             elog("digest: \(day) finished (exit \(status))")
-            if status == 0 { SummaryStatus.shared.finished("daily digest \(day)", at: Date(), output: out) }
-            else { SummaryStatus.shared.failed("daily digest \(day)", at: Date()) }
-            // The last-run marker is already set, so a failed digest won't retry until tomorrow. Saying
-            // nothing would leave the user with no digest and no idea why (the per-transcript summary
-            // path already pushes on failure — this one didn't).
+            // The last-run marker is already set, so a failed digest won't retry until tomorrow.
             if status == 0 {
+                SummaryStatus.shared.finished("daily digest \(day)", at: Date(), output: out)
                 Notifier.push(title: "Daily digest ready", body: "\(day) — \(inputs.count) meetings", filePath: out)
             } else {
+                let why = reapFailedPostProcess(outPath: out)
+                SummaryStatus.shared.failed("daily digest \(day)", at: Date(), reason: why)
                 Notifier.push(title: "Daily digest failed",
-                              body: "The summary command exited with code \(status) — check the runner in Settings › Summaries.")
+                              body: why ?? "The summary command exited with code \(status) — check Settings › Summaries.")
             }
         }
     }
@@ -8123,7 +8173,32 @@ struct Main {
                   && summaryMenuTitle(.idle, hm: hm) == "Summary: after the next transcript"
                   && summaryMenuTitle(.running("a.md"), hm: hm) == "Summary: running… a.md"
                   && summaryMenuTitle(.done("a.md", stamp), hm: hm) == "Summary: a.md · 12:03"
-                  && summaryMenuTitle(.failed("a.md", stamp), hm: hm) == "Summary FAILED: a.md · 12:03")
+                  && summaryMenuTitle(.failed("a.md", stamp, reason: "Not logged in"), hm: hm)
+                     == "Summary FAILED: a.md · 12:03")
+            // A row that is clickable must DO something. Enablement and the click read one decision, so
+            // they cannot disagree — clicking a failure explains it, never nothing.
+            check("tray: the summary row's click always has an outcome, and a failure explains itself",
+                  summaryRowAction(.failed("a.md", stamp, reason: "Not logged in · Please run /login"), lastOutput: nil)
+                  == .explain("a.md", "Not logged in · Please run /login")
+                  && summaryRowAction(.failed("a.md", stamp, reason: nil), lastOutput: "/s/old.md")
+                  == .explain("a.md", nil)                        // failure wins over a stale old file
+                  && summaryRowAction(.done("a.md", stamp), lastOutput: "/s/a.md") == .reveal("/s/a.md")
+                  && summaryRowAction(.idle, lastOutput: nil) == .none
+                  && summaryRowAction(.off, lastOutput: "/s/a.md") == .none)
+            // The runner writes STDOUT to `<out>.partial` and only then promotes it, so its error message
+            // lands INSIDE that file, never on stderr. `claude` exiting 1 with "Not logged in" left only
+            // "exit 1" in the log, and the orphaned .partial piled up in the notes vault for days.
+            let tmp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("macrec-reap-\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            let outPath = tmp.appendingPathComponent("2026-07-10-1030-standup.md").path
+            try? "Not logged in · Please run /login\n".write(toFile: outPath + ".partial", atomically: true, encoding: .utf8)
+            let reason = reapFailedPostProcess(outPath: outPath)
+            let orphanGone = !FileManager.default.fileExists(atPath: outPath + ".partial")
+            let noReason = reapFailedPostProcess(outPath: tmp.appendingPathComponent("absent.md").path)
+            try? FileManager.default.removeItem(at: tmp)
+            check("summary: a failed runner's reason is read back from its .partial, which is then removed",
+                  reason == "Not logged in · Please run /login" && orphanGone && noReason == nil)
             check("tray: the digest row says off, due, or already written today",
                   digestMenuTitle(enabled: false, dueTime: "20:00", lastRun: "", today: "2026-07-07")
                   == "Daily digest: off"
@@ -8143,6 +8218,10 @@ struct Main {
                   noOutput && running
                   && SummaryStatus.shared.current == .done("a.md", stamp)
                   && SummaryStatus.shared.lastOutput == "/s/a.md")
+            SummaryStatus.shared.failed("b.md", at: stamp, reason: "boom")
+            check("tray: a failure carries its reason all the way to the row's click",
+                  summaryRowAction(SummaryStatus.shared.current, lastOutput: SummaryStatus.shared.lastOutput)
+                  == .explain("b.md", "boom"))
             SummaryStatus.shared.resetForTest()
             // The row is a control, and a control wired to nothing looks perfect until you click it.
             check("tray: the summary row's reveal action is implemented",
