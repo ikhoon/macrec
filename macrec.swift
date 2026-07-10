@@ -2716,6 +2716,9 @@ final class SummaryStatus {
 
     var current: SummaryActivity { lock.lock(); defer { lock.unlock() }; return activity }
     var lastOutput: String? { lock.lock(); defer { lock.unlock() }; return lastPath }
+    /// Both halves under ONE lock: reading them separately lets a failure land between the two and the
+    /// row then offers to reveal a file for a run that just failed.
+    var snapshot: (SummaryActivity, String?) { lock.lock(); defer { lock.unlock() }; return (activity, lastPath) }
 
     func started(_ file: String) { lock.lock(); activity = .running(file); lock.unlock() }
     func finished(_ file: String, at date: Date, output: String?) {
@@ -2735,8 +2738,13 @@ final class SummaryStatus {
 func reapFailedPostProcess(outPath: String, fs: FileManager = .default) -> String? {
     let partial = outPath + ".partial"
     defer { try? fs.removeItem(atPath: partial) }
-    guard let data = fs.contents(atPath: partial),
-          let text = String(data: data, encoding: .utf8) else { return nil }
+    // Read a head, not the file: a runner can stream megabytes before it dies. Lossy decoding, because a
+    // half-written UTF-8 sequence at the cut must not throw the reason away.
+    guard let h = FileHandle(forReadingAtPath: partial) else { return nil }
+    defer { try? h.close() }
+    let head = (try? h.read(upToCount: 8192)) ?? Data()
+    guard !head.isEmpty else { return nil }
+    let text = String(decoding: head, as: UTF8.self)
     let reason = text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
         .first(where: { !$0.isEmpty })
     return reason.map { String($0.prefix(200)) }
@@ -6787,10 +6795,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private func refreshPostProcessRows() {
         let mode = effectivePostProcessMode(rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
                                             shellCmd: Pref.postProcessCommand)
-        let activity: SummaryActivity = mode == .off ? .off : SummaryStatus.shared.current
+        let (live, lastOut) = SummaryStatus.shared.snapshot
+        let activity: SummaryActivity = mode == .off ? .off : live
         let hm = DateFormatter(); hm.locale = Locale(identifier: "en_US_POSIX"); hm.dateFormat = "HH:mm"
         summaryLine.title = summaryMenuTitle(activity) { hm.string(from: $0) }
-        pendingSummaryAction = summaryRowAction(activity, lastOutput: SummaryStatus.shared.lastOutput)
+        pendingSummaryAction = summaryRowAction(activity, lastOutput: lastOut)
         summaryLine.isEnabled = pendingSummaryAction != .none   // enablement and the click are one decision
 
         let day = DateFormatter(); day.locale = Locale(identifier: "en_US_POSIX"); day.dateFormat = "yyyy-MM-dd"
@@ -6798,6 +6807,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
                                            dueTime: Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00"),
                                            lastRun: Pref.explicit(Pref.dailyDigestLastRun, ""),
                                            today: day.string(from: Date()))
+    }
+
+    /// Drives the REAL buildMenu + menuWillOpen and reports the two post-process rows. A deleted call to
+    /// `refreshPostProcessRows` or a renamed selector then leaves the rows frozen and turns the selftest
+    /// red — asserting that a function merely EXISTS proves nothing about it being wired.
+    func postProcessRowsAfterMenuOpenForTest() -> (summary: String, digest: String, enabled: Bool)? {
+        buildMenu()
+        guard let menu = statusItem.menu else { return nil }
+        menuWillOpen(menu)
+        menu.cancelTracking()
+        guard let s = summaryLine, let d = digestLine else { return nil }
+        return (s.title, d.title, s.isEnabled)
     }
 
     /// Clicking the summary row: reveal what it wrote, or explain why it didn't. Never nothing.
@@ -8196,9 +8217,26 @@ struct Main {
             let reason = reapFailedPostProcess(outPath: outPath)
             let orphanGone = !FileManager.default.fileExists(atPath: outPath + ".partial")
             let noReason = reapFailedPostProcess(outPath: tmp.appendingPathComponent("absent.md").path)
+            // Blank leading lines must not be mistaken for "no reason"; a runner that streamed megabytes
+            // before dying must not be slurped whole; invalid UTF-8 must not throw the reason away.
+            let blankPath = tmp.appendingPathComponent("blank.md").path
+            try? "\n\n   \nreal reason here\n".write(toFile: blankPath + ".partial", atomically: true, encoding: .utf8)
+            let skipsBlanks = reapFailedPostProcess(outPath: blankPath) == "real reason here"
+            let emptyPath = tmp.appendingPathComponent("empty.md").path
+            try? "".write(toFile: emptyPath + ".partial", atomically: true, encoding: .utf8)
+            let emptyIsNil = reapFailedPostProcess(outPath: emptyPath) == nil
+            let emptyGone = !FileManager.default.fileExists(atPath: emptyPath + ".partial")
+            let hugePath = tmp.appendingPathComponent("huge.md").path
+            try? ("error first\n" + String(repeating: "x", count: 5_000_000))
+                .write(toFile: hugePath + ".partial", atomically: true, encoding: .utf8)
+            let hugeOK = reapFailedPostProcess(outPath: hugePath) == "error first"
+            let badPath = tmp.appendingPathComponent("bad.md").path
+            try? Data([0xFF, 0xFE, 0x0A] + Array("boom".utf8)).write(to: URL(fileURLWithPath: badPath + ".partial"))
+            let badOK = reapFailedPostProcess(outPath: badPath) != nil   // lossy decode, not a crash or nil
             try? FileManager.default.removeItem(at: tmp)
             check("summary: a failed runner's reason is read back from its .partial, which is then removed",
-                  reason == "Not logged in · Please run /login" && orphanGone && noReason == nil)
+                  reason == "Not logged in · Please run /login" && orphanGone && noReason == nil
+                  && skipsBlanks && emptyIsNil && emptyGone && hugeOK && badOK)
             check("tray: the digest row says off, due, or already written today",
                   digestMenuTitle(enabled: false, dueTime: "20:00", lastRun: "", today: "2026-07-07")
                   == "Daily digest: off"
@@ -8218,14 +8256,29 @@ struct Main {
                   noOutput && running
                   && SummaryStatus.shared.current == .done("a.md", stamp)
                   && SummaryStatus.shared.lastOutput == "/s/a.md")
+            // The row reads BOTH halves under one lock. Reading them separately let a failure land between
+            // the two, so the row offered to reveal a file for the run that had just failed.
             SummaryStatus.shared.failed("b.md", at: stamp, reason: "boom")
+            let (act, out) = SummaryStatus.shared.snapshot
             check("tray: a failure carries its reason all the way to the row's click",
-                  summaryRowAction(SummaryStatus.shared.current, lastOutput: SummaryStatus.shared.lastOutput)
-                  == .explain("b.md", "boom"))
+                  summaryRowAction(act, lastOutput: out) == .explain("b.md", "boom")
+                  && out == "/s/a.md"                       // a stale success path is still remembered…
+                  && summaryRowAction(act, lastOutput: out) != .reveal("/s/a.md"))   // …but never offered
             SummaryStatus.shared.resetForTest()
             // The row is a control, and a control wired to nothing looks perfect until you click it.
             check("tray: the summary row's reveal action is implemented",
                   AppController.instancesRespond(to: Selector(("revealLastSummary"))))
+            // …and menuWillOpen must actually REFRESH those rows. Drive the real menu: a deleted
+            // refreshPostProcessRows() call would leave both titles empty, and this check red.
+            SummaryStatus.shared.resetForTest()
+            SummaryStatus.shared.failed("z.md", at: stamp, reason: "runner exploded")
+            let rows = AppController().postProcessRowsAfterMenuOpenForTest()
+            SummaryStatus.shared.resetForTest()
+            check("tray: opening the menu refreshes the post-process rows from live status",
+                  rows != nil
+                  && rows!.summary.hasPrefix("Summary")           // not the empty title it was built with
+                  && rows!.digest.hasPrefix("Daily digest")
+                  && (rows!.summary.contains("z.md") || rows!.summary == "Summaries: off"))
             check("flush push: terminal statuses classified, transient ones wait",
                   flushOutcome(for: "Saved: 2026-07-05-2100-2130.md")! == ("Transcript ready", "2026-07-05-2100-2130.md")
                   && flushOutcome(for: "No speech — discarded") != nil
