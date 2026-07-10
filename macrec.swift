@@ -2081,11 +2081,15 @@ final class RecordingEngine {
             if let cmd = postProcessInvocationFromPrefs(transcriptPath: url.path) {
                 let file = url.lastPathComponent
                 SummaryStatus.shared.started(file)
-                let out = summaryOutputPath(transcriptPath: url.path,
-                                            outDir: Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT"))
+                let mode = effectivePostProcessMode(rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
+                                                    shellCmd: Pref.postProcessCommand)
+                // A shell hook writes nowhere we know, so there is no file to reveal and no partial to reap.
+                let out = postProcessWritesSummaryFile(mode)
+                    ? summaryOutputPath(transcriptPath: url.path, outDir: Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT"))
+                    : nil
                 runPostProcessCommand(cmd) { status in
                     guard status != 0 else { SummaryStatus.shared.finished(file, at: Date(), output: out); return }
-                    let why = reapFailedPostProcess(outPath: out)
+                    let why = out.flatMap { reapFailedPostProcess(outPath: $0) }
                     SummaryStatus.shared.failed(file, at: Date(), reason: why)
                     elog("engine: post-process exited \(status) for \(file)" + (why.map { " — \($0)" } ?? ""))
                     Notifier.push(title: "Summary failed",
@@ -2741,6 +2745,12 @@ final class SummaryStatus {
     }
     func resetForTest() { lock.lock(); activity = .idle; lastPath = nil; lock.unlock() }
 }
+
+/// Does this mode write a summary file at the summary path? Only the built-in `.summary` mode redirects
+/// into `<out>.partial` and promotes it. A freeform shell hook is handed the transcript and writes
+/// wherever it likes — offering to reveal `<out>` after it runs would open a file that never existed,
+/// and reading `<out>.partial` for a failure reason would find nothing. Pure + selftested.
+func postProcessWritesSummaryFile(_ mode: PostProcessMode) -> Bool { mode == .summary }
 
 /// A summary runner writes its STDOUT to `<out>.partial` and only then promotes it, so when it fails
 /// the reason is inside that file, not on stderr — `claude` exiting 1 with "Not logged in · Please run
@@ -6727,8 +6737,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
 
     /// Grey out "Pause" when nothing is recording to pause (off-hours / idle); the menu re-validates
     /// each time it opens. "Resume" (paused) stays enabled. Other items are unaffected.
+    /// The menu auto-enables its items, so AppKit calls this AFTER menuWillOpen and it has the last word.
+    /// Setting `isEnabled` directly on a target/action row is silently undone here.
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem === toggleItem { return pauseItemEnabled(paused: paused, schedulePaused: schedulePaused, hasEngine: engine != nil) }
+        if menuItem === summaryLine { return pendingSummaryAction != .none }
         return true
     }
 
@@ -6814,8 +6827,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         let activity: SummaryActivity = mode == .off ? .off : live
         let hm = DateFormatter(); hm.locale = Locale(identifier: "en_US_POSIX"); hm.dateFormat = "HH:mm"
         summaryLine.title = summaryMenuTitle(activity) { hm.string(from: $0) }
+        // Enablement is decided ONCE, in validateMenuItem, from this same action — assigning isEnabled
+        // here would be overwritten by AppKit's validation pass.
         pendingSummaryAction = summaryRowAction(activity, lastOutput: lastOut)
-        summaryLine.isEnabled = pendingSummaryAction != .none   // enablement and the click are one decision
 
         let day = DateFormatter(); day.locale = Locale(identifier: "en_US_POSIX"); day.dateFormat = "yyyy-MM-dd"
         digestLine.title = digestMenuTitle(enabled: Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false),
@@ -6831,6 +6845,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         buildMenu()
         guard let menu = statusItem.menu else { return nil }
         menuWillOpen(menu)
+        // The menu auto-enables its items: AppKit re-validates every target/action item AFTER
+        // menuWillOpen, so reading `isEnabled` here without an update() pass reads back the value we
+        // just assigned, not the one the user sees. Drive the real validation.
+        menu.update()
         menu.cancelTracking()
         guard let s = summaryLine, let d = digestLine else { return nil }
         return (s.title, d.title, s.isEnabled)
@@ -8229,6 +8247,12 @@ struct Main {
                      == "Summary FAILED: a.md · 12:03")
             // A row that is clickable must DO something. Enablement and the click read one decision, so
             // they cannot disagree — clicking a failure explains it, never nothing.
+            // A freeform shell hook writes nowhere we know: nothing to reveal, no partial to reap.
+            check("summary: only the built-in summary mode writes a file we can reveal or reap",
+                  postProcessWritesSummaryFile(.summary)
+                  && !postProcessWritesSummaryFile(.shell)
+                  && !postProcessWritesSummaryFile(.off)
+                  && summaryRowAction(.done("a.md", stamp), lastOutput: nil) == .none)   // shell mode
             check("tray: the summary row's click always has an outcome, and a failure explains itself",
                   summaryRowAction(.failed("a.md", stamp, reason: "Not logged in · Please run /login"), lastOutput: nil)
                   == .explain("a.md", "Not logged in · Please run /login")
@@ -8311,12 +8335,18 @@ struct Main {
             SummaryStatus.shared.resetForTest()
             SummaryStatus.shared.failed("z.md", at: stamp, reason: "runner exploded")
             let rows = AppController().postProcessRowsAfterMenuOpenForTest()
-            SummaryStatus.shared.resetForTest()
             check("tray: opening the menu refreshes the post-process rows from live status",
                   rows != nil
                   && rows!.summary.hasPrefix("Summary")           // not the empty title it was built with
                   && rows!.digest.hasPrefix("Daily digest")
                   && (rows!.summary.contains("z.md") || rows!.summary == "Summaries: off"))
+            // A row with nothing to show must be GREY after AppKit's validation pass, not merely after
+            // our own `isEnabled = false`. The menu auto-enables items, so validateMenuItem has the last
+            // word — assigning isEnabled and reading it straight back was a test asserting itself.
+            SummaryStatus.shared.resetForTest()   // .idle, no output → the row can do nothing
+            let idleRows = AppController().postProcessRowsAfterMenuOpenForTest()
+            check("tray: a summary row with nothing to reveal is disabled after AppKit re-validates it",
+                  idleRows != nil && idleRows!.enabled == false)
             check("flush push: terminal statuses classified, transient ones wait",
                   flushOutcome(for: "Saved: 2026-07-05-2100-2130.md")! == ("Transcript ready", "2026-07-05-2100-2130.md")
                   && flushOutcome(for: "No speech — discarded") != nil
