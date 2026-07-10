@@ -28,12 +28,34 @@ import Compression   // zlib ratio — whisper repetition-loop detector (see Tra
 
 /// Minimal Keychain string store for long-lived credentials (generic passwords under this app's service).
 enum Keychain {
+    /// One SecItem read per account per process: every read is an authorization check, and an unsigned
+    /// build turns each one into a password prompt.
+    private static let lock = NSLock()
+    private static var cache: [String: String?] = [:]
+    private static var reads = 0
+
+    /// Set by the CLI subcommands that must never touch the user's real credentials.
+    nonisolated(unsafe) static var disabled = false
+
+    /// Reads that actually reached the Keychain. A flood of prompts is a caching bug, not a quirk.
+    static var readsForTest: Int { lock.lock(); defer { lock.unlock() }; return reads }
+
     private static func query(_ account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: "com.ikhoon.macrec",
          kSecAttrAccount as String: account]
     }
     static func get(_ account: String) -> String? {
+        if disabled { return nil }
+        lock.lock()
+        if let hit = cache[account] { lock.unlock(); return hit }
+        lock.unlock()
+        let value = read(account)
+        lock.lock(); cache[account] = value; lock.unlock()
+        return value
+    }
+    private static func read(_ account: String) -> String? {
+        lock.lock(); reads += 1; lock.unlock()
         var q = query(account)
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -52,9 +74,12 @@ enum Keychain {
     /// Returns whether the operation actually succeeded (callers migrating data must check).
     @discardableResult
     static func set(_ account: String, _ value: String) -> Bool {
+        if disabled { return true }
+        func remember(_ v: String?) { lock.lock(); cache[account] = v; lock.unlock() }
         guard !value.isEmpty else {
             let status = SecItemDelete(query(account) as CFDictionary)
             if status != errSecSuccess && status != errSecItemNotFound { elog("keychain: delete '\(account)' failed (\(status))"); return false }
+            remember(nil)
             return true
         }
         let data = Data(value.utf8)
@@ -67,6 +92,7 @@ enum Keychain {
             status = SecItemAdd(q as CFDictionary, nil)
         }
         if status != errSecSuccess { elog("keychain: save '\(account)' failed (\(status))"); return false }
+        remember(value)
         return true
     }
 }
@@ -4067,6 +4093,7 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
     /// sole stored credential).
     static var storedKey: String? {
         if let k = Keychain.get("deepgram") { return k }
+        guard !Keychain.disabled else { return nil }   // never migrate (nor delete the legacy pref) in tests
         if let k = Pref.d.string(forKey: Pref.deepgramKey), !k.isEmpty {
             if Keychain.set("deepgram", k) { Pref.d.removeObject(forKey: Pref.deepgramKey) }
             return k
@@ -6134,6 +6161,12 @@ struct Main {
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
 
+        // The test/snapshot subcommands build the real Settings pane and the real overlay, both of which
+        // ask every engine whether it is ready — a Keychain read each. Run them against no credentials.
+        if let a = args.first, ["selftest", "settings-snapshot", "icon-snapshot", "caption-snapshot"].contains(a) {
+            Keychain.disabled = true
+        }
+
         // Subcommands: help / version (accept the common flag spellings too).
         if let a = args.first, ["help", "--help", "-h"].contains(a) { printMacrecHelp(); exit(0) }
         if let a = args.first, ["version", "--version", "-v"].contains(a) { print("macrec \(macrecVersion)"); exit(0) }
@@ -6196,6 +6229,10 @@ struct Main {
             check("en-GB → en-GB (exact)",      pick("en-GB") == "en-GB")
             check("es_MX → same-language es",   pick("es_MX") == "es-US" || pick("es_MX") == "es-ES")
             check("unsupported lang → nil",     pick("sw_TZ") == nil)
+            // The harness must never read the user's real credentials, and a repeated read is a prompt.
+            _ = Keychain.get("deepgram"); _ = Keychain.get("deepgram"); _ = Keychain.get("openai")
+            check("keychain: the test harness never touches the real Keychain",
+                  Keychain.disabled && Keychain.readsForTest == 0 && Keychain.get("deepgram") == nil)
             check("labels ko → 나/상대",         speakerLabels(forLanguage: "ko") == ("나", "상대"))
             check("labels en → Me/Them",        speakerLabels(forLanguage: "en") == ("Me", "Them"))
             check("labels ja → 私/相手",         speakerLabels(forLanguage: "ja") == ("私", "相手"))
