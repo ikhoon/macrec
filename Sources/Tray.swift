@@ -1,0 +1,997 @@
+// The menu-bar app: the tray icon and its menu, the notifications it posts, and the AppController
+// that owns the recording engine and every window.
+
+import AppKit
+import AVFoundation
+import Foundation
+import UserNotifications
+
+
+enum Notifier {
+    static func requestAuth() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, err in
+            elog("notify: authorization granted=\(granted)\(err.map { " error=\($0)" } ?? "")")
+        }
+    }
+    /// filePath rides in userInfo; clicking the notification opens it (AppController is the delegate).
+    static func push(title: String, body: String, filePath: String? = nil, openURL: URL? = nil) {
+        let c = UNMutableNotificationContent()
+        c.title = title; c.body = body; c.sound = .default
+        var info: [String: String] = [:]
+        if let filePath { info["file"] = filePath }               // a local path — opened as a file on click
+        if let openURL { info["url"] = openURL.absoluteString }   // a web link — kept DISTINCT so a URL is never opened as a path
+        if !info.isEmpty { c.userInfo = info }
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)
+        ) { err in if let err { elog("notify: add failed: \(err)") } }
+    }
+}
+
+/// Container for a custom NSMenuItem view that replicates the NATIVE hover behavior a plain view
+/// lacks: the selection-material pill behind the row and an inverted (white) label while hovered.
+/// AppKit draws that for ordinary items only — a `view`-backed item gets nothing. The view-backed
+/// row exists so clicking "Transcribe now" does NOT dismiss the menu (user pick — watch the row's
+/// spinner in place). Tracking uses .activeAlways because menu tracking runs in its own event mode.
+final class MenuHoverView: NSView {
+    private let highlight = NSVisualEffectView()
+    var onHover: ((Bool) -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        autoresizingMask = [.width]              // stretch with whatever width the menu settles on
+        highlight.material = .selection
+        highlight.state = .active
+        highlight.isEmphasized = true
+        highlight.blendingMode = .behindWindow
+        highlight.wantsLayer = true
+        highlight.layer?.cornerRadius = 4
+        highlight.layer?.cornerCurve = .continuous
+        highlight.isHidden = true
+        highlight.frame = bounds.insetBy(dx: 5, dy: 0)   // native menus inset the pill ~5 pt
+        highlight.autoresizingMask = [.width, .height]
+        addSubview(highlight, positioned: .below, relativeTo: nil)
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) { setHover(true) }
+    override func mouseExited(with event: NSEvent) { setHover(false) }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        setHover(false)   // a menu reopen must never resurrect last time's highlight
+    }
+
+    func setHover(_ inside: Bool) {
+        highlight.isHidden = !inside
+        onHover?(inside)
+    }
+
+    var highlightVisibleForTest: Bool { !highlight.isHidden }
+    var trackingReadyForTest: Bool { updateTrackingAreas(); return !trackingAreas.isEmpty }
+}
+
+/// "WE stopped the engine" — the user paused (`paused`) OR the schedule parked it off-hours
+/// (`schedulePaused`). Clicking Resume in either state resumes/overrides and records now. This is the
+/// ONE decision behind the tray toggle: its label, its enablement, and what a click does all route
+/// through here, so they can't disagree (the schedule-paused Resume no-op was two of them
+/// disagreeing — the click branch resumed only `if paused`). Pure + selftested.
+func togglePauseShouldResume(paused: Bool, schedulePaused: Bool) -> Bool { paused || schedulePaused }
+
+/// Whether the tray's Pause/Resume item should be clickable: enabled while stopped-by-us (so Resume
+/// works, incl. off-hours) or while an engine is recording (so Pause works). Only true idle greys it
+/// out. Pure.
+func pauseItemEnabled(paused: Bool, schedulePaused: Bool, hasEngine: Bool) -> Bool {
+    togglePauseShouldResume(paused: paused, schedulePaused: schedulePaused) || hasEngine
+}
+
+/// The two CAPTURE grants that gate recording are satisfied (System Audio + Microphone). Neutral
+/// predicate shared by `allPermissionsGranted()` and the "Grant permissions…" hide logic — Calendar is
+/// optional (titling) and deliberately excluded so a user who declined it isn't nagged. Pure + selftested.
+func captureGrantsSatisfied(audioGranted: Bool, micGranted: Bool) -> Bool { audioGranted && micGranted }
+
+/// A directory picker on a menu-bar (`.accessory`) app must present as a SHEET on a VISIBLE window,
+/// or a bare `runModal()` opens behind everything (the "Choose… did nothing" bug). Fall back to
+/// activate-then-runModal only when there's no visible window to host a sheet. Pure + selftested.
+enum DirPickerPresentation: Equatable { case sheet, activateAndRunModal }
+func dirPickerPresentation(hasVisibleWindow: Bool) -> DirPickerPresentation {
+    hasVisibleWindow ? .sheet : .activateAndRunModal
+}
+
+/// The clickable URL for the "update available" alert, or nil for no button. Homebrew installs get no
+/// button (they upgrade via `brew`). Otherwise the release URL — but ONLY if it is https (never let a
+/// surprise API payload open a `file:` / `javascript:` / custom-scheme URL), falling back to the
+/// hardcoded https releases page when the API url is missing/blank/unsafe. Pure + selftested.
+func updateAlertOpenURL(installedViaBrew: Bool, htmlURL: String?, releasesURL: String) -> URL? {
+    guard !installedViaBrew else { return nil }
+    for s in [htmlURL, releasesURL] {
+        if let s, let u = URL(string: s), u.scheme?.lowercased() == "https" { return u }
+    }
+    return nil
+}
+
+/// A small rounded-tile vendor badge (solid brand color + white SF Symbol) for Settings section headers
+/// and picker items — at-a-glance identity for each engine/runner. NOT a trademarked logo: a
+/// self-contained, self-signed app can't embed those, so this is a tasteful brand-colored mark instead.
+func vendorBadge(_ symbol: String, _ color: NSColor, side: CGFloat = 18) -> NSImage {
+    let glyphCfg = NSImage.SymbolConfiguration(pointSize: side * 0.56, weight: .semibold)
+        .applying(NSImage.SymbolConfiguration(paletteColors: [.white]))
+    let glyph = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(glyphCfg)
+    let img = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+        let body = rect.insetBy(dx: 0.5, dy: 0.5)
+        NSGraphicsContext.current?.saveGraphicsState()
+        NSBezierPath(roundedRect: body, xRadius: body.width * 0.28, yRadius: body.width * 0.28).addClip()
+        color.setFill(); body.fill()
+        NSGraphicsContext.current?.restoreGraphicsState()
+        if let glyph {
+            let g = glyph.size
+            glyph.draw(in: NSRect(x: (side - g.width)/2, y: (side - g.height)/2, width: g.width, height: g.height))
+        }
+        return true
+    }
+    img.isTemplate = false
+    return img
+}
+
+/// macrec's menu-bar mark: the waveform-with-mic glyph (the old "transcribe" tray icon the user likes)
+/// as a menu-bar TEMPLATE so it adapts to the light/dark menu bar — no colored tile (user: drop the blue
+/// background). Voice tints it light orange; paused/idle dims the same mark (maccal-style) so it reads
+/// inactive. Rendered at the glyph's NATURAL aspect (waveform-mic is wider than tall — a square box clipped it).
+func brandMarkImage(side: CGFloat, recording: Bool, voice: Bool) -> NSImage {
+    let lightOrange = NSColor.systemOrange.blended(withFraction: 0.35, of: .white) ?? .systemOrange
+    let glyphCfg = NSImage.SymbolConfiguration(pointSize: side * 0.78, weight: .regular)
+        .applying(NSImage.SymbolConfiguration(paletteColors: [voice ? lightOrange : .white]))
+    let glyph = NSImage(systemSymbolName: "waveform.badge.mic", accessibilityDescription: "macrec")?
+        .withSymbolConfiguration(glyphCfg)
+    let sz = glyph?.size ?? NSSize(width: side, height: side)   // natural aspect, not forced square
+    let img = NSImage(size: sz, flipped: false) { rect in
+        // paused/idle draws the same mark at 45% so it reads inactive (maccal-style). `fraction` is the
+        // reliable opacity knob for NSImage.draw (cgContext.setAlpha didn't take).
+        glyph?.draw(in: rect, from: .zero, operation: .sourceOver, fraction: recording ? 1.0 : 0.45)
+        return true
+    }
+    img.isTemplate = !voice   // template adapts to the light/dark menu bar; the voice tint keeps its color
+    return img
+}
+
+/// Headless guard: the brand mark actually draws (not an all-transparent image — the "shipped visually
+/// destroyed" class of bug). Renders to an offscreen bitmap and checks a meaningful fraction is opaque.
+func brandMarkHasContent(recording: Bool, voice: Bool) -> Bool {
+    let side: CGFloat = 18, scale = 4
+    let px = Int(side) * scale
+    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return false }
+    rep.size = NSSize(width: side, height: side)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    brandMarkImage(side: side, recording: recording, voice: voice).draw(in: NSRect(x: 0, y: 0, width: side, height: side))
+    NSGraphicsContext.restoreGraphicsState()
+    var opaque = 0
+    for y in 0..<rep.pixelsHigh { for x in 0..<rep.pixelsWide {
+        if (rep.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.1 { opaque += 1 }
+    }}
+    return opaque > px * px / 10   // ≥ ~10% drawn
+}
+
+final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private var engine: RecordingEngine?
+    private var stopTask: Task<Void, Never>?   // in-flight engine stop (pause) — resume/restart await it so
+                                               // two capture pipelines never overlap on the shared audio state
+    private var voiceTimer: Timer?             // ~1 Hz poll for the voice-activity tray tint
+    private var schedTimer: Timer?             // ~30 s recording-schedule enforcement
+    private var notifyWhenTranscribed = false  // armed by "Transcribe now" — the menu closed, push the outcome
+    private var lastTranscriptURL: URL?        // most recent saved transcript (notification click opens it)
+    private var flushBusy = false              // one manual flush at a time; the row spinner shows progress
+    private var flushGeneration = 0            // failsafe-timeout token (a new flush invalidates old timers)
+    private var transcribeBtn: NSButton!               // "Transcribe now" row (view-backed: menu stays open)
+    private let menuRowSpinner = NSProgressIndicator() // replaces the row's icon while the flush runs
+    private var transcribeRowTitle = "Transcribe now"  // flashes the outcome ("No speech found") briefly
+    private var rowHovered = false                     // hover restyle must not clobber a flashed title
+    private var spinStartedAt: TimeInterval = 0        // enforce a visible minimum spin (see spinnerHold)
+    private var schedulePaused = false         // the SCHEDULE stopped the engine (vs the user's `paused`)
+    private var scheduleOverrideUntil: Date?   // manual Pause/Resume wins until this boundary passes
+    private var startTask: Task<Void, Never>?  // in-flight engine start — stops must wait for it
+    private var voiceShown = false
+    private var lastVoiceAt: TimeInterval = 0
+    private var statusLine: NSMenuItem!
+    private var levelItem: NSMenuItem!
+    private var lastSavedLine: NSMenuItem!
+    private var modelLine: NSMenuItem!
+    private var toggleItem: NSMenuItem!
+    private var liveItem: NSMenuItem?   // "Live captions" toggle (macOS 26+)
+    private var summaryLine: NSMenuItem!   // what post-processing is doing, refreshed when the menu opens
+    private var digestLine: NSMenuItem!
+    private var pendingSummaryAction: SummaryRowAction = .none
+    private var digestInFlight = false   // the 30 s tick must not launch a second digest
+    private var grantItem: NSMenuItem?  // "Grant permissions…" — shown ONLY while a permission is missing
+    private var paused = false
+    private var didAutoPrompt = false   // only auto-open the permission prompts/Settings once per launch
+    private var checkingForUpdates = false   // a manual update check is in flight — don't stack modal alerts
+    private var settingsWC: SettingsWindowController?
+    private var levelTimer: Timer?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Single instance: if a copy is already running (the LaunchAgent one), just tell it to open
+        // its menu and quit this launch — so clicking the app in /Applications opens the tray menu.
+        let bid = Bundle.main.bundleIdentifier ?? "com.ikhoon.macrec"
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+            .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+        if !others.isEmpty {
+            DistributedNotificationCenter.default().postNotificationName(
+                .init("com.ikhoon.macrec.openMenu"), object: nil, deliverImmediately: true)
+            NSApp.terminate(nil); return
+        }
+        buildMenu()
+        let vt = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.pollVoice() }
+        RunLoop.main.add(vt, forMode: .common)   // .common so the tint updates while menus track too
+        voiceTimer = vt
+        let st = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async { self?.checkSchedule(); self?.maybeRunDailyDigest(); self?.maybeCheckForUpdates() }   // timer runs in .common; engine state is main-confined
+        }
+        RunLoop.main.add(st, forMode: .common)
+        schedTimer = st
+        DistributedNotificationCenter.default().addObserver(
+            forName: .init("com.ikhoon.macrec.openMenu"), object: nil, queue: .main
+        ) { [weak self] _ in self?.openMenu() }
+        UNUserNotificationCenter.current().delegate = self   // click a completion push → open the file
+        CalendarLookup.requestAccess()   // one-time Calendar prompt (for titling transcripts)
+        setupModelDownload()             // first-run: fetch the large model, show progress in the menu
+        LoginItem.autoEnableOnceIfDistributed()   // distributed app: enable 24/7 autostart on first run
+        startEngineRespectingSchedule()           // a 23:00 login with a 10-19h schedule must NOT record
+        installStopHandler { [weak self] in
+            // `engine` is main-confined (voice poll, menu actions read it there) — the signal source
+            // fires on its own queue, so hop to main before touching it (review finding: racy mutation).
+            DispatchQueue.main.async {
+                self?.stopEngineSync()
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
+    private func setIcon(recording: Bool, voice: Bool = false) {
+        // The macrec menu-bar mark (waveform-mic glyph, template) — adapts to light/dark, no colored tile
+        // (user: drop the blue background). Voice tints light orange; paused/idle dims it (maccal-style).
+        let img = brandMarkImage(side: 18, recording: recording, voice: voice)
+        statusItem.button?.image = img
+        statusItem.length = ceil(img.size.width) + 4
+        if Pref.bool("trayDebug", "MR_TRAY_DEBUG", false) {
+            elog("icon set (recording=\(recording), voice=\(voice)), length=\(statusItem.length)")
+        }
+    }
+
+    /// Poll the engine's recent input levels (~1 Hz, negligible) and reflect "voice being picked up"
+    /// in the tray glyph. 2 s hysteresis so normal speech pauses don't flicker the icon.
+    private func pollVoice() {
+        guard let eng = engine, !paused else {
+            if voiceShown { voiceShown = false; setIcon(recording: engine != nil && !paused) }
+            return
+        }
+        let (mic, sys) = eng.liveLevels()
+        let now = ProcessInfo.processInfo.systemUptime
+        if max(mic, sys) > 0.02 { lastVoiceAt = now }   // ≈ one meter dot — speech, not room noise
+        let active = now - lastVoiceAt < 2.0
+        if active != voiceShown { voiceShown = active; setIcon(recording: true, voice: active) }
+    }
+
+    private func item(_ title: String, _ sel: Selector, _ key: String = "", symbol: String = "") -> NSMenuItem {
+        let i = NSMenuItem(title: title, action: sel, keyEquivalent: key); i.target = self
+        if !symbol.isEmpty { i.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title) }
+        return i
+    }
+
+    /// The two CAPTURE grants that gate recording are in place (System Audio + Microphone) — used to
+    /// hide "Grant permissions…" when there's nothing recording-critical left to grant (re-checked each
+    /// menu open, so allowing them elsewhere clears it). Calendar is optional and intentionally excluded.
+    private func allPermissionsGranted() -> Bool {
+        captureGrantsSatisfied(audioGranted: audioCaptureAuthorized(), micGranted: micAuthorized())
+    }
+
+    /// Grey out "Pause" when nothing is recording to pause (off-hours / idle); the menu re-validates
+    /// each time it opens. "Resume" (paused) stays enabled. Other items are unaffected.
+    /// The menu auto-enables its items, so AppKit calls this AFTER menuWillOpen and it has the last word.
+    /// Setting `isEnabled` directly on a target/action row is silently undone here.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem === toggleItem { return pauseItemEnabled(paused: paused, schedulePaused: schedulePaused, hasEngine: engine != nil) }
+        if menuItem === summaryLine { return pendingSummaryAction != .none }
+        return true
+    }
+
+    private func buildMenu() {
+        setIcon(recording: false)
+        let menu = NSMenu()
+        // Transcribe now keeps the menu OPEN while the status line swaps between
+        // strings of different lengths ("● Transcribing…" → "● No speech —
+        // skipped" → "● Recording · mic + system audio"). An NSMenu re-measures
+        // its width per change, so the open menu visibly jiggles. Pin a minimum
+        // width sized to the longest routine status so text swaps never resize it.
+        let widestStatus = "⚠ Grant System Audio Recording + Microphone to macrec"
+        let statusFont = NSFont.menuFont(ofSize: 0)
+        menu.minimumWidth = (widestStatus as NSString)
+            .size(withAttributes: [.font: statusFont]).width + 36 // item insets
+        // About on top (macOS convention), then a divider.
+        menu.addItem(item("About macrec", #selector(showAbout), symbol: "info.circle"))
+        menu.addItem(item("Check for Updates…", #selector(checkForUpdates), symbol: "arrow.triangle.2.circlepath"))
+        menu.addItem(.separator())
+        // Live status rows (disabled — informational; they carry their own inline status glyphs).
+        statusLine = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: ""); statusLine.isEnabled = false
+        levelItem = NSMenuItem(title: "🎤 —   🔊 —", action: nil, keyEquivalent: ""); levelItem.isEnabled = false
+        lastSavedLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); lastSavedLine.isEnabled = false; lastSavedLine.isHidden = true
+        modelLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); modelLine.isEnabled = false; modelLine.isHidden = true
+        // Post-processing used to leave no trace at all, so a working pipeline read as a broken one.
+        summaryLine = NSMenuItem(title: "", action: #selector(revealLastSummary), keyEquivalent: "")
+        summaryLine.target = self
+        digestLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); digestLine.isEnabled = false
+        menu.addItem(statusLine); menu.addItem(levelItem); menu.addItem(lastSavedLine); menu.addItem(modelLine)
+        menu.addItem(summaryLine); menu.addItem(digestLine)
+        menu.addItem(.separator())
+        // Transcribe now — view-backed so the click does NOT dismiss the menu (user pick, round 2:
+        // stay open and watch the row's spinner in place). MenuHoverView supplies the native-style
+        // hover pill AppKit withholds from view-backed items; the completion push still fires for
+        // whenever the menu IS closed while a flush runs.
+        let tItem = NSMenuItem()
+        let tView = MenuHoverView(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
+        let tBtn = NSButton(title: "Transcribe now", target: self, action: #selector(flushNow))
+        tBtn.isBordered = false; tBtn.alignment = .left
+        transcribeBtn = tBtn
+        styleTranscribeRow()
+        tView.onHover = { [weak self] hovered in
+            self?.rowHovered = hovered
+            self?.styleTranscribeRow()
+        }
+        tBtn.image = NSImage(systemSymbolName: "doc.badge.plus", accessibilityDescription: "Transcribe now")
+        tBtn.imagePosition = .imageLeading
+        // AppKit's default image↔title gap matches the standard imaged items; a small left inset
+        // lines the icon up with them.
+        tBtn.frame = NSRect(x: 14, y: 1, width: 221, height: 20)
+        tBtn.autoresizingMask = [.width]
+        menuRowSpinner.style = .spinning
+        menuRowSpinner.controlSize = .small
+        menuRowSpinner.isDisplayedWhenStopped = false
+        menuRowSpinner.frame = NSRect(x: 13, y: 3, width: 16, height: 16)   // sits where the icon was
+        tView.addSubview(tBtn); tView.addSubview(menuRowSpinner); tItem.view = tView
+        menu.addItem(tItem)
+        toggleItem = item("Pause", #selector(togglePause), symbol: "pause.circle"); menu.addItem(toggleItem)
+        if #available(macOS 26, *) {   // real-time caption overlay (on-device SpeechAnalyzer)
+            let li = item("Live captions", #selector(toggleLive), symbol: "captions.bubble")
+            li.state = LiveCaptions.shared.active ? .on : .off
+            liveItem = li; menu.addItem(li)
+        }
+        menu.addItem(.separator())
+        let grant = item("Grant permissions…", #selector(grantPermissions), symbol: "hand.raised")
+        grant.isHidden = allPermissionsGranted()   // only surfaces when audio or mic is still missing
+        grantItem = grant
+        menu.addItem(grant)
+        menu.addItem(item("Settings…", #selector(openSettings), ",", symbol: "gearshape"))
+        menu.addItem(item("Open transcripts folder", #selector(openTranscripts), "o", symbol: "folder"))
+        menu.addItem(.separator())
+        menu.addItem(item("Quit", #selector(quit), "q", symbol: "power"))
+        menu.delegate = self
+        statusItem.menu = menu
+    }
+
+    // Live input meter — only updates while the menu is open (cheap, and answers "is it working?").
+    /// The summary/digest rows, re-derived from prefs and live status every time the menu opens.
+    private func refreshPostProcessRows() {
+        let mode = effectivePostProcessMode(rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
+                                            shellCmd: Pref.postProcessCommand)
+        let (live, lastOut) = SummaryStatus.shared.snapshot
+        let activity: SummaryActivity = mode == .off ? .off : live
+        let hm = DateFormatter(); hm.locale = Locale(identifier: "en_US_POSIX"); hm.dateFormat = "HH:mm"
+        summaryLine.title = summaryMenuTitle(activity) { hm.string(from: $0) }
+        // Enablement is decided ONCE, in validateMenuItem, from this same action — assigning isEnabled
+        // here would be overwritten by AppKit's validation pass.
+        pendingSummaryAction = summaryRowAction(activity, lastOutput: lastOut)
+
+        let day = DateFormatter(); day.locale = Locale(identifier: "en_US_POSIX"); day.dateFormat = "yyyy-MM-dd"
+        digestLine.title = digestMenuTitle(enabled: Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false),
+                                           dueTime: Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00"),
+                                           lastRun: Pref.explicit(Pref.dailyDigestLastRun, ""),
+                                           today: day.string(from: Date()))
+    }
+
+    /// Drives the REAL buildMenu + menuWillOpen and reports the two post-process rows. A deleted call to
+    /// `refreshPostProcessRows` or a renamed selector then leaves the rows frozen and turns the selftest
+    /// red — asserting that a function merely EXISTS proves nothing about it being wired.
+    func postProcessRowsAfterMenuOpenForTest() -> (summary: String, digest: String, enabled: Bool)? {
+        buildMenu()
+        guard let menu = statusItem.menu else { return nil }
+        menuWillOpen(menu)
+        // The menu auto-enables its items: AppKit re-validates every target/action item AFTER
+        // menuWillOpen, so reading `isEnabled` here without an update() pass reads back the value we
+        // just assigned, not the one the user sees. Drive the real validation.
+        menu.update()
+        menu.cancelTracking()
+        guard let s = summaryLine, let d = digestLine else { return nil }
+        return (s.title, d.title, s.isEnabled)
+    }
+
+    /// Clicking the summary row: reveal what it wrote, or explain why it didn't. Never nothing.
+    @objc private func revealLastSummary() {
+        switch pendingSummaryAction {
+        case .none:
+            break
+        case .reveal(let path):
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        case .explain(let file, let reason):
+            NSApp.activate(ignoringOtherApps: true)
+            let a = NSAlert()
+            a.messageText = "Summary failed for \(file)"
+            a.informativeText = reason ?? "The summary runner exited with an error and wrote nothing. "
+                + "Check the runner in Settings › Summaries."
+            a.alertStyle = .warning
+            a.addButton(withTitle: "Open Settings")
+            a.addButton(withTitle: "Close").keyEquivalent = "\u{1b}"
+            if a.runModal() == .alertFirstButtonReturn { openSettings() }
+        }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        // Opt-in tray diagnostics (`defaults write com.ikhoon.macrec.prefs trayDebug -bool true`): the
+        // menu anchors to the status button's WINDOW — if it ever opens detached (screen edge, the
+        // reported multi-display bug), this frame is the evidence. The probe file additionally lets a
+        // remote diagnostic open+auto-close the menu (`touch /tmp/macrec-tray-probe && open -a macrec`).
+        if Pref.bool("trayDebug", "MR_TRAY_DEBUG", false) {
+            if let win = statusItem.button?.window {
+                let screens = NSScreen.screens.map { "(\(Int($0.frame.minX)),\(Int($0.frame.minY)) \(Int($0.frame.width))×\(Int($0.frame.height)))" }.joined(separator: " ")
+                elog("tray-diag open: btnWin=\(NSStringFromRect(win.frame)) onScreen=\(NSStringFromRect(win.screen?.frame ?? .zero)) mouse=\(NSStringFromPoint(NSEvent.mouseLocation)) len=\(statusItem.length) vis=\(statusItem.isVisible) screens=\(screens)")
+            }
+            if FileManager.default.fileExists(atPath: "/tmp/macrec-tray-probe") {
+                try? FileManager.default.removeItem(atPath: "/tmp/macrec-tray-probe")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { menu.cancelTracking() }
+            }
+        }
+        updateLevels()
+        // Reflect the live-captions state in case it was turned off by closing the floating panel.
+        if #available(macOS 26, *) { liveItem?.state = LiveCaptions.shared.active ? .on : .off }
+        // Hide "Grant permissions…" once both grants are in place (re-checked each open — the user may
+        // have just allowed them in System Settings). It reappears if a grant is ever revoked.
+        grantItem?.isHidden = allPermissionsGranted()
+        refreshPostProcessRows()
+        let t = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in self?.updateLevels() }
+        RunLoop.main.add(t, forMode: .eventTracking)   // fires while the menu is tracking
+        levelTimer = t
+    }
+    func menuDidClose(_ menu: NSMenu) { levelTimer?.invalidate(); levelTimer = nil }
+
+    private func meter(_ v: Float) -> String {
+        let n = min(8, max(0, Int(min(1, v * 4) * 8)))   // speech peaks ~0.1–0.5 → some gain
+        // ●/○ are a same-width pair (▰/▱ rendered at different sizes in the menu font).
+        return String(repeating: "●", count: n) + String(repeating: "○", count: 8 - n)
+    }
+
+    private func updateLevels() {
+        guard let eng = engine, !paused else { levelItem.title = "🎤 —   🔊 —"; return }
+        let (mic, sys) = eng.liveLevels()
+        levelItem.title = "🎤 \(meter(mic))  🔊 \(meter(sys))"
+    }
+
+    private func refresh(_ status: String) {
+        statusLine?.title = status
+        // Label + icon route through the SAME decision as the click and the enablement, so they can't
+        // disagree (see togglePauseShouldResume).
+        let stoppedByUs = togglePauseShouldResume(paused: paused, schedulePaused: schedulePaused)
+        toggleItem?.title = stoppedByUs ? "Resume" : "Pause"
+        toggleItem?.image = NSImage(systemSymbolName: stoppedByUs ? "play.circle" : "pause.circle", accessibilityDescription: nil)
+    }
+
+    /// First-run model download (the large model is too big to bundle). Surfaces progress in the menu;
+    /// the engine transcribes automatically once the file lands (it re-checks per segment).
+    private func setupModelDownload() {
+        ModelStore.shared.onProgress = { [weak self] p in
+            guard let self = self else { return }
+            if p >= 1.0 {
+                self.modelLine.title = "✓ Model ready"; self.modelLine.isHidden = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.modelLine.isHidden = true }
+            } else if p < 0 {
+                self.modelLine.title = "⚠ Model download failed — retries on restart"; self.modelLine.isHidden = false
+            } else {
+                self.modelLine.title = String(format: "⤓ Downloading model… %.0f%%", p * 100); self.modelLine.isHidden = false
+            }
+        }
+        if ModelStore.shared.isReady {
+            modelLine.isHidden = true
+        } else {
+            modelLine.title = "⤓ Preparing model…"; modelLine.isHidden = false
+        }
+        ModelStore.shared.ensure()
+    }
+
+    private func startEngine() {
+        let eng = RecordingEngine(cfg: EngineConfig.load())   // reload prefs each start so settings apply
+        eng.onSegmentResult = { [weak self] msg in
+            DispatchQueue.main.async {
+                if self?.paused == false { self?.statusLine.title = "● \(msg)" }
+                self?.pushFlushOutcomeIfNeeded(msg)
+            }
+        }
+        eng.onTranscriptURL = { [weak self] url in
+            DispatchQueue.main.async { self?.lastTranscriptURL = url }   // before onTranscriptSaved (FIFO)
+        }
+        eng.onTranscriptSaved = { [weak self] msg in
+            DispatchQueue.main.async {
+                self?.lastSavedLine.title = "✓ \(msg)"; self?.lastSavedLine.isHidden = false
+                if self?.paused == false { self?.statusLine.title = "● Recording · mic + system audio" }
+                self?.pushFlushOutcomeIfNeeded(msg)
+            }
+        }
+        engine = eng
+        startTask = Task {   // kept so stop paths can AWAIT the start — stopping mid-start would
+            do {             // no-op (nothing to tear down yet) and orphan a live capture pipeline
+                try await eng.start()
+                await MainActor.run {
+                    guard self.engine === eng else { return }   // stopped while starting — don't repaint
+                    self.paused = false; self.setIcon(recording: true); self.refresh("● Recording · mic + system audio")
+                }
+            } catch {
+                await MainActor.run {
+                    self.engine = nil; self.setIcon(recording: false)
+                    self.refresh("⚠ Grant System Audio Recording + Microphone to macrec")
+                    if !self.didAutoPrompt { self.didAutoPrompt = true; self.grantPermissions() }  // fire prompts + open Settings once
+                }
+            }
+        }
+    }
+
+    /// Start the engine unless the schedule says these are off-hours — in which case park in
+    /// schedule-pause WITHOUT starting. Gating the start (instead of start-then-stop) is what keeps
+    /// stop() from racing an in-flight start() at launch / settings-save time.
+    private func startEngineRespectingSchedule() {
+        if RecordSchedule.fromPrefs.isActive(at: Date()) {
+            if !paused && engine == nil { startEngine() }
+        } else {
+            schedulePaused = true
+            setIcon(recording: false)
+            refresh("⏸ Off-hours (schedule)")
+        }
+    }
+
+    @objc private func flushNow() {
+        guard engine != nil, !paused, !flushBusy else { return }   // busy = one flush at a time
+        notifyWhenTranscribed = true   // outcome arrives as a push (the menu may be closed by then)
+        Notifier.requestAuth()         // no-op after the user answered the first prompt
+        showFlushSpinner()             // the row's icon slot spins until the outcome lands
+        engine?.flushNow()
+        refresh("● Transcribing now…")
+    }
+
+    /// One push per armed "Transcribe now": the first TERMINAL status (saved / no speech / failed)
+    /// consumes the flag; intermediate ones ("Transcribing…") don't. The reveal is held so the
+    /// spinner stays visible ≥1 s — a "no speech" outcome lands in ~0.3 s, and a click that shows
+    /// nothing reads as a dead button (user report). The row then flashes the outcome in place.
+    private func pushFlushOutcomeIfNeeded(_ status: String) {
+        guard notifyWhenTranscribed, let o = flushOutcome(for: status) else { return }
+        notifyWhenTranscribed = false
+        let file = status.hasPrefix("Saved: ") ? lastTranscriptURL?.path : nil
+        let gen = flushGeneration
+        let hold = spinnerHold(elapsed: ProcessInfo.processInfo.systemUptime - spinStartedAt)
+        DispatchQueue.main.asyncAfter(deadline: .now() + hold) { [weak self] in
+            guard let self, self.flushGeneration == gen else { return }
+            self.hideFlushSpinner()
+            self.flashTranscribeRow(o.title)   // in-menu answer, e.g. "No speech found"
+            Notifier.push(title: o.title, body: o.body, filePath: file)
+        }
+    }
+
+    /// Menu-item look for the Transcribe-now row (borderless buttons default to the gray button
+    /// style), flipping to white while the hover pill shows — and rendering whatever the current
+    /// row title is, so a flashed outcome survives hover changes.
+    private func styleTranscribeRow() {
+        let fg: NSColor = rowHovered ? .selectedMenuItemTextColor : .labelColor
+        transcribeBtn.attributedTitle = NSAttributedString(
+            string: transcribeRowTitle,
+            attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: fg])
+        transcribeBtn.contentTintColor = fg
+    }
+
+    /// Show the flush outcome in the row itself for a moment ("No speech found"), then restore
+    /// "Transcribe now" — the menu stays open on click, so the answer belongs where the user is looking.
+    private func flashTranscribeRow(_ text: String) {
+        transcribeRowTitle = text
+        styleTranscribeRow()
+        let gen = flushGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self, self.flushGeneration == gen else { return }   // a newer flush owns the row
+            self.transcribeRowTitle = "Transcribe now"
+            self.styleTranscribeRow()
+        }
+    }
+
+    /// While a manual flush transcribes, the ROW shows the progress: its icon slot becomes a small
+    /// spinner. The tray glyph stays put — a changing menu-bar icon read as noise (user pick).
+    private func showFlushSpinner() {
+        guard !flushBusy else { return }
+        flushBusy = true
+        flushGeneration += 1
+        spinStartedAt = ProcessInfo.processInfo.systemUptime
+        // A transparent placeholder the SAME SIZE as the icon: with image=nil the title slides left
+        // into the icon slot and renders UNDER the spinner (user report: "UI broke while spinning").
+        let iconSize = transcribeBtn.image?.size ?? NSSize(width: 16, height: 16)
+        transcribeBtn.image = NSImage(size: iconSize)     // no representations = draws nothing
+        transcribeBtn.isEnabled = false           // no double-flush while one is running
+        menuRowSpinner.startAnimation(nil)
+        // Failsafe: whisper on a long segment takes minutes, but a lost outcome (engine swapped out
+        // mid-flush) must not leave the row spinning forever.
+        let gen = flushGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15 * 60) { [weak self] in
+            guard let self, self.flushBusy, self.flushGeneration == gen else { return }
+            elog("menu: flush spinner timed out — restoring the row")
+            self.hideFlushSpinner()
+        }
+    }
+
+    private func hideFlushSpinner() {
+        guard flushBusy else { return }
+        flushBusy = false
+        menuRowSpinner.stopAnimation(nil)
+        transcribeBtn.image = NSImage(systemSymbolName: "doc.badge.plus", accessibilityDescription: "Transcribe now")
+        transcribeBtn.isEnabled = true
+    }
+
+    @objc private func togglePause() {
+        // A manual choice beats the schedule until the next boundary — stored as the boundary's
+        // TIMESTAMP so it still expires when the Mac slept across it (nil = schedule never flips).
+        scheduleOverrideUntil = RecordSchedule.fromPrefs.nextBoundary(after: Date())
+        // Resume covers BOTH states WE own: a manual pause and a schedule-parked (off-hours) engine.
+        // The bug: schedule-pause (paused == false) fell through to the else and manually PAUSED
+        // instead of resuming. Same decision the label/enablement use — capture before clearing.
+        let wasStopped = togglePauseShouldResume(paused: paused, schedulePaused: schedulePaused)
+        schedulePaused = false
+        if wasStopped {
+            paused = false; refresh("Resuming…")
+            resumeEngineAfterStop()
+        } else {
+            paused = true; setIcon(recording: false); refresh("⏸ Paused")
+            if let eng = engine {
+                engine = nil
+                let starting = startTask
+                stopTask = Task { if let starting { _ = await starting.value }; await eng.stop() }
+            }
+        }
+    }
+
+    /// Start the engine once any in-flight stop has finished (see togglePause for why waiting matters).
+    private func resumeEngineAfterStop() {
+        // Pause's stop is fire-and-forget (instant UI); a quick resume must WAIT for it, or two
+        // capture pipelines briefly overlap (two mic queues + two taps on the shared audio state).
+        // stopTask stays set until the stop has truly finished — clearing it on read would let a
+        // pause→resume→pause→resume flurry start an engine while the first stop is still in flight.
+        let stopping = stopTask
+        Task {
+            if let stopping { _ = await stopping.value }
+            await MainActor.run {
+                if self.stopTask == stopping { self.stopTask = nil }
+                if !self.paused && !self.schedulePaused && self.engine == nil { self.startEngine() }
+            }
+        }
+    }
+
+    /// L3 of the pipeline (PIPELINE.md): once the configured time passes, digest the day's meeting
+    /// summaries into Daily/YYYY-MM/YYYY-MM-DD.md. Rides the same 30 s tick as the schedule; the
+    /// last-run marker (not a timer) makes a slept-through deadline catch up on wake. The marker is
+    /// set when the run LAUNCHES — a failed run logs and retries tomorrow rather than every 30 s.
+    private func maybeRunDailyDigest() {
+        guard Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false) else { return }
+        let now = Date()
+        let time = Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00")
+        guard dailyDigestDue(now: now, time: time, lastRun: Pref.explicit(Pref.dailyDigestLastRun, "")) else { return }
+        let dayF = DateFormatter(); dayF.locale = Locale(identifier: "en_US_POSIX"); dayF.dateFormat = "yyyy-MM-dd"
+        let day = dayF.string(from: now)
+        // The 30 s tick must not launch a second digest, but a FAILED one has to retry — so the in-flight
+        // guard is in memory and the persistent "done" marker is written only once the runner succeeds.
+        // Writing the marker up front meant a login error at 20:00 silently cost the whole day.
+        guard !digestInFlight else { return }
+        digestInFlight = true
+        // Every early return below must clear the flag, or the digest never runs again this process.
+        var launched = false
+        defer { if !launched { digestInFlight = false } }
+        let cfg = EngineConfig.load()
+        let fm = FileManager.default
+        let month = String(day.prefix(7))
+        let tDir = cfg.transcriptsDir.appendingPathComponent(month)
+        let transcripts = ((try? fm.contentsOfDirectory(atPath: tDir.path)) ?? [])
+            .filter { $0.hasSuffix(".md") }.map { tDir.appendingPathComponent($0).path }
+        let sumPref = Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT")
+        let sDir = sumPref.isEmpty ? tDir.path
+                                   : ((sumPref as NSString).expandingTildeInPath + "/" + month)
+        let summaries = ((try? fm.contentsOfDirectory(atPath: sDir)) ?? [])
+            .filter { $0.hasSuffix(".md") }.map { sDir + "/" + $0 }
+        // The digest is promoted with `mv`, which overwrites whatever sits at the destination. A name
+        // template that resolves onto an existing transcript/summary would silently destroy it.
+        let existingNotes = Set(transcripts.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        let out = dailyDigestOutputPath(day: day,
+                                        outDir: Pref.explicit(Pref.dailyDigestOut, "MR_DAILY_DIGEST_OUT"),
+                                        summaryOutDir: sumPref, transcriptsDir: cfg.transcriptsDir.path,
+                                        nameTemplate: Pref.explicit(Pref.dailyDigestName, "MR_DAILY_DIGEST_NAME"))
+        func retire(_ outcome: DigestOutcome) {
+            if digestMarksDayDone(outcome) { Pref.d.set(day, forKey: Pref.dailyDigestLastRun) }
+        }
+        guard !existingNotes.contains(URL(fileURLWithPath: out).standardizedFileURL.path) else {
+            elog("digest: \(out) is an existing transcript — refusing to overwrite it")
+            retire(.wouldOverwrite)   // retrying changes nothing until the user edits the name
+            Notifier.push(title: "Daily digest skipped",
+                          body: "The file name resolves onto an existing note (\(URL(fileURLWithPath: out).lastPathComponent)). "
+                              + "Change it in Settings › Summaries › File name.")
+            return
+        }
+        // Exclude the digest itself: it lands in a folder we just scanned and shares the day prefix.
+        let inputs = dailyDigestInputs(day: day, transcripts: transcripts, summaries: summaries, excluding: out)
+        guard !inputs.isEmpty else { elog("digest: no meetings on \(day) — skipping"); retire(.nothingToDo); return }
+        let runner = SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude
+        let inline = effectiveSummaryPrompt(inline: Pref.explicit(Pref.dailyPrompt, "MR_DAILY_DIGEST_PROMPT"),
+                                            filePath: Pref.explicit(Pref.dailyPromptFile, "MR_DAILY_DIGEST_PROMPT_FILE"))
+        let prompt = inline.isEmpty ? defaultDailyDigestPrompt : inline
+        guard let cmd = dailyDigestInvocation(runner: runner, prompt: prompt,
+                                              inputs: inputs, outPath: out) else { retire(.nothingToDo); return }
+        elog("digest: \(day) — \(inputs.count) inputs → \(out)")
+        SummaryStatus.shared.started("daily digest \(day)")
+        launched = true
+        runPostProcessCommand(cmd) { [weak self] status in
+            if status == 0 {
+                // Only a SUCCESSFUL run retires the day; a failure retries on the next tick.
+                elog("digest: \(day) finished (exit 0)")
+                if digestMarksDayDone(.wrote) { Pref.d.set(day, forKey: Pref.dailyDigestLastRun) }
+                SummaryStatus.shared.finished("daily digest \(day)", at: Date(), output: out)
+                Notifier.push(title: "Daily digest ready", body: "\(day) — \(inputs.count) meetings", filePath: out)
+            } else {
+                let why = reapFailedPostProcess(outPath: out)
+                // The reason belongs in the LOG too, not only in a notification the user may miss.
+                elog("digest: \(day) failed (exit \(status))" + (why.map { " — \($0)" } ?? " — no output"))
+                SummaryStatus.shared.failed("daily digest \(day)", at: Date(), reason: why)
+                Notifier.push(title: "Daily digest failed",
+                              body: why ?? "The summary command exited with code \(status) — check Settings › Summaries.")
+            }
+            DispatchQueue.main.async { self?.digestInFlight = false }
+        }
+    }
+
+    /// Enforce the recording schedule (~30 s tick). A manual Pause/Resume overrides until the next
+    /// schedule boundary — an expiry TIMESTAMP, so it lapses even if the Mac slept across it.
+    private func checkSchedule() {
+        let sched = RecordSchedule.fromPrefs
+        let now = Date()
+        if let until = scheduleOverrideUntil, now >= until { scheduleOverrideUntil = nil }
+        if !sched.enabled || scheduleOverrideUntil != nil {
+            if schedulePaused {   // schedule turned off (or overridden) while it held the engine
+                schedulePaused = false
+                if !paused { refresh("Resuming…"); resumeEngineAfterStop() }
+            }
+            return
+        }
+        if !sched.isActive(at: now), !paused, !schedulePaused, engine != nil {
+            schedulePaused = true
+            setIcon(recording: false)
+            refresh("⏸ Off-hours (schedule)")
+            if let eng = engine {
+                engine = nil
+                let starting = startTask
+                stopTask = Task { if let starting { _ = await starting.value }; await eng.stop() }
+            }
+        } else if sched.isActive(at: now), schedulePaused {
+            schedulePaused = false
+            refresh("Resuming…")
+            resumeEngineAfterStop()
+        }
+    }
+
+    /// Toggle the real-time caption overlay (macOS 26+ SpeechAnalyzer). The saved whisper transcript
+    /// is unaffected — this is a live view only.
+    @available(macOS 26, *)
+    @objc private func toggleLive() {
+        LiveCaptions.shared.toggle()
+        liveItem?.state = LiveCaptions.shared.active ? .on : .off
+    }
+
+    /// Fire the permission prompts inline. System Audio Recording, Microphone and Calendar all show
+    /// a normal consent popup on macOS 15+ (kTCCServiceAudioCapture prompts like the mic does), so no
+    /// Settings trip is needed for a first grant. If audio is still denied afterwards (user clicked
+    /// Deny earlier → no re-prompt), deep-link to the Privacy pane so they can toggle it.
+    @objc private func grantPermissions() {
+        NSApp.activate(ignoringOtherApps: true)
+        _ = requestPermissions()          // System Audio Recording prompt + Microphone popup
+        CalendarLookup.requestAccess()    // Calendar popup
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard !audioCaptureAuthorized() else { return }
+            if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture") {
+                NSWorkspace.shared.open(u)   // "System Audio Recording Only" pane
+            }
+        }
+    }
+
+    @objc private func openSettings() {
+        if settingsWC == nil { settingsWC = SettingsWindowController(onSave: { [weak self] in self?.restartEngine() }) }
+        settingsWC?.showWindow(nil)
+        settingsWC?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func restartEngine() {
+        refresh("Applying settings…")
+        setupModelDownload()   // a newly-selected model starts downloading (if not already present)
+        let old = engine; engine = nil; paused = false
+        schedulePaused = false; scheduleOverrideUntil = nil   // a settings save re-baselines the schedule
+        let pending = stopTask   // settings saved while paused → that stop may still be in flight; kept set
+        let starting = startTask // until done so an interleaved resume can't slip past it (see togglePause)
+        Task {
+            if let starting { _ = await starting.value }
+            if let pending { _ = await pending.value }
+            if let old = old { await old.stop() }
+            await MainActor.run {
+                if self.stopTask == pending { self.stopTask = nil }
+                self.startEngineRespectingSchedule()   // a just-edited schedule applies NOW, without
+            }                                          // the start-then-stop race of a blind start
+        }
+    }
+
+    /// Clicking the app icon in /Applications/Launchpad/Dock while it's running → open the tray menu.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        openMenu(); return true
+    }
+
+    /// Open the tray menu programmatically (when the app is clicked in /Applications).
+    @objc private func openMenu() {
+        NSApp.activate(ignoringOtherApps: true)
+        statusItem.button?.performClick(nil)
+    }
+
+    @objc private func openTranscripts() {
+        let dir = EngineConfig.load().transcriptsDir
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(dir)
+    }
+
+    /// Manual check (menu): ALWAYS gives visible in-app feedback — an alert for up-to-date / newer /
+    /// failure — not only a notification (which the user may have silenced, so the menu looked dead).
+    @objc private func checkForUpdates() {
+        guard !checkingForUpdates else { return }   // one modal at a time — a re-click must not stack alerts
+        checkingForUpdates = true
+        UpdateChecker.fetchLatest { [weak self] tag, url in   // fetchLatest already calls back on the main queue
+            guard let self else { return }
+            self.checkingForUpdates = false
+            guard let tag else {
+                self.showUpdateAlert(title: "Update check failed",
+                                     text: "Couldn't reach GitHub. Check your connection and try again.", style: .warning)
+                return
+            }
+            if isNewerVersion(tag, than: macrecVersion) {
+                let openURL = updateAlertOpenURL(installedViaBrew: UpdateChecker.installedViaBrew,
+                                                 htmlURL: url, releasesURL: UpdateChecker.releasesURL)
+                self.showUpdateAlert(title: "macrec \(tag) is available",
+                                     text: UpdateChecker.installedViaBrew ? "Run `brew upgrade --cask macrec` to update."
+                                                                          : "Open the release page to download it.",
+                                     openURL: openURL)
+            } else {
+                self.showUpdateAlert(title: "You're up to date",
+                                     text: "macrec v\(macrecVersion) is the latest release.")
+            }
+        }
+    }
+
+    /// A visible, focus-stealing result for a user-initiated update check. macrec is `.accessory`, so
+    /// activate first or the alert can open behind everything (the "no reaction" the user saw). With an
+    /// `openURL` it offers Open (default/Return) + Cancel (Esc); otherwise a lone OK.
+    private func showUpdateAlert(title: String, text: String, openURL: URL? = nil, style: NSAlert.Style = .informational) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert(); a.messageText = title; a.informativeText = text; a.alertStyle = style
+        if openURL != nil {
+            a.addButton(withTitle: "Open")                              // first button = default, bound to Return
+            a.addButton(withTitle: "Cancel").keyEquivalent = "\u{1b}"   // Esc dismisses without opening a browser
+        }
+        let resp = a.runModal()
+        if let openURL, resp == .alertFirstButtonReturn { NSWorkspace.shared.open(openURL) }
+    }
+
+    /// Background daily check — rides the 30 s tick with a last-run marker (same catch-up-after-
+    /// sleep semantics as the daily digest). Silent unless something new is actually out.
+    private func maybeCheckForUpdates() {
+        guard Pref.bool(Pref.autoUpdateCheck, "MR_AUTO_UPDATE_CHECK", true) else { return }
+        let dayF = DateFormatter(); dayF.locale = Locale(identifier: "en_US_POSIX"); dayF.dateFormat = "yyyy-MM-dd"
+        let today = dayF.string(from: Date())
+        guard Pref.explicit(Pref.updateCheckLastRun, "") != today else { return }
+        Pref.d.set(today, forKey: Pref.updateCheckLastRun)
+        UpdateChecker.fetchLatest { [weak self] tag, url in
+            guard let tag, isNewerVersion(tag, than: macrecVersion) else { return }
+            self?.announceUpdate(tag: tag, url: url)
+        }
+    }
+
+    private func announceUpdate(tag: String, url: String?) {
+        // Sanitize the click target through the SAME https-only gate the manual alert uses (nil for
+        // brew → no click target) — the notification path must not open a file:/custom-scheme URL either.
+        let open = updateAlertOpenURL(installedViaBrew: UpdateChecker.installedViaBrew,
+                                      htmlURL: url, releasesURL: UpdateChecker.releasesURL)
+        let how = UpdateChecker.installedViaBrew ? "Run: brew upgrade --cask macrec"
+                                                 : "Click to open the release page."
+        elog("update: \(tag) available (current v\(macrecVersion))")
+        Notifier.push(title: "macrec \(tag) is available", body: how, openURL: open)
+    }
+
+    @objc private func showAbout() {
+        NSApp.activate(ignoringOtherApps: true)
+        let para = NSMutableParagraphStyle(); para.alignment = .center
+        let credits = NSAttributedString(
+            string: "Always-on meeting recorder",
+            attributes: [.font: NSFont.systemFont(ofSize: 13), .paragraphStyle: para])
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationName: "macrec",
+            .applicationVersion: macrecVersion,
+            .credits: credits,
+        ])
+    }
+
+    /// Stop the engine (→ destroys the Core Audio process tap + aggregate device) synchronously, once.
+    /// A leaked tap can wedge coreaudiod ("no sound until killall coreaudiod"), so run it on EVERY
+    /// termination path: menu Quit, SIGTERM/kickstart, and logout/shutdown (applicationWillTerminate).
+    private func stopEngineSync() {
+        guard let eng = engine else { return }
+        engine = nil   // idempotent — later callers see nil and skip (no double-stop)
+        let s = DispatchSemaphore(value: 0)
+        Task { await eng.stop(); s.signal() }
+        _ = s.wait(timeout: .now() + 15)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) { stopEngineSync() }
+
+    @objc private func quit() { stopEngineSync(); NSApp.terminate(nil) }
+}
+
+extension AppController: UNUserNotificationCenterDelegate {
+    /// Menu-bar agents count as "foreground", which by default swallows banners — show them anyway.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    /// Clicking a "Transcript ready" push opens the saved file.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let info = response.notification.request.content.userInfo
+        // Web links ride under "url" (https-only — sanitized at push time, re-checked here); local
+        // transcript paths ride under "file". Keeping them distinct means a URL is never opened as a
+        // file path, nor a path as a URL (the old shared "file" key + hasPrefix("http") did both).
+        if let s = info["url"] as? String, let u = URL(string: s), u.scheme?.lowercased() == "https" {
+            NSWorkspace.shared.open(u)
+        } else if let p = info["file"] as? String {
+            NSWorkspace.shared.open(URL(fileURLWithPath: p))
+        }
+        completionHandler()
+    }
+}
+
+var appController: AppController?   // retained for process lifetime
+
+func runMenuBarApp() -> Never {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)   // menu-bar only, no Dock icon (LSUIElement)
+    let c = AppController()
+    appController = c
+    app.delegate = c
+    app.run()
+    exit(0)
+}
+
+/// Install a one-shot stop handler for SIGINT/SIGTERM. Returns the source (keep it alive).
+func installStopHandler(_ handler: @escaping () -> Void) {
+    let q = DispatchQueue(label: "macrec.stop-signal")
+    for s in [SIGINT, SIGTERM] {
+        signal(s, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: s, queue: q)
+        src.setEventHandler(handler: handler)
+        src.resume()
+        signalSources.append(src)
+    }
+}
+
+// MARK: - main
+
+/// Single source of truth for the version — a compile-time constant so `macrec version` reports
+/// correctly even when run via the Homebrew `bin/macrec` symlink (where Bundle.main resolves to
+/// /opt/homebrew/bin, not the .app, so the Info.plist can't be read). install.sh / package.sh
+/// stamp CFBundleShortVersionString from THIS value, so the binary and the bundle never drift.
+let macrecVersion = "0.5.0"
