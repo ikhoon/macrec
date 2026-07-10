@@ -8035,15 +8035,26 @@ struct Main {
                 let e = cw.edgeSurvivesForTest
                 check("live: the outline survives a fully transparent backdrop and never eats the mouse",
                       e.visible && e.ignoresMouse)
-                // The picker was built once at window creation: an engine switched off in Settings, or a
-                // key just pasted in, stayed invisible until the overlay was closed and reopened.
-                let engineChoicesBefore = cw.engineChoicesForTest
-                Pref.d.set(["whisper"], forKey: Pref.liveEnginesOn)
+                // The picker was built once at window creation: an engine switched off in Settings stayed
+                // in the menu until the overlay was reopened. Assert it re-reads the ON list — never that
+                // a particular engine is installed. `isReady` probes the filesystem and the Keychain, and
+                // CI has neither whisper-cli nor its model, so pinning `[.whisper]` made this machine-dependent.
+                // Assert it RE-READS the ON list. Which engines are *ready* depends on the machine —
+                // `isReady` probes the filesystem, the Keychain and MR_*_KEY env vars — so the only thing
+                // this can pin is that a saved change is picked up without reopening the overlay. What
+                // gets picked from a given (ready, enabled) pair is `selectableLiveEngines`, tested purely.
+                Pref.d.set([LiveEngine.apple.rawValue], forKey: Pref.liveEnginesOn)
                 cw.reloadEngineChoices()
-                let engineChoicesAfter = cw.engineChoicesForTest
+                let appleOnly = cw.engineChoicesForTest
+                Pref.d.set(LiveEngine.allCases.map(\.rawValue), forKey: Pref.liveEnginesOn)
+                cw.reloadEngineChoices()
+                let allOn = cw.engineChoicesForTest
                 Pref.d.removeObject(forKey: Pref.liveEnginesOn)
                 check("live: reloadEngineChoices re-reads Settings instead of staying frozen at window creation",
-                      engineChoicesAfter == [.whisper] && engineChoicesAfter != engineChoicesBefore)
+                      appleOnly == [.apple]                       // the ON list narrows the menu…
+                      && allOn.count >= appleOnly.count           // …and widening it re-reads, not caches
+                      && allOn.first == .apple                    // order follows allCases, apple first
+                      && !allOn.isEmpty)                          // never strands the user
             }
             // The harness must never read the user's real credentials, and every read is an authorization
             // check — an unsigned dev build turns each one into a password prompt.
@@ -8373,14 +8384,19 @@ struct Main {
                   AppController.instancesRespond(to: Selector(("revealLastSummary"))))
             // …and menuWillOpen must actually REFRESH those rows. Drive the real menu: a deleted
             // refreshPostProcessRows() call would leave both titles empty, and this check red.
+            // Pin the mode: with no saved pref (a fresh machine, and CI) the effective mode is .off and the
+            // row reads "Summaries: off", which says nothing about whether menuWillOpen refreshed it.
+            let savedMode = Pref.d.object(forKey: Pref.postProcessMode)
+            Pref.d.set(PostProcessMode.summary.rawValue, forKey: Pref.postProcessMode)
             SummaryStatus.shared.resetForTest()
             SummaryStatus.shared.failed("z.md", at: stamp, reason: "runner exploded")
             let rows = AppController().postProcessRowsAfterMenuOpenForTest()
             check("tray: opening the menu refreshes the post-process rows from live status",
                   rows != nil
-                  && rows!.summary.hasPrefix("Summary")           // not the empty title it was built with
-                  && rows!.digest.hasPrefix("Daily digest")
-                  && (rows!.summary.contains("z.md") || rows!.summary == "Summaries: off"))
+                  && rows!.summary.contains("z.md")               // the live failure, not the built-in empty title
+                  && rows!.digest.hasPrefix("Daily digest"))
+            if let savedMode { Pref.d.set(savedMode, forKey: Pref.postProcessMode) }
+            else { Pref.d.removeObject(forKey: Pref.postProcessMode) }
             // A row with nothing to show must be GREY after AppKit's validation pass, not merely after
             // our own `isEnabled = false`. The menu auto-enables items, so validateMenuItem has the last
             // word — assigning isEnabled and reading it straight back was a test asserting itself.
