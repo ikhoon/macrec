@@ -128,6 +128,25 @@ lenses:
 9. Performance & resource use
 10. Test coverage (is there a selftest reproducing the fix?)
 
+## 4a. Commit as you go — and split by dependency, never by keyword
+
+Commit each fix the moment it is green (build + selftest). Letting a branch accumulate turns splitting
+into archaeology.
+
+When you do have to split an accumulated diff: group by **symbol dependency**, not by topic keywords.
+A slice is a definition plus every call site plus the `selftest` checks that use it, and slices are
+ordered so a symbol is defined before it is used. Classifying hunks by keyword scatters a definition
+and its uses across commits and nothing compiles — that is a bug in the split, not evidence that the
+file is unsplittable. Compile-check each slice with `swiftc` (never run an unsigned binary, see §4b).
+
+## 4b. Never run macrec from an unsigned binary
+
+A bare `swiftc … -o /tmp/x` binary has no code signature, so every Keychain read it makes raises an
+authorization prompt — and `selftest` / the snapshot commands build the real Settings pane and the real
+overlay, which ask each engine whether it is ready. Compile-check with `swiftc` if you must, but **run**
+only `./macrec-stage.app/Contents/MacOS/macrec` (signed by `install.sh`). The test subcommands also set
+`Keychain.disabled`, so they never read the maintainer's real credentials at all.
+
 ## 5. Decisions & preferences the maintainer has stated once — don't ask again
 
 - **Single file.** `macrec.swift` stays one file through stabilization (the build is one
