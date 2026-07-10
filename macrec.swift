@@ -41,6 +41,7 @@ enum Keychain {
     /// Every request for a SECRET, cached or not. Asking for a secret is what raises the authorization
     /// prompt; asking whether one exists does not. Code that only needs presence must use `exists`.
     static var secretRequestsForTest: Int { lock.lock(); defer { lock.unlock() }; return secretRequests }
+    static func forgetCacheForTest() { lock.lock(); cache.removeAll(); lock.unlock() }
 
     private static func query(_ account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
@@ -89,29 +90,44 @@ enum Keychain {
         guard let d = out as? Data, let s = String(data: d, encoding: .utf8), !s.isEmpty else { return nil }
         return s
     }
-    /// Empty value deletes the item. Update-then-add (never delete-then-add: a failed add would
-    /// silently drop the stored credential); non-success statuses are logged, not swallowed.
+    /// Empty value deletes the item. A non-empty value RECREATES it: macOS binds an item's access
+    /// control list to the process that created it, and `SecItemUpdate` never refreshes that list — so
+    /// an item created once by the wrong binary keeps asking the user to authorize the right one,
+    /// forever. Deleting and re-adding rebinds the ACL to the app doing the save.
+    ///
+    /// The old update-then-add order guarded against a failed add dropping the credential. We hold
+    /// `value` throughout, so a failed add is retried and then reported — it is never silently lost.
     /// Returns whether the operation actually succeeded (callers migrating data must check).
     @discardableResult
     static func set(_ account: String, _ value: String) -> Bool {
         if disabled { return true }
         func remember(_ v: String?) { lock.lock(); cache[account] = v; lock.unlock() }
+        func delete() -> OSStatus { SecItemDelete(query(account) as CFDictionary) }
+
         guard !value.isEmpty else {
-            let status = SecItemDelete(query(account) as CFDictionary)
+            let status = delete()
             if status != errSecSuccess && status != errSecItemNotFound { elog("keychain: delete '\(account)' failed (\(status))"); return false }
             remember(nil)
             return true
         }
-        let data = Data(value.utf8)
-        var status = SecItemUpdate(query(account) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if status == errSecItemNotFound {
-            var q = query(account)
-            q[kSecValueData as String] = data
-            // Credential stays on THIS machine (no backup/migration restore) but is readable after login.
-            q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            status = SecItemAdd(q as CFDictionary, nil)
+        let status = delete()
+        if status != errSecSuccess && status != errSecItemNotFound {
+            elog("keychain: could not clear '\(account)' before rewriting it (\(status))"); return false
         }
-        if status != errSecSuccess { elog("keychain: save '\(account)' failed (\(status))"); return false }
+        var q = query(account)
+        q[kSecValueData as String] = Data(value.utf8)
+        // Credential stays on THIS machine (no backup/migration restore) but is readable after login.
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        var add = SecItemAdd(q as CFDictionary, nil)
+        if add != errSecSuccess {
+            elog("keychain: add '\(account)' failed (\(add)) — retrying once")
+            add = SecItemAdd(q as CFDictionary, nil)
+        }
+        if add != errSecSuccess {
+            elog("keychain: save '\(account)' failed (\(add)); the previous value was removed and NOT restored")
+            remember(nil)
+            return false
+        }
         remember(value)
         return true
     }
@@ -7799,6 +7815,29 @@ struct Main {
             check("keychain: engine readiness and opening Settings request no secrets",
                   Keychain.secretRequestsForTest == secretsBefore
                   && sw.keyFieldsForTest.allSatisfy { $0.isEmpty || $0 == SettingsWindowController.keyMask })
+            // MR_KEYCHAIN_ROUNDTRIP=1 drives the REAL Keychain against a throwaway account. It writes,
+            // reads back, overwrites and deletes — proving `set` recreates the item (SecItemUpdate leaves
+            // the creating process's ACL in place, which is how a credential ends up asking the wrong
+            // binary for permission forever). Off by default: the harness must not touch credentials.
+            if ProcessInfo.processInfo.environment["MR_KEYCHAIN_ROUNDTRIP"] == "1" {
+                let acct = "selftest-roundtrip"
+                Keychain.disabled = false
+                Keychain.forgetCacheForTest()
+                _ = Keychain.set(acct, "")                       // start clean
+                let absent = !Keychain.exists(acct) && Keychain.get(acct) == nil
+                let wrote = Keychain.set(acct, "first")
+                Keychain.forgetCacheForTest()
+                let readBack = Keychain.get(acct) == "first" && Keychain.exists(acct)
+                let rewrote = Keychain.set(acct, "second")
+                Keychain.forgetCacheForTest()
+                let reread = Keychain.get(acct) == "second"
+                _ = Keychain.set(acct, "")
+                Keychain.forgetCacheForTest()
+                let gone = !Keychain.exists(acct)
+                Keychain.disabled = true
+                check("keychain: real round-trip — write, read, recreate on overwrite, delete",
+                      absent && wrote && readBack && rewrote && reread && gone)
+            }
             // A switch on + no key used to be silent: the engine simply never showed up in the picker.
             check("live: an engine switched on without its credential is reported, not silently dropped",
                   enginesMissingCredentials(LiveEngine.allCases, enabled: { $0 == .deepgram || $0 == .apple },
