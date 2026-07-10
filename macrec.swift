@@ -2591,6 +2591,18 @@ func dailyDigestDue(now: Date, time: String, lastRun: String, calendar: Calendar
     return mins >= hm[0] * 60 + hm[1]
 }
 
+/// Should the day be marked done, given how the digest ended? Only a run that produced a file, or one
+/// that can never succeed today (nothing to summarize, a name that would clobber a note), retires the
+/// day. A runner that failed — no login, no network — must be retried on the next tick, or a transient
+/// error at 20:00 silently costs the whole day. Pure + selftested.
+enum DigestOutcome: Equatable { case wrote, nothingToDo, wouldOverwrite, runnerFailed }
+func digestMarksDayDone(_ outcome: DigestOutcome) -> Bool {
+    switch outcome {
+    case .wrote, .nothingToDo, .wouldOverwrite: return true
+    case .runnerFailed:                         return false
+    }
+}
+
 /// The digest's file name from a user template: `{date}` / `{month}`, default `{date}.md`. Separators
 /// are stripped (a `/` would escape the month folder) and the day is forced in — a template without it
 /// resolves to one path for the whole month and the atomic `mv` would eat yesterday. Pure + selftested.
@@ -2794,6 +2806,8 @@ func runPostProcessCommand(_ command: String, completion: ((Int32) -> Void)? = n
             let data = out.fileHandleForReading.readDataToEndOfFile()   // EOF first, then exit — no pipe deadlock
             p.waitUntilExit()
             killer.cancel()
+            // The command redirects its own stdout into `<out>.partial`, so this pipe is usually empty and
+            // the reason lives in that file — see reapFailedPostProcess, which the callers use on failure.
             let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             elog("post-process: exit \(p.terminationStatus)" + (s.isEmpty ? "" : " — \(s.prefix(400))"))
             completion?(p.terminationStatus)
@@ -6627,6 +6641,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private var summaryLine: NSMenuItem!   // what post-processing is doing, refreshed when the menu opens
     private var digestLine: NSMenuItem!
     private var pendingSummaryAction: SummaryRowAction = .none
+    private var digestInFlight = false   // the 30 s tick must not launch a second digest
     private var grantItem: NSMenuItem?  // "Grant permissions…" — shown ONLY while a permission is missing
     private var paused = false
     private var didAutoPrompt = false   // only auto-open the permission prompts/Settings once per launch
@@ -7092,7 +7107,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         guard dailyDigestDue(now: now, time: time, lastRun: Pref.explicit(Pref.dailyDigestLastRun, "")) else { return }
         let dayF = DateFormatter(); dayF.locale = Locale(identifier: "en_US_POSIX"); dayF.dateFormat = "yyyy-MM-dd"
         let day = dayF.string(from: now)
-        Pref.d.set(day, forKey: Pref.dailyDigestLastRun)
+        // The 30 s tick must not launch a second digest, but a FAILED one has to retry — so the in-flight
+        // guard is in memory and the persistent "done" marker is written only once the runner succeeds.
+        // Writing the marker up front meant a login error at 20:00 silently cost the whole day.
+        guard !digestInFlight else { return }
+        digestInFlight = true
+        // Every early return below must clear the flag, or the digest never runs again this process.
+        var launched = false
+        defer { if !launched { digestInFlight = false } }
         let cfg = EngineConfig.load()
         let fm = FileManager.default
         let month = String(day.prefix(7))
@@ -7111,8 +7133,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
                                         outDir: Pref.explicit(Pref.dailyDigestOut, "MR_DAILY_DIGEST_OUT"),
                                         summaryOutDir: sumPref, transcriptsDir: cfg.transcriptsDir.path,
                                         nameTemplate: Pref.explicit(Pref.dailyDigestName, "MR_DAILY_DIGEST_NAME"))
+        func retire(_ outcome: DigestOutcome) {
+            if digestMarksDayDone(outcome) { Pref.d.set(day, forKey: Pref.dailyDigestLastRun) }
+        }
         guard !existingNotes.contains(URL(fileURLWithPath: out).standardizedFileURL.path) else {
             elog("digest: \(out) is an existing transcript — refusing to overwrite it")
+            retire(.wouldOverwrite)   // retrying changes nothing until the user edits the name
             Notifier.push(title: "Daily digest skipped",
                           body: "The file name resolves onto an existing note (\(URL(fileURLWithPath: out).lastPathComponent)). "
                               + "Change it in Settings › Summaries › File name.")
@@ -7120,27 +7146,32 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         }
         // Exclude the digest itself: it lands in a folder we just scanned and shares the day prefix.
         let inputs = dailyDigestInputs(day: day, transcripts: transcripts, summaries: summaries, excluding: out)
-        guard !inputs.isEmpty else { elog("digest: no meetings on \(day) — skipping"); return }
+        guard !inputs.isEmpty else { elog("digest: no meetings on \(day) — skipping"); retire(.nothingToDo); return }
         let runner = SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude
         let inline = effectiveSummaryPrompt(inline: Pref.explicit(Pref.dailyPrompt, "MR_DAILY_DIGEST_PROMPT"),
                                             filePath: Pref.explicit(Pref.dailyPromptFile, "MR_DAILY_DIGEST_PROMPT_FILE"))
         let prompt = inline.isEmpty ? defaultDailyDigestPrompt : inline
         guard let cmd = dailyDigestInvocation(runner: runner, prompt: prompt,
-                                              inputs: inputs, outPath: out) else { return }
+                                              inputs: inputs, outPath: out) else { retire(.nothingToDo); return }
         elog("digest: \(day) — \(inputs.count) inputs → \(out)")
         SummaryStatus.shared.started("daily digest \(day)")
-        runPostProcessCommand(cmd) { status in
-            elog("digest: \(day) finished (exit \(status))")
-            // The last-run marker is already set, so a failed digest won't retry until tomorrow.
+        launched = true
+        runPostProcessCommand(cmd) { [weak self] status in
             if status == 0 {
+                // Only a SUCCESSFUL run retires the day; a failure retries on the next tick.
+                elog("digest: \(day) finished (exit 0)")
+                if digestMarksDayDone(.wrote) { Pref.d.set(day, forKey: Pref.dailyDigestLastRun) }
                 SummaryStatus.shared.finished("daily digest \(day)", at: Date(), output: out)
                 Notifier.push(title: "Daily digest ready", body: "\(day) — \(inputs.count) meetings", filePath: out)
             } else {
                 let why = reapFailedPostProcess(outPath: out)
+                // The reason belongs in the LOG too, not only in a notification the user may miss.
+                elog("digest: \(day) failed (exit \(status))" + (why.map { " — \($0)" } ?? " — no output"))
                 SummaryStatus.shared.failed("daily digest \(day)", at: Date(), reason: why)
                 Notifier.push(title: "Daily digest failed",
                               body: why ?? "The summary command exited with code \(status) — check Settings › Summaries.")
             }
+            DispatchQueue.main.async { self?.digestInFlight = false }
         }
     }
 
@@ -8237,6 +8268,13 @@ struct Main {
             check("summary: a failed runner's reason is read back from its .partial, which is then removed",
                   reason == "Not logged in · Please run /login" && orphanGone && noReason == nil
                   && skipsBlanks && emptyIsNil && emptyGone && hugeOK && badOK)
+            // The marker used to be stamped BEFORE the run. A login error at 20:00 then marked the day
+            // done, and the digest never retried — exactly what happened on 2026-07-09 and 07-10.
+            check("digest: only a run that wrote a file (or can never succeed today) retires the day",
+                  digestMarksDayDone(.wrote)
+                  && digestMarksDayDone(.nothingToDo)      // no meetings — retrying finds none either
+                  && digestMarksDayDone(.wouldOverwrite)   // the name collides until the user changes it
+                  && !digestMarksDayDone(.runnerFailed))   // no login / no network — retry on the next tick
             check("tray: the digest row says off, due, or already written today",
                   digestMenuTitle(enabled: false, dueTime: "20:00", lastRun: "", today: "2026-07-07")
                   == "Daily digest: off"
