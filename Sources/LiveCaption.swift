@@ -114,10 +114,24 @@ final class LiveTranscriber: LiveTranscribing {
     }
 }
 
+// MARK: - live translation providers (pluggable)
+//
+// A translator turns one caption line (or sentence, or the volatile tail) into the target language.
+// `translate` is called many times per line off the main thread and must be cheap to call repeatedly.
+// Apple's on-device Translation (LiveTranslator) is the default; a cloud provider (DeepLTranslator, …)
+// conforms to the same protocol so the rest of LiveCaptions never learns which one is running — add one
+// by conforming to `LiveTranslating` + a `TranslationProvider` case, its key coming from the Keychain.
+
+/// One translation backend. Returns nil on any failure (unavailable pair, network, no key) — captions
+/// then show the original text only, never a hang or an error where the translation would be.
+protocol LiveTranslating: AnyObject {
+    func translate(_ text: String) async -> String?
+}
+
 /// On-device translation of finalized caption lines (macOS 26 Translation framework). Best-effort:
 /// if the language pair isn't installed/available it returns nil and captions show the original only.
 @available(macOS 26, *)
-final class LiveTranslator {
+final class LiveTranslator: LiveTranslating {
     private let session: TranslationSession
     private let lock = NSLock()
     private var prepared = false
@@ -1040,7 +1054,7 @@ final class LiveCaptions {
     private let feedQueue = DispatchQueue(label: "macrec.live.feed", qos: .userInitiated)
     private var mic: (any LiveTranscribing)?
     private var sys: (any LiveTranscribing)?
-    private var translator: LiveTranslator?   // nil = no live translation
+    private var translator: (any LiveTranslating)?   // nil = no live translation
     private var window: LiveCaptionWindow?
     struct CapLine {
         var speaker: String
