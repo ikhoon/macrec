@@ -2079,9 +2079,14 @@ final class RecordingEngine {
             onTranscriptURL?(url)
             onTranscriptSaved?("Saved: \(url.lastPathComponent)")
             if let cmd = postProcessInvocationFromPrefs(transcriptPath: url.path) {
+                let file = url.lastPathComponent
+                SummaryStatus.shared.started(file)
+                let out = summaryOutputPath(transcriptPath: url.path,
+                                            outDir: Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT"))
                 runPostProcessCommand(cmd) { status in
-                    guard status != 0 else { return }   // a failing summary runner must never fail silently
-                    elog("engine: post-process exited \(status) for \(url.lastPathComponent)")
+                    guard status != 0 else { SummaryStatus.shared.finished(file, at: Date(), output: out); return }
+                    SummaryStatus.shared.failed(file, at: Date())
+                    elog("engine: post-process exited \(status) for \(file)")
                     Notifier.push(title: "Summary failed",
                                   body: "The summary command exited with code \(status) — check the runner in Settings › Summaries.")
                 }
@@ -2654,6 +2659,52 @@ func dailyDigestInvocation(runner: SummaryRunner, prompt: String, inputs: [Strin
     }
     return "mkdir -p \(shq(dir)) && \(runnerCmd) "
          + "> \(shq(outPath + ".partial")) && mv \(shq(outPath + ".partial")) \(shq(outPath))"
+}
+
+/// What post-processing is doing right now. Without this the pipeline is a black box: a summary runs
+/// after a transcript is saved, leaves no trace, and the app looks broken.
+enum SummaryActivity: Equatable {
+    case off
+    case idle
+    case running(String)
+    case done(String, Date)
+    case failed(String, Date)
+}
+
+/// The tray row for post-processing. Pure + selftested.
+func summaryMenuTitle(_ activity: SummaryActivity, hm: (Date) -> String) -> String {
+    switch activity {
+    case .off:                 return "Summaries: off"
+    case .idle:                return "Summary: after the next transcript"
+    case .running(let file):   return "Summary: running… \(file)"
+    case .done(let file, let t):   return "Summary: \(file) · \(hm(t))"
+    case .failed(let file, let t): return "Summary FAILED: \(file) · \(hm(t))"
+    }
+}
+
+/// The tray row for the daily digest. Pure + selftested.
+func digestMenuTitle(enabled: Bool, dueTime: String, lastRun: String, today: String) -> String {
+    guard enabled else { return "Daily digest: off" }
+    if lastRun == today { return "Daily digest: written today" }
+    return "Daily digest: due at \(dueTime)"
+}
+
+/// Last known post-processing activity. Written from the process queue, read on the main thread.
+final class SummaryStatus {
+    static let shared = SummaryStatus()
+    private let lock = NSLock()
+    private var activity: SummaryActivity = .idle
+    private var lastPath: String?
+
+    var current: SummaryActivity { lock.lock(); defer { lock.unlock() }; return activity }
+    var lastOutput: String? { lock.lock(); defer { lock.unlock() }; return lastPath }
+
+    func started(_ file: String) { lock.lock(); activity = .running(file); lock.unlock() }
+    func finished(_ file: String, at date: Date, output: String?) {
+        lock.lock(); activity = .done(file, date); lastPath = output; lock.unlock()
+    }
+    func failed(_ file: String, at date: Date) { lock.lock(); activity = .failed(file, date); lock.unlock() }
+    func resetForTest() { lock.lock(); activity = .idle; lastPath = nil; lock.unlock() }
 }
 
 func postProcessInvocationFromPrefs(transcriptPath: String) -> String? {
@@ -6530,6 +6581,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private var modelLine: NSMenuItem!
     private var toggleItem: NSMenuItem!
     private var liveItem: NSMenuItem?   // "Live captions" toggle (macOS 26+)
+    private var summaryLine: NSMenuItem!   // what post-processing is doing, refreshed when the menu opens
+    private var digestLine: NSMenuItem!
     private var grantItem: NSMenuItem?  // "Grant permissions…" — shown ONLY while a permission is missing
     private var paused = false
     private var didAutoPrompt = false   // only auto-open the permission prompts/Settings once per launch
@@ -6641,7 +6694,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         levelItem = NSMenuItem(title: "🎤 —   🔊 —", action: nil, keyEquivalent: ""); levelItem.isEnabled = false
         lastSavedLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); lastSavedLine.isEnabled = false; lastSavedLine.isHidden = true
         modelLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); modelLine.isEnabled = false; modelLine.isHidden = true
+        // Post-processing used to leave no trace at all, so a working pipeline read as a broken one.
+        summaryLine = NSMenuItem(title: "", action: #selector(revealLastSummary), keyEquivalent: "")
+        summaryLine.target = self
+        digestLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); digestLine.isEnabled = false
         menu.addItem(statusLine); menu.addItem(levelItem); menu.addItem(lastSavedLine); menu.addItem(modelLine)
+        menu.addItem(summaryLine); menu.addItem(digestLine)
         menu.addItem(.separator())
         // Transcribe now — view-backed so the click does NOT dismiss the menu (user pick, round 2:
         // stay open and watch the row's spinner in place). MenuHoverView supplies the native-style
@@ -6689,6 +6747,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     }
 
     // Live input meter — only updates while the menu is open (cheap, and answers "is it working?").
+    /// The summary/digest rows, re-derived from prefs and live status every time the menu opens.
+    private func refreshPostProcessRows() {
+        let mode = effectivePostProcessMode(rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
+                                            shellCmd: Pref.postProcessCommand)
+        let activity: SummaryActivity = mode == .off ? .off : SummaryStatus.shared.current
+        let hm = DateFormatter(); hm.locale = Locale(identifier: "en_US_POSIX"); hm.dateFormat = "HH:mm"
+        summaryLine.title = summaryMenuTitle(activity) { hm.string(from: $0) }
+        summaryLine.isEnabled = SummaryStatus.shared.lastOutput != nil
+
+        let day = DateFormatter(); day.locale = Locale(identifier: "en_US_POSIX"); day.dateFormat = "yyyy-MM-dd"
+        digestLine.title = digestMenuTitle(enabled: Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false),
+                                           dueTime: Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00"),
+                                           lastRun: Pref.explicit(Pref.dailyDigestLastRun, ""),
+                                           today: day.string(from: Date()))
+    }
+
+    /// Clicking the summary row reveals the file it produced — the one thing the user wants from it.
+    @objc private func revealLastSummary() {
+        guard let path = SummaryStatus.shared.lastOutput else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
     func menuWillOpen(_ menu: NSMenu) {
         // Opt-in tray diagnostics (`defaults write com.ikhoon.macrec.prefs trayDebug -bool true`): the
         // menu anchors to the status button's WINDOW — if it ever opens detached (screen edge, the
@@ -6710,6 +6790,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         // Hide "Grant permissions…" once both grants are in place (re-checked each open — the user may
         // have just allowed them in System Settings). It reappears if a grant is ever revoked.
         grantItem?.isHidden = allPermissionsGranted()
+        refreshPostProcessRows()
         let t = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in self?.updateLevels() }
         RunLoop.main.add(t, forMode: .eventTracking)   // fires while the menu is tracking
         levelTimer = t
@@ -6975,8 +7056,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         guard let cmd = dailyDigestInvocation(runner: runner, prompt: prompt,
                                               inputs: inputs, outPath: out) else { return }
         elog("digest: \(day) — \(inputs.count) inputs → \(out)")
+        SummaryStatus.shared.started("daily digest \(day)")
         runPostProcessCommand(cmd) { status in
             elog("digest: \(day) finished (exit \(status))")
+            if status == 0 { SummaryStatus.shared.finished("daily digest \(day)", at: Date(), output: out) }
+            else { SummaryStatus.shared.failed("daily digest \(day)", at: Date()) }
             // The last-run marker is already set, so a failed digest won't retry until tomorrow. Saying
             // nothing would leave the user with no digest and no idea why (the per-transcript summary
             // path already pushes on failure — this one didn't).
@@ -8030,6 +8114,39 @@ struct Main {
             }
             // Transcribe-now push: terminal statuses notify (the menu may be closed by then),
             // transient ones keep waiting — a dangling flag would mis-attribute the NEXT hourly segment.
+            // Post-processing was invisible: it ran, left nothing behind, and the app read as broken.
+            let stamp = schedDate("2026-07-07 12:03")
+            let hm: (Date) -> String = { d in let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX")
+                                             f.timeZone = utc.timeZone; f.dateFormat = "HH:mm"; return f.string(from: d) }
+            check("tray: the summary row names the state, the file and when it happened",
+                  summaryMenuTitle(.off, hm: hm) == "Summaries: off"
+                  && summaryMenuTitle(.idle, hm: hm) == "Summary: after the next transcript"
+                  && summaryMenuTitle(.running("a.md"), hm: hm) == "Summary: running… a.md"
+                  && summaryMenuTitle(.done("a.md", stamp), hm: hm) == "Summary: a.md · 12:03"
+                  && summaryMenuTitle(.failed("a.md", stamp), hm: hm) == "Summary FAILED: a.md · 12:03")
+            check("tray: the digest row says off, due, or already written today",
+                  digestMenuTitle(enabled: false, dueTime: "20:00", lastRun: "", today: "2026-07-07")
+                  == "Daily digest: off"
+                  && digestMenuTitle(enabled: true, dueTime: "20:00", lastRun: "", today: "2026-07-07")
+                  == "Daily digest: due at 20:00"
+                  && digestMenuTitle(enabled: true, dueTime: "20:00", lastRun: "2026-07-07", today: "2026-07-07")
+                  == "Daily digest: written today"
+                  && digestMenuTitle(enabled: true, dueTime: "20:00", lastRun: "2026-07-06", today: "2026-07-07")
+                  == "Daily digest: due at 20:00")
+            // A summary that ran must be reachable: the row is only clickable once it produced a file.
+            SummaryStatus.shared.resetForTest()
+            let noOutput = SummaryStatus.shared.lastOutput == nil && SummaryStatus.shared.current == .idle
+            SummaryStatus.shared.started("a.md")
+            let running = SummaryStatus.shared.current == .running("a.md")
+            SummaryStatus.shared.finished("a.md", at: stamp, output: "/s/a.md")
+            check("tray: summary status tracks running → done and remembers the file it wrote",
+                  noOutput && running
+                  && SummaryStatus.shared.current == .done("a.md", stamp)
+                  && SummaryStatus.shared.lastOutput == "/s/a.md")
+            SummaryStatus.shared.resetForTest()
+            // The row is a control, and a control wired to nothing looks perfect until you click it.
+            check("tray: the summary row's reveal action is implemented",
+                  AppController.instancesRespond(to: Selector(("revealLastSummary"))))
             check("flush push: terminal statuses classified, transient ones wait",
                   flushOutcome(for: "Saved: 2026-07-05-2100-2130.md")! == ("Transcript ready", "2026-07-05-2100-2130.md")
                   && flushOutcome(for: "No speech — discarded") != nil
