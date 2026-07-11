@@ -648,6 +648,33 @@ final class WhisperLiveTranscriber: LiveTranscribing {
     }
 }
 
+/// Convert a capture buffer to 16-bit little-endian PCM (mono) at `fmt`'s sample rate, reusing the
+/// caller's converter — the exact conversion every streaming STT client feeds its socket (raw bytes for
+/// binary framing, or the payload a base64 JSON frame wraps). Feed-thread only. Shared by the WebSocket
+/// engines below; the first brick of the reusable streaming base (see ARCHITECTURE.md).
+func pcm16LE(from buffer: AVAudioPCMBuffer, to fmt: AVAudioFormat, converter: inout AVAudioConverter?) -> Data? {
+    let mono: AVAudioPCMBuffer
+    if buffer.format == fmt {
+        mono = buffer
+    } else {
+        if converter == nil || converter?.inputFormat != buffer.format {
+            converter = AVAudioConverter(from: buffer.format, to: fmt)
+        }
+        guard let c = converter else { return nil }
+        let cap = AVAudioFrameCount(Double(buffer.frameLength) * fmt.sampleRate / buffer.format.sampleRate) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return nil }
+        var fed = false; var err: NSError?
+        c.convert(to: out, error: &err) { _, s in if fed { s.pointee = .noDataNow; return nil }; fed = true; s.pointee = .haveData; return buffer }
+        guard err == nil, out.frameLength > 0 else { return nil }
+        mono = out
+    }
+    guard let ch = mono.floatChannelData?[0] else { return nil }
+    let n = Int(mono.frameLength); guard n > 0 else { return nil }
+    var i16 = [Int16](repeating: 0, count: n)
+    for i in 0..<n { let v = max(-1, min(1, ch[i])); i16[i] = Int16(v * 32767) }
+    return i16.withUnsafeBufferPointer { Data(buffer: $0) }
+}
+
 /// Cloud live engine: streams 16 kHz linear16 audio to Deepgram's realtime WebSocket API and maps its
 /// interim/final results onto the overlay's volatile/final line model. THE ONLY feature that sends audio
 /// off-device, and only while the overlay is open with this engine selected — the saved whisper transcript
@@ -748,11 +775,7 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
     func feed(_ buffer: AVAudioPCMBuffer) {
         // No early `task` check — that state is q-confined (reading it here would race start()/stop()).
         // The no-connection case (e.g. missing key) just converts ~µs worth and drops inside q.async.
-        guard let mono = toCanon(buffer), let ch = mono.floatChannelData?[0] else { return }
-        let n = Int(mono.frameLength); guard n > 0 else { return }
-        var i16 = [Int16](repeating: 0, count: n)
-        for i in 0..<n { let v = max(-1, min(1, ch[i])); i16[i] = Int16(v * 32767) }
-        let data = i16.withUnsafeBufferPointer { Data(buffer: $0) }   // little-endian on all Apple platforms
+        guard let data = pcm16LE(from: buffer, to: fmt, converter: &converter) else { return }
         q.async { [weak self] in
             guard let self, let t = self.task, !self.stopped else { return }
             self.pending.append(data)
@@ -824,17 +847,6 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
         let isFinal = obj["is_final"] as? Bool ?? false
         guard !transcript.isEmpty else { return }
         onUpdate(transcript, isFinal)
-    }
-
-    private func toCanon(_ buf: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        if buf.format == fmt { return buf }
-        if converter == nil || converter?.inputFormat != buf.format { converter = AVAudioConverter(from: buf.format, to: fmt) }
-        guard let c = converter else { return nil }
-        let cap = AVAudioFrameCount(Double(buf.frameLength) * fmt.sampleRate / buf.format.sampleRate) + 1024
-        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return nil }
-        var fed = false; var err: NSError?
-        c.convert(to: out, error: &err) { _, s in if fed { s.pointee = .noDataNow; return nil }; fed = true; s.pointee = .haveData; return buf }
-        return (err == nil && out.frameLength > 0) ? out : nil
     }
 }
 
@@ -948,11 +960,7 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
 
     func feed(_ buffer: AVAudioPCMBuffer) {
         // No off-queue state peeks (q-confined); the no-connection case just converts ~µs and drops.
-        guard let mono = toCanon(buffer), let ch = mono.floatChannelData?[0] else { return }
-        let n = Int(mono.frameLength); guard n > 0 else { return }
-        var i16 = [Int16](repeating: 0, count: n)
-        for i in 0..<n { let v = max(-1, min(1, ch[i])); i16[i] = Int16(v * 32767) }
-        let data = i16.withUnsafeBufferPointer { Data(buffer: $0) }   // little-endian on all Apple platforms
+        guard let data = pcm16LE(from: buffer, to: fmt, converter: &converter) else { return }
         q.async { [weak self] in
             guard let self, self.task != nil, !self.stopped else { return }
             self.pending.append(data)
@@ -1038,17 +1046,6 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
             onUpdate("(OpenAI error — check the API key / log)", true)
         default: break   // session.created / committed / speech_started … — not caption-relevant
         }
-    }
-
-    private func toCanon(_ buf: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        if buf.format == fmt { return buf }
-        if converter == nil || converter?.inputFormat != buf.format { converter = AVAudioConverter(from: buf.format, to: fmt) }
-        guard let c = converter else { return nil }
-        let cap = AVAudioFrameCount(Double(buf.frameLength) * fmt.sampleRate / buf.format.sampleRate) + 1024
-        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return nil }
-        var fed = false; var err: NSError?
-        c.convert(to: out, error: &err) { _, s in if fed { s.pointee = .noDataNow; return nil }; fed = true; s.pointee = .haveData; return buf }
-        return (err == nil && out.frameLength > 0) ? out : nil
     }
 }
 
@@ -1147,11 +1144,7 @@ final class GladiaLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
 
     func feed(_ buffer: AVAudioPCMBuffer) {
         // No off-queue state peeks (q-confined); the no-connection case just converts ~µs and drops.
-        guard let mono = toCanon(buffer), let ch = mono.floatChannelData?[0] else { return }
-        let n = Int(mono.frameLength); guard n > 0 else { return }
-        var i16 = [Int16](repeating: 0, count: n)
-        for i in 0..<n { let v = max(-1, min(1, ch[i])); i16[i] = Int16(v * 32767) }
-        let data = i16.withUnsafeBufferPointer { Data(buffer: $0) }   // little-endian on all Apple platforms
+        guard let data = pcm16LE(from: buffer, to: fmt, converter: &converter) else { return }
         q.async { [weak self] in
             guard let self, !self.stopped else { return }
             // PRE-ROLL: unlike the other engines, the socket only exists after Gladia's REST init
@@ -1222,17 +1215,6 @@ final class GladiaLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
         default: break   // audio_chunk acks / lifecycle events — not caption-relevant
         }
     }
-
-    private func toCanon(_ buf: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        if buf.format == fmt { return buf }
-        if converter == nil || converter?.inputFormat != buf.format { converter = AVAudioConverter(from: buf.format, to: fmt) }
-        guard let c = converter else { return nil }
-        let cap = AVAudioFrameCount(Double(buf.frameLength) * fmt.sampleRate / buf.format.sampleRate) + 1024
-        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return nil }
-        var fed = false; var err: NSError?
-        c.convert(to: out, error: &err) { _, s in if fed { s.pointee = .noDataNow; return nil }; fed = true; s.pointee = .haveData; return buf }
-        return (err == nil && out.frameLength > 0) ? out : nil
-    }
 }
 
 /// Cloud live engine: ElevenLabs Scribe v2 Realtime — best-in-class Korean/Japanese accuracy, streaming.
@@ -1295,11 +1277,7 @@ final class ElevenLabsLiveTranscriber: NSObject, LiveTranscribing, URLSessionWeb
     }
 
     func feed(_ buffer: AVAudioPCMBuffer) {
-        guard let mono = toCanon(buffer), let ch = mono.floatChannelData?[0] else { return }
-        let n = Int(mono.frameLength); guard n > 0 else { return }
-        var i16 = [Int16](repeating: 0, count: n)
-        for i in 0..<n { let v = max(-1, min(1, ch[i])); i16[i] = Int16(v * 32767) }
-        let data = i16.withUnsafeBufferPointer { Data(buffer: $0) }   // little-endian on all Apple platforms
+        guard let data = pcm16LE(from: buffer, to: fmt, converter: &converter) else { return }
         q.async { [weak self] in
             guard let self, self.task != nil, !self.stopped else { return }
             self.pending.append(data)
@@ -1373,17 +1351,6 @@ final class ElevenLabsLiveTranscriber: NSObject, LiveTranscribing, URLSessionWeb
             }
             // session_started, commit_throttled, etc. → ignore
         }
-    }
-
-    private func toCanon(_ buf: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        if buf.format == fmt { return buf }
-        if converter == nil || converter?.inputFormat != buf.format { converter = AVAudioConverter(from: buf.format, to: fmt) }
-        guard let c = converter else { return nil }
-        let cap = AVAudioFrameCount(Double(buf.frameLength) * fmt.sampleRate / buf.format.sampleRate) + 1024
-        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return nil }
-        var fed = false; var err: NSError?
-        c.convert(to: out, error: &err) { _, s in if fed { s.pointee = .noDataNow; return nil }; fed = true; s.pointee = .haveData; return buf }
-        return (err == nil && out.frameLength > 0) ? out : nil
     }
 }
 
