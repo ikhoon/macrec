@@ -88,6 +88,23 @@ func runSelftest() -> Never {
             Pref.d.removeObject(forKey: "echoSuppress"); Pref.d.removeObject(forKey: "echoSuppressActive")
             EchoCanceller.shared.reset()                     // back to sane knobs for any later checks
             check("AEC knobs: garbage prefs don't crash preprocessor init", knobOut >= 0)
+            // AEC reference gating (#29): when the dedicated full-mix reference tap is live, appendSys must
+            // NOT also push the filtered mix as reference — a double feed corrupts the FIFO pairing the AEC
+            // relies on. This is the seam the shouldStartReferenceTap decision test can't see (that's the
+            // *choice*; this is the *wiring* that honors it).
+            Pref.d.set(true, forKey: Pref.echoReduce)
+            EchoCanceller.shared.reset()
+            let gateRec = Recorder(sysWriter: nil, micWriter: nil)
+            gateRec.referenceComesFromFullMixTap = true       // full-mix tap owns the reference…
+            let gateBase = EchoCanceller.shared.refDepthForTest
+            gateRec.appendSys(ecBuf(256))
+            let gatedOff = EchoCanceller.shared.refDepthForTest == gateBase     // …so appendSys pushes nothing
+            gateRec.referenceComesFromFullMixTap = false      // no full-mix tap → the filtered mix IS the reference
+            gateRec.appendSys(ecBuf(256))
+            let gatedOn = EchoCanceller.shared.refDepthForTest > gateBase       // …so appendSys pushes it
+            Pref.d.removeObject(forKey: Pref.echoReduce)
+            EchoCanceller.shared.reset()
+            check("AEC reference gating: live full-mix tap suppresses the filtered-mix reference push", gatedOff && gatedOn)
             // Deepgram engine: realtime-message parsing (interim → volatile, is_final → final, junk ignored).
             var dgGot: [(String, Bool)] = []
             let dg = DeepgramLiveTranscriber(label: "t", locale: Locale(identifier: "ko-KR")) { s, f in dgGot.append((s, f)) }
@@ -510,6 +527,16 @@ func runSelftest() -> Never {
                                Pref.cal, Pref.calendars, Pref.hintsTerms, Pref.hintsFile, Pref.hintsCalendar]
             check("settings: every recorder-affecting pref (schedule included) forces an engine restart on Save",
                   mustRestart.allSatisfy { SettingsWindowController.engineKeysForTest.contains($0) })
+            // The echo canceller must be fed the FULL speaker mix, not the transcript's filtered one — an
+            // excluded app (Spotify) still plays out loud and bleeds into the mic, so a reference missing
+            // it can never cancel that bleed. The dedicated full-mix reference tap is stood up only when
+            // echo reduction is on AND something is excluded (with nothing excluded the filtered tap already
+            // IS the full mix). This is the exact guard CaptureSession.startReferenceTap uses.
+            check("aec: stand up the full-mix reference tap only when echo reduction is on AND apps are excluded",
+                  shouldStartReferenceTap(echoReduceEnabled: true,  hasExcludedApps: true)   // the one case that needs it
+                  && !shouldStartReferenceTap(echoReduceEnabled: true,  hasExcludedApps: false) // nothing excluded → filtered IS full
+                  && !shouldStartReferenceTap(echoReduceEnabled: false, hasExcludedApps: true)  // AEC off → moot
+                  && !shouldStartReferenceTap(echoReduceEnabled: false, hasExcludedApps: false))
             // System-audio exclusion: match on Core Audio's own process list, so a helper process that
             // plays under its own bundle id is at least VISIBLE (AppKit's app lookup never saw it), and
             // notice when a relaunch (new object id) has made the live tap's frozen exclusion set stale.

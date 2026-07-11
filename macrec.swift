@@ -711,8 +711,23 @@ final class SystemAudioTap {
 /// Continuous capture whose per-source writers are swapped on a timer (hourly rotation), so capture
 /// never stops and there are no gaps. System audio via a Core Audio tap ("System Audio Recording
 /// Only" permission); mic via a separate AVCaptureSession.
+///
+/// The echo canceller's far-end reference must be what the SPEAKERS play. The transcript tap omits
+/// `excludeBundleIds`, so an excluded app (playing out loud) is missing from it and its bleed into the
+/// mic can never be cancelled. So when echo reduction is on AND something is excluded, we stand up a
+/// SECOND tap that excludes only our own process — the full speaker mix — and route the reference through
+/// it instead. With nothing excluded the filtered tap already IS the full mix, so the extra tap is moot.
+/// Pure + selftested; the CaptureSession wiring below follows this decision exactly.
+func shouldStartReferenceTap(echoReduceEnabled: Bool, hasExcludedApps: Bool) -> Bool {
+    echoReduceEnabled && hasExcludedApps
+}
+
 final class CaptureSession {
     private var tap: SystemAudioTap?
+    /// A second tap that excludes ONLY our own process — the full speaker mix — feeding the echo
+    /// canceller the far-end signal it needs. The transcript's `tap` above still omits excludeBundleIds,
+    /// so what gets recorded is unchanged; this only exists while echo reduction is on.
+    private var referenceTap: SystemAudioTap?
     private let mic = MicCapture()
     let rec = Recorder(sysWriter: nil, micWriter: nil)
     private let excludeBundleIds: [String]
@@ -744,16 +759,40 @@ final class CaptureSession {
     private func startTap() throws {
         guard Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) else {
             elog("engine: system-audio capture OFF (mic-only)")
+            rec.referenceComesFromFullMixTap = false   // no system tap at all → the flag must not linger true
             return
         }
         let t = SystemAudioTap(excludeBundleIds: excludeBundleIds) { [weak self] buf in self?.rec.appendSys(buf) }
         try t.start()
         tap = t
+        try startReferenceTap()
+    }
+
+    /// The AEC reference tap: the full speaker mix (only our own pid excluded), feeding the echo
+    /// canceller so it can cancel even an app the transcript tap leaves out. Only while echo reduction
+    /// is on; a failure here degrades to the filtered reference rather than killing capture.
+    private func startReferenceTap() throws {
+        referenceTap?.stop(); referenceTap = nil
+        // Filtered mix owns the reference until a full-mix tap is proven live — so any window where the
+        // filtered tap is already delivering but the reference tap isn't up yet falls back correctly.
+        rec.referenceComesFromFullMixTap = false
+        guard shouldStartReferenceTap(echoReduceEnabled: EchoCanceller.shared.enabled,
+                                      hasExcludedApps: !excludeBundleIds.isEmpty) else { return }
+        let r = SystemAudioTap(excludeBundleIds: []) { buf in EchoCanceller.shared.pushReference(buf) }
+        // Hand the reference to the full-mix tap BEFORE it can fire, so appendSys yields first and the two
+        // never push the same instant (a double feed corrupts the FIFO pairing). Revert if start fails.
+        rec.referenceComesFromFullMixTap = true
+        do { try r.start(); referenceTap = r }
+        catch {
+            rec.referenceComesFromFullMixTap = false
+            elog("engine: AEC reference tap failed (\(error)) — falling back to the filtered mix")
+        }
     }
 
     /// Rebuild the tap + mic (e.g. resuming after sleep/wake). Keeps the current writers running.
     func restartStream() async -> Bool {
         tap?.stop(); tap = nil
+        referenceTap?.stop(); referenceTap = nil   // startTap rebuilds it; drop the old one so a failure leaves none
         do { try startTap(); try mic.start(into: rec); return true }
         catch { elog("engine: tap restart failed: \(error)"); return false }
     }
@@ -769,10 +808,12 @@ final class CaptureSession {
         _ = await restartStream()
     }
 
-    /// Pause capture (mic + system tap) on lock/sleep.
+    /// Pause capture (mic + both system taps) on lock/sleep.
     func suspendStream() async {
         mic.stop()
         tap?.stop(); tap = nil
+        referenceTap?.stop(); referenceTap = nil
+        rec.referenceComesFromFullMixTap = false
     }
 
     /// Snapshot the current writers into a CompletedSegment and (if `continueRecording`) swap in fresh
@@ -804,6 +845,8 @@ final class CaptureSession {
         mic.stop()
         let done = cut(continueRecording: false)
         tap?.stop(); tap = nil
+        referenceTap?.stop(); referenceTap = nil
+        rec.referenceComesFromFullMixTap = false   // symmetry with suspendStream: no tap live → flag false
         return done
     }
 }
