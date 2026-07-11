@@ -538,6 +538,15 @@ func runSelftest() -> Never {
                                             ready: { $0 == .apple }) == [.deepgram]
                   && enginesMissingCredentials(LiveEngine.allCases, enabled: { _ in true }, ready: { _ in true }).isEmpty
                   && enginesMissingCredentials(LiveEngine.allCases, enabled: { _ in false }, ready: { _ in false }).isEmpty)
+            // The DeepL translation provider joins that same "you turned it on without a key" warning —
+            // it used to save silently and just fall back to Apple. Engines + provider in one list.
+            check("live: DeepL selected without a key is reported alongside missing-key engines",
+                  missingCredentialLabels(engines: [], engineEnabled: { _ in false }, engineReady: { _ in false },
+                                          translationProvider: .deepl, deeplReady: false) == ["DeepL translation"]
+                  && missingCredentialLabels(engines: [], engineEnabled: { _ in false }, engineReady: { _ in false },
+                                             translationProvider: .deepl, deeplReady: true).isEmpty     // key present → fine
+                  && missingCredentialLabels(engines: [], engineEnabled: { _ in false }, engineReady: { _ in false },
+                                             translationProvider: .apple, deeplReady: false).isEmpty)   // Apple needs no key
             // Indexing allCases picked the wrong engine as soon as one was filtered out of the menu.
             check("live: a popup index maps into the FILTERED list, never into allCases",
                   engineAtPopupIndex(1, choices: [.whisper, .deepgram, .openai, .gladia]) == .deepgram
