@@ -380,7 +380,7 @@ func envKeyPresent(_ name: String) -> Bool {
 
 /// Selectable live engine. Extensible: add a case, a title, and a branch in `makeTranscriber`.
 enum LiveEngine: String, CaseIterable {
-    case apple, whisper, deepgram, openai, gladia
+    case apple, whisper, deepgram, openai, gladia, elevenlabs
     /// The engine in use — but only if it is still selectable. A key deleted from the Keychain, or an
     /// engine switched off in Settings, must not leave the overlay pinned to an engine that can only
     /// print an error where the captions should be.
@@ -395,6 +395,7 @@ enum LiveEngine: String, CaseIterable {
         case .deepgram: return "Deepgram ☁"
         case .openai:   return "OpenAI ☁"
         case .gladia:   return "Gladia ☁"
+        case .elevenlabs: return "ElevenLabs ☁"
         }
     }
     /// Can this engine actually run right now? A cloud engine needs its API key; whisper needs its
@@ -411,6 +412,7 @@ enum LiveEngine: String, CaseIterable {
         case .deepgram: return Keychain.exists("deepgram") || envKeyPresent("MR_DEEPGRAM_KEY")
         case .openai:   return Keychain.exists("openai") || envKeyPresent("MR_OPENAI_KEY")
         case .gladia:   return Keychain.exists("gladia") || envKeyPresent("MR_GLADIA_KEY")
+        case .elevenlabs: return Keychain.exists("elevenlabs") || envKeyPresent("MR_ELEVENLABS_KEY")
         }
     }
     /// The title without the cloud marker — a row that already sits under a vendor header shouldn't
@@ -1233,6 +1235,158 @@ final class GladiaLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
     }
 }
 
+/// Cloud live engine: ElevenLabs Scribe v2 Realtime — best-in-class Korean/Japanese accuracy, streaming.
+/// Sends audio off-device ONLY while the overlay runs with this engine selected; API key in the Keychain
+/// (Settings → Live; `MR_ELEVENLABS_KEY`). No SDK. Server VAD segments turns: `partial_transcript` updates
+/// the current (volatile) line, `committed_transcript` finalizes it. Audio is base64 PCM16 (16 kHz mono)
+/// inside an `input_audio_chunk` JSON frame; auth is the `xi-api-key` header. Protocol per elevenlabs.io docs.
+final class ElevenLabsLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSocketDelegate {
+    private let label: String
+    private let locale: Locale
+    private let onUpdate: (String, Bool) -> Void
+    private let onLocale: ((Locale) -> Void)?
+    private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+    private let q = DispatchQueue(label: "macrec.elevenlabslive", qos: .userInitiated)   // confines connection state
+    private var converter: AVAudioConverter?   // feed thread only (one capture thread per transcriber)
+    private var task: URLSessionWebSocketTask?
+    private var session: URLSession?
+    private var pending = Data()               // audio awaiting send (batch ≈100 ms)
+    private var stopped = false
+    private let batchBytes = 1600 * 2          // 100 ms of 16 kHz Int16
+
+    static var storedKey: String? { Keychain.get("elevenlabs") }
+    static var apiKey: String { storedKey ?? ProcessInfo.processInfo.environment["MR_ELEVENLABS_KEY"] ?? "" }
+
+    /// The realtime STT WebSocket URL: Scribe v2 Realtime, 16 kHz PCM in, server-VAD segmenting, and the
+    /// caption language (ISO 639-1, e.g. "ko"/"ja"); empty language → server auto-detects. Pure + testable.
+    static func realtimeURL(lang: String) -> URL {
+        var c = URLComponents(string: "wss://api.elevenlabs.io/v1/speech-to-text/realtime")!
+        var items = [URLQueryItem(name: "model_id", value: "scribe_v2_realtime"),
+                     URLQueryItem(name: "audio_format", value: "pcm_16000"),
+                     URLQueryItem(name: "commit_strategy", value: "vad")]
+        if !lang.isEmpty { items.append(URLQueryItem(name: "language_code", value: lang)) }
+        c.queryItems = items
+        return c.url!
+    }
+
+    init(label: String, locale: Locale, onLocale: ((Locale) -> Void)? = nil,
+         onUpdate: @escaping (String, Bool) -> Void) {
+        self.label = label; self.locale = locale; self.onLocale = onLocale; self.onUpdate = onUpdate
+    }
+
+    func start() {
+        onLocale?(locale)
+        let key = Self.apiKey
+        guard !key.isEmpty else {
+            onUpdate("ElevenLabs API key not set — Settings → Live (or MR_ELEVENLABS_KEY)", true)
+            elog("elevenlabslive[\(label)]: no API key — engine idle"); return
+        }
+        let lang = locale.language.languageCode?.identifier ?? ""
+        var req = URLRequest(url: Self.realtimeURL(lang: lang))
+        req.setValue(key, forHTTPHeaderField: "xi-api-key")
+        q.async { [self] in
+            guard !stopped else { return }   // stop() can land before this block on a quick toggle
+            let s = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+            let t = s.webSocketTask(with: req)
+            session = s; task = t
+            t.resume(); receiveLoop(t)
+        }
+        elog("elevenlabslive[\(label)]: connecting (lang=\(lang.isEmpty ? "auto" : lang))")
+    }
+
+    func feed(_ buffer: AVAudioPCMBuffer) {
+        guard let mono = toCanon(buffer), let ch = mono.floatChannelData?[0] else { return }
+        let n = Int(mono.frameLength); guard n > 0 else { return }
+        var i16 = [Int16](repeating: 0, count: n)
+        for i in 0..<n { let v = max(-1, min(1, ch[i])); i16[i] = Int16(v * 32767) }
+        let data = i16.withUnsafeBufferPointer { Data(buffer: $0) }   // little-endian on all Apple platforms
+        q.async { [weak self] in
+            guard let self, self.task != nil, !self.stopped else { return }
+            self.pending.append(data)
+            guard self.pending.count >= self.batchBytes else { return }
+            let out = self.pending; self.pending.removeAll(keepingCapacity: true)
+            self.sendAudio(out, commit: false)
+        }
+    }
+
+    private func sendAudio(_ chunk: Data, commit: Bool) {   // caller is on q
+        guard let t = task else { return }
+        let msg = #"{"message_type":"input_audio_chunk","audio_base_64":""# + chunk.base64EncodedString()
+            + #"","commit":"# + (commit ? "true" : "false") + #","sample_rate":16000}"#
+        t.send(.string(msg)) { [weak self] err in
+            if let err, let self, !self.stopped { elog("elevenlabslive[\(self.label)] send: \(err.localizedDescription)") }
+        }
+    }
+
+    func stop() {
+        q.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.stopped = true
+            guard let t = self.task else { return }
+            self.task = nil; let s = self.session; self.session = nil
+            // Flush the tail with a final commit so the server transcribes what it's holding, then close.
+            let finish = { t.cancel(with: .normalClosure, reason: nil); s?.finishTasksAndInvalidate() }
+            let msg = #"{"message_type":"input_audio_chunk","audio_base_64":""# + self.pending.base64EncodedString()
+                + #"","commit":true,"sample_rate":16000}"#
+            self.pending.removeAll(keepingCapacity: false)
+            t.send(.string(msg)) { _ in finish() }
+            elog("elevenlabslive[\(self.label)]: stopped")
+        }
+    }
+
+    private func receiveLoop(_ t: URLSessionWebSocketTask) {
+        t.receive { [weak self] result in
+            guard let self else { return }
+            self.q.async {   // state is q-confined; also serializes handle() with teardown
+                guard !self.stopped else { return }
+                switch result {
+                case .failure(let err):
+                    elog("elevenlabslive[\(self.label)] receive: \(err.localizedDescription)")
+                    self.onUpdate("(ElevenLabs connection lost: \(err.localizedDescription))", true)
+                    self.stopped = true
+                    self.task?.cancel(with: .abnormalClosure, reason: nil); self.task = nil
+                    self.session?.finishTasksAndInvalidate(); self.session = nil
+                case .success(let msg):
+                    if case .string(let text) = msg { self.handle(text) }
+                    self.receiveLoop(t)
+                }
+            }
+        }
+    }
+
+    func handle(_ text: String) {   // internal for the selftest (message parsing is the pure logic here)
+        guard let data = text.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = obj["message_type"] as? String else { return }
+        switch type {
+        case "partial_transcript":                                   // full current partial → REPLACES the line
+            if let t = obj["text"] as? String, !t.isEmpty { onUpdate(t, false) }
+        case "committed_transcript", "committed_transcript_with_timestamps":   // final
+            if let t = obj["text"] as? String, !t.isEmpty { onUpdate(t, true) }
+        case "auth_error", "quota_exceeded", "unaccepted_terms":     // terminal + actionable → tell the user
+            elog("elevenlabslive[\(label)] server \(type): \(obj["error"] as? String ?? "")")
+            onUpdate("(ElevenLabs \(type) — check the API key/quota)", true)
+        default:
+            // The server closes on any error (receiveLoop then surfaces "connection lost"); log the reason.
+            if type.hasSuffix("error") || type == "rate_limited" || type == "queue_overflow" {
+                elog("elevenlabslive[\(label)] server \(type): \(obj["error"] as? String ?? "")")
+            }
+            // session_started, commit_throttled, etc. → ignore
+        }
+    }
+
+    private func toCanon(_ buf: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        if buf.format == fmt { return buf }
+        if converter == nil || converter?.inputFormat != buf.format { converter = AVAudioConverter(from: buf.format, to: fmt) }
+        guard let c = converter else { return nil }
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * fmt.sampleRate / buf.format.sampleRate) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap) else { return nil }
+        var fed = false; var err: NSError?
+        c.convert(to: out, error: &err) { _, s in if fed { s.pointee = .noDataNow; return nil }; fed = true; s.pointee = .haveData; return buf }
+        return (err == nil && out.frameLength > 0) ? out : nil
+    }
+}
+
 /// Which speakers to transcribe for the live overlay. Each source runs its own on-device analyzer,
 /// so transcribing one instead of two roughly halves inference load → lower latency. Default is
 /// `.other` (the remote party / system audio): you already know what you said, and it's the cheaper
@@ -1389,6 +1543,7 @@ final class LiveCaptions {
         case .deepgram: return DeepgramLiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
         case .openai:   return OpenAILiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
         case .gladia:   return GladiaLiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
+        case .elevenlabs: return ElevenLabsLiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
         case .apple:    return LiveTranscriber(label: label, locale: locale, onLocale: onLocale, onUpdate: onUpdate)
         }
     }
