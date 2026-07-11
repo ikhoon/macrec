@@ -44,3 +44,29 @@ better provider, not a rewrite.
 - Broaden capture beyond meetings (calendar, activity) — ambient, not meeting-triggered.
 
 The pluggable pipeline is the enabler; the two core values are the destination.
+
+## Positioning (competitive) — the combination, not the ingredients
+
+A mid-2026 landscape scan: the *ingredients* are crowded, the *combination* is nearly vacant.
+- **Crowded, don't lead here:** local Whisper transcription (MacWhisper, superwhisper, Aiko), cloud
+  meeting notetakers (Otter, Fireflies, Fathom, tl;dv, Circleback, Fellow, Read.ai), suite-bundled AI
+  (Zoom AI Companion, Teams Copilot, Notion AI), cloud interpretation (DeepL Voice, Wordly, Interprefy).
+  "No bot in the call" went mainstream in late 2025 — it is **table stakes, not a moat.** Never sell
+  macrec as "a Mac transcriber" or "an AI notetaker" — that benchmarks us against a field we don't lead.
+- **Nearly empty — our whitespace:** macOS-native **+** fully local across the *whole* pipeline **+**
+  *both* pillars in one app **+** pluggable. Closest rivals, each single-pillar: **Hyprnote/anarlog**
+  (OSS local notetaker — our nearest, beat it on pipeline depth + both-pillars + product finish);
+  **Apple Live Translation** (on-device but locked to Apple's own apps — we capture *any* audio);
+  **Granola** (polished but hybrid — cloud summarization, so not local-first).
+
+**The wedge (one line):** *"Your meetings and conversations never leave your Mac — and they compound into
+knowledge you can work from."* Lean, in order, into: (1) **fully local as a hard guarantee** (the one
+claim the whole cloud/hybrid field structurally can't match; also the enterprise/regulated angle);
+(2) **the pipeline, not the note** (daily log → knowledge an LLM acts on — depth nobody local builds);
+(3) **two pillars, one private app** (notetaker *and* live interpreter — our most ownable sentence);
+(4) **pluggable** (local by default, opt-in cloud ceiling for quality).
+
+**Risks to respect:** platform vendors baking it in for free (Zoom/Teams/Notion/Apple) — beat them only
+on privacy + any-audio capture + the pipeline they don't build, and move while the gap is open; Hyprnote
+is OSS/YC on our exact ground (win on depth + finish + speed); don't fight Granola on polish — reframe to
+privacy. The whitespace is real but narrow and closing.
