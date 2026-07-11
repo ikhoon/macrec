@@ -240,6 +240,8 @@ enum Pref {
     static let captionLang = "liveCaptionLang"          // live-caption transcription locale ("" = system)
     static let translateTo = "liveTranslateTo"          // live-caption translation target ("" = off)
     static let translateProvider = "liveTranslateProvider"  // translation backend: apple|deepl (falls back to apple)
+    static let ttsProvider = "liveTTSProvider"              // interpretation voice: apple (cloud pluggable later)
+    static let interpretOutputUID = "liveInterpretOutputUID"  // Core Audio device UID the interpreted voice plays to
     static let liveFontSize = "liveFontSize"            // live-caption overlay font size (pt)
     static let liveOpacity = "liveOpacity"              // live-caption overlay opacity (0.3–1.0)
     static let liveBarCollapsed = "liveBarCollapsed"    // overlay control strip collapsed (space for captions)

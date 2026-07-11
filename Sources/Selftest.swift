@@ -185,6 +185,27 @@ func runSelftest() -> Never {
             check("settings: translation provider popup values match the enum, in order",
                   TranslationProvider.allCases.map(\.rawValue) == ["apple", "deepl"]
                   && TranslationProvider.allCases.map(\.title).allSatisfy { !$0.isEmpty })
+            // Interpretation pipeline (Decorator stages, pluggable TTS). Speak a final translation ONCE;
+            // never a partial, never an untranslated line, never twice — and always forward downstream so
+            // the overlay still renders. The TTS backend is a protocol so a cloud voice drops in later.
+            check("interpret: speak a final translation once, not partials/dupes",
+                  shouldSpeakInterpretation(isFinal: true, hasTranslation: true, alreadySpoken: false)
+                  && !shouldSpeakInterpretation(isFinal: false, hasTranslation: true, alreadySpoken: false)   // partial
+                  && !shouldSpeakInterpretation(isFinal: true, hasTranslation: false, alreadySpoken: false)   // not translated yet
+                  && !shouldSpeakInterpretation(isFinal: true, hasTranslation: true, alreadySpoken: true))    // already spoken
+            check("interpret: TTS provider enum is pluggable (apple on-device now)",
+                  TTSProvider.allCases.map(\.rawValue) == ["apple"] && TTSProvider.apple.isReady && TTSProvider.current == .apple)
+            final class RecordingSynth: SpeechSynthesizing { var said: [(String, String)] = []
+                func speak(_ t: String, lang: String) { said.append((t, lang)) }; func stopSpeaking() {} }
+            final class CountingSink: UtteranceSink { var count = 0; func receive(_ u: Utterance) { count += 1 } }
+            let synth = RecordingSynth(); let downstream = CountingSink()
+            let speak = SpeakingStage(tts: synth, next: downstream)
+            let uid = UUID()
+            speak.receive(Utterance(id: uid, speaker: "me", sourceText: "안녕", sourceLang: "ko", isFinal: false, translation: nil, targetLang: "ja"))
+            speak.receive(Utterance(id: uid, speaker: "me", sourceText: "안녕하세요", sourceLang: "ko", isFinal: true, translation: "こんにちは", targetLang: "ja"))
+            speak.receive(Utterance(id: uid, speaker: "me", sourceText: "안녕하세요", sourceLang: "ko", isFinal: true, translation: "こんにちは", targetLang: "ja"))
+            check("interpret: SpeakingStage speaks once + always forwards to the next stage",
+                  synth.said.count == 1 && synth.said.first?.0 == "こんにちは" && synth.said.first?.1 == "ja" && downstream.count == 3)
             // Saved-transcript scaffold localization: language-selected labels, and the old workflow
             // footer must never come back.
             let tDoc = TranscriptDoc(title: "T", day: "2026-07-05", hmStart: "10:00", hmEnd: "11:00", mins: 60,
