@@ -206,6 +206,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     private let openaiKeyField = NSSecureTextField()
     private let openaiBaseField = NSTextField()   // OpenAI-compatible proxy/gateway base URL ("" = official)
     private let gladiaKeyField = NSSecureTextField()
+    private let elevenlabsKeyField = NSSecureTextField()  // ElevenLabs Scribe STT (best ko/ja accuracy)
     private let deeplKeyField = NSSecureTextField()        // DeepL translation key (cloud translator, opt-in)
     private let translateProviderPopup = NSPopUpButton()   // live-translation backend: Apple (on-device) | DeepL
     private let translateProviderValues = TranslationProvider.allCases.map(\.rawValue)
@@ -294,7 +295,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             c.completes = true
             c.delegate = self   // red-on-invalid, same treatment as the schedule fields
         }
-        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField, gladiaKeyField, deeplKeyField, postProcessField, promptFileField] { f.translatesAutoresizingMaskIntoConstraints = false }
+        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField, gladiaKeyField, elevenlabsKeyField, deeplKeyField, postProcessField, promptFileField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
         dirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         audioDirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
@@ -307,6 +308,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         openaiBaseField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         gladiaKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         gladiaKeyField.placeholderString = "Gladia API key"
+        elevenlabsKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        elevenlabsKeyField.placeholderString = "ElevenLabs API key"
         deeplKeyField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         deeplKeyField.placeholderString = "DeepL API key (…:fx for the free tier)"
         promptFileField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
@@ -772,6 +775,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
                 engineRow(.gladia, "Streaming cloud recognizer with broad language coverage."),
                 r("API key", gladiaKeyField, "app.gladia.io — broad language coverage incl. Korean streaming.", wide: true),
             ], icon: vendorBadge("globe", NSColor(srgbRed: 0.42, green: 0.31, blue: 0.95, alpha: 1))),
+            Section(header: "ElevenLabs", note: nil, rows: [
+                engineRow(.elevenlabs, "Scribe v2 Realtime — strongest Korean/Japanese accuracy (streaming)."),
+                r("API key", elevenlabsKeyField, "elevenlabs.io — best-in-class ko/ja transcription.", wide: true),
+            ], icon: vendorBadge("waveform.circle", NSColor(srgbRed: 0.42, green: 0.45, blue: 0.50, alpha: 1))),
             Section(header: "Translation", note: "Translates captions into the target language you pick in the "
                     + "overlay's control bar. Apple runs on-device; DeepL is a cloud service (markedly better "
                     + "for JA↔KO) that needs its own key — with it selected, caption text is sent to DeepL's "
@@ -1244,7 +1251,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
         // Presence, not the secret. Prefilling the real key made opening Settings an authorization prompt
         // per engine, for a value the user never asked to see.
-        for (account, field) in [("deepgram", deepgramKeyField), ("openai", openaiKeyField), ("gladia", gladiaKeyField), ("deepl", deeplKeyField)] {
+        for (account, field) in [("deepgram", deepgramKeyField), ("openai", openaiKeyField), ("gladia", gladiaKeyField), ("elevenlabs", elevenlabsKeyField), ("deepl", deeplKeyField)] {
             field.stringValue = Keychain.exists(account) ? Self.keyMask : ""
         }
         translateProviderPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.translateProvider) ?? "apple", translateProviderValues))
@@ -1415,7 +1422,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     static let keyMask = "••••••••••••"
 
     func loadForTest() { load() }
-    var keyFieldsForTest: [String] { [deepgramKeyField, openaiKeyField, gladiaKeyField, deeplKeyField].map(\.stringValue) }
+    var keyFieldsForTest: [String] { [deepgramKeyField, openaiKeyField, gladiaKeyField, elevenlabsKeyField, deeplKeyField].map(\.stringValue) }
 
     /// Every pref the recorder reads. Missing one means Save saves it and nothing happens.
     private static let engineKeys = [
@@ -1466,7 +1473,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         // "unchanged", so Save never reads or rewrites a key it wasn't given — and never asks the user
         // to authorize handing the old one back just to save an unrelated setting.
         let creds = [("deepgram", deepgramKeyField, "Deepgram"), ("openai", openaiKeyField, "OpenAI"),
-                     ("gladia", gladiaKeyField, "Gladia"), ("deepl", deeplKeyField, "DeepL")]
+                     ("gladia", gladiaKeyField, "Gladia"), ("elevenlabs", elevenlabsKeyField, "ElevenLabs"),
+                     ("deepl", deeplKeyField, "DeepL")]
             .filter { $0.1.stringValue != Self.keyMask }
         let previousKeys = creds.map { ($0.0, Keychain.get($0.0) ?? "") }
         for (i, cred) in creds.enumerated() {

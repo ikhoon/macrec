@@ -139,6 +139,26 @@ func runSelftest() -> Never {
             check("openai base: garbage → official", oaURL("ftp://nope") == oaOfficial && oaURL("::::") == oaOfficial)
             check("openai base: gateway query kept, intent deduped", oaURL("https://gw.example/x?intent=foo&team=a") ==
                   "wss://gw.example/x/v1/realtime?team=a&intent=transcription")
+            // ElevenLabs Scribe: realtime-message parsing. partial_transcript is the full current partial
+            // (REPLACES the volatile line); committed_transcript finalizes; junk/session/error → no caption.
+            var elGot: [(String, Bool)] = []
+            let el = ElevenLabsLiveTranscriber(label: "t", locale: Locale(identifier: "ja-JP")) { s, f in elGot.append((s, f)) }
+            el.handle(#"{"message_type":"session_started","session_id":"x"}"#)                       // control → dropped
+            el.handle(#"{"message_type":"partial_transcript","text":"こん"}"#)                        // interim
+            el.handle(#"{"message_type":"partial_transcript","text":"こんにちは"}"#)                  // interim (replaces)
+            el.handle(#"{"message_type":"committed_transcript","text":"こんにちは"}"#)                // final
+            el.handle(#"{"message_type":"partial_transcript","text":""}"#)                            // empty → dropped
+            el.handle("not json")                                                                     // junk → dropped
+            check("elevenlabs: partial replaces, committed finalizes", elGot.count == 3
+                  && elGot[0] == ("こん", false) && elGot[1] == ("こんにちは", false) && elGot[2] == ("こんにちは", true))
+            // The realtime URL carries the Scribe v2 model, 16k PCM, server VAD, and the ISO-639-1 language;
+            // an empty language omits language_code (server auto-detects).
+            let elURL = ElevenLabsLiveTranscriber.realtimeURL(lang: "ko").absoluteString
+            check("elevenlabs url: model + pcm16 + vad + language_code",
+                  elURL.hasPrefix("wss://api.elevenlabs.io/v1/speech-to-text/realtime?")
+                  && elURL.contains("model_id=scribe_v2_realtime") && elURL.contains("audio_format=pcm_16000")
+                  && elURL.contains("commit_strategy=vad") && elURL.contains("language_code=ko")
+                  && !ElevenLabsLiveTranscriber.realtimeURL(lang: "").absoluteString.contains("language_code"))
             // Live translation provider: DeepL is honored only with a key, else demote to Apple — the same
             // "don't offer what can't run" rule the transcription engines follow. Pure decision.
             check("translate provider: DeepL needs a key, else Apple",
@@ -405,7 +425,7 @@ func runSelftest() -> Never {
             check("live: the engine picker offers only engines that are ON and READY (never empty)",
                   selectableLiveEngines(LiveEngine.allCases, ready: noKeys, enabled: { _ in true }) == [.apple, .whisper]
                   && selectableLiveEngines(LiveEngine.allCases, ready: { _ in true },
-                                           enabled: { $0 != .apple }) == [.whisper, .deepgram, .openai, .gladia]
+                                           enabled: { $0 != .apple }) == [.whisper, .deepgram, .openai, .gladia, .elevenlabs]
                   && selectableLiveEngines(LiveEngine.allCases, ready: noKeys,
                                            enabled: { $0 != .apple && $0 != .whisper }) == [.apple]
                   && selectableLiveEngines(LiveEngine.allCases, ready: { _ in false }, enabled: { _ in false }) == [.apple])
