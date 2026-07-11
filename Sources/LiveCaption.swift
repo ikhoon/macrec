@@ -190,6 +190,13 @@ func translationProvider(stored: TranslationProvider, deeplReady: Bool) -> Trans
     (stored == .deepl && !deeplReady) ? .apple : stored
 }
 
+/// Does a live reconfigure need to rebuild the translator? True when EITHER the target language or the
+/// provider changed. The provider was the input a reconfigure used to ignore, so a Settings switch from
+/// Apple to DeepL left the running overlay translating with the old backend. Pure + selftested.
+func liveTranslatorNeedsRebuild(oldTarget: String, newTarget: String, oldProvider: String, newProvider: String) -> Bool {
+    oldTarget != newTarget || oldProvider != newProvider
+}
+
 /// Map a BCP-47 language id ("ja", "ko-KR", "en-US") to a DeepL language code: the uppercase primary
 /// subtag, with the regional variant DeepL requires for a few targets (EN→EN-US, PT→PT-PT). An unmapped
 /// code passes through uppercased; DeepL then rejects it and `translate` returns nil. Selftested.
@@ -1186,7 +1193,7 @@ final class LiveCaptions {
     private var showLabels = true   // false in single-speaker modes (one voice → the label is redundant)
     // Last-applied live config — so reconfigure() can no-op on unchanged values and avoid needless
     // analyzer rebuilds (each rebuild re-pays the ~model warm-up).
-    private var curLocaleId = "", curEngine = "", curSource = "", curTranslateId = ""
+    private var curLocaleId = "", curEngine = "", curSource = "", curTranslateId = "", curTranslateProvider = ""
     private var engineGen = 0   // bumped on translator rebuild; a translate Task from an older gen is ignored
     private let maxLines = 12
     private(set) var active = false
@@ -1268,7 +1275,7 @@ final class LiveCaptions {
         srcLock.lock(); mic = m; sys = s; srcLock.unlock()
         m?.start(); s?.start()
         curLocaleId = cfg.locale.identifier; curEngine = cfg.engine.rawValue
-        curSource = cfg.source.rawValue; curTranslateId = cfg.translateId
+        curSource = cfg.source.rawValue; curTranslateId = cfg.translateId; curTranslateProvider = TranslationProvider.current.rawValue
         elog("live: engine built (engine=\(cfg.engine.rawValue), locale=\(cfg.locale.identifier), source=\(cfg.source.rawValue), translate=\(cfg.translateId.isEmpty ? "off" : cfg.translateId))")
     }
 
@@ -1291,7 +1298,8 @@ final class LiveCaptions {
         guard active else { return }
         let cfg = liveConfig()
         let sameSources = cfg.locale.identifier == curLocaleId && cfg.engine.rawValue == curEngine && cfg.source.rawValue == curSource
-        let sameTranslate = cfg.translateId == curTranslateId
+        let sameTranslate = !liveTranslatorNeedsRebuild(oldTarget: curTranslateId, newTarget: cfg.translateId,
+                                                        oldProvider: curTranslateProvider, newProvider: TranslationProvider.current.rawValue)
         if sameSources && sameTranslate { return }   // nothing changed (e.g. re-picked the active language)
         // Keep the transcript history on every change — the overlay filters what it SHOWS by source
         // (Both→Me hides the other party's lines; switching back to Both reveals them again).
@@ -1311,7 +1319,7 @@ final class LiveCaptions {
             buildEngine()   // rebuild (warms up); the existing captions stay on screen
             elog("live: reconfigured (rebuild)")
         } else {
-            rebuildTranslator(cfg); curTranslateId = cfg.translateId   // translate-only → instant
+            rebuildTranslator(cfg); curTranslateId = cfg.translateId; curTranslateProvider = TranslationProvider.current.rawValue   // translate-only → instant
             elog("live: reconfigured (translator only)")
         }
         renderScheduled = false; render()

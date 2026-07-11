@@ -150,6 +150,18 @@ func runSelftest() -> Never {
             check("deepl form: reserved chars encoded",
                   DeepLTranslator.formBody([("text", "a & b=c+d"), ("target_lang", "KO")])
                   == "text=a%20%26%20b%3Dc%2Bd&target_lang=KO")
+            // Reconfigure seam: switching the provider in Settings (target language unchanged) must rebuild
+            // the running overlay's translator — the exact input reconfigure used to ignore, so an
+            // Apple→DeepL switch kept translating on Apple until the overlay was toggled off/on.
+            check("live: translator rebuilds on a provider change, not just a target change",
+                  liveTranslatorNeedsRebuild(oldTarget: "ko", newTarget: "ko", oldProvider: "apple", newProvider: "deepl")
+                  && liveTranslatorNeedsRebuild(oldTarget: "ko", newTarget: "en", oldProvider: "apple", newProvider: "apple")
+                  && !liveTranslatorNeedsRebuild(oldTarget: "ko", newTarget: "ko", oldProvider: "deepl", newProvider: "deepl"))
+            // Settings provider popup: values (saved) and titles (shown) both derive from the enum in the
+            // same order, so Save can't persist a rawValue that doesn't match what the user picked.
+            check("settings: translation provider popup values match the enum, in order",
+                  TranslationProvider.allCases.map(\.rawValue) == ["apple", "deepl"]
+                  && TranslationProvider.allCases.map(\.title).allSatisfy { !$0.isEmpty })
             // Saved-transcript scaffold localization: language-selected labels, and the old workflow
             // footer must never come back.
             let tDoc = TranscriptDoc(title: "T", day: "2026-07-05", hmStart: "10:00", hmEnd: "11:00", mins: 60,
