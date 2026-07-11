@@ -139,6 +139,52 @@ func runSelftest() -> Never {
             check("openai base: garbage → official", oaURL("ftp://nope") == oaOfficial && oaURL("::::") == oaOfficial)
             check("openai base: gateway query kept, intent deduped", oaURL("https://gw.example/x?intent=foo&team=a") ==
                   "wss://gw.example/x/v1/realtime?team=a&intent=transcription")
+            // Live translation provider: DeepL is honored only with a key, else demote to Apple — the same
+            // "don't offer what can't run" rule the transcription engines follow. Pure decision.
+            check("translate provider: DeepL needs a key, else Apple",
+                  translationProvider(stored: .deepl, deeplReady: true)  == .deepl
+                  && translationProvider(stored: .deepl, deeplReady: false) == .apple   // no key → fall back
+                  && translationProvider(stored: .apple, deeplReady: true)  == .apple)
+            // DeepL language mapping: uppercase primary subtag; targets that DeepL requires a regional
+            // variant for (EN, PT) get one; source keeps the base. (The user's pair is JA→KO.)
+            check("deepl lang: BCP-47 → DeepL code",
+                  deepLLang("ja", isTarget: true) == "JA" && deepLLang("ko-KR", isTarget: true) == "KO"
+                  && deepLLang("en", isTarget: true) == "EN-US" && deepLLang("en", isTarget: false) == "EN"
+                  && deepLLang("pt-BR", isTarget: true) == "PT-PT")
+            // DeepL free vs pro endpoint is decided by the key suffix (":fx" = free tier, different host).
+            check("deepl endpoint: :fx → api-free host, else pro host",
+                  DeepLTranslator.endpoint(forKey: "abc:fx").host == "api-free.deepl.com"
+                  && DeepLTranslator.endpoint(forKey: "abc").host == "api.deepl.com")
+            // DeepL retry policy: retry only transient failures (429 rate-limit, 5xx). A 4xx (bad key,
+            // quota, unsupported language) won't fix itself — retrying would just double the load.
+            check("deepl retry: only 429 + 5xx are retried",
+                  deepLShouldRetry(status: 429) && deepLShouldRetry(status: 500) && deepLShouldRetry(status: 503)
+                  && !deepLShouldRetry(status: 200) && !deepLShouldRetry(status: 403)
+                  && !deepLShouldRetry(status: 456) && !deepLShouldRetry(status: 400))
+            // DeepL response parsing: first non-empty translation; malformed/empty → nil (captions then
+            // show the original, never a crash or a blank line).
+            func dlParse(_ s: String) -> String? { DeepLTranslator.parse(s.data(using: .utf8)!) }
+            check("deepl parse: translations[0].text, else nil",
+                  dlParse(#"{"translations":[{"detected_source_language":"JA","text":"안녕하세요"}]}"#) == "안녕하세요"
+                  && dlParse(#"{"translations":[]}"#) == nil
+                  && dlParse(#"{"message":"Wrong endpoint"}"#) == nil
+                  && dlParse("not json") == nil)
+            // form body must percent-encode reserved chars so caption text with & = + never breaks the POST.
+            check("deepl form: reserved chars encoded",
+                  DeepLTranslator.formBody([("text", "a & b=c+d"), ("target_lang", "KO")])
+                  == "text=a%20%26%20b%3Dc%2Bd&target_lang=KO")
+            // Reconfigure seam: switching the provider in Settings (target language unchanged) must rebuild
+            // the running overlay's translator — the exact input reconfigure used to ignore, so an
+            // Apple→DeepL switch kept translating on Apple until the overlay was toggled off/on.
+            check("live: translator rebuilds on a provider change, not just a target change",
+                  liveTranslatorNeedsRebuild(oldTarget: "ko", newTarget: "ko", oldProvider: "apple", newProvider: "deepl")
+                  && liveTranslatorNeedsRebuild(oldTarget: "ko", newTarget: "en", oldProvider: "apple", newProvider: "apple")
+                  && !liveTranslatorNeedsRebuild(oldTarget: "ko", newTarget: "ko", oldProvider: "deepl", newProvider: "deepl"))
+            // Settings provider popup: values (saved) and titles (shown) both derive from the enum in the
+            // same order, so Save can't persist a rawValue that doesn't match what the user picked.
+            check("settings: translation provider popup values match the enum, in order",
+                  TranslationProvider.allCases.map(\.rawValue) == ["apple", "deepl"]
+                  && TranslationProvider.allCases.map(\.title).allSatisfy { !$0.isEmpty })
             // Saved-transcript scaffold localization: language-selected labels, and the old workflow
             // footer must never come back.
             let tDoc = TranscriptDoc(title: "T", day: "2026-07-05", hmStart: "10:00", hmEnd: "11:00", mins: 60,
