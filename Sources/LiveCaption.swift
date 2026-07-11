@@ -382,6 +382,16 @@ func enginesMissingCredentials(_ engines: [LiveEngine], enabled: (LiveEngine) ->
     engines.filter { enabled($0) && !ready($0) }
 }
 
+/// Everything the user turned on that will silently fall back to Apple for want of a credential:
+/// transcription engines switched on without a key, plus the DeepL translation provider selected
+/// without a key. The on-Save warning renders exactly this list. Pure + selftested.
+func missingCredentialLabels(engines: [LiveEngine], engineEnabled: (LiveEngine) -> Bool, engineReady: (LiveEngine) -> Bool,
+                             translationProvider: TranslationProvider, deeplReady: Bool) -> [String] {
+    var out = enginesMissingCredentials(engines, enabled: engineEnabled, ready: engineReady).map(\.plainTitle)
+    if translationProvider == .deepl && !deeplReady { out.append("DeepL translation") }
+    return out
+}
+
 /// The engine a popup index refers to. It indexes the FILTERED list the popup was built from — reading
 /// `LiveEngine.allCases[index]` selected the wrong engine the moment any engine was left out of the
 /// menu. Pure + selftested.

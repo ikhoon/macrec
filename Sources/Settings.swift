@@ -1431,13 +1431,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     /// A switch turned on for an engine with no key silently did nothing: the engine just never appeared
     /// in the overlay's picker. Say so at the moment the user saves it.
     private func warnAboutEnginesMissingCredentials() {
-        let missing = enginesMissingCredentials(LiveEngine.allCases, enabled: { $0.isEnabled }, ready: { $0.isReady })
+        let selectedProvider = TranslationProvider(rawValue: Pref.d.string(forKey: Pref.translateProvider) ?? "") ?? .apple
+        let missing = missingCredentialLabels(engines: LiveEngine.allCases,
+                                              engineEnabled: { $0.isEnabled }, engineReady: { $0.isReady },
+                                              translationProvider: selectedProvider, deeplReady: TranslationProvider.deepl.isReady)
         guard !missing.isEmpty else { return }
-        let names = missing.map(\.plainTitle).joined(separator: ", ")
+        let names = missing.joined(separator: ", ")
         let a = NSAlert()
-        a.messageText = missing.count == 1 ? "\(names) has no API key" : "Some engines have no API key"
-        a.informativeText = "\(names) stayed switched on but won't appear in the overlay's engine picker "
-            + "until the key is filled in. Everything else was saved."
+        a.messageText = missing.count == 1 ? "\(names) has no API key" : "Some features have no API key"
+        a.informativeText = "Without a key, \(names) can't run — captions fall back to Apple. "
+            + "Everything else was saved."
         a.alertStyle = .warning
         if dirPickerPresentation(hasVisibleWindow: window?.isVisible == true) == .sheet, let win = window {
             a.beginSheetModal(for: win, completionHandler: nil)
