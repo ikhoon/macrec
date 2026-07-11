@@ -449,6 +449,9 @@ final class EchoCanceller {
 final class Recorder {
     var sysWriter: SourceWriter?
     var micWriter: SourceWriter?
+    /// Set by CaptureSession when a full-mix reference tap is feeding the canceller instead. This tap is
+    /// the transcript's filtered mix, which omits excluded apps and must NOT be the AEC reference then.
+    var referenceComesFromFullMixTap = false
     let queue = DispatchQueue(label: "macrec.audio")
 
     init(sysWriter: SourceWriter?, micWriter: SourceWriter?) {
@@ -459,7 +462,8 @@ final class Recorder {
     /// System audio arrives from the Core Audio tap (an owned copy — safe to hand to the queue).
     /// Live captions are fed straight from here (lowest latency — no WAV-write/canon-convert/queue hop).
     func appendSys(_ buf: AVAudioPCMBuffer) {
-        if EchoCanceller.shared.enabled { EchoCanceller.shared.pushReference(buf) }   // reference for mic echo ducking
+        // Feed the AEC reference only when the full-mix tap ISN'T (this filtered mix drops excluded apps).
+        if EchoCanceller.shared.enabled && !referenceComesFromFullMixTap { EchoCanceller.shared.pushReference(buf) }
         if #available(macOS 26, *) { LiveCaptions.shared.feedSystem(buf) }
         queue.async { self.sysWriter?.append(buf) }
     }
