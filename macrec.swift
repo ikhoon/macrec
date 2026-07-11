@@ -239,6 +239,7 @@ enum Pref {
     static let liveTimestamps = "liveTimestamps"        // show timestamps in the live-caption overlay
     static let captionLang = "liveCaptionLang"          // live-caption transcription locale ("" = system)
     static let translateTo = "liveTranslateTo"          // live-caption translation target ("" = off)
+    static let translateProvider = "liveTranslateProvider"  // translation backend: apple|deepl (falls back to apple)
     static let liveFontSize = "liveFontSize"            // live-caption overlay font size (pt)
     static let liveOpacity = "liveOpacity"              // live-caption overlay opacity (0.3–1.0)
     static let liveBarCollapsed = "liveBarCollapsed"    // overlay control strip collapsed (space for captions)
