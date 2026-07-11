@@ -214,11 +214,14 @@ func deepLLang(_ id: String, isTarget: Bool) -> String {
 /// Source language is AUTO-DETECTED (robust to a mis-set caption language); only the target is fixed.
 /// API key in the Keychain (Settings → Live; `MR_DEEPL_KEY`). Free keys (suffix ":fx") use the api-free
 /// host. Returns nil on any failure, so captions fall back to the original text. No SDK — one POST.
+/// DeepL statuses worth one retry: 429 (rate limit) and 5xx (transient server). A 4xx like bad key,
+/// quota exhausted, or unsupported language won't fix itself on a retry. Pure + selftested.
+func deepLShouldRetry(status: Int) -> Bool { status == 429 || (500...599).contains(status) }
+
 final class DeepLTranslator: LiveTranslating {
     private let key: String
     private let targetLang: String
     private let endpoint: URL
-    private let session = URLSession(configuration: .default)
 
     static var storedKey: String? { Keychain.get("deepl") }
     static var apiKey: String { storedKey ?? ProcessInfo.processInfo.environment["MR_DEEPL_KEY"] ?? "" }
@@ -244,12 +247,23 @@ final class DeepLTranslator: LiveTranslating {
         req.setValue("DeepL-Auth-Key \(key)", forHTTPHeaderField: "Authorization")
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.httpBody = Self.formBody([("text", text), ("target_lang", targetLang)]).data(using: .utf8)
-        do {
-            let (data, resp) = try await session.data(for: req)
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
-            guard code == 200 else { elog("live: DeepL HTTP \(code)"); return nil }
-            return Self.parse(data)
-        } catch { elog("live: DeepL request failed: \(error)"); return nil }
+        // One retry on a transient failure: sentences translate as concurrent requests, so a burst can
+        // trip DeepL's rate limit — and without a retry that sentence's translation is dropped for good,
+        // which (in-order rendering) blanks the rest of the line's translation too.
+        for attempt in 0..<2 {
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                if code == 200 { return Self.parse(data) }
+                // Log the body — DeepL states the reason (bad key / quota / rate limit / bad lang) in JSON.
+                elog("live: DeepL HTTP \(code): \(String(data: data, encoding: .utf8)?.prefix(200) ?? "")")
+                if !deepLShouldRetry(status: code) { return nil }   // permanent — a retry won't help
+            } catch {
+                elog("live: DeepL request failed: \(error)")   // network blip — retriable
+            }
+            if attempt == 0 { try? await Task.sleep(nanoseconds: 400_000_000) }   // brief backoff
+        }
+        return nil
     }
 
     /// x-www-form-urlencoded body — percent-encodes every key and value (caption text can hold & = +).
@@ -1203,10 +1217,12 @@ final class LiveCaptions {
 
     /// Settings were saved: the engine picker and the engine itself must reflect them without the user
     /// closing and reopening the overlay (an engine switched off stayed in the menu until then).
-    func settingsSaved() {
+    /// `translationCredsChanged` = the DeepL key was edited; force a translator rebuild so the running
+    /// overlay picks up the new key even when the provider/target didn't change.
+    func settingsSaved(translationCredsChanged: Bool = false) {
         guard active else { return }
         window?.reloadEngineChoices()
-        reconfigure()
+        reconfigure(force: translationCredsChanged)
     }
 
     func start() {
@@ -1294,13 +1310,17 @@ final class LiveCaptions {
     /// Apply an overlay control-bar change. Keeps the transcript history; only rebuilds the analyzer
     /// (which re-warms) when the locale/engine/source actually changed. Re-picking the active value is a
     /// no-op, and a translate-only change swaps just the translator (instant, no warm-up).
-    private func reconfigure() {
+    /// `force` rebuilds the translator even when provider/target look unchanged — a Settings Save may
+    /// have rotated the DeepL API key, which the value comparison can't see (and re-reading the key to
+    /// compare would risk a Keychain prompt). Save is infrequent, so an unconditional translator rebuild
+    /// is cheap; without it, fixing a bad key in Settings never reached the running overlay.
+    private func reconfigure(force: Bool = false) {
         guard active else { return }
         let cfg = liveConfig()
         let sameSources = cfg.locale.identifier == curLocaleId && cfg.engine.rawValue == curEngine && cfg.source.rawValue == curSource
         let sameTranslate = !liveTranslatorNeedsRebuild(oldTarget: curTranslateId, newTarget: cfg.translateId,
                                                         oldProvider: curTranslateProvider, newProvider: TranslationProvider.current.rawValue)
-        if sameSources && sameTranslate { return }   // nothing changed (e.g. re-picked the active language)
+        if !force && sameSources && sameTranslate { return }   // nothing changed (e.g. re-picked the active language)
         // Keep the transcript history on every change — the overlay filters what it SHOWS by source
         // (Both→Me hides the other party's lines; switching back to Both reveals them again).
         for i in lines.indices where !lines[i].final { lines[i].final = true }

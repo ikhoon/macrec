@@ -774,7 +774,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             ], icon: vendorBadge("globe", NSColor(srgbRed: 0.42, green: 0.31, blue: 0.95, alpha: 1))),
             Section(header: "Translation", note: "Translates captions into the target language you pick in the "
                     + "overlay's control bar. Apple runs on-device; DeepL is a cloud service (markedly better "
-                    + "for JA↔KO) that needs its own key. DeepL falls back to Apple when no key is set.", rows: [
+                    + "for JA↔KO) that needs its own key — with it selected, caption text is sent to DeepL's "
+                    + "servers. DeepL falls back to Apple when no key is set.", rows: [
                 r("Provider", translateProviderPopup, "Apple (on-device) or DeepL (cloud)."),
                 r("DeepL API key", deeplKeyField, "Free or Pro key from deepl.com/pro-api. Only used when the "
                   + "provider is DeepL; source language is auto-detected.", wide: true),
@@ -1530,7 +1531,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         if #available(macOS 13, *), !LoginItem.managedByLaunchAgent {
             if LoginItem.setEnabled(loginBtn.state == .on) == .requiresApproval { LoginItem.openSettings() }
         }
-        if #available(macOS 26, *) { LiveCaptions.shared.settingsSaved() }
+        // A rotated DeepL key must reach the running overlay even if provider/target didn't change.
+        if #available(macOS 26, *) { LiveCaptions.shared.settingsSaved(translationCredsChanged: creds.contains { $0.0 == "deepl" }) }
         warnAboutEnginesMissingCredentials()
         // `stop()` discards the in-progress segment, and Return in any field now fires Save.
         if engineSettingsDigest() != engineBefore { onSave() }

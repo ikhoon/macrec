@@ -138,6 +138,12 @@ func runSelftest() -> Never {
             check("deepl endpoint: :fx → api-free host, else pro host",
                   DeepLTranslator.endpoint(forKey: "abc:fx").host == "api-free.deepl.com"
                   && DeepLTranslator.endpoint(forKey: "abc").host == "api.deepl.com")
+            // DeepL retry policy: retry only transient failures (429 rate-limit, 5xx). A 4xx (bad key,
+            // quota, unsupported language) won't fix itself — retrying would just double the load.
+            check("deepl retry: only 429 + 5xx are retried",
+                  deepLShouldRetry(status: 429) && deepLShouldRetry(status: 500) && deepLShouldRetry(status: 503)
+                  && !deepLShouldRetry(status: 200) && !deepLShouldRetry(status: 403)
+                  && !deepLShouldRetry(status: 456) && !deepLShouldRetry(status: 400))
             // DeepL response parsing: first non-empty translation; malformed/empty → nil (captions then
             // show the original, never a crash or a blank line).
             func dlParse(_ s: String) -> String? { DeepLTranslator.parse(s.data(using: .utf8)!) }
