@@ -1176,9 +1176,12 @@ func printMacrecHelp() {
     """)
 }
 
-@main
-struct Main {
-    static func main() async {
+/// The app's entry logic, invoked by Cli/Entry.swift's `@main` (see CLAUDE.md for the hybrid build).
+public enum App {
+    // @MainActor: Cli/Entry.swift's `await App.main()` suspends, so without this runMenuBarApp() builds
+    // the tray NSWindow off the main thread. (See also Task.detached in the engine stop handler below.)
+    @MainActor
+    public static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
 
         // The test/snapshot subcommands build the real Settings pane and the real overlay, which read
@@ -1355,7 +1358,10 @@ struct Main {
             do { try await engine.start() } catch { elog("engine: \(error)"); exit(3) }
             installStopHandler {
                 let s = DispatchSemaphore(value: 0)
-                Task { await engine.stop(); s.signal() }
+                // Task.detached, NOT Task {}: main() is @MainActor, so a plain Task would inherit the
+                // main actor and never run — the main thread is parked on the wait() below. Detached
+                // runs engine.stop() on the global executor so s.signal() actually fires.
+                Task.detached { await engine.stop(); s.signal() }
                 _ = s.wait(timeout: .now() + 20)
                 exit(0)
             }

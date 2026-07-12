@@ -2,6 +2,9 @@ import AVFoundation
 import CoreAudio
 import CoreMedia
 import Foundation
+#if SWIFT_PACKAGE
+    import CSpeexDSP // swift build: speex symbols via the C module; the swiftc build uses speex-bridge.h
+#endif
 
 // MARK: - echo canceller (opt-in speaker→mic echo reduction via SpeexDSP AEC)
 //

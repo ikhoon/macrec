@@ -1,0 +1,6 @@
+// Proper C module for the `swift build` path (a bridging header can't live on a library target that
+// other targets import — it leaks into every importer). The raw swiftc line still uses speex-bridge.h.
+module CSpeexDSP [system] {
+    header "shim.h"
+    export *
+}

@@ -1,9 +1,13 @@
 # build artifact — install.sh rebuilds & signs it
 macrec-stage.app/
 
+# SwiftPM build products (swift build / swift test / editor indexing)
+.build/
+.swiftpm/
+
 # package.sh outputs: distributable .app/zip + cached whisper.cpp checkout & build
 dist/
-.build/
+.whisper-build/
 
 # per-machine config (copy from config.sh.example) — keeps personal paths out of the repo
 config.sh

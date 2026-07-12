@@ -1,16 +1,22 @@
 # macrec — dev rules for Claude
 
-macOS menu-bar meeting recorder. `macrec.swift` is the CLI entry point and the low-level primitives;
-`Sources/` holds the rest as **per-module directories**, one concern per file — `Audio/`, `Live/`,
-`Pipeline/`, `Settings/`, `Tray/`, `Selftest/`, `Eval/`. **Migrating to standard SwiftPM**
-(`Sources/` + `Tests/`, XCTest) — decided to easily leverage the OSS ecosystem (packages, `swift
-test`, indexing, tooling) instead of the bespoke single-`swiftc` build. Done incrementally + design-
-first: step one is additive (add `Package.swift` + `Tests/` so `swift build`/`swift test` work) while
-`install.sh`/`package.sh` keep building + signing the `.app` unchanged (the cert-based DR must survive).
-Until the cutover the build is `swiftc macrec.swift $(find Sources -name '*.swift')` (recursive;
-`version.sh` searches the same way). Menu-bar (tray) app today, architected to grow
-into a full windowed **desktop app**; recording is table stakes — the value is the pipeline above it
-(transcript → summary → daily digest → knowledge). See `PIPELINE.md`.
+macOS menu-bar meeting recorder. `macrec.swift` holds the app's entry logic (`public enum App`) and
+the low-level primitives; `Sources/` holds the rest as **per-module directories**, one concern per
+file — `Audio/`, `Live/`, `Pipeline/`, `Settings/`, `Tray/`, `Selftest/`, `Eval/`. **Standard SwiftPM
+layout** (chosen to leverage the OSS ecosystem — packages, `swift test`, indexing, tooling): a library
+target **MacRecKit** (`macrec.swift` + `Sources/`, no `@main`) + a thin executable **macrec**
+(`Cli/Entry.swift`, holds `@main`, calls `App.main()`) + XCTest **Tests/MacRecKitTests** + a C module
+**CSpeexDSP** for the SpeexDSP AEC. So `swift build` / `swift test` / editor indexing all work.
+**Hybrid build (deliberate):** the signed `.app` is still produced by the single-module swiftc line in
+`install.sh` / `package.sh` — `swiftc macrec.swift Cli/Entry.swift $(find Sources -name '*.swift')`
+(recursive; `version.sh` searches the same way) — so the cert-based DR + TCC grants are untouched.
+`Cli/Entry.swift` conditionally imports `MacRecKit`, and the speex files (`EchoCanceller`/`Recorder`/
+`AudioSelftests`) conditionally import `CSpeexDSP` — both under `#if SWIFT_PACKAGE`, so the swiftc build
+stays one module with the bridging header. `App.main()` is `@MainActor` — the `await App.main()` hop
+would otherwise build the tray NSWindow off the main thread. Menu-bar (tray) app today, architected to
+grow into a full windowed **desktop app**; recording is table stakes — the value is the pipeline above
+it (transcript → summary → daily digest → knowledge).
+See `PIPELINE.md`.
 
 **Read `AGENTS.md` too** — the operating rules distilled from maintainer feedback (the quality
 bar, non-negotiable habits, the CS-fundamentals self-check, and the post-implementation
