@@ -14,7 +14,8 @@ source "$HERE/config.sh"
 
 DIST="$HERE/dist"
 APP="$DIST/macrec.app"
-WBUILD="$HERE/.build/whisper.cpp"                  # cached whisper.cpp checkout + build
+WBUILD="$HERE/.whisper-build/whisper.cpp"          # cached whisper.cpp checkout + build (NOT .build:
+                                                   # that is SwiftPM's, wiped by `swift package clean`)
 SILERO="$HOME/whisper-models/ggml-silero-v5.1.2.bin"
 SILERO_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
 
@@ -43,7 +44,7 @@ rm -f /tmp/_cxxcheck
 WCLI="$WBUILD/build/bin/whisper-cli"
 if [[ ! -x "$WCLI" || -n "$REBUILD_WHISPER" ]]; then
   echo "▸ building self-contained whisper-cli (static + Metal embed)…  (first time only, takes minutes)"
-  mkdir -p "$HERE/.build"
+  mkdir -p "$HERE/.whisper-build"
   [[ -d "$WBUILD/.git" ]] || git clone --depth 1 https://github.com/ggml-org/whisper.cpp "$WBUILD"
   SDK="$(xcrun --show-sdk-path)"
   cmake -S "$WBUILD" -B "$WBUILD/build" \
@@ -81,7 +82,7 @@ swiftc -swift-version 5 -parse-as-library -O \
   -framework AVFoundation -framework CoreMedia -framework CoreAudio \
   -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech -framework Translation \
   -import-objc-header "$HERE/speex-bridge.h" -I "$SPEEX_PREFIX/include" "$SPEEX_PREFIX/lib/libspeexdsp.a" \
-  "$HERE/macrec.swift" $(find "$HERE/Sources" -name '*.swift') -o "$APP/Contents/MacOS/macrec"
+  "$HERE/macrec.swift" "$HERE/Cli/Entry.swift" $(find "$HERE/Sources" -name '*.swift') -o "$APP/Contents/MacOS/macrec"
 
 # ── 6) bundle whisper-cli + VAD + icon ──────────────────────────────────────────
 cp "$WCLI"    "$APP/Contents/Helpers/whisper-cli"
