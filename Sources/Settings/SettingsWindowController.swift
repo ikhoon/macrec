@@ -3,6 +3,13 @@ import AVFoundation
 import EventKit
 import Foundation
 
+/// A count field (minutes, seconds) is valid when empty (falls back to a default on save) or a
+/// non-negative integer; anything else is a typo the parser can't read. Pure + selftested.
+func numericFieldValid(_ s: String) -> Bool {
+    let t = s.trimmingCharacters(in: .whitespaces)
+    return t.isEmpty || (Int(t).map { $0 >= 0 } ?? false)
+}
+
 /// The Settings window: builds every pane, loads/saves prefs, and restarts the engine on Save — but
 /// only when an engine-affecting pref actually changed (see engineKeys / engineSettingsDigest).
 final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSComboBoxDelegate {
@@ -12,6 +19,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     func controlTextDidChange(_ obj: Notification) {
         guard let f = obj.object as? NSTextField else { return }
         if f === audioRawCombo || f === audioRetCombo { recolorRetentionCombos() }
+        if f === calGatePadField || f === voiceField {
+            f.textColor = numericFieldValid(f.stringValue) ? .labelColor : .systemRed
+        }
     }
 
     fileprivate func recolorRetentionCombos() {
@@ -1150,6 +1160,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         }
         updatePostProcessEnabled()
         voiceField.stringValue = String(Int(c.voiceMinSeconds))
+        for f in [calGatePadField, voiceField] {   // reset the red-on-invalid tint to the loaded (valid) value
+            f.textColor = numericFieldValid(f.stringValue) ? .labelColor : .systemRed
+        }
         vadBtn.state = c.vadEnabled ? .on : .off
         systemAudioBtn.state = Pref.bool(Pref.systemAudio, "MR_SYSTEM_AUDIO", true) ? .on : .off
         echoBtn.state = Pref.bool(Pref.echoReduce, "MR_ECHO_REDUCE", false) ? .on : .off
@@ -1281,6 +1294,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
 
     func loadForTest() { load() }
     var keyFieldsForTest: [String] { [deepgramKeyField, openaiKeyField, gladiaKeyField, elevenlabsKeyField, deeplKeyField].map(\.stringValue) }
+    /// Test hook: the tint controlTextDidChange actually applies to a numeric field for `input`.
+    func numericTintForTest(_ input: String) -> NSColor {
+        calGatePadField.stringValue = input
+        controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: calGatePadField))
+        return calGatePadField.textColor ?? .labelColor
+    }
 
     /// Every pref the recorder reads. Missing one means Save saves it and nothing happens.
     private static let engineKeys = [
@@ -1381,8 +1400,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         d.set(serializeDays(), forKey: Pref.schedDays)
         d.set(serializeHours(), forKey: Pref.schedHours)
         d.set(calGateBtn.state == .on, forKey: Pref.calGated)
-        d.set(max(0, min(Int(calGatePadField.stringValue) ?? 5, 1440)), forKey: Pref.calGatePad)
-        d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
+        // Ignored on save when INVALID (red) — keep the previously-saved value; empty → the default.
+        // numericFieldValid already rejects negatives, so no coercion to 0 and no persisting a "-1".
+        if numericFieldValid(calGatePadField.stringValue) {
+            d.set(min(Int(calGatePadField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 5, 1440), forKey: Pref.calGatePad)
+        }
+        if numericFieldValid(voiceField.stringValue) {
+            d.set(Double(Int(voiceField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 5), forKey: Pref.voiceMin)
+        }
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
         d.set(echoBtn.state == .on, forKey: Pref.echoReduce)
