@@ -277,6 +277,8 @@ enum Pref {
     static let schedEnabled = "scheduleEnabled"         // record only on a schedule (default: 24/7)
     static let schedDays = "scheduleDays"               // e.g. "mon-fri" / "mon,wed,fri" / "sat,sun"
     static let schedHours = "scheduleHours"             // e.g. "10:00-12:00, 13:00-19:00" (gaps = excluded)
+    static let calGated = "calendarGated"               // record only while a calendar meeting is live
+    static let calGatePad = "calendarGatePadMin"        // minutes to record before/after a meeting (default 5)
     /// Explicit save (even empty) beats the env — for fields where empty is meaningful.
     static func explicit(_ key: String, _ env: String) -> String {
         if d.object(forKey: key) != nil { return d.string(forKey: key) ?? "" }

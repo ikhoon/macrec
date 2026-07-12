@@ -19,7 +19,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private var transcribeRowTitle = "Transcribe now"  // flashes the outcome ("No speech found") briefly
     private var rowHovered = false                     // hover restyle must not clobber a flashed title
     private var spinStartedAt: TimeInterval = 0        // enforce a visible minimum spin (see spinnerHold)
-    private var schedulePaused = false         // the SCHEDULE stopped the engine (vs the user's `paused`)
+    private var schedulePaused = false         // the recording window (schedule OR calendar) stopped it
+    private var schedulePauseReason: RecordPause?  // which gate — so the tray message updates if it flips
     private var scheduleOverrideUntil: Date?   // manual Pause/Resume wins until this boundary passes
     private var startTask: Task<Void, Never>?  // in-flight engine start — stops must wait for it
     private var voiceShown = false
@@ -367,13 +368,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     /// schedule-pause WITHOUT starting. Gating the start (instead of start-then-stop) is what keeps
     /// stop() from racing an in-flight start() at launch / settings-save time.
     private func startEngineRespectingSchedule() {
-        if RecordSchedule.fromPrefs.isActive(at: Date()) {
-            if !paused && engine == nil { startEngine() }
-        } else {
+        if let pause = recordingWindowPauseNow(overriding: scheduleOverrideUntil != nil, now: Date()) {
             schedulePaused = true
+            schedulePauseReason = pause
             setIcon(recording: false)
-            refresh("⏸ Off-hours (schedule)")
+            refresh(pauseMessage(pause))
+            elog("engine: not started — \(pauseReason(pause))")
+        } else if !paused, engine == nil {
+            startEngine()
         }
+    }
+
+    private func pauseReason(_ p: RecordPause) -> String {
+        p == .offHours ? "off-hours (schedule)" : "no live calendar meeting"
     }
 
     @objc private func flushNow() {
@@ -459,9 +466,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     }
 
     @objc private func togglePause() {
-        // A manual choice beats the schedule until the next boundary — stored as the boundary's
-        // TIMESTAMP so it still expires when the Mac slept across it (nil = schedule never flips).
-        scheduleOverrideUntil = RecordSchedule.fromPrefs.nextBoundary(after: Date())
+        // A manual choice beats BOTH gates until the next schedule boundary — stored as the boundary's
+        // TIMESTAMP so it still expires when the Mac slept across it. With no schedule boundary (calendar-
+        // only gating) it holds until the user acts again (distantFuture), not nil — else Resume during a
+        // "no meeting" pause self-reverts on the next tick.
+        scheduleOverrideUntil = overrideExpiry(RecordSchedule.fromPrefs, now: Date())
         // Resume covers BOTH states WE own: a manual pause and a schedule-parked (off-hours) engine.
         // The bug: schedule-pause (paused == false) fell through to the else and manually PAUSED
         // instead of resuming. Same decision the label/enablement use — capture before clearing.
@@ -577,30 +586,50 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
 
     /// Enforce the recording schedule (~30 s tick). A manual Pause/Resume overrides until the next
     /// schedule boundary — an expiry TIMESTAMP, so it lapses even if the Mac slept across it.
-    private func checkSchedule() {
+    /// The recording-window pause reason RIGHT NOW (schedule ∩ calendar-gate), or nil to record. Read
+    /// live each call so a saved setting takes effect without a restart. `overriding` = a manual
+    /// Pause/Resume override is in force, which records regardless of both gates until it expires.
+    private func recordingWindowPauseNow(overriding: Bool, now: Date) -> RecordPause? {
+        if overriding { return nil }
         let sched = RecordSchedule.fromPrefs
+        let gated = Pref.bool(Pref.calGated, "MR_CALENDAR_GATE", false)
+        let pad = Pref.int(Pref.calGatePad, "MR_CALENDAR_GATE_PAD", 5)
+        return recordingWindowState(scheduleEnabled: sched.enabled, scheduleActive: sched.isActive(at: now),
+                                    calendarGated: gated, calendarAuthorized: CalendarLookup.authorized,
+                                    meetingActive: gated ? CalendarLookup.meetingLiveNow(padMinutes: pad) : false)
+    }
+
+    private func pauseMessage(_ p: RecordPause) -> String {
+        switch p {
+        case .offHours: return "⏸ Off-hours (schedule)"
+        case .noMeeting: return "⏸ No meeting (calendar)"
+        }
+    }
+
+    private func checkSchedule() {
         let now = Date()
         if let until = scheduleOverrideUntil, now >= until { scheduleOverrideUntil = nil }
-        if !sched.enabled || scheduleOverrideUntil != nil {
-            if schedulePaused {   // schedule turned off (or overridden) while it held the engine
-                schedulePaused = false
-                if !paused { refresh("Resuming…"); resumeEngineAfterStop() }
+        let pause = recordingWindowPauseNow(overriding: scheduleOverrideUntil != nil, now: now)
+        if pause == nil {
+            if schedulePaused {   // the recording window re-opened (schedule/calendar/override) while held
+                schedulePaused = false; schedulePauseReason = nil
+                if !paused { elog("engine: recording window reopened"); refresh("Resuming…"); resumeEngineAfterStop() }
             }
             return
         }
-        if !sched.isActive(at: now), !paused, !schedulePaused, engine != nil {
+        if !paused, !schedulePaused, engine != nil {   // window closed while recording → park the engine
             schedulePaused = true
             setIcon(recording: false)
-            refresh("⏸ Off-hours (schedule)")
             if let eng = engine {
                 engine = nil
                 let starting = startTask
                 stopTask = Task { if let starting { _ = await starting.value }; await eng.stop() }
             }
-        } else if sched.isActive(at: now), schedulePaused {
-            schedulePaused = false
-            refresh("Resuming…")
-            resumeEngineAfterStop()
+        }
+        if schedulePaused, schedulePauseReason != pause {   // reflect the CURRENT reason (schedule↔calendar)
+            schedulePauseReason = pause
+            refresh(pauseMessage(pause!))
+            elog("engine: parked — \(pauseReason(pause!))")
         }
     }
 
@@ -639,7 +668,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         refresh("Applying settings…")
         setupModelDownload()   // a newly-selected model starts downloading (if not already present)
         let old = engine; engine = nil; paused = false
-        schedulePaused = false; scheduleOverrideUntil = nil   // a settings save re-baselines the schedule
+        schedulePaused = false; schedulePauseReason = nil; scheduleOverrideUntil = nil   // Save re-baselines
         let pending = stopTask   // settings saved while paused → that stop may still be in flight; kept set
         let starting = startTask // until done so an interleaved resume can't slip past it (see togglePause)
         Task {

@@ -18,6 +18,29 @@ func recordingWindowActive(scheduleEnabled: Bool, scheduleActive: Bool,
     (!scheduleEnabled || scheduleActive) && (!calendarGated || meetingActive)
 }
 
+/// Why the recorder is parked, so the menu can explain the pause (`nil` = record now).
+enum RecordPause: Equatable { case offHours, noMeeting }
+
+/// When a manual Pause/Resume override should expire: the schedule's next boundary, or — when the
+/// schedule defines none (disabled, or calendar-only gating) — the distant future, so the override
+/// HOLDS until the user acts again. `nextBoundary` alone returns nil there, which would collapse the
+/// override to "none" and let the next 30 s tick re-park a just-resumed engine. Pure + selftested.
+func overrideExpiry(_ schedule: RecordSchedule, now: Date) -> Date {
+    schedule.nextBoundary(after: now) ?? .distantFuture
+}
+
+/// The recording-window decision WITH its reason, layering calendar-permission fail-open onto
+/// `recordingWindowActive`. Gating fails OPEN without Calendar access — a permission the user hasn't
+/// granted must never silently stop all recording. Schedule is the outer gate, so when both block the
+/// reason is off-hours. Pure + selftested.
+func recordingWindowState(scheduleEnabled: Bool, scheduleActive: Bool, calendarGated: Bool,
+                          calendarAuthorized: Bool, meetingActive: Bool) -> RecordPause? {
+    let gated = calendarGated && calendarAuthorized   // no permission → not gated (fail open)
+    if recordingWindowActive(scheduleEnabled: scheduleEnabled, scheduleActive: scheduleActive,
+                             calendarGated: gated, meetingActive: meetingActive) { return nil }
+    return (scheduleEnabled && !scheduleActive) ? .offHours : .noMeeting
+}
+
 struct RecordSchedule: Equatable {
     var enabled: Bool
     var weekdays: Set<Int>            // 1=Sun … 7=Sat (Calendar.component(.weekday))
