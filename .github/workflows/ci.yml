@@ -11,6 +11,10 @@ on:
     paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
+# Read-only token: neither job pushes or writes to the repo (build + lint only).
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: macos-26   # needs the macOS 26 SDK to compile the SpeechAnalyzer (live-captions) code
@@ -67,6 +71,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false   # read-only lint job — don't leave GITHUB_TOKEN in git config
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
