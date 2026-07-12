@@ -1,10 +1,12 @@
 # macrec — dev rules for Claude
 
 macOS menu-bar meeting recorder. `macrec.swift` is the CLI entry point and the low-level primitives;
-`Sources/` holds one concern per file — `Audio`, `Pipeline`, `LiveCaption`, `Settings`, `Tray`,
-`Selftest`. The build stays one `swiftc macrec.swift Sources/*.swift` (no SwiftPM). Menu-bar (tray) app today,
-architected to grow into a full windowed app; recording is table stakes — the value is the
-pipeline above it (transcript → summary → daily digest → knowledge). See `PIPELINE.md`.
+`Sources/` holds the rest as **per-module directories**, one concern per file — `Audio/`, `Live/`,
+`Pipeline/`, `Settings/`, `Tray/`, `Selftest/`, `Eval/`. Still no SwiftPM — the build is one
+`swiftc macrec.swift $(find Sources -name '*.swift')` (recursive, so subdirectories are picked up
+automatically; `version.sh` searches the same way). Menu-bar (tray) app today, architected to grow
+into a full windowed **desktop app**; recording is table stakes — the value is the pipeline above it
+(transcript → summary → daily digest → knowledge). See `PIPELINE.md`.
 
 **Read `AGENTS.md` too** — the operating rules distilled from maintainer feedback (the quality
 bar, non-negotiable habits, the CS-fundamentals self-check, and the post-implementation

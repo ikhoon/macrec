@@ -166,10 +166,12 @@ only `./macrec-stage.app/Contents/MacOS/macrec` (signed by `install.sh`). The te
   this is macrec's reminder to actually run it against CodeRabbit before merging.)
 - **Split, one concern per file.** `macrec.swift` was one 8888-line file until the day it made a
   change set impossible to divide into compiling commits. It is now the CLI entry point plus the
-  low-level primitives, and `Sources/` holds the rest: `Audio`, `Pipeline`, `LiveCaption`,
-  `Settings`, `Tray`, `Selftest`. Still no SwiftPM — the build stays one `swiftc macrec.swift
-  Sources/*.swift`. `Sources/` is what `swift package init` creates, so a later move to SwiftPM
-  needs no rename.
+  low-level primitives, and `Sources/` holds the rest as **per-module directories**: `Audio/`,
+  `Live/`, `Pipeline/`, `Settings/`, `Tray/`, `Selftest/`, `Eval/`, each a concern per file. Still
+  no SwiftPM — the build is `swiftc macrec.swift $(find Sources -name '*.swift')` (recursive, so
+  subdir files compile automatically; `version.sh` searches the same way, and `let macrecVersion`
+  can live in any of them). `Sources/` is what `swift package init` creates, so a later move to
+  SwiftPM needs no rename.
 - **Moving code is not changing code.** A refactor commit must prove it: capture `selftest` output
   before, and diff it after. Identical or it isn't pure motion. Never mix a fix into a move.
 - **No org/employer identifiers** in code, fixtures, placeholders, or PR text (`CLAUDE.md`).
@@ -184,3 +186,7 @@ only `./macrec-stage.app/Contents/MacOS/macrec` (signed by `install.sh`). The te
   (it crashes), so it lands only once full Xcode is installed — a linter you can run locally beats a
   CI-only one. Apple's `swift-format` was rejected as the formatter: on macrec's style it wanted to
   rewrite ~18k lines. Don't re-litigate; extend it (add SwiftLint) when Xcode is available.
+- **No idle — keep improving.** When the maintainer hands you no immediate task (or you're waiting on
+  CI / a review to finish), don't stop: strengthen tests, improve code quality, and pull the next item
+  from `BACKLOG.md`. Momentum with the quality bar intact — never busywork, and never a risky change you
+  can't verify. *(macrec-scoped for now.)*

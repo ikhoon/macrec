@@ -17,6 +17,13 @@ it is a knowledge substrate.
 - Render what **I hear** into **my** language.
 Bidirectional, real-time, any-language.
 
+## Form factor: menu-bar today → full desktop app
+
+macrec is a menu-bar (tray) app now, deliberately architected to grow into a **full windowed desktop
+app** with more features. As the pipeline deepens — a readable/searchable transcript, in-place AI
+actions on the day, the knowledge substrate above — those surfaces want real windows. The tray is the
+seed, not the ceiling.
+
 ## Where we are: ~1%. The blocker is QUALITY.
 
 Transcription and translation quality — **especially Korean and Japanese** — is too low to trust.
