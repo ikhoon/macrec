@@ -25,6 +25,9 @@ func runSelftest() -> Never {
             check("labels ko → 나/상대",         speakerLabels(forLanguage: "ko") == ("나", "상대"))
             check("labels en → Me/Them",        speakerLabels(forLanguage: "en") == ("Me", "Them"))
             check("labels ja → 私/相手",         speakerLabels(forLanguage: "ja") == ("私", "相手"))
+            check("labels zh → 我/对方",         speakerLabels(forLanguage: "zh") == ("我", "对方"))
+            check("labels nil → Me/Them",       speakerLabels(forLanguage: nil) == ("Me", "Them"))
+            check("labels unmapped → Me/Them",  speakerLabels(forLanguage: "fr") == ("Me", "Them"))
             // EchoCanceller (SpeexDSP AEC) framing/plumbing — deterministic, no audio device needed.
             // Guards the contract: the mic ALWAYS flows through (cumulative out ≈ in, ±one buffered frame),
             // whether or not a reference is present — a regression that starved the mic would fail here.
