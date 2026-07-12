@@ -1380,8 +1380,3 @@ func runPostProcessCommand(_ command: String, completion: ((Int32) -> Void)? = n
         }
     }
 }
-
-// MARK: - settings window (grouped row-card form, persists to UserDefaults)
-
-/// Scroll-document container whose origin is the TOP (AppKit views are bottom-up by default) —
-/// forms in a scroll view should start at the top and grow downward.
