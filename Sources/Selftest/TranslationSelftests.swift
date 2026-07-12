@@ -10,6 +10,15 @@ func translationSelftests(_ check: (String, Bool) -> Void) {
           translationProvider(stored: .deepl, deeplReady: true)  == .deepl
           && translationProvider(stored: .deepl, deeplReady: false) == .apple   // no key → fall back
           && translationProvider(stored: .apple, deeplReady: true)  == .apple)
+    // Sentence-streamed translation renders the in-order prefix of landed parts. A nil part = a sentence
+    // still IN FLIGHT → stop (keep order). But a sentence that FAILED both attempts must store its
+    // original as a fallback (non-nil), or that one failure truncates every later sentence until finalize.
+    check("translated prefix: a failed sentence's fallback avoids truncating later ones (DeepL bug)",
+          translatedPrefix(["A", "B", "C"], tail: nil) == "A B C"
+          && translatedPrefix(["A", nil, "C"], tail: nil) == "A"                  // nil = in flight → stop in order
+          && translatedPrefix(["A", "b(orig)", "C"], tail: nil) == "A b(orig) C"  // FAILED → fallback → NO truncation
+          && translatedPrefix(["A"], tail: "tail") == "A tail"
+          && translatedPrefix([], tail: nil) == nil)
     // DeepL language mapping: uppercase primary subtag; targets that DeepL requires a regional
     // variant for (EN, PT) get one; source keeps the base. (The user's pair is JA→KO.)
     check("deepl lang: BCP-47 → DeepL code",
