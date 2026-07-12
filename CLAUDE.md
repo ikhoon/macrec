@@ -15,15 +15,17 @@ practices surface, without being asked.
 
 Never declare a change done from the code alone. Every change goes through, in order:
 
-1. **Build**: `./install.sh` — must be 0 errors.
-2. **Selftest**: `./macrec-stage.app/Contents/MacOS/macrec selftest` — must end `selftest: ALL PASS`.
+1. **Format**: `swiftformat .` — CI hard-fails on `swiftformat --lint` drift, so format before you commit.
+   The config (`.swiftformat`) is a hygiene guardrail (whitespace/redundancy), not a restyle.
+2. **Build**: `./install.sh` — must be 0 errors.
+3. **Selftest**: `./macrec-stage.app/Contents/MacOS/macrec selftest` — must end `selftest: ALL PASS`.
    Every new pure function / decision gets a selftest case, reproducing the real failure it fixes
    (the exact numbers/strings from the incident). One mistake is forgivable; shipping it twice is not.
-3. **For ANY UI change — actually SEE it**: `./macrec-stage.app/Contents/MacOS/macrec settings-snapshot /tmp/shots`
+4. **For ANY UI change — actually SEE it**: `./macrec-stage.app/Contents/MacOS/macrec settings-snapshot /tmp/shots`
    then open the PNGs and look. A "structurally valid" pane (grids present, selftest green) shipped
    visually destroyed twice because it was never rendered. The `settings: no pane control is
    collapsed or overlapping` selftest now fails the build on that class of breakage — but still LOOK.
-4. **Install + restart**: the app auto-reinstalls to `/Applications` via `install.sh`; then
+5. **Install + restart**: the app auto-reinstalls to `/Applications` via `install.sh`; then
    `launchctl kickstart -k gui/$(id -u)/com.ikhoon.macrec`.
 
 ## UI test kit

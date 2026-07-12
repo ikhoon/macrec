@@ -177,3 +177,10 @@ only `./macrec-stage.app/Contents/MacOS/macrec` (signed by `install.sh`). The te
 - **Deliberate prior picks** — the always-visible (non-overlay) scrollbar, non-shouty
   sentence-case headers, the lighter-orange voice tint, the modest pane title size — are
   intentional and annotated in code comments. Read the comment before "fixing" them.
+- **Formatter is SwiftFormat; the linter (SwiftLint) is deferred.** Formatting is `swiftformat` with an
+  **allowlist** config (`.swiftformat`) — whitespace/redundancy the code already follows, no restyle — so
+  the dense hand-tuned style (semicolons, long lines, aligned comments) survives; CI lints it pinned.
+  SwiftLint is the intended linter but its sourcekit **won't load on a CommandLineTools-only machine**
+  (it crashes), so it lands only once full Xcode is installed — a linter you can run locally beats a
+  CI-only one. Apple's `swift-format` was rejected as the formatter: on macrec's style it wanted to
+  rewrite ~18k lines. Don't re-litigate; extend it (add SwiftLint) when Xcode is available.

@@ -35,11 +35,14 @@ jobs:
 
       # SwiftFormat is a hygiene guardrail (allowlist ruleset in .swiftformat) — no restyle, just
       # whitespace/redundancy the code already follows. Runs before the expensive compile so a style
-      # slip fails in seconds instead of after a full build.
-      - name: Lint — SwiftFormat (style)
+      # slip fails in seconds instead of after a full build. Pinned (not `brew install`) so a future
+      # release can't silently change a rule's behavior and fail an unrelated PR — bump deliberately.
+      - name: Lint — SwiftFormat (style, pinned 0.62.1)
         run: |
-          brew install swiftformat
-          swiftformat --lint .
+          curl -fsSL https://github.com/nicklockwood/SwiftFormat/releases/download/0.62.1/swiftformat.zip -o "$RUNNER_TEMP/sf.zip"
+          unzip -q "$RUNNER_TEMP/sf.zip" -d "$RUNNER_TEMP"
+          chmod +x "$RUNNER_TEMP/swiftformat"
+          "$RUNNER_TEMP/swiftformat" --lint .
 
       - name: Install speexdsp (AEC — statically linked into the binary)
         run: brew install speexdsp
