@@ -39,7 +39,7 @@ jobs:
             -framework AVFoundation -framework CoreMedia -framework CoreAudio \
             -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech -framework Translation \
             -import-objc-header speex-bridge.h -I "$SPEEX_PREFIX/include" "$SPEEX_PREFIX/lib/libspeexdsp.a" \
-            macrec.swift Sources/*.swift -o "$RUNNER_TEMP/macrec"
+            macrec.swift $(find Sources -name '*.swift') -o "$RUNNER_TEMP/macrec"
 
       - name: Guard — no ScreenCaptureKit + speexdsp is statically linked
         run: |
