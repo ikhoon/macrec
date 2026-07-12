@@ -81,7 +81,7 @@ swiftc -swift-version 5 -parse-as-library -O \
   -framework AVFoundation -framework CoreMedia -framework CoreAudio \
   -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech -framework Translation \
   -import-objc-header "$HERE/speex-bridge.h" -I "$SPEEX_PREFIX/include" "$SPEEX_PREFIX/lib/libspeexdsp.a" \
-  "$HERE/macrec.swift" "$HERE"/Sources/*.swift -o "$APP/Contents/MacOS/macrec"
+  "$HERE/macrec.swift" $(find "$HERE/Sources" -name '*.swift') -o "$APP/Contents/MacOS/macrec"
 
 # ── 6) bundle whisper-cli + VAD + icon ──────────────────────────────────────────
 cp "$WCLI"    "$APP/Contents/Helpers/whisper-cli"
