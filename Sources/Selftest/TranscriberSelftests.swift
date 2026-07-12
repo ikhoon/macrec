@@ -58,4 +58,17 @@ func transcriberSelftests(_ check: (String, Bool) -> Void) {
           && elURL.contains("model_id=scribe_v2_realtime") && elURL.contains("audio_format=pcm_16000")
           && elURL.contains("commit_strategy=vad") && elURL.contains("language_code=ko")
           && !ElevenLabsLiveTranscriber.realtimeURL(lang: "").absoluteString.contains("language_code"))
+    // convert16 hands finishOrDiscard the .16.wav it just created; a throwing write must delete that
+    // partial, a successful write must keep it.
+    let cvTmp = FileManager.default.temporaryDirectory.appendingPathComponent("macrec-cv-\(UUID().uuidString).16.wav")
+    FileManager.default.createFile(atPath: cvTmp.path, contents: Data([0, 0]))       // the caller's just-created output
+    let cvExisted = FileManager.default.fileExists(atPath: cvTmp.path)
+    let cvFailed = Transcriber.finishOrDiscard(cvTmp) { throw NSError(domain: "selftest.convert16", code: 1) }
+    check("convert16 cleanup: a throwing write removes the partial it was handed",
+          cvExisted && cvFailed == nil && !FileManager.default.fileExists(atPath: cvTmp.path))
+    FileManager.default.createFile(atPath: cvTmp.path, contents: Data([0, 0]))
+    let cvOK = Transcriber.finishOrDiscard(cvTmp) {}
+    check("convert16 cleanup: a successful write keeps the file",
+          cvOK == cvTmp && FileManager.default.fileExists(atPath: cvTmp.path))
+    try? FileManager.default.removeItem(at: cvTmp)   // don't leave the test's own artifact
 }
