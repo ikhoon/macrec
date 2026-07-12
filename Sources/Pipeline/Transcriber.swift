@@ -144,16 +144,32 @@ enum Transcriber {
             let settings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000.0,
                 AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
                 AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false]
+            // forWriting: creates outURL on disk — from here a throw must delete THIS partial (never a
+            // .16.wav an earlier run wrote), so the loop runs inside finishOrDiscard.
             let outFile = try AVAudioFile(forWriting: outURL, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
-            let block: AVAudioFrameCount = 16000
-            while inFile.framePosition < inFile.length {
-                guard let buf = AVAudioPCMBuffer(pcmFormat: canon, frameCapacity: block) else { break }
-                try inFile.read(into: buf, frameCount: block)
-                if buf.frameLength == 0 { break }
-                try outFile.write(from: buf)
+            return finishOrDiscard(outURL, onError: { elog("convert16(\(src.lastPathComponent)): \($0)") }) {
+                let block: AVAudioFrameCount = 16000
+                while inFile.framePosition < inFile.length {
+                    guard let buf = AVAudioPCMBuffer(pcmFormat: canon, frameCapacity: block) else { break }
+                    try inFile.read(into: buf, frameCount: block)
+                    if buf.frameLength == 0 { break }
+                    try outFile.write(from: buf)
+                }
             }
-            return outURL
         } catch { elog("convert16(\(src.lastPathComponent)): \(error)"); return nil }
+    }
+
+    /// The caller has just created `partial` on disk; run `write`, and on any throw delete that partial
+    /// (the file this call started — never a pre-existing one) and return nil. A cleanup that itself
+    /// fails is surfaced via `onError`, not swallowed. Injected `onError` keeps the selftest silent.
+    static func finishOrDiscard(_ partial: URL, onError: (Error) -> Void = { _ in },
+                                _ write: () throws -> Void) -> URL? {
+        do { try write(); return partial }
+        catch {
+            onError(error)
+            do { try FileManager.default.removeItem(at: partial) } catch { onError(error) }
+            return nil
+        }
     }
 
     /// Transcribe mic ("me") and system ("them") SEPARATELY, then merge by time into a speaker-labeled
