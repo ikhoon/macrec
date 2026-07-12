@@ -320,10 +320,10 @@ func settingsSelftests(_ check: (String, Bool) -> Void) {
     // Every pref that must make Save restart the recorder. Omitting one means the setting saves
     // and nothing happens — turning the schedule OFF left the engine parked off-hours, because
     // only restartEngine() clears `schedulePaused` and re-baselines the schedule.
-    let mustRestart = [Pref.schedEnabled, Pref.schedDays, Pref.schedHours, Pref.segment, Pref.model,
-                       Pref.customModel, Pref.lang, Pref.exclude, Pref.txtDir, Pref.audioDir,
-                       Pref.systemAudio, Pref.echoReduce, Pref.vad, Pref.keepAudio, Pref.voiceMin,
-                       Pref.cal, Pref.calendars, Pref.hintsTerms, Pref.hintsFile, Pref.hintsCalendar]
+    let mustRestart = [Pref.schedEnabled, Pref.schedDays, Pref.schedHours, Pref.calGated, Pref.calGatePad,
+                       Pref.segment, Pref.model, Pref.customModel, Pref.lang, Pref.exclude, Pref.txtDir,
+                       Pref.audioDir, Pref.systemAudio, Pref.echoReduce, Pref.vad, Pref.keepAudio,
+                       Pref.voiceMin, Pref.cal, Pref.calendars, Pref.hintsTerms, Pref.hintsFile, Pref.hintsCalendar]
     check("settings: every recorder-affecting pref (schedule included) forces an engine restart on Save",
           mustRestart.allSatisfy { SettingsWindowController.engineKeysForTest.contains($0) })
     // The echo canceller must be fed the FULL speaker mix, not the transcript's filtered one — an

@@ -75,6 +75,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     private let hintsTermsField = NSTextField()   // hint terms (comma/newline separated)
     private let hintsFileField = NSTextField()    // external hints file path
     private let schedBtn = NSSwitch()
+    private let calGateBtn = NSSwitch()          // record only while a calendar meeting is live
+    private let calGatePadField = NSTextField()  // minutes to record before/after a meeting
     // Schedule is SELECTED, not typed (user, repeatedly): a 7-day multi-select + time-range pickers.
     private let daysSeg = NSSegmentedControl()          // Mon…Sun, multi-select (.selectAny)
     private let hoursRangesStack = NSStackView()        // one row per time range (start–end + remove)
@@ -131,8 +133,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             c.completes = true
             c.delegate = self   // red-on-invalid, same treatment as the schedule fields
         }
-        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField, gladiaKeyField, elevenlabsKeyField, deeplKeyField, postProcessField, promptFileField] { f.translatesAutoresizingMaskIntoConstraints = false }
+        for f in [voiceField, dirField, audioDirField, customModelField, deepgramKeyField, openaiKeyField, openaiBaseField, gladiaKeyField, elevenlabsKeyField, deeplKeyField, postProcessField, promptFileField, calGatePadField] { f.translatesAutoresizingMaskIntoConstraints = false }
         voiceField.widthAnchor.constraint(equalToConstant: 60).isActive = true
+        calGatePadField.widthAnchor.constraint(equalToConstant: 60).isActive = true
         dirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         audioDirField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         customModelField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
@@ -165,6 +168,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         dailyTimePicker.datePickerElements = .hourMinute
         dailyTimePicker.translatesAutoresizingMaskIntoConstraints = false
         schedBtn.target = self; schedBtn.action = #selector(scheduleToggled)
+        calGateBtn.target = self; calGateBtn.action = #selector(calGateToggled)
         // Days: a 7-segment multi-select (Mon…Sun) — click to toggle, no typing, no invalid state.
         daysSeg.segmentCount = daySegKeys.count
         daysSeg.trackingMode = .selectAny
@@ -511,8 +515,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
                 r("Hours", hoursControl, "The gap between two ranges is your lunch break; a range that "
                   + "ends before it starts wraps past midnight. No ranges = all hours.", wide: true),
             ]),
-            Section(header: nil, note: "Off-hours the tray shows ⏸ Off-hours (schedule). A manual "
-                    + "Pause/Resume overrides the schedule until its next boundary.", rows: []),
+            Section(header: "Calendar", note: nil, rows: [
+                sw(calGateBtn, "Record only during calendar meetings",
+                   "Also gate on a live meeting from your Titling calendars. Needs Calendar access — "
+                   + "without it this is ignored (recording is never silently stopped)."),
+                r("± minutes", calGatePadField, "Also record this many minutes before and after a meeting."),
+            ]),
+            Section(header: nil, note: "Off-hours the tray shows ⏸ Off-hours (schedule); between meetings "
+                    + "⏸ No meeting (calendar). A manual Pause/Resume overrides both until the schedule's "
+                    + "next boundary.", rows: []),
         ])
         pane("Storage", "archivebox", .systemBrown, [
             Section(header: "Transcripts", note: nil, rows: [
@@ -930,6 +941,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     /// Days & Hours only apply when "Record only on a schedule" is ON — dim/disable them otherwise
     /// so the pane never looks like it's asking for input it will ignore.
     @objc private func scheduleToggled() { updateScheduleEnabled() }
+    @objc private func calGateToggled() { updateCalGateEnabled() }
+    private func updateCalGateEnabled() {
+        let on = calGateBtn.state == .on
+        calGatePadField.isEnabled = on
+        calGatePadField.alphaValue = on ? 1 : 0.4
+    }
     private func updateScheduleEnabled() {
         let on = schedBtn.state == .on
         daysSeg.isEnabled = on
@@ -1121,6 +1138,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         loadScheduleUI(days: Pref.explicit(Pref.schedDays, "MR_SCHEDULE_DAYS"),
                        hours: Pref.explicit(Pref.schedHours, "MR_SCHEDULE_HOURS"))
         updateScheduleEnabled()   // dim Days/Hours when the schedule is off
+        calGateBtn.state = Pref.bool(Pref.calGated, "MR_CALENDAR_GATE", false) ? .on : .off
+        calGatePadField.stringValue = String(Pref.int(Pref.calGatePad, "MR_CALENDAR_GATE_PAD", 5))
+        updateCalGateEnabled()    // dim the ± minutes field when the gate is off
         // Long paths head-truncate in the field — the tooltip always carries the full value.
         for f in [dirField, audioDirField, customModelField, hintsFileField, promptFileField,
                   summaryOutField, postProcessField] {
@@ -1270,6 +1290,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         // the schedule, so leaving these out meant switching "Record only on a schedule" OFF saved the
         // pref and left the engine parked off-hours, with no way to get recording back from Settings.
         Pref.schedEnabled, Pref.schedDays, Pref.schedHours,
+        // Calendar-gate too: toggling "record only during meetings" must re-evaluate the window on Save
+        // (else it parks/records with no meeting until the next 30 s tick) — same reason as the schedule.
+        Pref.calGated, Pref.calGatePad,
     ]
     /// A switch turned on for an engine with no key silently did nothing: the engine just never appeared
     /// in the overlay's picker. Say so at the moment the user saves it.
@@ -1355,6 +1378,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         d.set(schedBtn.state == .on, forKey: Pref.schedEnabled)
         d.set(serializeDays(), forKey: Pref.schedDays)
         d.set(serializeHours(), forKey: Pref.schedHours)
+        d.set(calGateBtn.state == .on, forKey: Pref.calGated)
+        d.set(max(0, min(Int(calGatePadField.stringValue) ?? 5, 1440)), forKey: Pref.calGatePad)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)

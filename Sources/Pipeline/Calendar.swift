@@ -58,10 +58,19 @@ func meetingActiveNow(_ events: [EventCandidate], now: Date, padding: TimeInterv
     }
 }
 
+/// The calendar gate's padding in seconds, clamped to [0, 24h] so a huge pref value can't overflow the
+/// `Int × 60` (Swift traps on overflow) nor make the gate absurdly always-on. Pure + selftested.
+func calendarPadSeconds(_ minutes: Int) -> TimeInterval {
+    TimeInterval(max(0, min(minutes, 1440)) * 60)
+}
+
 // MARK: - calendar lookup (title a transcript from the overlapping event)
 
 enum CalendarLookup {
-    static let store = EKEventStore()
+    // Two stores so the main-thread recording gate never touches the SAME EKEventStore concurrently with
+    // the pipeline's background match()/titling (EventKit permission is app-wide, so no extra prompt).
+    static let store = EKEventStore()      // pipeline (background queue): match() + titling
+    static let gateStore = EKEventStore()  // main thread: the recording gate (meetingLiveNow)
 
     static var authorized: Bool { EKEventStore.authorizationStatus(for: .event) == .fullAccess }
 
@@ -72,13 +81,35 @@ enum CalendarLookup {
         }
     }
 
+    /// Is a chosen-calendar meeting live right now (± `padMinutes`)? The calendar gate for "record only
+    /// during meetings", over the same calendars titling uses (empty selection = all). All-day and
+    /// zero-duration events are ignored. Returns false when unauthorized — the recording-window
+    /// decision fails OPEN on `authorized`, so gating never silently stops recording without access.
+    static func meetingLiveNow(padMinutes: Int) -> Bool {
+        guard authorized else { return false }
+        let now = Date()
+        let pad = calendarPadSeconds(padMinutes)   // clamped [0, 24h] — overflow-safe (see the helper)
+        // Tiny window (a few events) → a fast synchronous fetch; only runs when the user opted into gating.
+        let pred = gateStore.predicateForEvents(withStart: now.addingTimeInterval(-pad - 60),
+                                                end: now.addingTimeInterval(pad + 60),
+                                                calendars: selectedCalendars(in: gateStore))
+        let events = gateStore.events(matching: pred)
+            .filter { !$0.isAllDay && !($0.title ?? "").isEmpty }
+            .map { EventCandidate(title: $0.title, start: $0.startDate, end: $0.endDate, hasLink: false) }
+        return meetingActiveNow(events, now: now, padding: pad)
+    }
+
     /// `start` is the EVENT's start (not the segment's) — a transcript stamps itself with the meeting's
     /// time when one maps. See `transcriptStart`.
     struct Match { let title: String; let link: String?; let attendees: [String]; let start: Date }
 
     /// The event calendars the user chose to source titles from (by title). Empty selection — or a
     /// selection that matches nothing (e.g. a renamed calendar) — means "all calendars" (nil).
-    static var selectedCalendars: [EKCalendar]? {
+    static var selectedCalendars: [EKCalendar]? { selectedCalendars(in: store) }
+
+    /// Calendars are store-scoped in EventKit (a predicate must use calendars from the store it queries),
+    /// so the gate resolves its selection against its OWN store.
+    private static func selectedCalendars(in store: EKEventStore) -> [EKCalendar]? {
         let names = (Pref.d.stringArray(forKey: Pref.calendars) ?? [])
             .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         guard !names.isEmpty else { return nil }
