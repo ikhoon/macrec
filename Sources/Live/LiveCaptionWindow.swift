@@ -561,7 +561,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
             out.append(NSAttributedString(string: l.text, attributes: [   // text stays neutral like single-speaker mode
                 .font: textFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: para]))
             if l.inProgress {   // still transcribing this line → typing indicator inside the text
-                out.append(NSAttributedString(string: (l.text.isEmpty ? "…" : " …"), attributes: [
+                out.append(NSAttributedString(string: l.text.isEmpty ? "…" : " …", attributes: [
                     .font: textFont, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
             }
             if let t = l.translated, !t.isEmpty {

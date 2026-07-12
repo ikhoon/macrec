@@ -171,4 +171,3 @@ final class DeepLTranslator: LiveTranslating {
         return t
     }
 }
-

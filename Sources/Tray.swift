@@ -6,7 +6,6 @@ import AVFoundation
 import Foundation
 import UserNotifications
 
-
 enum Notifier {
     static func requestAuth() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, err in

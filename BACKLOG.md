@@ -6,7 +6,7 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
 ## Now — in progress
 
 - [ ] **Modularize `Sources/` into per-module directories** — pure byte-identical moves, one module/PR.
-      Audio/ ✅ (#99). Next: Live/, Pipeline/, Settings/, Tray/.
+      Audio/ ✅, Live/ ✅ (#99). Next: Pipeline/, Settings/, Tray/.
 - [ ] **Reusable streaming base** (#52) — collapse the 5 WebSocket clients into one `StreamingWSTranscriber`
       + per-provider spec. Step 1 (shared PCM16 conversion) ✅ merged (#98). Next: the base + per-engine specs.
 
@@ -36,6 +36,10 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
 
 ## Infra / refactor
 
+- [x] **SwiftFormat** formatter — allowlist hygiene config (`.swiftformat`) + pinned CI lint (#102).
+- [ ] **SwiftLint** linter — needs full Xcode locally (its sourcekit won't load on a CommandLineTools-only
+      machine — it crashes); add `.swiftlint.yml` + a CI step once Xcode is installed. SwiftFormat covers
+      formatting meanwhile. Markdown is already linted in CI (markdownlint-cli2, #101).
 - [ ] Modularize `Selftest.swift` into per-module selftest files (#53) — after the code splits land.
 - [ ] Add `///` doc comments to top-level types + key APIs, per module (#54) — separate from the pure moves.
 - [ ] Evaluate/adopt a build tool — hybrid SwiftPM (compile+index+`swift test`), scripts keep the `.app` (#55).

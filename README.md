@@ -93,6 +93,10 @@ cd ~/src/macrec
 
 > On a machine with the dev LaunchAgent, the app leaves autostart to launchd and the "Start at login" toggle shows as managed.
 
+**Formatting:** `brew install swiftformat`, then run `swiftformat .` before committing. The config
+(`.swiftformat`) is a hygiene guardrail — whitespace + redundancy only, no restyle — and CI runs
+`swiftformat --lint`, failing on drift.
+
 ### Building a distributable
 
 ```bash
