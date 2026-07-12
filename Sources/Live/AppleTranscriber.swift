@@ -109,4 +109,3 @@ final class LiveTranscriber: LiveTranscribing {
         task?.cancel(); task = nil
     }
 }
-

@@ -6,9 +6,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
   pull_request:
-    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 # Read-only token: neither job pushes or writes to the repo (build + lint only).
@@ -32,6 +32,18 @@ jobs:
         run: |
           v=$(./version.sh) || { echo "::error::version.sh failed — install.sh/package.sh version parse is broken"; exit 1; }
           echo "✅ version resolves to $v (shared by install.sh, package.sh, and this job)"
+
+      # SwiftFormat is a hygiene guardrail (allowlist ruleset in .swiftformat) — no restyle, just
+      # whitespace/redundancy the code already follows. Runs before the expensive compile so a style
+      # slip fails in seconds instead of after a full build. Pinned by version AND SHA-256 (not `brew
+      # install`) so neither a silent rule change nor a tampered asset can run in CI — bump both together.
+      - name: Lint — SwiftFormat (style, pinned 0.62.1)
+        run: |
+          curl -fsSL https://github.com/nicklockwood/SwiftFormat/releases/download/0.62.1/swiftformat.zip -o "$RUNNER_TEMP/sf.zip"
+          echo "7cb1cb1fae04932047c7015441c543848e8e60e1572d808d080e0a1f1661114a  $RUNNER_TEMP/sf.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/sf.zip" -d "$RUNNER_TEMP"
+          chmod +x "$RUNNER_TEMP/swiftformat"
+          "$RUNNER_TEMP/swiftformat" --lint .
 
       - name: Install speexdsp (AEC — statically linked into the binary)
         run: brew install speexdsp
