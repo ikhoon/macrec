@@ -92,14 +92,12 @@ func cerKo(hyp: String, ref: String, options: CEROptions = CEROptions()) -> Doub
     cer(normalizeKo(hyp, options), normalizeKo(ref, options))
 }
 
-/// chrF — a character n-gram F-score (orders 1…`maxOrder`, β=`beta`), a reference-based TRANSLATION
-/// metric that sidesteps CJK word segmentation by scoring on characters. Range 0…1 (1 = identical).
-/// Unlike CER, punctuation is KEPT (it carries meaning in a translation, and chrF is defined to score
-/// it); text is NFC-normalized and whitespace-stripped, case preserved. Averaging convention: precision
-/// and recall are averaged over the EFFECTIVE orders (those short enough that both strings have n-grams)
-/// FIRST, then one F-beta — so a short utterance isn't penalized for orders longer than itself.
-/// Both-empty → 1; one-empty → 0. Pure + selftested. (Exact sacreBLEU eps-parity is a future refinement.)
+/// chrF — character n-gram F-score (orders 1…`maxOrder`, β=`beta`), a reference-based TRANSLATION
+/// metric scoring CHARACTERS (no CJK word segmentation), range 0…1. Unlike CER it KEEPS punctuation and
+/// case; precision/recall average over the orders both strings are long enough for, then one F-beta.
+/// Both-empty → 1, one-empty → 0, `maxOrder < 1` → 0. Pure + selftested.
 func chrF(candidate: String, reference: String, maxOrder: Int = 6, beta: Double = 2) -> Double {
+    guard maxOrder >= 1 else { return 0 }
     let cand = chrfChars(candidate), ref = chrfChars(reference)
     if cand.isEmpty, ref.isEmpty { return 1 }
     var precs: [Double] = [], recs: [Double] = []
@@ -115,9 +113,10 @@ func chrF(candidate: String, reference: String, maxOrder: Int = 6, beta: Double 
     guard !precs.isEmpty else { return 0 }            // no shared order length → no character overlap
     let avgP = precs.reduce(0, +) / Double(precs.count)
     let avgR = recs.reduce(0, +) / Double(recs.count)
-    guard avgP + avgR > 0 else { return 0 }
     let b2 = beta * beta
-    return (1 + b2) * avgP * avgR / (b2 * avgP + avgR)
+    let denom = b2 * avgP + avgR
+    guard denom > 0 else { return 0 }                 // guards NaN when both averages are 0 (or β=0, avgR=0)
+    return (1 + b2) * avgP * avgR / denom
 }
 
 /// NFC + whitespace-strip; punctuation and case PRESERVED (chrF scores them). Characters are Unicode

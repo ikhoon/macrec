@@ -42,4 +42,6 @@ func evalSelftests(_ check: (String, Bool) -> Void) {
           && cerJa(hyp: "会議。", ref: "会議") == 0)
     let chrfPartial = chrF(candidate: "会議を始める", reference: "会議を終える")
     check("chrf: partial character overlap scores between 0 and 1", chrfPartial > 0 && chrfPartial < 1)
+    // Guard: maxOrder < 1 would trap on `1...maxOrder`; it returns 0 instead of crashing.
+    check("chrf: maxOrder < 1 → 0 (no crash)", chrF(candidate: "a", reference: "a", maxOrder: 0) == 0)
 }
