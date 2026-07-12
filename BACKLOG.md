@@ -16,6 +16,9 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
 - [ ] Expose the daily log to an agent/LLM (queryable store / MCP surface) so it can act on the day.
 - [ ] Selectable calendar fields in the transcript header, fed to the summarizer (#31).
 - [ ] Finish the Summaries tab (#4).
+- [ ] **Live AI actions on the session** — summarize / extract action items in-place on the running
+      transcript (reuse the summarizer), so a meeting becomes an LLM-actionable log without waiting for
+      the batch pipeline. Our differentiator, surfaced live. *(MacWhisper live-UI comparison)*
 
 ## Pillar 2 — real-time cross-language understanding
 
@@ -26,6 +29,15 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
 - [ ] Reverse direction: what I hear → my language, spoken.
 - [ ] Configurable caption + translation text colors (#34).
 - [ ] Subtitle mode: position, line count, window chrome (#43).
+- [ ] **Readable live transcript view** — a resizable companion window (scroll + search) so a session
+      doesn't evaporate when the overlay closes; the overlay stays glanceable. Feeds Pillar 1.
+      *(MacWhisper's live view is a persistent, searchable, exportable document; ours is ephemeral.)*
+- [ ] **Export the live transcript** — Markdown / SRT / VTT / txt, plus per-utterance copy (today: only
+      whole-buffer copy).
+- [ ] **Surface meeting context in the live overlay** — show the mapped calendar title in the header +
+      auto start/stop on meeting detect (the pipeline titles transcripts; the live UI never shows it).
+- [ ] **Overlay polish** — emphasize the current speaker/line, thin the control-bar density (progressive
+      disclosure), tighten typography/spacing.
 
 ## Quality (priority zero)
 
@@ -33,6 +45,8 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
 - [x] DeepL translation (#93, merged).
 - [ ] Validate an API key with a real authenticated probe (#32).
 - [ ] Debug visibility for cloud API traffic (#24) — partly done (DeepL error body logged).
+- [ ] **N-speaker diarization** within "them" — today speakers are the me/them 2-way (mic vs system
+      audio); MacWhisper labels + names N speakers. Accuracy work, model-dependent. *(MacWhisper gap)*
 
 ## Infra / refactor
 
@@ -50,6 +64,9 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
 
 - [ ] Settings: warn before Close discards unsaved edits (#35).
 - [ ] UI consistency pass across all Settings panes (#26).
+- [ ] **Inline transcript editing** — fix STT errors in place (improves the saved log). *(MacWhisper Editor)*
+- [ ] **Playback sync** — click a transcript line → jump to that point in the recorded audio (post-session
+      review). *(MacWhisper)*
 
 ## Bugs / edges
 
