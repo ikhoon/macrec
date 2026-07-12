@@ -680,7 +680,7 @@ final class SystemAudioTap {
                                               mScope: kAudioObjectPropertyScopeGlobal,
                                               mElement: kAudioObjectPropertyElementMain)
         var size = UInt32(MemoryLayout<CFString?>.size)
-        var cf: CFString? = nil
+        var cf: CFString?
         let st = withUnsafeMutablePointer(to: &cf) {
             AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, $0)
         }
