@@ -1,8 +1,7 @@
 import Foundation
 
-// The eval RUNNER's pure core: score STT engines over ko/ja samples and format a leaderboard. The
-// actual transcription (Whisper/Apple + audio) is injected as a `transcribe` closure, so the
-// orchestration, the corpus micro-average, and the table are selftestable without audio/engine/network.
+// The eval RUNNER's pure core. Transcription (Whisper/Apple + audio) is injected as a `transcribe`
+// closure, so the orchestration, corpus micro-average, and report are testable without audio/network.
 
 /// A reference sample: an id, its language ("ja"/"ko" — picks the normalizer), and the ground-truth text.
 struct EvalSample: Equatable {
@@ -27,9 +26,11 @@ func cerParts(hyp: String, ref: String, language: String) -> (edits: Int, refCou
     return (levenshtein(h, r), r.count)
 }
 
-/// Score each engine over the samples: transcribe each, sum edits and reference chars, then take the
-/// corpus CER = Σ edits / Σ N (micro-average). An empty corpus (no reference text) scores 0 when the
-/// engine also stays silent, 1 when it invents text. Pure given `transcribe`; results sorted best-first.
+/// Score each engine over the samples: corpus CER = Σ edits / Σ N (micro-average). CER is UNBOUNDED —
+/// an empty-reference sample the engine hallucinates into adds its insertions to Σ edits but 0 to Σ N,
+/// so a corpus with hallucinated silence can exceed 1.0 (correct: inventing text on silence is error).
+/// A wholly-empty corpus (Σ N = 0) → 0 if every engine stayed silent, 1 if any invented text. Ties
+/// break by engine name so the leaderboard is deterministic. Pure given `transcribe`.
 func runEval(samples: [EvalSample], engines: [String],
              transcribe: (EvalSample, String) -> String) -> [EngineScore] {
     engines.map { engine -> EngineScore in
@@ -42,17 +43,18 @@ func runEval(samples: [EvalSample], engines: [String],
         let cer = refChars > 0 ? Double(edits) / Double(refChars) : (edits > 0 ? 1 : 0)
         return EngineScore(engine: engine, cer: cer, samples: samples.count)
     }
-    .sorted { $0.cer < $1.cer }
+    .sorted { $0.cer != $1.cer ? $0.cer < $1.cer : $0.engine < $1.engine }
 }
 
 /// A fixed-width leaderboard — engines best-CER first, CER as a percentage. `title` heads the table.
 func evalReport(_ scores: [EngineScore], title: String = "ko/ja STT — CER (lower is better)") -> String {
     guard !scores.isEmpty else { return "\(title)\n(no engines scored)" }
     let w = max(6, scores.map { $0.engine.count }.max() ?? 6)
+    let posix = Locale(identifier: "en_US_POSIX")   // fixed decimal separator — never "33,3%" on comma locales
     func pad(_ s: String, _ n: Int) -> String { s.padding(toLength: max(n, s.count), withPad: " ", startingAt: 0) }
     var lines = [title, "", "\(pad("engine", w))   CER      n"]
     for s in scores {
-        lines.append("\(pad(s.engine, w))   \(pad(String(format: "%.1f%%", s.cer * 100), 7))  \(s.samples)")
+        lines.append("\(pad(s.engine, w))   \(pad(String(format: "%.1f%%", locale: posix, s.cer * 100), 7))  \(s.samples)")
     }
     return lines.joined(separator: "\n")
 }

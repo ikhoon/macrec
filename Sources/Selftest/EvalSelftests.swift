@@ -64,4 +64,16 @@ func evalSelftests(_ check: (String, Bool) -> Void) {
     check("eval report: leaderboard lists engines best-CER first with a percentage",
           rpt.contains("0.0%") && rpt.contains("33.3%")
           && rpt.range(of: "A")!.lowerBound < rpt.range(of: "B")!.lowerBound)
+    check("eval cerParts: (edits, reference length) per language",
+          cerParts(hyp: "会義", ref: "会議", language: "ja") == (1, 2)
+          && cerParts(hyp: "회의시장", ref: "회의시작", language: "ko") == (1, 4))
+    // A mixed corpus with a hallucinated empty-reference sample pushes corpus CER above 1.
+    let mixed = [EvalSample(id: "m1", language: "ja", reference: "会議"),   // 2 chars, engine perfect
+                 EvalSample(id: "m2", language: "ja", reference: "")]      // empty ref, engine invents 3 chars
+    check("eval runner: hallucinated silence pushes corpus CER above 1",
+          approx(runEval(samples: mixed, engines: ["h"],
+                         transcribe: { s, _ in s.id == "m1" ? "会議" : "幻幻幻" })[0].cer, 3.0 / 2.0))
+    // Equal-CER ties break deterministically by engine name (both perfect → A before B, input order B,A).
+    let tie = runEval(samples: samples, engines: ["B", "A"], transcribe: { s, _ in s.reference })
+    check("eval runner: equal-CER ties sort by engine name", tie.map { $0.engine } == ["A", "B"])
 }
