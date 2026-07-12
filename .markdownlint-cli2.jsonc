@@ -1,0 +1,15 @@
+{
+  // markdownlint config for macrec docs. Tuned to the docs' deliberate style; enforces the structural
+  // rules (blank lines around headings/lists/fences) that CI should catch. Run: npx markdownlint-cli2 "**/*.md"
+  "config": {
+    "default": true,
+    "MD013": false,                    // line length — prose wraps at 112 by hand (CLAUDE.md); tables/diagrams exceed
+    "MD033": false,                    // inline HTML — READMEs use <h1 align>, <details>, <img> on purpose
+    "MD041": false,                    // first-line heading — some docs open with a note before the H1
+    "MD040": false,                    // fenced-code language — ASCII diagrams are intentionally language-less
+    "MD026": false,                    // trailing punctuation in headings — some are intentional
+    "MD024": { "siblings_only": true } // duplicate headings ok unless siblings
+  },
+  "globs": ["**/*.md"],
+  "ignores": ["**/node_modules/**", "dist/**", ".build/**"]
+}
