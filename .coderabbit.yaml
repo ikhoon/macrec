@@ -6,10 +6,10 @@ language: "en-US"
 reviews:
   profile: "assertive"            # this project's bar is high — surface more, not fewer, issues
   request_changes_workflow: false
-  high_level_summary: true
+  high_level_summary: false       # skip the "Summary by CodeRabbit" walkthrough — the maintainer finds it noise
   review_status: true
   poem: false
-  collapse_walkthrough: false
+  collapse_walkthrough: true
   auto_review:
     enabled: true
     drafts: false
