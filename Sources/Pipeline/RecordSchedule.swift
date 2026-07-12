@@ -41,6 +41,7 @@ func recordingWindowState(scheduleEnabled: Bool, scheduleActive: Bool, calendarG
     return (scheduleEnabled && !scheduleActive) ? .offHours : .noMeeting
 }
 
+/// The recording schedule — which weekdays + hour ranges recording is allowed, parsed from the fields.
 struct RecordSchedule: Equatable {
     var enabled: Bool
     var weekdays: Set<Int>            // 1=Sun … 7=Sat (Calendar.component(.weekday))

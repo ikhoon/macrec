@@ -3,6 +3,8 @@ import AVFoundation
 import Foundation
 import UserNotifications
 
+/// The menu-bar app: owns the status item + menu, the recording engine's lifecycle, and the
+/// schedule/calendar recording gate.
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var engine: RecordingEngine?

@@ -8,6 +8,7 @@ import Foundation
 
 // MARK: - recorder (holds the per-source writers)
 
+/// Holds the per-source audio writers (system + mic) for one recording segment.
 final class Recorder {
     var sysWriter: SourceWriter?
     var micWriter: SourceWriter?

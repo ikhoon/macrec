@@ -6,6 +6,7 @@ import Foundation
 
 // MARK: - recording engine (continuous, hourly rotation, mic-gated transcription)
 
+/// The recording engine: rotates capture into segments, transcribes voiced ones, runs retention sweeps.
 final class RecordingEngine {
     let cfg: EngineConfig
     let session: CaptureSession

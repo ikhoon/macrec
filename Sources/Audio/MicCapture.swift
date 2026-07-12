@@ -5,6 +5,7 @@ import Foundation
 
 // MARK: - microphone capture (separate AVCaptureSession — does NOT touch the output device)
 
+/// Captures the microphone via AVCaptureSession, delivering audio frames to a callback for recording.
 final class MicCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private let session = AVCaptureSession()
     private let output = AVCaptureAudioDataOutput()
