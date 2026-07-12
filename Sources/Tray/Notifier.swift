@@ -3,6 +3,7 @@ import AVFoundation
 import Foundation
 import UserNotifications
 
+/// User-notification helpers (permission + posting) for transcript / summary outcomes.
 enum Notifier {
     static func requestAuth() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, err in

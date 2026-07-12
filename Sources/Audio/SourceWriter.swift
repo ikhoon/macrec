@@ -5,6 +5,7 @@ import Foundation
 
 // MARK: - per-source writer (converts to canon, writes a temp float32 WAV)
 
+/// Writes one audio source (mic or system) to a WAV file, converting to the on-disk format as it goes.
 final class SourceWriter {
     let url: URL
     private let file: AVAudioFile

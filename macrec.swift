@@ -213,6 +213,7 @@ func micStatus() -> Bool {
 // The settings UI writes to UserDefaults. The headless `engine` CLI / power users can override via MR_* env vars.
 // Precedence: UserDefaults (if the key exists) > env > built-in default.
 
+/// Typed preference keys + accessors over a dedicated UserDefaults suite (saved pref > env var > default).
 enum Pref {
     // Dedicated suite (MUST differ from the bundle id — suiteName==bundleID returns nil / doesn't work).
     // Works around .standard domain not resolving when launchd execs the binary inside the .app directly.
@@ -487,6 +488,7 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
 
 // MARK: - engine config
 
+/// The resolved recording configuration (segment length, dirs, model, language, exclusions…) the engine runs on.
 struct EngineConfig {
     var segmentSeconds: Double
     var voiceMinSeconds: Double
@@ -551,6 +553,7 @@ struct EngineConfig {
 
 // MARK: - completed segment + continuous capture session
 
+/// One finished capture segment: its start time + the system/mic WAV files, awaiting transcription.
 struct CompletedSegment {
     let start: Date
     let sysURL: URL
@@ -727,6 +730,7 @@ func shouldStartReferenceTap(echoReduceEnabled: Bool, hasExcludedApps: Bool) -> 
     echoReduceEnabled && hasExcludedApps
 }
 
+/// Owns the live audio capture — the system-audio tap(s) + mic — feeding the writers and echo canceller.
 final class CaptureSession {
     private var tap: SystemAudioTap?
     /// A second tap that excludes ONLY our own process — the full speaker mix — feeding the echo
@@ -915,6 +919,7 @@ func transcriptStart(segStart: Date, segEnd: Date, eventStart: Date?) -> Date {
     guard let e = eventStart else { return segStart }
     return min(max(e, segStart), segEnd)
 }
+/// Checks GitHub for a newer release and reports back on the main queue.
 enum UpdateChecker {
     static let releasesURL = "https://github.com/ikhoon/macrec/releases/latest"
 
@@ -950,6 +955,7 @@ func settingsSearchHits(query: String, index: [[String]]) -> [Int] {
     return index.indices.filter { i in index[i].contains { $0.lowercased().contains(q) } }
 }
 
+/// Manages launch-at-login (SMAppService), deferring to the dev LaunchAgent when one owns autostart.
 enum LoginItem {
     /// The dev LaunchAgent (install.sh). When present, launchd owns autostart — not us.
     static var managedByLaunchAgent: Bool {

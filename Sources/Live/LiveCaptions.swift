@@ -27,6 +27,7 @@ enum LiveCaptionOptions {
 
 /// Owns the two per-source transcribers + optional translator + the floating caption window.
 @available(macOS 26, *)
+/// Drives the live-caption overlay: wires the transcriber + translator into the caption window. Shared.
 final class LiveCaptions {
     static let shared = LiveCaptions()
     // mic/sys are written on the main thread (start/stop) and read on the audio queue (feed*), so a

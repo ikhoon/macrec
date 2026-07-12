@@ -66,6 +66,8 @@ func calendarPadSeconds(_ minutes: Int) -> TimeInterval {
 
 // MARK: - calendar lookup (title a transcript from the overlapping event)
 
+/// Reads the user's calendars (EventKit): titles a transcript from the overlapping meeting, and gates
+/// recording on a live meeting (the "record only during meetings" feature).
 enum CalendarLookup {
     // Two stores so the main-thread recording gate never touches the SAME EKEventStore concurrently with
     // the pipeline's background match()/titling (EventKit permission is app-wide, so no extra prompt).

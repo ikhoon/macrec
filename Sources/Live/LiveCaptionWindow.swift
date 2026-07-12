@@ -61,6 +61,7 @@ final class NonInteractiveView: NSView {
 /// the live settings (language, who to transcribe, translation, text size, timestamps) so changes take
 /// effect immediately; opacity is a drag slider on that bar. Nothing lives in the Settings window.
 @available(macOS 26, *)
+/// The floating caption overlay — a layer-backed HUD panel showing live transcription/translation.
 final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     private let panel: NSPanel
     /// The only thing the opacity slider fades. Layer-backed, not an NSVisualEffectView: the window
