@@ -1,0 +1,31 @@
+# SwiftLint config for macrec — a code-quality linter that RESPECTS the deliberate dense style and
+# leaves formatting to SwiftFormat. The opinionated rules that fight macrec's hand-tuned code (short
+# names in dense math, long lines, big files/functions) are OFF; the bug/consistency rules stay ON.
+# Formatting rules overlap SwiftFormat's allowlist, so they're OFF here too — two tools must not fight
+# over the same bytes. Run: swiftlint  (needs full Xcode — its sourcekit won't load on CLT-only).
+disabled_rules:
+  # deliberate dense style
+  - identifier_name           # short names (t, p, d, s, ov) are deliberate in the dense audio/parse code
+  - line_length               # prose/code wraps by hand; long lines are intentional (see .swiftformat)
+  - function_body_length      # render() / buildControlBar() / paneLayoutIssues() are long by design
+  - type_body_length          # SettingsWindowController / AppController are big controllers by design
+  - file_length               # a few module files are large after the split
+  - cyclomatic_complexity     # a handful of dense decision functions
+  - large_tuple               # (speaker, text, translated, time, mine, inProgress) tuples are deliberate
+  - function_parameter_count  # some pure functions take 6 clear inputs by design (postProcessInvocation)
+  # formatting: SwiftFormat's domain — off here so the two tools don't fight over the same bytes
+  - trailing_comma
+  - comma
+  - colon
+  - opening_brace
+  - statement_position
+  - switch_case_alignment
+  # deliberate API / idiom
+  - multiple_closures_with_trailing_closure  # finishOrDiscard(_:onError:_:) takes a trailing write closure
+  - optional_data_string_conversion          # String(decoding:as:) is a deliberate non-failable choice
+excluded:
+  - .build
+  - dist
+  - macrec-stage.app
+  - make-icon.swift   # standalone build-time tool, not app code (excluded from the SwiftPM target too)
+  - set-output.swift  # standalone build-time tool, not app code

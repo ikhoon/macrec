@@ -175,7 +175,7 @@ enum Transcriber {
     /// Transcribe mic ("me") and system ("them") SEPARATELY, then merge by time into a speaker-labeled
     /// transcript. Mixes a kept WAV only when keepAudio. Returns (mixedWav?, text).
     static func transcribe(_ seg: CompletedSegment, cfg: EngineConfig) -> (mixed: URL?, text: String)? {
-        var mixed: URL? = nil
+        var mixed: URL?
         if cfg.keepAudio {
             let stem = URL(fileURLWithPath: seg.sysURL.path).deletingPathExtension().deletingPathExtension()
             let m = URL(fileURLWithPath: stem.path + ".wav")

@@ -6,9 +6,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ["macrec.swift", "Sources/**/*.swift", "Package.swift", "speex-bridge.h", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "Package.swift", "speex-bridge.h", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".swiftlint.yml", ".github/workflows/ci.yml"]
   pull_request:
-    paths: ["macrec.swift", "Sources/**/*.swift", "Package.swift", "speex-bridge.h", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "Package.swift", "speex-bridge.h", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".swiftlint.yml", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 # Read-only token: neither job pushes or writes to the repo (build + lint only).
@@ -44,6 +44,18 @@ jobs:
           unzip -q "$RUNNER_TEMP/sf.zip" -d "$RUNNER_TEMP"
           chmod +x "$RUNNER_TEMP/swiftformat"
           "$RUNNER_TEMP/swiftformat" --lint .
+
+      # SwiftLint is the semantic guardrail (.swiftlint.yml): the bug/consistency rules SwiftFormat
+      # can't see. It needs sourcekit, which loads here because the runner has full Xcode (it won't on
+      # CommandLineTools-only). --strict fails the build on ANY violation, so the clean baseline holds.
+      # Pinned by version AND SHA-256 (not `brew install`), same rationale as SwiftFormat above.
+      - name: Lint — SwiftLint (semantics, pinned 0.65.0)
+        run: |
+          curl -fsSL https://github.com/realm/SwiftLint/releases/download/0.65.0/portable_swiftlint.zip -o "$RUNNER_TEMP/sl.zip"
+          echo "d6cb0aa7a2f5f1ef306fc9e37bcb54dc9a26facc8f7784ac0c3dd3eccf5c6ba6  $RUNNER_TEMP/sl.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/sl.zip" -d "$RUNNER_TEMP/sl"
+          chmod +x "$RUNNER_TEMP/sl/swiftlint"
+          "$RUNNER_TEMP/sl/swiftlint" lint --strict
 
       - name: Install speexdsp (AEC — statically linked into the binary)
         run: brew install speexdsp
