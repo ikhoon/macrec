@@ -23,6 +23,13 @@ concise and specific to macrec; don't pad the file with generic advice.
 
 ## 1. The bar
 
+- **Design before you implement.** For any feature or non-trivial change, establish the design FIRST
+  — the shape, the seams, the tradeoffs, the open decisions — before writing code. Even QA needs a
+  design to check the work against. When the change is substantial or foundational (a new subsystem, a
+  build-system migration), spend real effort on the design (a written plan; for big ones, a
+  research + adversarial-review workflow) and surface the decisions the maintainer must make. Jumping
+  straight to code on a feature is the mistake — the eval harness and the SwiftPM move were both
+  designed first, on purpose.
 - **Quality over shipping.** A rough release is worse than no release ("구린데 릴리즈 해서 뭐하게?").
   Do not steer toward PRs/releases while rough edges remain. Earn the release with QA.
 - **Independently QA.** Don't wait to be told what's broken — drive the app yourself and find it.
@@ -167,12 +174,15 @@ only `./macrec-stage.app/Contents/MacOS/macrec` (signed by `install.sh`). The te
 - **Split, one concern per file.** `macrec.swift` was one 8888-line file until the day it made a
   change set impossible to divide into compiling commits. It is now the CLI entry point plus the
   low-level primitives, and `Sources/` holds the rest as **per-module directories**: `Audio/`,
-  `Live/`, `Pipeline/`, `Settings/`, `Tray/`, `Selftest/`, `Eval/`, each a concern per file. Still
-  no SwiftPM — the build compiles `macrec.swift $(find Sources -name '*.swift')` (recursive, so
-  subdir files compile automatically; `version.sh` searches the same way, and `let macrecVersion`
-  can live in any of them). That is the *input-file* set — the full `swiftc` invocation (frameworks,
-  the static speexdsp lib, the bridging header) lives in `install.sh`/`package.sh`. `Sources/` is what
-  `swift package init` creates, so a later move to SwiftPM needs no rename.
+  `Live/`, `Pipeline/`, `Settings/`, `Tray/`, `Selftest/`, `Eval/`, each a concern per file.
+  **Migrating to standard SwiftPM** (`Sources/` + `Tests/`, XCTest) — decided to easily leverage the
+  OSS ecosystem rather than the bespoke single-`swiftc` build. Done incrementally + design-first: the
+  first step is additive (`Package.swift` + a `Tests/` target so `swift build`/`swift test` work)
+  while `install.sh`/`package.sh` keep building + signing the `.app` unchanged — the cert-based DR
+  must survive (TCC grants + the self-updater depend on it). Until the cutover the build compiles
+  `macrec.swift $(find Sources -name '*.swift')` (recursive; `version.sh` searches the same way, so
+  `let macrecVersion` can live in any file); the full `swiftc` invocation (frameworks, the static
+  speexdsp lib, the objc bridging header) lives in `install.sh`/`package.sh`.
 - **Moving code is not changing code.** A refactor commit must prove it: capture `selftest` output
   before, and diff it after. Identical or it isn't pure motion. Never mix a fix into a move.
 - **No org/employer identifiers** in code, fixtures, placeholders, or PR text (`CLAUDE.md`).
