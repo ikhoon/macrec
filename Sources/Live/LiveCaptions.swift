@@ -27,6 +27,17 @@ enum LiveCaptionOptions {
 
 /// Owns the two per-source transcribers + optional translator + the floating caption window.
 @available(macOS 26, *)
+/// The in-order translated prefix: the leading run of landed per-sentence parts, then the volatile tail.
+/// A `nil` part is a sentence still IN FLIGHT, so rendering stops there to keep parts in order. A FAILED
+/// sentence must therefore store its fallback (never nil), or one failure would truncate the whole line's
+/// translation until finalize. Pure + selftested.
+func translatedPrefix(_ parts: [String?], tail: String?) -> String? {
+    var out: [String] = []
+    for p in parts { guard let p else { break }; out.append(p) }
+    if let tail { out.append(tail) }
+    return out.isEmpty ? nil : out.joined(separator: " ")
+}
+
 /// Drives the live-caption overlay: wires the transcriber + translator into the caption window. Shared.
 final class LiveCaptions {
     static let shared = LiveCaptions()
@@ -46,19 +57,12 @@ final class LiveCaptions {
         var transParts: [String?] = []      // per-sentence translations, positional (async-safe)
         var transRequested = 0              // how many complete sentences have been sent to translate
         var transFinal = false              // the authoritative full-text translation has landed
+        var transHadFallback = false        // a sentence fell back to its original → re-translate on finalize
         var transTail: String?              // live translation of the UNFINISHED tail (volatile)
         var tailInFlight = false            // ONE tail request at a time — landing refires with the newest tail
         var tailLastSent = ""               // tail text of the in-flight/last request (skip if unchanged)
         var tailSentAt: Double = 0          // floor between back-to-back refires
-        var translated: String? {
-            // IN-ORDER prefix only: sentence translations land async, and rendering part 2 while
-            // part 1 is still in flight would show the translation out of order. The tail always
-            // renders last (it is by definition the newest region).
-            var parts: [String] = []
-            for p in transParts { guard let p else { break }; parts.append(p) }
-            if let t = transTail { parts.append(t) }
-            return parts.isEmpty ? nil : parts.joined(separator: " ")
-        }
+        var translated: String? { translatedPrefix(transParts, tail: transTail) }
     }
     private var lines: [CapLine] = []
     private var mineLabel = ""   // label used for the mic track (for speaker coloring)
@@ -276,7 +280,9 @@ final class LiveCaptions {
             // that serializes — the NEXT line's first tail queued behind it ("second line is
             // slow" — user report). Promote what's shown instead; only lines that never got any
             // streaming translation (e.g. translation just switched on) still pay a full pass.
-            if lines[index].translated != nil {
+            // Promote what's shown — UNLESS a sentence fell back to its original (transHadFallback), in
+            // which case re-translate the full line below so the final version is fully translated.
+            if lines[index].translated != nil, !lines[index].transHadFallback {
                 if let tail = lines[index].transTail {
                     lines[index].transParts.append(tail)   // freeze the volatile tail as the last part
                     lines[index].transTail = nil
@@ -301,13 +307,17 @@ final class LiveCaptions {
             for idx in line.transRequested..<complete.count {
                 let sentence = complete[idx]
                 Task { [weak self] in
-                    guard let out = await translator.translate(sentence) else { return }
+                    let out = await translator.translate(sentence)   // nil = both attempts failed
                     await MainActor.run {
                         guard let self, self.engineGen == gen,
                               let k = self.lines.lastIndex(where: { $0.time == lineTime }),
                               !self.lines[k].transFinal else { return }
                         while self.lines[k].transParts.count <= idx { self.lines[k].transParts.append(nil) }
-                        self.lines[k].transParts[idx] = out
+                        // On failure store the ORIGINAL sentence, not nil — else the in-order prefix
+                        // truncates every later (successful) sentence. Finalize re-translates the full
+                        // line to replace the fallback.
+                        self.lines[k].transParts[idx] = out ?? sentence
+                        if out == nil { self.lines[k].transHadFallback = true }
                         self.render()
                     }
                 }
