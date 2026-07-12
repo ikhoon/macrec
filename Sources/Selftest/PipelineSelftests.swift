@@ -384,7 +384,8 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
           && !meetingActiveNow([EventCandidate(title: "pt", start: schedDate("2026-07-08 10:00"),
                                                end: schedDate("2026-07-08 10:00"), hasLink: false)],
                                now: schedDate("2026-07-08 10:00"), padding: 60)               // zero-duration event ignored
-          && !meetingActiveNow(mtg, now: schedDate("2026-07-08 09:30"), padding: .infinity))  // non-finite pad clamped, not all-time
+          && !meetingActiveNow(mtg, now: schedDate("2026-07-08 09:30"), padding: .infinity)   // +inf clamped → not all-time
+          && meetingActiveNow(mtg, now: schedDate("2026-07-08 10:30"), padding: .nan))         // NaN clamped to 0 → mid-meeting active
     check("recording window: each gate blocks independently; both-off admits all",
           recordingWindowActive(scheduleEnabled: false, scheduleActive: false, calendarGated: false, meetingActive: false)   // both off → yes
           && recordingWindowActive(scheduleEnabled: true, scheduleActive: true, calendarGated: true, meetingActive: true)    // both pass → yes
