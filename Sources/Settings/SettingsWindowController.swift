@@ -1294,6 +1294,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
 
     func loadForTest() { load() }
     var keyFieldsForTest: [String] { [deepgramKeyField, openaiKeyField, gladiaKeyField, elevenlabsKeyField, deeplKeyField].map(\.stringValue) }
+    /// Test hook: the tint controlTextDidChange actually applies to a numeric field for `input`.
+    func numericTintForTest(_ input: String) -> NSColor {
+        calGatePadField.stringValue = input
+        controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: calGatePadField))
+        return calGatePadField.textColor ?? .labelColor
+    }
 
     /// Every pref the recorder reads. Missing one means Save saves it and nothing happens.
     private static let engineKeys = [
@@ -1394,8 +1400,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         d.set(serializeDays(), forKey: Pref.schedDays)
         d.set(serializeHours(), forKey: Pref.schedHours)
         d.set(calGateBtn.state == .on, forKey: Pref.calGated)
-        d.set(max(0, min(Int(calGatePadField.stringValue) ?? 5, 1440)), forKey: Pref.calGatePad)
-        d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
+        // Ignored on save when INVALID (red) — keep the previously-saved value; empty → the default.
+        // numericFieldValid already rejects negatives, so no coercion to 0 and no persisting a "-1".
+        if numericFieldValid(calGatePadField.stringValue) {
+            d.set(min(Int(calGatePadField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 5, 1440), forKey: Pref.calGatePad)
+        }
+        if numericFieldValid(voiceField.stringValue) {
+            d.set(Double(Int(voiceField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 5), forKey: Pref.voiceMin)
+        }
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
         d.set(echoBtn.state == .on, forKey: Pref.echoReduce)

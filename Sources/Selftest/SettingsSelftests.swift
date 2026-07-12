@@ -329,6 +329,9 @@ func settingsSelftests(_ check: (String, Bool) -> Void) {
     check("settings: a count field is valid iff empty or a non-negative integer (else red-on-invalid)",
           numericFieldValid("") && numericFieldValid("  ") && numericFieldValid("5") && numericFieldValid("0")
           && !numericFieldValid("-1") && !numericFieldValid("abc") && !numericFieldValid("5.5") && !numericFieldValid("1 2"))
+    check("settings: controlTextDidChange actually tints the field (red on invalid, label on valid/empty)",
+          sw.numericTintForTest("-1") == .systemRed && sw.numericTintForTest("abc") == .systemRed
+          && sw.numericTintForTest("5") == .labelColor && sw.numericTintForTest("") == .labelColor)
     // The echo canceller must be fed the FULL speaker mix, not the transcript's filtered one — an
     // excluded app (Spotify) still plays out loud and bleeds into the mic, so a reference missing
     // it can never cancel that bleed. The dedicated full-mix reference tap is stood up only when
