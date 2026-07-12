@@ -58,6 +58,12 @@ func meetingActiveNow(_ events: [EventCandidate], now: Date, padding: TimeInterv
     }
 }
 
+/// The calendar gate's padding in seconds, clamped to [0, 24h] so a huge pref value can't overflow the
+/// `Int × 60` (Swift traps on overflow) nor make the gate absurdly always-on. Pure + selftested.
+func calendarPadSeconds(_ minutes: Int) -> TimeInterval {
+    TimeInterval(max(0, min(minutes, 1440)) * 60)
+}
+
 // MARK: - calendar lookup (title a transcript from the overlapping event)
 
 enum CalendarLookup {
@@ -82,7 +88,7 @@ enum CalendarLookup {
     static func meetingLiveNow(padMinutes: Int) -> Bool {
         guard authorized else { return false }
         let now = Date()
-        let pad = TimeInterval(max(0, padMinutes) * 60)
+        let pad = calendarPadSeconds(padMinutes)   // clamped [0, 24h] — overflow-safe (see the helper)
         // Tiny window (a few events) → a fast synchronous fetch; only runs when the user opted into gating.
         let pred = gateStore.predicateForEvents(withStart: now.addingTimeInterval(-pad - 60),
                                                 end: now.addingTimeInterval(pad + 60),

@@ -380,7 +380,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     }
 
     private func pauseReason(_ p: RecordPause) -> String {
-        p == .offHours ? "off-hours (schedule)" : "no live calendar meeting"
+        switch p {
+        case .offHours: return "off-hours (schedule)"
+        case .noMeeting: return "no live calendar meeting"
+        }
     }
 
     @objc private func flushNow() {

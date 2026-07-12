@@ -386,6 +386,10 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
                                now: schedDate("2026-07-08 10:00"), padding: 60)               // zero-duration event ignored
           && !meetingActiveNow(mtg, now: schedDate("2026-07-08 09:30"), padding: .infinity)   // +inf clamped → not all-time
           && meetingActiveNow(mtg, now: schedDate("2026-07-08 10:30"), padding: .nan))         // NaN clamped to 0 → mid-meeting active
+    check("calendar pad seconds: clamped [0, 24h], overflow-safe on a huge pref value",
+          calendarPadSeconds(5) == 300 && calendarPadSeconds(-5) == 0
+          && calendarPadSeconds(1440) == 86400 && calendarPadSeconds(1441) == 86400
+          && calendarPadSeconds(Int.max) == 86400)   // Int.max must clamp, never trap on Int × 60
     check("recording window: each gate blocks independently; both-off admits all",
           recordingWindowActive(scheduleEnabled: false, scheduleActive: false, calendarGated: false, meetingActive: false)   // both off → yes
           && recordingWindowActive(scheduleEnabled: true, scheduleActive: true, calendarGated: true, meetingActive: true)    // both pass → yes

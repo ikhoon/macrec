@@ -1379,7 +1379,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         d.set(serializeDays(), forKey: Pref.schedDays)
         d.set(serializeHours(), forKey: Pref.schedHours)
         d.set(calGateBtn.state == .on, forKey: Pref.calGated)
-        d.set(max(0, Int(calGatePadField.stringValue) ?? 5), forKey: Pref.calGatePad)
+        d.set(max(0, min(Int(calGatePadField.stringValue) ?? 5, 1440)), forKey: Pref.calGatePad)
         d.set(Double(Int(voiceField.stringValue) ?? 5), forKey: Pref.voiceMin)
         d.set(vadBtn.state == .on, forKey: Pref.vad)
         d.set(systemAudioBtn.state == .on, forKey: Pref.systemAudio)
