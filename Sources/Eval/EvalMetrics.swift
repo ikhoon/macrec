@@ -91,3 +91,44 @@ func cerJa(hyp: String, ref: String) -> Double { cer(normalizeJa(hyp), normalize
 func cerKo(hyp: String, ref: String, options: CEROptions = CEROptions()) -> Double {
     cer(normalizeKo(hyp, options), normalizeKo(ref, options))
 }
+
+/// chrF — character n-gram F-score (orders 1…`maxOrder`, β=`beta`), a reference-based TRANSLATION
+/// metric scoring CHARACTERS (no CJK word segmentation), range 0…1. Unlike CER it KEEPS punctuation and
+/// case; precision/recall average over the orders both strings are long enough for, then one F-beta.
+/// Both-empty → 1, one-empty → 0, `maxOrder < 1` → 0. Pure + selftested.
+func chrF(candidate: String, reference: String, maxOrder: Int = 6, beta: Double = 2) -> Double {
+    guard maxOrder >= 1 else { return 0 }
+    let cand = chrfChars(candidate), ref = chrfChars(reference)
+    if cand.isEmpty, ref.isEmpty { return 1 }
+    var precs: [Double] = [], recs: [Double] = []
+    for n in 1...maxOrder {
+        let cg = charNgrams(cand, n), rg = charNgrams(ref, n)
+        let nCand = cg.values.reduce(0, +), nRef = rg.values.reduce(0, +)
+        guard nCand > 0, nRef > 0 else { continue }   // an order longer than a string isn't effective
+        var match = 0
+        for (gram, c) in cg { match += min(c, rg[gram] ?? 0) }
+        precs.append(Double(match) / Double(nCand))
+        recs.append(Double(match) / Double(nRef))
+    }
+    guard !precs.isEmpty else { return 0 }            // no shared order length → no character overlap
+    let avgP = precs.reduce(0, +) / Double(precs.count)
+    let avgR = recs.reduce(0, +) / Double(recs.count)
+    let b2 = beta * beta
+    let denom = b2 * avgP + avgR
+    guard denom > 0 else { return 0 }                 // guards NaN when both averages are 0 (or β=0, avgR=0)
+    return (1 + b2) * avgP * avgR / denom
+}
+
+/// NFC + whitespace-strip; punctuation and case PRESERVED (chrF scores them). Characters are Unicode
+/// scalars (code points), matching sacreBLEU chrF — not grapheme clusters.
+private func chrfChars(_ s: String) -> [Character] {
+    Array(s.precomposedStringWithCanonicalMapping.unicodeScalars
+        .filter { !$0.properties.isWhitespace }.map(Character.init))
+}
+
+private func charNgrams(_ chars: [Character], _ n: Int) -> [String: Int] {
+    guard chars.count >= n else { return [:] }
+    var counts: [String: Int] = [:]
+    for i in 0...(chars.count - n) { counts[String(chars[i..<(i + n)]), default: 0] += 1 }
+    return counts
+}
