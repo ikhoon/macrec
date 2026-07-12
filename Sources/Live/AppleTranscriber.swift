@@ -11,6 +11,7 @@ import Translation
 // segment rotation stays the authoritative, saved transcript — this overlay is an ephemeral view.
 
 @available(macOS 26, *)
+/// Live on-device transcription via Apple's SpeechAnalyzer (macOS 26+), emitting (text, isFinal) updates.
 final class LiveTranscriber: LiveTranscribing {
     private let label: String
     private let locale: Locale

@@ -21,6 +21,7 @@ protocol LiveTranslating: AnyObject {
 /// On-device translation of finalized caption lines (macOS 26 Translation framework). Best-effort:
 /// if the language pair isn't installed/available it returns nil and captions show the original only.
 @available(macOS 26, *)
+/// Live translation via Apple's Translation framework (on-device, macOS 26+).
 final class LiveTranslator: LiveTranslating {
     private let session: TranslationSession
     private let lock = NSLock()
@@ -108,6 +109,7 @@ func deepLLang(_ id: String, isTarget: Bool) -> String {
 /// quota exhausted, or unsupported language won't fix itself on a retry. Pure + selftested.
 func deepLShouldRetry(status: Int) -> Bool { status == 429 || (500...599).contains(status) }
 
+/// Live translation via the DeepL API (needs an API key).
 final class DeepLTranslator: LiveTranslating {
     private let key: String
     private let targetLang: String

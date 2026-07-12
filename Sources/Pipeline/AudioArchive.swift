@@ -10,8 +10,10 @@ import Foundation
 // Recent segments stay WAV (instant scrubbing / re-transcription); older ones are archived to
 // .m4a and the transcript's audio link is rewritten to match. Deletion applies to both forms.
 
+/// The storage tier of a recording's audio: raw WAV, compressed AAC, or deleted.
 enum AudioTier: Equatable { case raw, compressed, deleted }
 
+/// Retention policy for recorded audio: when to compress (raw→AAC) and when to delete.
 struct AudioArchivePolicy: Equatable {
     var rawDays: Int      // days a file stays raw WAV; 0 = never compress
     var totalDays: Int    // age at which audio (raw or compressed) is deleted; 0 = keep forever
@@ -51,6 +53,7 @@ struct AudioArchivePolicy: Equatable {
     }
 }
 
+/// Runs the audio retention sweep — compresses aging WAVs to AAC and deletes them past the limit.
 enum AudioArchiver {
     /// WAV → AAC 32 kbps .m4a (afconvert). Writes to a .partial temp, then promotes — a killed
     /// sweep never leaves a half-written archive behind. The original's modification date is

@@ -3,6 +3,7 @@ import AVFoundation
 import EventKit
 import Foundation
 
+/// An NSView with a top-left origin (isFlipped) so settings content lays out top-down in a scroll view.
 final class FlippedDocView: NSView { override var isFlipped: Bool { true } }
 
 /// A rounded, hairline-bordered settings group. Marker type so the UI selftest can count

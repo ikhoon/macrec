@@ -6,6 +6,7 @@ import Foundation
 
 // MARK: - transcriber (per-track whisper-cli → speaker-labeled, time-merged transcript)
 
+/// Transcribes a recorded segment with whisper-cli into timestamped, speaker-labeled text.
 enum Transcriber {
     /// Run whisper-cli (VAD + suppress-non-speech) on a 16kHz/16-bit WAV; return its timestamped stdout.
     private static func runWhisper(_ wav16: URL, _ cfg: EngineConfig, hints: String = "") -> String {

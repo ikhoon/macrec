@@ -15,7 +15,9 @@ import Foundation
 /// Shell-quote a single argument for the zsh command line.
 func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
+/// How a finished transcript is post-processed: off, the built-in summary, or a user shell command.
 enum PostProcessMode: String { case off, summary, shell }
+/// The agent CLI used for the built-in summary.
 enum SummaryRunner: String, CaseIterable { case claude, codex, gemini }
 
 /// The built-in summary prompt — the turn-key default (editable in Settings). Answering in the
