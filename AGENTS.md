@@ -168,10 +168,11 @@ only `./macrec-stage.app/Contents/MacOS/macrec` (signed by `install.sh`). The te
   change set impossible to divide into compiling commits. It is now the CLI entry point plus the
   low-level primitives, and `Sources/` holds the rest as **per-module directories**: `Audio/`,
   `Live/`, `Pipeline/`, `Settings/`, `Tray/`, `Selftest/`, `Eval/`, each a concern per file. Still
-  no SwiftPM — the build is `swiftc macrec.swift $(find Sources -name '*.swift')` (recursive, so
+  no SwiftPM — the build compiles `macrec.swift $(find Sources -name '*.swift')` (recursive, so
   subdir files compile automatically; `version.sh` searches the same way, and `let macrecVersion`
-  can live in any of them). `Sources/` is what `swift package init` creates, so a later move to
-  SwiftPM needs no rename.
+  can live in any of them). That is the *input-file* set — the full `swiftc` invocation (frameworks,
+  the static speexdsp lib, the bridging header) lives in `install.sh`/`package.sh`. `Sources/` is what
+  `swift package init` creates, so a later move to SwiftPM needs no rename.
 - **Moving code is not changing code.** A refactor commit must prove it: capture `selftest` output
   before, and diff it after. Identical or it isn't pure motion. Never mix a fix into a move.
 - **No org/employer identifiers** in code, fixtures, placeholders, or PR text (`CLAUDE.md`).
