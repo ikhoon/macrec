@@ -149,6 +149,21 @@ only `./macrec-stage.app/Contents/MacOS/macrec` (signed by `install.sh`). The te
 
 ## 5. Decisions & preferences the maintainer has stated once — don't ask again
 
+- **Queue my tangential opinions; don't detour.** When I spot something worth doing that isn't the
+  current task — a refactor, a build-tool idea, a follow-up — I add it to `BACKLOG.md` and keep going on
+  what was asked. I don't stop to present options or ask "which first?" for my *own* suggestions; I surface
+  a queued idea only when the maintainer asks or it genuinely blocks the task. (Their explicit mid-work
+  requests are different — those get captured AND acted on per §0.) *macrec-scoped for now, not a global rule.*
+- **`BACKLOG.md` is the transparent todo list.** Manage work there, in-repo and diffable — not in GitHub
+  Issues (overkill) and not only in an invisible internal task list. Keep it current as work lands.
+- **Code changes update the docs they touch.** If a change makes `README` / `PIPELINE.md` /
+  `ARCHITECTURE.md` / `VISION.md` / `AGENTS.md` / `CLAUDE.md` stale — a moved file, a changed build
+  command, a renamed layout — update the doc in the same PR (or a tracked follow-up if the layout is
+  still moving, then update once it settles). Stale docs are a bug.
+- **Engage every code-review comment before merge.** CodeRabbit (or a human) review is not a formality:
+  read each comment, and either *accept* it (fix + say so) or *defend* it (a reasoned wontfix) — never
+  merge past an unaddressed comment. (The global rule "fixed and wontfix are different outcomes" applies;
+  this is macrec's reminder to actually run it against CodeRabbit before merging.)
 - **Split, one concern per file.** `macrec.swift` was one 8888-line file until the day it made a
   change set impossible to divide into compiling commits. It is now the CLI entry point plus the
   low-level primitives, and `Sources/` holds the rest: `Audio`, `Pipeline`, `LiveCaption`,
