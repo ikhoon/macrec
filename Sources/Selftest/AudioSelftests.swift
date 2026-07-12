@@ -2,6 +2,9 @@ import AppKit
 import AVFoundation
 import EventKit
 import Foundation
+#if SWIFT_PACKAGE
+    import CSpeexDSP // swift build: speex symbols via the C module; the swiftc build uses speex-bridge.h
+#endif
 
 func audioSelftests(_ check: (String, Bool) -> Void) {
     // EchoCanceller (SpeexDSP AEC) framing/plumbing — deterministic, no audio device needed.

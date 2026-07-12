@@ -1176,9 +1176,16 @@ func printMacrecHelp() {
     """)
 }
 
-@main
-struct Main {
-    static func main() async {
+/// The app's single public entry seam. `@main` lives in the thin executable target (Cli/Entry.swift),
+/// which calls this — so MacRecKit is a library with no `@main` and can be `@testable import`ed by the
+/// XCTest target without a duplicate-`_main` clash. Everything else stays internal to the module.
+public enum App {
+    // @MainActor is load-bearing: the thin Cli/Entry.swift calls `await App.main()`, and that await is a
+    // suspension point — without this the body resumes on a background executor and `runMenuBarApp()`
+    // builds its NSWindow off the main thread ("NSWindow should only be instantiated on the main
+    // thread!"). The old inline `@main` avoided it only because nothing suspended before the window.
+    @MainActor
+    public static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
 
         // The test/snapshot subcommands build the real Settings pane and the real overlay, which read
@@ -1355,7 +1362,10 @@ struct Main {
             do { try await engine.start() } catch { elog("engine: \(error)"); exit(3) }
             installStopHandler {
                 let s = DispatchSemaphore(value: 0)
-                Task { await engine.stop(); s.signal() }
+                // Task.detached, NOT Task {}: main() is @MainActor, so a plain Task would inherit the
+                // main actor and never run — the main thread is parked on the wait() below. Detached
+                // runs engine.stop() on the global executor so s.signal() actually fires.
+                Task.detached { await engine.stop(); s.signal() }
                 _ = s.wait(timeout: .now() + 20)
                 exit(0)
             }

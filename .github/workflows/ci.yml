@@ -6,9 +6,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ["macrec.swift", "Sources/**/*.swift", "Package.swift", "speex-bridge.h", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".swiftlint.yml", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "Cli/**/*.swift", "Tests/**/*.swift", "CSpeexDSP/**", "Package.swift", "speex-bridge.h", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".swiftlint.yml", ".github/workflows/ci.yml"]
   pull_request:
-    paths: ["macrec.swift", "Sources/**/*.swift", "Package.swift", "speex-bridge.h", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".swiftlint.yml", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "Cli/**/*.swift", "Tests/**/*.swift", "CSpeexDSP/**", "Package.swift", "speex-bridge.h", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".swiftlint.yml", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 # Read-only token: neither job pushes or writes to the repo (build + lint only).
@@ -58,7 +58,11 @@ jobs:
           "$RUNNER_TEMP/sl/swiftlint" lint --strict
 
       - name: Install speexdsp (AEC — statically linked into the binary)
-        run: brew install speexdsp
+        run: |
+          brew install speexdsp
+          # Export the resolved prefix so the SwiftPM steps (swift build / swift test) resolve speex to
+          # the SAME location as the swiftc build, not Package.swift's Apple-silicon fallback.
+          echo "SPEEX_PREFIX=$(brew --prefix speexdsp)" >> "$GITHUB_ENV"
 
       - name: Build (swiftc — same frameworks/libs as install.sh, unsigned)
         run: |
@@ -67,7 +71,7 @@ jobs:
             -framework AVFoundation -framework CoreMedia -framework CoreAudio \
             -framework CoreGraphics -framework AppKit -framework EventKit -framework ServiceManagement -framework Speech -framework Translation \
             -import-objc-header speex-bridge.h -I "$SPEEX_PREFIX/include" "$SPEEX_PREFIX/lib/libspeexdsp.a" \
-            macrec.swift $(find Sources -name '*.swift') -o "$RUNNER_TEMP/macrec"
+            macrec.swift Cli/Entry.swift $(find Sources -name '*.swift') -o "$RUNNER_TEMP/macrec"
 
       - name: Guard — no ScreenCaptureKit + speexdsp is statically linked
         run: |
@@ -100,6 +104,12 @@ jobs:
             echo "::error::SwiftPM binary links libspeexdsp dynamically — must be static so the .app is self-contained"; exit 1
           fi
           echo "✅ SwiftPM manifest builds; binary self-contained"
+
+      # `swift test` runs the XCTest target (MacRecKitTests), a second front-end over the SAME
+      # <module>Selftests closures the `macrec selftest` subcommand runs — so the editor-runnable suite
+      # and the shipped subcommand can't diverge, and a pane that only breaks headlessly fails here.
+      - name: Test (SwiftPM — XCTest over the selftest closures)
+        run: swift test
 
       - name: Smoke-test CLI (headless, no GUI / permissions)
         run: |
