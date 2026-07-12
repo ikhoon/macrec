@@ -2,9 +2,13 @@
 
 macOS menu-bar meeting recorder. `macrec.swift` is the CLI entry point and the low-level primitives;
 `Sources/` holds the rest as **per-module directories**, one concern per file — `Audio/`, `Live/`,
-`Pipeline/`, `Settings/`, `Tray/`, `Selftest/`, `Eval/`. Still no SwiftPM — the build is one
-`swiftc macrec.swift $(find Sources -name '*.swift')` (recursive, so subdirectories are picked up
-automatically; `version.sh` searches the same way). Menu-bar (tray) app today, architected to grow
+`Pipeline/`, `Settings/`, `Tray/`, `Selftest/`, `Eval/`. **Migrating to standard SwiftPM**
+(`Sources/` + `Tests/`, XCTest) — decided to easily leverage the OSS ecosystem (packages, `swift
+test`, indexing, tooling) instead of the bespoke single-`swiftc` build. Done incrementally + design-
+first: step one is additive (add `Package.swift` + `Tests/` so `swift build`/`swift test` work) while
+`install.sh`/`package.sh` keep building + signing the `.app` unchanged (the cert-based DR must survive).
+Until the cutover the build is `swiftc macrec.swift $(find Sources -name '*.swift')` (recursive;
+`version.sh` searches the same way). Menu-bar (tray) app today, architected to grow
 into a full windowed **desktop app**; recording is table stakes — the value is the pipeline above it
 (transcript → summary → daily digest → knowledge). See `PIPELINE.md`.
 
