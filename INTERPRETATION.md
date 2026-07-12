@@ -44,6 +44,7 @@ that demotes to a safe default when a credential is missing.
 | **Interpret**| (composition)        | transcribe→translate→speak | a single cloud **speech-to-speech** stage  |
 
 Two ways a cloud interpreter plugs in, both supported by the chain:
+
 1. **Swap one layer** — a `CloudSpeechSynthesizer: SpeechSynthesizing` replaces Apple TTS; the rest is
    unchanged.
 2. **Replace several stages with one** — a cloud service that takes source audio and returns target
