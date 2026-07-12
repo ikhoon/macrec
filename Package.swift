@@ -2,17 +2,12 @@
 import Foundation
 import PackageDescription
 
-// macrec ships via install.sh / package.sh: an unchanged `swiftc` line still produces the signed .app,
-// its cert-based Designated Requirement, and the TCC grants that depend on it. This manifest is
-// deliberately ADDITIVE — it exists only so `swift build` and editor indexing (SourceKit-LSP) work on
-// the exact same single module. It does NOT feed the release build; the scripts are untouched.
+// Additive: powers `swift build` + SourceKit indexing only. The signed .app (cert-DR, TCC) is still
+// built by the unchanged swiftc line in install.sh / package.sh — this manifest never feeds a release.
 
-// SpeexDSP (the static AEC library) lives at a Homebrew prefix. Overridable for a non-standard install;
-// the default is the Apple-silicon Homebrew path install.sh falls back to.
 let speexPrefix = ProcessInfo.processInfo.environment["SPEEX_PREFIX"] ?? "/opt/homebrew/opt/speexdsp"
 
-// The bridging header path must be ABSOLUTE: `swift build` compiles from a different working directory
-// than the swiftc line, so a relative "speex-bridge.h" (which install.sh can use) would not resolve.
+// Absolute: `swift build`'s working dir differs from swiftc's, so a relative header path won't resolve.
 let headerPath = URL(fileURLWithPath: #filePath)
     .deletingLastPathComponent()
     .appendingPathComponent("speex-bridge.h").path
@@ -21,9 +16,7 @@ let package = Package(
     name: "macrec",
     platforms: [.macOS("26.0")],
     targets: [
-        // One executable target spanning the same files as the swiftc line: root macrec.swift (holds
-        // @main) + every file under Sources/. Explicit `sources:` keeps the set self-limiting, so no
-        // hand-maintained exclude list can drift out of date.
+        // Same files as the swiftc line; explicit `sources:` stays self-limiting (no exclude list to drift).
         .executableTarget(
             name: "macrec",
             path: ".",

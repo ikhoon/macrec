@@ -6,9 +6,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ["macrec.swift", "Sources/**/*.swift", "Package.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "Package.swift", "speex-bridge.h", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
   pull_request:
-    paths: ["macrec.swift", "Sources/**/*.swift", "Package.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "Package.swift", "speex-bridge.h", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 # Read-only token: neither job pushes or writes to the repo (build + lint only).
@@ -76,11 +76,15 @@ jobs:
 
       - name: Guard — SwiftPM binary is also self-contained (static speexdsp, no ScreenCaptureKit)
         run: |
+          set -euo pipefail
           BIN=.build/debug/macrec
-          if otool -L "$BIN" | grep -qi ScreenCaptureKit; then
+          # Fail closed: a missing binary or broken otool must not read as a clean guard.
+          [[ -x "$BIN" ]] || { echo "::error::SwiftPM binary missing: $BIN"; exit 1; }
+          deps="$(otool -L "$BIN")" || { echo "::error::otool failed on $BIN"; exit 1; }
+          if grep -qi ScreenCaptureKit <<<"$deps"; then
             echo "::error::SwiftPM binary links ScreenCaptureKit — system audio must use the Core Audio tap"; exit 1
           fi
-          if otool -L "$BIN" | grep -qi speexdsp; then
+          if grep -qi speexdsp <<<"$deps"; then
             echo "::error::SwiftPM binary links libspeexdsp dynamically — must be static so the .app is self-contained"; exit 1
           fi
           echo "✅ SwiftPM manifest builds; binary self-contained"
