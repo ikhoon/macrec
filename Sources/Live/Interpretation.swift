@@ -79,4 +79,3 @@ final class SpeakingStage: UtteranceSink {
         next?.receive(u)
     }
 }
-

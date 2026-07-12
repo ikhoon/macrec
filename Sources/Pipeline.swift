@@ -8,7 +8,6 @@ import Compression   // zlib ratio — the whisper repetition-loop detector
 import EventKit
 import Foundation
 
-
 /// A calendar event reduced to what titling a recorded segment depends on — a pure stand-in for
 /// `EKEvent` so the choice below is directly testable.
 struct EventCandidate: Equatable {

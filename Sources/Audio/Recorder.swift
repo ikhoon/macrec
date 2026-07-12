@@ -41,7 +41,7 @@ final class Recorder {
     /// Drain in-flight callbacks, then release the AVAudioFiles so they flush their WAV headers
     /// to disk before mixdown reads them.
     func finalizeWriters() {
-        queue.sync { }
+        queue.sync {}
         if let s = sysWriter {
             elog("stats sys " + s.stats)
             if s.framesOut > 16000 && s.peak < 0.001 {
@@ -53,4 +53,3 @@ final class Recorder {
         micWriter = nil
     }
 }
-

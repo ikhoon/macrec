@@ -267,4 +267,3 @@ final class EchoCanceller {
         return s
     }
 }
-

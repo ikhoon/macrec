@@ -1,0 +1,13 @@
+# SwiftFormat config for macrec — a HYGIENE guardrail, not a restyle.
+#
+# Allowlist only (`--rules`): we enforce whitespace + redundancy rules the codebase already follows,
+# and deliberately leave the opinionated rules OFF so the maintainer's dense, hand-tuned style is
+# preserved — no wrapping, no `redundantSelf`, no `hoistPatternLet`/`andOperator`, no import sorting,
+# no semicolon stripping. Adding a rule here is a decision; measure its churn first.
+#
+# Run (fix):   swiftformat .
+# Check (CI):  swiftformat --lint .
+--swiftversion 5.10
+--exclude .build,dist,macrec-stage.app
+
+--rules trailingSpace,linebreakAtEndOfFile,consecutiveBlankLines,emptyBraces,duplicateImports,redundantParens,spaceInsideParens,spaceInsideBrackets,spaceInsideBraces,blankLinesAtStartOfScope,blankLinesAtEndOfScope,redundantGet,redundantInit,redundantBackticks,redundantType

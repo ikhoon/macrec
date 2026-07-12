@@ -6,9 +6,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
   pull_request:
-    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 # Read-only token: neither job pushes or writes to the repo (build + lint only).
@@ -32,6 +32,14 @@ jobs:
         run: |
           v=$(./version.sh) || { echo "::error::version.sh failed — install.sh/package.sh version parse is broken"; exit 1; }
           echo "✅ version resolves to $v (shared by install.sh, package.sh, and this job)"
+
+      # SwiftFormat is a hygiene guardrail (allowlist ruleset in .swiftformat) — no restyle, just
+      # whitespace/redundancy the code already follows. Runs before the expensive compile so a style
+      # slip fails in seconds instead of after a full build.
+      - name: Lint — SwiftFormat (style)
+        run: |
+          brew install swiftformat
+          swiftformat --lint .
 
       - name: Install speexdsp (AEC — statically linked into the binary)
         run: brew install speexdsp

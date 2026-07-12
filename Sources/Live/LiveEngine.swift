@@ -132,4 +132,3 @@ func selectableLiveEngines(_ all: [LiveEngine], ready: (LiveEngine) -> Bool,
     let picked = all.filter { enabled($0) && ready($0) }
     return picked.isEmpty ? [.apple] : picked
 }
-

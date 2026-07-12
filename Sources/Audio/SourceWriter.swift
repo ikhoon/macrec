@@ -173,4 +173,3 @@ func mixDown(sysURL: URL, micURL: URL?, outURL: URL) throws {
         try outFile.write(from: out)
     }
 }
-

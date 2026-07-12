@@ -870,4 +870,3 @@ final class ElevenLabsLiveTranscriber: NSObject, LiveTranscribing, URLSessionWeb
         }
     }
 }
-

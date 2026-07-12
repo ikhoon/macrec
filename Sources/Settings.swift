@@ -76,7 +76,7 @@ final class SidebarCell: NSTableCellView {
 final class SidebarRowView: NSTableRowView {
     override var isEmphasized: Bool {
         get { true }
-        set { }
+        set {}
     }
     override var interiorBackgroundStyle: NSView.BackgroundStyle { isSelected ? .emphasized : .normal }
     override func drawSelection(in dirtyRect: NSRect) {
@@ -155,7 +155,6 @@ func isNewerVersion(_ candidate: String, than current: String) -> Bool {
     return false
 }
 
-
 /// The title bar and footer a pane's document height doesn't account for.
 let snapshotChromeHeight: CGFloat = 96
 
@@ -167,7 +166,6 @@ func snapshotContentHeight(runtime: CGFloat, document: CGFloat, cap: CGFloat = 4
 }
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSComboBoxDelegate {
-
     /// A field the parser can't read must LOOK broken while typing — schedule fields silently
     /// falling open to "record everything" is a privacy failure; a retention typo would silently
     /// keep the last saved period. Invalid input turns red and is ignored on save.
