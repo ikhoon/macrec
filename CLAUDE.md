@@ -10,11 +10,12 @@ target **MacRecKit** (`macrec.swift` + `Sources/`, no `@main`) + a thin executab
 **Hybrid build (deliberate):** the signed `.app` is still produced by the single-module swiftc line in
 `install.sh` / `package.sh` — `swiftc macrec.swift Cli/Entry.swift $(find Sources -name '*.swift')`
 (recursive; `version.sh` searches the same way) — so the cert-based DR + TCC grants are untouched.
-`Cli/Entry.swift` serves both build systems via `#if SWIFT_PACKAGE` (the import of MacRecKit / CSpeexDSP
-is present only under `swift build`; the swiftc build is one module with a bridging header). `App.main()`
-is `@MainActor` — the `await App.main()` hop would otherwise build the tray NSWindow off the main
-thread. Menu-bar (tray) app today, architected to grow into a full windowed **desktop app**; recording
-is table stakes — the value is the pipeline above it (transcript → summary → daily digest → knowledge).
+`Cli/Entry.swift` conditionally imports `MacRecKit`, and the speex files (`EchoCanceller`/`Recorder`/
+`AudioSelftests`) conditionally import `CSpeexDSP` — both under `#if SWIFT_PACKAGE`, so the swiftc build
+stays one module with the bridging header. `App.main()` is `@MainActor` — the `await App.main()` hop
+would otherwise build the tray NSWindow off the main thread. Menu-bar (tray) app today, architected to
+grow into a full windowed **desktop app**; recording is table stakes — the value is the pipeline above
+it (transcript → summary → daily digest → knowledge).
 See `PIPELINE.md`.
 
 **Read `AGENTS.md` too** — the operating rules distilled from maintainer feedback (the quality

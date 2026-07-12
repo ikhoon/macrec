@@ -1176,14 +1176,10 @@ func printMacrecHelp() {
     """)
 }
 
-/// The app's single public entry seam. `@main` lives in the thin executable target (Cli/Entry.swift),
-/// which calls this — so MacRecKit is a library with no `@main` and can be `@testable import`ed by the
-/// XCTest target without a duplicate-`_main` clash. Everything else stays internal to the module.
+/// The app's entry logic, invoked by Cli/Entry.swift's `@main` (see CLAUDE.md for the hybrid build).
 public enum App {
-    // @MainActor is load-bearing: the thin Cli/Entry.swift calls `await App.main()`, and that await is a
-    // suspension point — without this the body resumes on a background executor and `runMenuBarApp()`
-    // builds its NSWindow off the main thread ("NSWindow should only be instantiated on the main
-    // thread!"). The old inline `@main` avoided it only because nothing suspended before the window.
+    // @MainActor: Cli/Entry.swift's `await App.main()` suspends, so without this runMenuBarApp() builds
+    // the tray NSWindow off the main thread. (See also Task.detached in the engine stop handler below.)
     @MainActor
     public static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())

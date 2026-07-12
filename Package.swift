@@ -2,13 +2,10 @@
 import Foundation
 import PackageDescription
 
-// The signed .app is still built by the single-module swiftc line in install.sh / package.sh (it
-// compiles macrec.swift + Sources + Cli/Entry.swift into one binary, with speex-bridge.h as its
-// bridging header). This manifest additionally lets `swift build`, SourceKit indexing, and `swift test`
-// work by splitting the same files into a library (MacRecKit, no @main) + a thin executable (@main) +
-// an XCTest target, with speex reached through a proper C module (CSpeexDSP) rather than a bridging
-// header — a bridging header can't live on a library others import. See Cli/Entry.swift + the
-// `#if SWIFT_PACKAGE import CSpeexDSP` guards for how one set of files serves both build systems.
+// The signed .app is still built by the swiftc line in install.sh / package.sh; this manifest adds the
+// library split (MacRecKit + thin macrec exe + CSpeexDSP C module + XCTest) so `swift test` works.
+// See CLAUDE.md for the hybrid build; a bridging header can't live on a library others import, hence
+// CSpeexDSP.
 
 // SpeexDSP's Homebrew prefix. For a non-default install (e.g. Intel brew at /usr/local), build with
 // `SPEEX_PREFIX=$(brew --prefix speexdsp) swift build`.
