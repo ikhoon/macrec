@@ -386,6 +386,10 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
                                now: schedDate("2026-07-08 10:00"), padding: 60)               // zero-duration event ignored
           && !meetingActiveNow(mtg, now: schedDate("2026-07-08 09:30"), padding: .infinity)   // +inf clamped → not all-time
           && meetingActiveNow(mtg, now: schedDate("2026-07-08 10:30"), padding: .nan))         // NaN clamped to 0 → mid-meeting active
+    check("calendar pad seconds: clamped [0, 24h], overflow-safe on a huge pref value",
+          calendarPadSeconds(5) == 300 && calendarPadSeconds(-5) == 0
+          && calendarPadSeconds(1440) == 86400 && calendarPadSeconds(1441) == 86400
+          && calendarPadSeconds(Int.max) == 86400)   // Int.max must clamp, never trap on Int × 60
     check("recording window: each gate blocks independently; both-off admits all",
           recordingWindowActive(scheduleEnabled: false, scheduleActive: false, calendarGated: false, meetingActive: false)   // both off → yes
           && recordingWindowActive(scheduleEnabled: true, scheduleActive: true, calendarGated: true, meetingActive: true)    // both pass → yes
@@ -395,6 +399,24 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
           && !recordingWindowActive(scheduleEnabled: true, scheduleActive: false, calendarGated: false, meetingActive: false) // calendar OFF, schedule blocks
           && recordingWindowActive(scheduleEnabled: true, scheduleActive: true, calendarGated: false, meetingActive: false)  // calendar off → schedule only
           && recordingWindowActive(scheduleEnabled: false, scheduleActive: false, calendarGated: true, meetingActive: true)) // schedule off → calendar only
+    check("recording window state: fail-open on missing permission; schedule is the outer reason",
+          recordingWindowState(scheduleEnabled: false, scheduleActive: false, calendarGated: false,
+                               calendarAuthorized: false, meetingActive: false) == nil                     // nothing gates → record
+          && recordingWindowState(scheduleEnabled: true, scheduleActive: false, calendarGated: false,
+                                  calendarAuthorized: true, meetingActive: false) == .offHours             // schedule blocks
+          && recordingWindowState(scheduleEnabled: false, scheduleActive: false, calendarGated: true,
+                                  calendarAuthorized: true, meetingActive: false) == .noMeeting            // calendar blocks
+          && recordingWindowState(scheduleEnabled: true, scheduleActive: false, calendarGated: true,
+                                  calendarAuthorized: true, meetingActive: false) == .offHours             // BOTH gates block → schedule (outer) reason
+          && recordingWindowState(scheduleEnabled: false, scheduleActive: false, calendarGated: true,
+                                  calendarAuthorized: false, meetingActive: false) == nil                  // GATED but no permission → fail OPEN
+          && recordingWindowState(scheduleEnabled: false, scheduleActive: false, calendarGated: true,
+                                  calendarAuthorized: true, meetingActive: true) == nil)                   // in a meeting → record
+    check("override expiry: no schedule boundary holds forever (distantFuture), else the schedule boundary",
+          overrideExpiry(RecordSchedule(enabled: false, weekdays: [], ranges: []),
+                         now: schedDate("2026-07-08 10:30")) == .distantFuture                             // calendar-only: Resume must hold
+          && overrideExpiry(RecordSchedule.from(enabled: true, days: "mon-fri", hours: "10:00-19:00"),
+                            now: schedDate("2026-07-08 10:30")) != .distantFuture)                         // real schedule DOES flip
     // Dead-mic detection — the jack-input incident: hours of segments "voiced" by clicks
     // (energy-gate trips) while containing zero speech-length runs, all discarded silently.
     check("mic guard: speech-run accounting (clicks never qualify, speech does)",
