@@ -136,11 +136,13 @@ enum Transcriber {
     }
 
     /// Convert a float32 WAV to 16kHz/16-bit (what whisper-cli expects). Returns the temp file URL.
+    /// A mid-conversion throw (a read/write error after `AVAudioFile(forWriting:)` has created the
+    /// file) must not orphan the half-written `.16.wav`, so the write runs inside `cleaningUpOnFailure`.
     private static func convert16(_ src: URL) -> URL? {
-        do {
+        let outURL = URL(fileURLWithPath: src.deletingPathExtension().path + ".16.wav")
+        return cleaningUpOnFailure(outURL, onError: { elog("convert16(\(src.lastPathComponent)): \($0)") }) {
             let inFile = try AVAudioFile(forReading: src)
             guard inFile.length > 0 else { return nil }
-            let outURL = URL(fileURLWithPath: src.deletingPathExtension().path + ".16.wav")
             let settings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000.0,
                 AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
                 AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false]
@@ -153,7 +155,16 @@ enum Transcriber {
                 try outFile.write(from: buf)
             }
             return outURL
-        } catch { elog("convert16(\(src.lastPathComponent)): \(error)"); return nil }
+        }
+    }
+
+    /// Run `body`; on any throw, delete `partial` (a half-written output file) and return nil — so a
+    /// failed conversion never orphans a partial file on disk. `onError` receives the error for logging
+    /// (injected so a selftest can exercise the cleanup path without emitting a log line).
+    static func cleaningUpOnFailure(_ partial: URL, onError: (Error) -> Void = { _ in },
+                                    _ body: () throws -> URL?) -> URL? {
+        do { return try body() }
+        catch { onError(error); try? FileManager.default.removeItem(at: partial); return nil }
     }
 
     /// Transcribe mic ("me") and system ("them") SEPARATELY, then merge by time into a speaker-labeled
