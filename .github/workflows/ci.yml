@@ -35,11 +35,12 @@ jobs:
 
       # SwiftFormat is a hygiene guardrail (allowlist ruleset in .swiftformat) — no restyle, just
       # whitespace/redundancy the code already follows. Runs before the expensive compile so a style
-      # slip fails in seconds instead of after a full build. Pinned (not `brew install`) so a future
-      # release can't silently change a rule's behavior and fail an unrelated PR — bump deliberately.
+      # slip fails in seconds instead of after a full build. Pinned by version AND SHA-256 (not `brew
+      # install`) so neither a silent rule change nor a tampered asset can run in CI — bump both together.
       - name: Lint — SwiftFormat (style, pinned 0.62.1)
         run: |
           curl -fsSL https://github.com/nicklockwood/SwiftFormat/releases/download/0.62.1/swiftformat.zip -o "$RUNNER_TEMP/sf.zip"
+          echo "7cb1cb1fae04932047c7015441c543848e8e60e1572d808d080e0a1f1661114a  $RUNNER_TEMP/sf.zip" | shasum -a 256 -c -
           unzip -q "$RUNNER_TEMP/sf.zip" -d "$RUNNER_TEMP"
           chmod +x "$RUNNER_TEMP/swiftformat"
           "$RUNNER_TEMP/swiftformat" --lint .
