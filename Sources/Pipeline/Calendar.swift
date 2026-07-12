@@ -49,10 +49,10 @@ func bestEventIndex(segStart: Date, segEnd: Date, candidates: [EventCandidate]) 
 }
 
 /// Is a calendar meeting live right now (± `padding`)? The gate for "record only during meetings":
-/// `now` ∈ [start − pad, end + pad) for a real (end > start) event. Negative padding is clamped to 0
-/// so it can never silently shrink the window; a zero/negative-duration event is ignored. Selftested.
+/// `now` ∈ [start − pad, end + pad) for a real (end > start) event. A negative OR non-finite padding
+/// is clamped to 0 (it must neither shrink nor blow the window open); zero-duration events are ignored.
 func meetingActiveNow(_ events: [EventCandidate], now: Date, padding: TimeInterval) -> Bool {
-    let pad = max(0, padding)
+    let pad = padding.isFinite ? max(0, padding) : 0
     return events.contains {
         $0.end > $0.start && now >= $0.start.addingTimeInterval(-pad) && now < $0.end.addingTimeInterval(pad)
     }
