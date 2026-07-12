@@ -136,35 +136,40 @@ enum Transcriber {
     }
 
     /// Convert a float32 WAV to 16kHz/16-bit (what whisper-cli expects). Returns the temp file URL.
-    /// A mid-conversion throw (a read/write error after `AVAudioFile(forWriting:)` has created the
-    /// file) must not orphan the half-written `.16.wav`, so the write runs inside `cleaningUpOnFailure`.
     private static func convert16(_ src: URL) -> URL? {
-        let outURL = URL(fileURLWithPath: src.deletingPathExtension().path + ".16.wav")
-        return cleaningUpOnFailure(outURL, onError: { elog("convert16(\(src.lastPathComponent)): \($0)") }) {
+        do {
             let inFile = try AVAudioFile(forReading: src)
             guard inFile.length > 0 else { return nil }
+            let outURL = URL(fileURLWithPath: src.deletingPathExtension().path + ".16.wav")
             let settings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000.0,
                 AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
                 AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false]
+            // forWriting: creates outURL on disk — from here a throw must delete THIS partial (never a
+            // .16.wav an earlier run wrote), so the loop runs inside finishOrDiscard.
             let outFile = try AVAudioFile(forWriting: outURL, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
-            let block: AVAudioFrameCount = 16000
-            while inFile.framePosition < inFile.length {
-                guard let buf = AVAudioPCMBuffer(pcmFormat: canon, frameCapacity: block) else { break }
-                try inFile.read(into: buf, frameCount: block)
-                if buf.frameLength == 0 { break }
-                try outFile.write(from: buf)
+            return finishOrDiscard(outURL, onError: { elog("convert16(\(src.lastPathComponent)): \($0)") }) {
+                let block: AVAudioFrameCount = 16000
+                while inFile.framePosition < inFile.length {
+                    guard let buf = AVAudioPCMBuffer(pcmFormat: canon, frameCapacity: block) else { break }
+                    try inFile.read(into: buf, frameCount: block)
+                    if buf.frameLength == 0 { break }
+                    try outFile.write(from: buf)
+                }
             }
-            return outURL
-        }
+        } catch { elog("convert16(\(src.lastPathComponent)): \(error)"); return nil }
     }
 
-    /// Run `body`; on any throw, delete `partial` (a half-written output file) and return nil — so a
-    /// failed conversion never orphans a partial file on disk. `onError` receives the error for logging
-    /// (injected so a selftest can exercise the cleanup path without emitting a log line).
-    static func cleaningUpOnFailure(_ partial: URL, onError: (Error) -> Void = { _ in },
-                                    _ body: () throws -> URL?) -> URL? {
-        do { return try body() }
-        catch { onError(error); try? FileManager.default.removeItem(at: partial); return nil }
+    /// The caller has just created `partial` on disk; run `write`, and on any throw delete that partial
+    /// (the file this call started — never a pre-existing one) and return nil. A cleanup that itself
+    /// fails is surfaced via `onError`, not swallowed. Injected `onError` keeps the selftest silent.
+    static func finishOrDiscard(_ partial: URL, onError: (Error) -> Void = { _ in },
+                                _ write: () throws -> Void) -> URL? {
+        do { try write(); return partial }
+        catch {
+            onError(error)
+            do { try FileManager.default.removeItem(at: partial) } catch { onError(error) }
+            return nil
+        }
     }
 
     /// Transcribe mic ("me") and system ("them") SEPARATELY, then merge by time into a speaker-labeled
