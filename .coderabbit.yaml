@@ -6,10 +6,10 @@ language: "en-US"
 reviews:
   profile: "assertive"            # this project's bar is high — surface more, not fewer, issues
   request_changes_workflow: false
-  high_level_summary: true
+  high_level_summary: false       # skip the "Summary by CodeRabbit" walkthrough — the maintainer finds it noise
   review_status: true
   poem: false
-  collapse_walkthrough: false
+  collapse_walkthrough: true
   auto_review:
     enabled: true
     drafts: false
@@ -38,6 +38,13 @@ reviews:
         Build/release scripts (zsh). The app version has ONE source of truth (version.sh); never
         reintroduce an inline, file-specific grep for `macrecVersion`. Never hardcode org/employer
         identifiers, hostnames, or ticket IDs in any script, fixture, or placeholder.
+    - path: "**/*.md"
+      instructions: >-
+        Docs. The "no identifiers" rule targets EMPLOYER / INTERNAL identifiers only — employer names,
+        internal project/customer/service/host names, ticket IDs. Do NOT flag the project's OWN public
+        name (macrec) or public third-party VENDOR/PRODUCT names (OpenAI, DeepL, ElevenLabs, Deepgram,
+        Gladia, Whisper, Azure, and named competitor products) — these are legitimate and necessary to
+        reference (they are the integrations and the market). Markdown-lint findings (MD022 etc.) are welcome.
 
 chat:
   auto_reply: true
