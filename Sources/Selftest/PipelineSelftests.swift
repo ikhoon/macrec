@@ -368,23 +368,29 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
           && pick([]) == nil
           && eventOverlap(kickoff, segStart: seg, segEnd: segEnd) == 3600
           && eventOverlap(goalCheck, segStart: seg, segEnd: segEnd) == 120)
-    // Calendar-gated recording: record only while a meeting is live (± padding); composes with the
-    // time schedule. Default (both gates off) always records — no behaviour change unless opted in.
+    // Calendar-gated recording: record only while a meeting is live (± padding), composed with the schedule.
     let mtg = [EventCandidate(title: "sync", start: schedDate("2026-07-08 10:00"),
                               end: schedDate("2026-07-08 11:00"), hasLink: true)]
-    check("calendar gate: active inside a meeting, not outside (± padding)",
-          meetingActiveNow(mtg, now: schedDate("2026-07-08 10:30"), padding: 0)             // mid-meeting
-          && !meetingActiveNow(mtg, now: schedDate("2026-07-08 09:30"), padding: 0)          // before
-          && !meetingActiveNow(mtg, now: schedDate("2026-07-08 11:30"), padding: 0)          // after
-          && meetingActiveNow(mtg, now: schedDate("2026-07-08 09:58"), padding: 300)         // 2 min early, 5-min pad
-          && !meetingActiveNow(mtg, now: schedDate("2026-07-08 09:50"), padding: 300)        // 10 min early, still out
-          && !meetingActiveNow([], now: schedDate("2026-07-08 10:30"), padding: 0))          // no events → never
-    check("recording window: schedule ∧ calendar gates intersect; either-off admits all",
-          recordingWindowActive(scheduleEnabled: false, scheduleActive: false, calendarGated: false, meetingActive: false)
-          && !recordingWindowActive(scheduleEnabled: true, scheduleActive: false, calendarGated: false, meetingActive: false)
-          && recordingWindowActive(scheduleEnabled: true, scheduleActive: true, calendarGated: true, meetingActive: true)
-          && !recordingWindowActive(scheduleEnabled: false, scheduleActive: false, calendarGated: true, meetingActive: false)
-          && recordingWindowActive(scheduleEnabled: true, scheduleActive: true, calendarGated: false, meetingActive: false))
+    check("calendar gate: half-open [start, end) ± padding, real events only",
+          meetingActiveNow(mtg, now: schedDate("2026-07-08 10:30"), padding: 0)              // mid-meeting
+          && meetingActiveNow(mtg, now: schedDate("2026-07-08 10:00"), padding: 0)            // AT start → active
+          && !meetingActiveNow(mtg, now: schedDate("2026-07-08 11:00"), padding: 0)           // AT end → not (half-open)
+          && !meetingActiveNow(mtg, now: schedDate("2026-07-08 09:30"), padding: 0)           // before
+          && meetingActiveNow(mtg, now: schedDate("2026-07-08 09:55"), padding: 300)          // exactly start − 5-min pad
+          && !meetingActiveNow(mtg, now: schedDate("2026-07-08 09:54"), padding: 300)         // one min earlier → out
+          && !meetingActiveNow(mtg, now: schedDate("2026-07-08 11:05"), padding: 300)         // exactly end + pad → not
+          && !meetingActiveNow([], now: schedDate("2026-07-08 10:30"), padding: 0)            // no events → never
+          && meetingActiveNow(mtg, now: schedDate("2026-07-08 10:30"), padding: -600)         // negative pad clamped to 0
+          && !meetingActiveNow([EventCandidate(title: "pt", start: schedDate("2026-07-08 10:00"),
+                                               end: schedDate("2026-07-08 10:00"), hasLink: false)],
+                               now: schedDate("2026-07-08 10:00"), padding: 60))              // zero-duration event ignored
+    check("recording window: each gate blocks independently; both-off admits all",
+          recordingWindowActive(scheduleEnabled: false, scheduleActive: false, calendarGated: false, meetingActive: false)   // both off → yes
+          && recordingWindowActive(scheduleEnabled: true, scheduleActive: true, calendarGated: true, meetingActive: true)    // both pass → yes
+          && !recordingWindowActive(scheduleEnabled: true, scheduleActive: false, calendarGated: true, meetingActive: true)  // schedule blocks (calendar passes)
+          && !recordingWindowActive(scheduleEnabled: true, scheduleActive: true, calendarGated: true, meetingActive: false)  // calendar blocks (schedule passes)
+          && recordingWindowActive(scheduleEnabled: true, scheduleActive: true, calendarGated: false, meetingActive: false)  // calendar off → schedule only
+          && recordingWindowActive(scheduleEnabled: false, scheduleActive: false, calendarGated: true, meetingActive: true)) // schedule off → calendar only
     // Dead-mic detection — the jack-input incident: hours of segments "voiced" by clicks
     // (energy-gate trips) while containing zero speech-length runs, all discarded silently.
     check("mic guard: speech-run accounting (clicks never qualify, speech does)",

@@ -48,12 +48,14 @@ func bestEventIndex(segStart: Date, segEnd: Date, candidates: [EventCandidate]) 
         .first
 }
 
-/// Is a calendar meeting happening right now (± `padding`)? The gate for a "record only during
-/// meetings" mode: true iff `now` falls within [start − padding, end + padding) for some event. The
-/// padding catches a meeting that starts a beat before the recorder polls, or runs a beat over.
-/// Pure + selftested.
+/// Is a calendar meeting live right now (± `padding`)? The gate for "record only during meetings":
+/// `now` ∈ [start − pad, end + pad) for a real (end > start) event. Negative padding is clamped to 0
+/// so it can never silently shrink the window; a zero/negative-duration event is ignored. Selftested.
 func meetingActiveNow(_ events: [EventCandidate], now: Date, padding: TimeInterval) -> Bool {
-    events.contains { now >= $0.start.addingTimeInterval(-padding) && now < $0.end.addingTimeInterval(padding) }
+    let pad = max(0, padding)
+    return events.contains {
+        $0.end > $0.start && now >= $0.start.addingTimeInterval(-pad) && now < $0.end.addingTimeInterval(pad)
+    }
 }
 
 // MARK: - calendar lookup (title a transcript from the overlapping event)

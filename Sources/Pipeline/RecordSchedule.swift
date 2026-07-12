@@ -10,10 +10,9 @@ import Foundation
 // ranges IS the lunch exclusion). Outside the window the engine is suspended; a manual Pause/Resume
 // overrides the schedule until the next boundary.
 
-/// Should the recorder be active at this moment, given BOTH gates? The time schedule and calendar
-/// gating each ADMIT the moment when their toggle is off; when on, each must pass. Recording runs only
-/// in the intersection — schedule hours AND (if calendar-gated) a live meeting. Default = both off =
-/// always record, so there is no behaviour change unless the user opts in. Pure + selftested.
+/// Record now, given BOTH gates? Each gate admits the moment when its toggle is off; recording runs
+/// only in the intersection (schedule hours AND, if calendar-gated, a live meeting). Both off = always
+/// record — no behaviour change unless opted in. Pure + selftested.
 func recordingWindowActive(scheduleEnabled: Bool, scheduleActive: Bool,
                            calendarGated: Bool, meetingActive: Bool) -> Bool {
     (!scheduleEnabled || scheduleActive) && (!calendarGated || meetingActive)
