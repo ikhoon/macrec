@@ -44,4 +44,24 @@ func evalSelftests(_ check: (String, Bool) -> Void) {
     check("chrf: partial character overlap scores between 0 and 1", chrfPartial > 0 && chrfPartial < 1)
     // Guard: maxOrder < 1 would trap on `1...maxOrder`; it returns 0 instead of crashing.
     check("chrf: maxOrder < 1 → 0 (no crash)", chrF(candidate: "a", reference: "a", maxOrder: 0) == 0)
+    // Eval runner: corpus CER is micro-averaged (Σ edits / Σ N), per engine, sorted best-first.
+    let samples = [EvalSample(id: "s1", language: "ja", reference: "会議"),       // 2 chars
+                   EvalSample(id: "s2", language: "ko", reference: "회의시작")]    // 4 chars
+    let fake: (EvalSample, String) -> String = { s, engine in
+        if engine == "A" { return s.reference }                                   // perfect
+        return s.id == "s1" ? "会義" : "회의시장"                                  // one substitution each
+    }
+    let scores = runEval(samples: samples, engines: ["B", "A"], transcribe: fake)
+    check("eval runner: corpus CER micro-averaged, engines sorted best-first",
+          scores.count == 2 && scores[0].engine == "A" && scores[0].cer == 0 && scores[0].samples == 2
+          && scores[1].engine == "B" && approx(scores[1].cer, 2.0 / 6.0))   // 1+1 edits over 2+4 ref chars
+    check("eval runner: empty-reference corpus → 0 if silent, 1 if invented",
+          runEval(samples: [EvalSample(id: "e", language: "ja", reference: "")], engines: ["x"],
+                  transcribe: { _, _ in "" })[0].cer == 0
+          && runEval(samples: [EvalSample(id: "e", language: "ja", reference: "")], engines: ["x"],
+                     transcribe: { _, _ in "幻" })[0].cer == 1)
+    let rpt = evalReport(scores)
+    check("eval report: leaderboard lists engines best-CER first with a percentage",
+          rpt.contains("0.0%") && rpt.contains("33.3%")
+          && rpt.range(of: "A")!.lowerBound < rpt.range(of: "B")!.lowerBound)
 }
