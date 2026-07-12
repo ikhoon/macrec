@@ -5,8 +5,10 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
 
 ## Now — in progress
 
-- [ ] **Modularize `Sources/` into per-module directories** — pure byte-identical moves, one module/PR.
-      Audio/ ✅, Live/ ✅ (#99). Next: Pipeline/, Settings/, Tray/.
+- [x] **Modularize `Sources/` into per-module directories** — pure byte-identical moves, one module/PR.
+      Audio/ · Live/ (#99), Tray/ (#106), Pipeline/ (#107), Settings/ (#108), Selftest/ (#109). All done.
+- [ ] **Eval harness — ko/ja quality measurement** (quality priority zero). CER metrics (ja/ko) ✅ (#110).
+      Next: the `macrec eval` runner (local Apple/Whisper first), chrF + translation eval, cloud opt-in.
 - [ ] **Reusable streaming base** (#52) — collapse the 5 WebSocket clients into one `StreamingWSTranscriber`
       + per-provider spec. Step 1 (shared PCM16 conversion) ✅ merged (#98). Next: the base + per-engine specs.
 
