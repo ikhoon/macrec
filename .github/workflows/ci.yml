@@ -6,9 +6,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "Package.swift", "speex-bridge.h", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
   pull_request:
-    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "Package.swift", "speex-bridge.h", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".swiftformat", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 # Read-only token: neither job pushes or writes to the repo (build + lint only).
@@ -66,6 +66,28 @@ jobs:
             echo "::error::binary links libspeexdsp dynamically — must be static so the .app is self-contained"; exit 1
           fi
           echo "✅ no ScreenCaptureKit; speexdsp statically linked"
+
+      # The additive Package.swift lets `swift build` + editor indexing work on the SAME single module;
+      # the shipped .app is still produced by the swiftc line above. A rotted manifest would break only
+      # in the editor and never here — so build it and apply the same self-contained-linkage guard, so
+      # the manifest can't drift out of sync with the swiftc build.
+      - name: Build (SwiftPM — the additive manifest for indexing/dev)
+        run: swift build
+
+      - name: Guard — SwiftPM binary is also self-contained (static speexdsp, no ScreenCaptureKit)
+        run: |
+          set -euo pipefail
+          BIN=.build/debug/macrec
+          # Fail closed: a missing binary or broken otool must not read as a clean guard.
+          [[ -x "$BIN" ]] || { echo "::error::SwiftPM binary missing: $BIN"; exit 1; }
+          deps="$(otool -L "$BIN")" || { echo "::error::otool failed on $BIN"; exit 1; }
+          if grep -qi ScreenCaptureKit <<<"$deps"; then
+            echo "::error::SwiftPM binary links ScreenCaptureKit — system audio must use the Core Audio tap"; exit 1
+          fi
+          if grep -qi speexdsp <<<"$deps"; then
+            echo "::error::SwiftPM binary links libspeexdsp dynamically — must be static so the .app is self-contained"; exit 1
+          fi
+          echo "✅ SwiftPM manifest builds; binary self-contained"
 
       - name: Smoke-test CLI (headless, no GUI / permissions)
         run: |
