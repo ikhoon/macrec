@@ -23,4 +23,12 @@ func evalSelftests(_ check: (String, Bool) -> Void) {
     check("cer: lowercase Latin (GDP == gdp)", cerJa(hyp: "GDP", ref: "gdp") == 0)
     // Korean space-agnostic — 띄어쓰기 differences don't count.
     check("cer ko: whitespace-agnostic (회의 시작 == 회의시작)", cerKo(hyp: "회의 시작", ref: "회의시작") == 0)
+    // Bracket strip covers [...] and <...>, not only (...).
+    check("cer ja: [...] and <...> brackets stripped", normalizeJa("あ[注]い<x>う") == ["あ", "い", "う"])
+    // Punctuation (P*) and symbols (S*) strip — surface marks shouldn't count against the score.
+    check("cer: punctuation + symbols stripped", cerJa(hyp: "会議。", ref: "会議") == 0
+          && cerKo(hyp: "안녕!", ref: "안녕") == 0 && cerJa(hyp: "A★B", ref: "AB") == 0)
+    // stripWhitespace:false is the space-SENSITIVE diagnostic seam — a space now counts as an edit.
+    check("cer ko: stripWhitespace:false counts spaces",
+          cerKo(hyp: "회의 시작", ref: "회의시작", options: CEROptions(stripWhitespace: false)) > 0)
 }
