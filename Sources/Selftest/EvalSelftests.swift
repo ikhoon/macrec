@@ -31,4 +31,15 @@ func evalSelftests(_ check: (String, Bool) -> Void) {
     // stripWhitespace:false is the space-SENSITIVE diagnostic seam — a space now counts as an edit.
     check("cer ko: stripWhitespace:false counts spaces",
           cerKo(hyp: "회의 시작", ref: "회의시작", options: CEROptions(stripWhitespace: false)) > 0)
+    // chrF — character n-gram F-score (β=2) for translation quality. Identical → 1, disjoint → 0.
+    check("chrf: identical → 1", chrF(candidate: "회의를 시작합시다", reference: "회의를 시작합시다") == 1
+          && chrF(candidate: "は", reference: "は") == 1)
+    check("chrf: both empty → 1, one empty → 0", chrF(candidate: "", reference: "") == 1
+          && chrF(candidate: "x", reference: "") == 0 && chrF(candidate: "", reference: "x") == 0)
+    check("chrf: no shared character → 0", chrF(candidate: "猫", reference: "犬") == 0)
+    // chrF SCORES punctuation (CER strips it) — 会議。 vs 会議 is a partial match (0.875), never perfect.
+    check("chrf: punctuation counts, unlike CER", approx(chrF(candidate: "会議。", reference: "会議"), 0.875)
+          && cerJa(hyp: "会議。", ref: "会議") == 0)
+    let chrfPartial = chrF(candidate: "会議を始める", reference: "会議を終える")
+    check("chrf: partial character overlap scores between 0 and 1", chrfPartial > 0 && chrfPartial < 1)
 }

@@ -91,3 +91,45 @@ func cerJa(hyp: String, ref: String) -> Double { cer(normalizeJa(hyp), normalize
 func cerKo(hyp: String, ref: String, options: CEROptions = CEROptions()) -> Double {
     cer(normalizeKo(hyp, options), normalizeKo(ref, options))
 }
+
+/// chrF — a character n-gram F-score (orders 1…`maxOrder`, β=`beta`), a reference-based TRANSLATION
+/// metric that sidesteps CJK word segmentation by scoring on characters. Range 0…1 (1 = identical).
+/// Unlike CER, punctuation is KEPT (it carries meaning in a translation, and chrF is defined to score
+/// it); text is NFC-normalized and whitespace-stripped, case preserved. Averaging convention: precision
+/// and recall are averaged over the EFFECTIVE orders (those short enough that both strings have n-grams)
+/// FIRST, then one F-beta — so a short utterance isn't penalized for orders longer than itself.
+/// Both-empty → 1; one-empty → 0. Pure + selftested. (Exact sacreBLEU eps-parity is a future refinement.)
+func chrF(candidate: String, reference: String, maxOrder: Int = 6, beta: Double = 2) -> Double {
+    let cand = chrfChars(candidate), ref = chrfChars(reference)
+    if cand.isEmpty, ref.isEmpty { return 1 }
+    var precs: [Double] = [], recs: [Double] = []
+    for n in 1...maxOrder {
+        let cg = charNgrams(cand, n), rg = charNgrams(ref, n)
+        let nCand = cg.values.reduce(0, +), nRef = rg.values.reduce(0, +)
+        guard nCand > 0, nRef > 0 else { continue }   // an order longer than a string isn't effective
+        var match = 0
+        for (gram, c) in cg { match += min(c, rg[gram] ?? 0) }
+        precs.append(Double(match) / Double(nCand))
+        recs.append(Double(match) / Double(nRef))
+    }
+    guard !precs.isEmpty else { return 0 }            // no shared order length → no character overlap
+    let avgP = precs.reduce(0, +) / Double(precs.count)
+    let avgR = recs.reduce(0, +) / Double(recs.count)
+    guard avgP + avgR > 0 else { return 0 }
+    let b2 = beta * beta
+    return (1 + b2) * avgP * avgR / (b2 * avgP + avgR)
+}
+
+/// NFC + whitespace-strip; punctuation and case PRESERVED (chrF scores them). Characters are Unicode
+/// scalars (code points), matching sacreBLEU chrF — not grapheme clusters.
+private func chrfChars(_ s: String) -> [Character] {
+    Array(s.precomposedStringWithCanonicalMapping.unicodeScalars
+        .filter { !$0.properties.isWhitespace }.map(Character.init))
+}
+
+private func charNgrams(_ chars: [Character], _ n: Int) -> [String: Int] {
+    guard chars.count >= n else { return [:] }
+    var counts: [String: Int] = [:]
+    for i in 0...(chars.count - n) { counts[String(chars[i..<(i + n)]), default: 0] += 1 }
+    return counts
+}
