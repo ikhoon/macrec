@@ -85,6 +85,7 @@ cd ~/src/macrec
 ```
 
 `install.sh` will:
+
 1. create a **stable self-signed code-signing certificate** once (`make-signing-cert.sh`),
 2. build the app → `macrec.app`,
 3. **sign it with that cert** (so TCC permissions survive every rebuild — see below),
@@ -103,6 +104,7 @@ cd ~/src/macrec
 ### One-time permissions
 
 On first launch macrec **requests these inline** (normal consent popups — click *Allow*; no Settings trip needed):
+
 - **System Audio Recording Only** → the least-privilege macOS 15+ permission for capturing the system audio mix (records other participants). **Not** Screen Recording.
 - **Microphone** → records your voice.
 - **Calendar** → titles transcripts from the overlapping meeting event.
@@ -112,6 +114,7 @@ They also appear in **System Settings → Privacy & Security** (listed as **macr
 > Why not Screen Recording? System audio is captured with a **Core Audio process tap** (macOS 14.4+), gated by the dedicated **System Audio Recording Only** permission (`kTCCServiceAudioCapture`) — so macrec never requests Screen Recording and no screen content is ever accessed.
 
 The code-signing **designated requirement** references the certificate + bundle id, so **rebuilds keep the grant** (and the Login Item stays registered). Don't delete/regenerate the cert — the key lives only in your login keychain (deliberately no file backup; an on-disk key would let local malware sign itself as macrec and inherit the mic/system-audio grants). If it's ever lost, re-run `make-signing-cert.sh` and re-grant once. If a grant gets into a bad state, reset it once (bundle id `com.ikhoon.macrec`) and relaunch to re-prompt:
+
 ```bash
 tccutil reset AudioCapture com.ikhoon.macrec
 tccutil reset Microphone   com.ikhoon.macrec
@@ -151,7 +154,7 @@ Design notes (each one is a bug we actually hit):
 Stored in `UserDefaults` (suite `com.ikhoon.macrec.prefs`); saving restarts the engine immediately.
 
 | Setting | Default |
-|---|---|
+| --- | --- |
 | Segment length (on the hour) | 1 hour (15 m / 30 m / 1 h / 2 h) |
 | Transcription language | Auto-detect |
 | **Transcription model** | Large v3 Turbo (turbo-q5_0 / large-v3 / medium / small / base / tiny) |
@@ -199,7 +202,7 @@ macrec --out out.wav --duration 20 [--exclude-app <bundleid>] [--no-mic]   # one
 ## Files
 
 | File | Role |
-|---|---|
+| --- | --- |
 | `macrec.swift` | the whole app: capture engine, model store, transcriber, menu-bar UI, settings, login item, CLI |
 | `install.sh` | build + sign + install to `/Applications/macrec.app` + LaunchAgent (dev machine) |
 | `package.sh` | build static `whisper-cli` + bundle into a self-contained, self-signed `macrec.app` → `dist/macrec.zip` |

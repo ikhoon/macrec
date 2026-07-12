@@ -6,10 +6,14 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".github/workflows/ci.yml"]
   pull_request:
-    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", ".github/workflows/ci.yml"]
+    paths: ["macrec.swift", "Sources/**/*.swift", "**/*.sh", "**/*.md", ".markdownlint-cli2.jsonc", ".github/workflows/ci.yml"]
   workflow_dispatch:
+
+# Read-only token: neither job pushes or writes to the repo (build + lint only).
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -59,3 +63,18 @@ jobs:
       - name: Unit self-tests (pure logic — locale mapping, speaker labels)
         run: |
           "$RUNNER_TEMP/macrec" selftest
+
+  # Lint the docs (VISION/ARCHITECTURE/README/…) with the same markdownlint-cli2 config the
+  # maintainer runs locally, so a structural regression (missing blank line around a heading/list/
+  # fence) fails the PR instead of accumulating. Ubuntu + pinned version = fast and reproducible.
+  markdown-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false   # read-only lint job — don't leave GITHUB_TOKEN in git config
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Lint Markdown (.markdownlint-cli2.jsonc)
+        run: npx --yes markdownlint-cli2@0.23.0
