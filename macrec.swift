@@ -213,7 +213,8 @@ func micStatus() -> Bool {
 // The settings UI writes to UserDefaults. The headless `engine` CLI / power users can override via MR_* env vars.
 // Precedence: UserDefaults (if the key exists) > env > built-in default.
 
-/// Typed preference keys + accessors over a dedicated UserDefaults suite (saved pref > env var > default).
+/// Typed preference keys + accessors over a dedicated UserDefaults suite; fallback is accessor-specific
+/// (generally saved pref → env var → built-in default, but e.g. Pref.str treats an empty saved string as unset).
 enum Pref {
     // Dedicated suite (MUST differ from the bundle id — suiteName==bundleID returns nil / doesn't work).
     // Works around .standard domain not resolving when launchd execs the binary inside the .app directly.

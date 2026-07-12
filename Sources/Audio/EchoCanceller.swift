@@ -20,8 +20,8 @@ import Foundation
 //     delay, or the causal filter cancels nothing; every drain trims the ring to ≤ maxLag staleness.
 //  2. FRESHNESS ACROSS GAPS — after the mic goes silent (pause/sleep/toggle/restart), buffered residue
 //     and the adapted filter belong to a dead stream; cancelMic self-heals by resetting on a >0.5 s gap.
-/// SpeexDSP acoustic echo canceller: subtracts the speaker (far-end) mix from the mic so meeting audio
-/// isn't re-recorded as echo. Shared singleton.
+/// SpeexDSP acoustic echo canceller that adaptively suppresses far-end speaker audio from the mic (so
+/// meeting audio isn't re-recorded as echo). Shared singleton.
 final class EchoCanceller {
     static let shared = EchoCanceller()
     private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!

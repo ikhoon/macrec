@@ -3,7 +3,8 @@ import AVFoundation
 import EventKit
 import Foundation
 
-/// The Settings window: builds every pane, loads/saves prefs, and restarts the engine on Save.
+/// The Settings window: builds every pane, loads/saves prefs, and restarts the engine on Save — but
+/// only when an engine-affecting pref actually changed (see engineKeys / engineSettingsDigest).
 final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSComboBoxDelegate {
     /// A field the parser can't read must LOOK broken while typing — schedule fields silently
     /// falling open to "record everything" is a privacy failure; a retention typo would silently
