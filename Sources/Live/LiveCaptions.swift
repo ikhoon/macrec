@@ -45,7 +45,7 @@ final class LiveCaptions {
         var transParts: [String?] = []      // per-sentence translations, positional (async-safe)
         var transRequested = 0              // how many complete sentences have been sent to translate
         var transFinal = false              // the authoritative full-text translation has landed
-        var transTail: String? = nil        // live translation of the UNFINISHED tail (volatile)
+        var transTail: String?              // live translation of the UNFINISHED tail (volatile)
         var tailInFlight = false            // ONE tail request at a time — landing refires with the newest tail
         var tailLastSent = ""               // tail text of the in-flight/last request (skip if unchanged)
         var tailSentAt: Double = 0          // floor between back-to-back refires
@@ -70,7 +70,7 @@ final class LiveCaptions {
     private(set) var active = false
 
     /// Menu toggle (main thread).
-    func toggle() { active ? stop() : start() }
+    func toggle() { if active { stop() } else { start() } }
 
     /// Settings were saved: the engine picker and the engine itself must reflect them without the user
     /// closing and reopening the overlay (an engine switched off stayed in the menu until then).

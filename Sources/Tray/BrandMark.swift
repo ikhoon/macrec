@@ -61,8 +61,10 @@ func brandMarkHasContent(recording: Bool, voice: Bool) -> Bool {
     brandMarkImage(side: side, recording: recording, voice: voice).draw(in: NSRect(x: 0, y: 0, width: side, height: side))
     NSGraphicsContext.restoreGraphicsState()
     var opaque = 0
-    for y in 0..<rep.pixelsHigh { for x in 0..<rep.pixelsWide {
-        if (rep.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.1 { opaque += 1 }
-    }}
+    for y in 0..<rep.pixelsHigh {
+        for x in 0..<rep.pixelsWide where (rep.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.1 {
+            opaque += 1
+        }
+    }
     return opaque > px * px / 10   // ≥ ~10% drawn
 }
