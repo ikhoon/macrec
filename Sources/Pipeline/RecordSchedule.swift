@@ -10,6 +10,14 @@ import Foundation
 // ranges IS the lunch exclusion). Outside the window the engine is suspended; a manual Pause/Resume
 // overrides the schedule until the next boundary.
 
+/// Record now, given BOTH gates? Each gate admits the moment when its toggle is off; recording runs
+/// only in the intersection (schedule hours AND, if calendar-gated, a live meeting). Both off = always
+/// record — no behaviour change unless opted in. Pure + selftested.
+func recordingWindowActive(scheduleEnabled: Bool, scheduleActive: Bool,
+                           calendarGated: Bool, meetingActive: Bool) -> Bool {
+    (!scheduleEnabled || scheduleActive) && (!calendarGated || meetingActive)
+}
+
 struct RecordSchedule: Equatable {
     var enabled: Bool
     var weekdays: Set<Int>            // 1=Sun … 7=Sat (Calendar.component(.weekday))
