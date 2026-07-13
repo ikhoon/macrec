@@ -108,8 +108,30 @@ jobs:
       # `swift test` runs the XCTest target (MacRecKitTests), a second front-end over the SAME
       # <module>Selftests closures the `macrec selftest` subcommand runs — so the editor-runnable suite
       # and the shipped subcommand can't diverge, and a pane that only breaks headlessly fails here.
-      - name: Test (SwiftPM — XCTest over the selftest closures)
-        run: swift test
+      - name: Test (SwiftPM — XCTest over the selftest closures, with coverage)
+        run: swift test --enable-code-coverage
+
+      # Export the SwiftPM coverage (llvm profdata) as lcov for Codecov. The test bundle + profdata live
+      # under the resolved bin dir; find the .xctest so this doesn't hard-code the arch triple.
+      - name: Export coverage (lcov)
+        run: |
+          BIN=$(swift build --show-bin-path)
+          BUNDLE=$(find "$BIN" -maxdepth 1 -name '*.xctest' | head -1)
+          XCTEST="$BUNDLE/Contents/MacOS/$(basename "$BUNDLE" .xctest)"
+          # Exclude Selftest/: those <module>Selftests closures ARE the tests (the shipped `macrec
+          # selftest` runs them, XCTest bridges to them) — counting them as covered source inflates the
+          # number. This reports the production coverage the tests actually reach.
+          xcrun llvm-cov export -format=lcov "$XCTEST" \
+            -instr-profile "$BIN/codecov/default.profdata" \
+            -ignore-filename-regex='(Tests/|\.build/|Sources/Selftest/)' > coverage.lcov
+          echo "coverage.lcov: $(grep -c '^SF:' coverage.lcov) files"
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.lcov
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false   # a Codecov hiccup must not fail an otherwise-green PR
 
       - name: Smoke-test CLI (headless, no GUI / permissions)
         run: |
