@@ -146,16 +146,20 @@ func settingsSelftests(_ check: (String, Bool) -> Void) {
           && subtitleLine(original: "Let's begin.", translated: "  ") == ("Let's begin.", nil)
           && subtitleLine(original: "", translated: "회의") == ("회의", nil))
     // Read at a glance, not squinted at; and a film shows one utterance, not a scrolling wall.
-    check("live: a subtitle is larger than the log's body text and shows at most two lines",
-          subtitleFontSize(14) == 20 && subtitleFontSize(9) == 18 && subtitleMaxLines == 2)
+    check("live: a subtitle is larger than the log's body text and shows only the current utterance",
+          subtitleFontSize(14) == 20 && subtitleFontSize(9) == 18 && subtitleMaxLines == 1)
+    check("live: past log lines are dimmed, the current line stays full strength",
+          captionLineAlpha(isCurrent: true) == 1.0 && captionLineAlpha(isCurrent: false) < 1.0)
     // A transparent LOG keeps an outline so it still reads as a grabbable window; a subtitle must
     // not have one — a rectangle drawn around a film subtitle is what breaks the illusion.
     check("live: the window outline is drawn for the log view and never for a subtitle",
           captionEdgeVisible(subtitle: false) && !captionEdgeVisible(subtitle: true))
-    check("live: captions get a backplate only when the backdrop is too faint to carry contrast",
+    // The opacity slider fades only the window backdrop; the text keeps its own solid plate at every
+    // opacity below fully-opaque, so lowering opacity never makes the text or its background transparent.
+    check("live: captions carry a backplate at any opacity below fully-opaque (only a solid panel skips it)",
           captionTextNeedsBackplate(backdropAlpha: 0.0)
-          && captionTextNeedsBackplate(backdropAlpha: 0.55)
-          && !captionTextNeedsBackplate(backdropAlpha: 0.6)
+          && captionTextNeedsBackplate(backdropAlpha: 0.5)
+          && captionTextNeedsBackplate(backdropAlpha: 0.99)
           && !captionTextNeedsBackplate(backdropAlpha: 1.0))
     check("live: overlay opacity spans a fully transparent backdrop to a fully opaque one",
           captionBackdropAlpha(0.0) == 0.0 && captionBackdropAlpha(1.0) == 1.0
@@ -197,6 +201,12 @@ func settingsSelftests(_ check: (String, Bool) -> Void) {
         let e = cw.edgeSurvivesForTest
         check("live: the outline survives a fully transparent backdrop and never eats the mouse",
               e.visible && e.ignoresMouse)
+        // …and it traces the window's rounded BOTTOM corners (radius 15), or a fully-transparent overlay
+        // collapses to a bare rectangle. The top corners meet the square titlebar, so they stay sharp.
+        let corner = cw.cornerRoundingForTest
+        check("live: outline AND backdrop round the window's bottom corners (transparent overlay stays a window)",
+              corner.edgeRadius == LiveCaptionWindow.windowCornerRadius && corner.edgeBottomOnly
+              && corner.backdropRadius == LiveCaptionWindow.windowCornerRadius && corner.backdropBottomOnly)
         // The picker was built once at window creation: an engine switched off in Settings stayed
         // in the menu until the overlay was reopened. Assert it re-reads the ON list — never that
         // a particular engine is installed. `isReady` probes the filesystem and the Keychain, and
