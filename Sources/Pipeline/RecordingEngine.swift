@@ -16,7 +16,8 @@ final class RecordingEngine {
     private(set) var running = false
     private var recovering = false
     private var suspended = false   // true while the display/system is asleep
-    private var exclusionRefresh: DispatchWorkItem?   // debounces the app-launch exclusion re-scan
+    private var exclusionRefresh: DispatchWorkItem?   // debounces the app-launch / output-change tap re-scan
+    private var outputListenerRegistered = false      // register the default-output listener exactly once
     private var warnedDeadMic = false            // one dead-mic push per engine run (not per hour)
     var onTranscriptSaved: ((String) -> Void)?   // (message) — for refreshing UI state
     var onTranscriptURL: ((URL) -> Void)?        // path of the saved transcript file — notification click → open file
@@ -62,12 +63,13 @@ final class RecordingEngine {
         return rec.queue.sync { (rec.micWriter?.recentLevel ?? 0, rec.sysWriter?.recentLevel ?? 0) }
     }
 
-    /// Coalesce a burst of launch/quit notifications into one exclusion re-scan.
-    private func scheduleExclusionRefresh() {
+    /// Coalesce a burst of launch/quit notifications OR a default-output-device change into one tap
+    /// re-scan (the tap freezes both its exclusion set and its pinned output device).
+    private func scheduleTapRefresh() {
         exclusionRefresh?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.running, !self.suspended else { return }
-            Task { await self.session.refreshExclusionsIfStale() }
+            Task { await self.session.refreshTapIfStale() }
         }
         exclusionRefresh = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
@@ -138,7 +140,17 @@ final class RecordingEngine {
         // only when the set actually drifted. Debounced: an app's helper processes appear in a burst.
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
             wc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                self?.scheduleExclusionRefresh()
+                self?.scheduleTapRefresh()
+            }
+        }
+        // The tap's aggregate is pinned to the default output at creation; if that output moves mid-session
+        // (headphones, a virtual/BlackHole device, a per-app router like SoundSource) the frozen aggregate
+        // keeps pulling the OLD device and capture goes silent — the exact gap `recover()` only closed on
+        // wake. Rebuild through the same debounced, staleness-guarded path. Registered once.
+        if !outputListenerRegistered {
+            outputListenerRegistered = true
+            onDefaultOutputDeviceChange { [weak self] in
+                DispatchQueue.main.async { self?.scheduleTapRefresh() }
             }
         }
         // Screen lock/unlock (distributed notifications) — pause while locked, too.

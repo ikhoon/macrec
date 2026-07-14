@@ -44,6 +44,32 @@ func outputDeviceUID(_ id: AudioDeviceID) -> String? {
     return s.isEmpty ? nil : s
 }
 
+/// Invoke `changed` (on a background queue) whenever the system default OUTPUT device changes. The
+/// recorder registers this once so its system-audio tap — whose aggregate is pinned to a specific output
+/// at creation — can rebuild when the output moves mid-session. A process-lifetime listener (never
+/// removed): the recorder outlives it.
+func onDefaultOutputDeviceChange(_ changed: @escaping () -> Void) {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr,
+                                        DispatchQueue.global(qos: .utility)) { _, _ in changed() }
+}
+
+/// Human-readable device name for logs (e.g. "MacBook Pro Speakers", "BlackHole 2ch", a SoundSource
+/// device) — so a capture problem can be traced to which output the tap is actually following.
+func outputDeviceName(_ id: AudioDeviceID) -> String {
+    guard id != 0 else { return "?" }
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    var cf = "" as CFString
+    var size = UInt32(MemoryLayout<CFString>.size)
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &cf) == noErr else { return "?" }
+    let s = cf as String
+    return s.isEmpty ? "?" : s
+}
+
 /// Find an output-capable device by its UID.
 func outputDevice(forUID uid: String) -> AudioDeviceID? {
     var size = UInt32(0)
