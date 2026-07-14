@@ -36,7 +36,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private var summaryLine: NSMenuItem!   // what post-processing is doing, refreshed when the menu opens
     private var digestLine: NSMenuItem!
     private var pendingSummaryAction: SummaryRowAction = .none
-    private var digestInFlight = false   // the 30 s tick must not launch a second digest
+    private let digestCoordinator = DigestCoordinator()   // the digest tick, extracted for scenario QA
     private var grantItem: NSMenuItem?  // "Grant permissions…" — shown ONLY while a permission is missing
     private var paused = false
     private var didAutoPrompt = false   // only auto-open the permission prompts/Settings once per launch
@@ -516,84 +516,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         }
     }
 
-    /// L3 of the pipeline (PIPELINE.md): once the configured time passes, digest the day's meeting
-    /// summaries into Daily/YYYY-MM/YYYY-MM-DD.md. Rides the same 30 s tick as the schedule; the
-    /// last-run marker (not a timer) makes a slept-through deadline catch up on wake. The marker is
-    /// set when the run LAUNCHES — a failed run logs and retries tomorrow rather than every 30 s.
-    private func maybeRunDailyDigest() {
-        guard Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false) else { return }
-        let now = Date()
-        let time = Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00")
-        guard dailyDigestDue(now: now, time: time, lastRun: Pref.explicit(Pref.dailyDigestLastRun, "")) else { return }
-        let dayF = DateFormatter(); dayF.locale = Locale(identifier: "en_US_POSIX"); dayF.dateFormat = "yyyy-MM-dd"
-        let day = dayF.string(from: now)
-        // The 30 s tick must not launch a second digest, but a FAILED one has to retry — so the in-flight
-        // guard is in memory and the persistent "done" marker is written only once the runner succeeds.
-        // Writing the marker up front meant a login error at 20:00 silently cost the whole day.
-        guard !digestInFlight else { return }
-        digestInFlight = true
-        // Every early return below must clear the flag, or the digest never runs again this process.
-        var launched = false
-        defer { if !launched { digestInFlight = false } }
-        let cfg = EngineConfig.load()
-        let fm = FileManager.default
-        let month = String(day.prefix(7))
-        let tDir = cfg.transcriptsDir.appendingPathComponent(month)
-        let transcripts = ((try? fm.contentsOfDirectory(atPath: tDir.path)) ?? [])
-            .filter { $0.hasSuffix(".md") }.map { tDir.appendingPathComponent($0).path }
-        let sumPref = Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT")
-        let sDir = sumPref.isEmpty ? tDir.path
-                                   : ((sumPref as NSString).expandingTildeInPath + "/" + month)
-        let summaries = ((try? fm.contentsOfDirectory(atPath: sDir)) ?? [])
-            .filter { $0.hasSuffix(".md") }.map { sDir + "/" + $0 }
-        // The digest is promoted with `mv`, which overwrites whatever sits at the destination. A name
-        // template that resolves onto an existing transcript/summary would silently destroy it.
-        let existingNotes = Set(transcripts.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
-        let out = dailyDigestOutputPath(day: day,
-                                        outDir: Pref.explicit(Pref.dailyDigestOut, "MR_DAILY_DIGEST_OUT"),
-                                        summaryOutDir: sumPref, transcriptsDir: cfg.transcriptsDir.path,
-                                        nameTemplate: Pref.explicit(Pref.dailyDigestName, "MR_DAILY_DIGEST_NAME"))
-        func retire(_ outcome: DigestOutcome) {
-            if digestMarksDayDone(outcome) { Pref.d.set(day, forKey: Pref.dailyDigestLastRun) }
-        }
-        guard !existingNotes.contains(URL(fileURLWithPath: out).standardizedFileURL.path) else {
-            elog("digest: \(out) is an existing transcript — refusing to overwrite it")
-            retire(.wouldOverwrite)   // retrying changes nothing until the user edits the name
-            Notifier.push(title: "Daily digest skipped",
-                          body: "The file name resolves onto an existing note (\(URL(fileURLWithPath: out).lastPathComponent)). "
-                              + "Change it in Settings › Summaries › File name.")
-            return
-        }
-        // Exclude the digest itself: it lands in a folder we just scanned and shares the day prefix.
-        let inputs = dailyDigestInputs(day: day, transcripts: transcripts, summaries: summaries, excluding: out)
-        guard !inputs.isEmpty else { elog("digest: no meetings on \(day) — skipping"); retire(.nothingToDo); return }
-        let runner = SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude
-        let inline = effectiveSummaryPrompt(inline: Pref.explicit(Pref.dailyPrompt, "MR_DAILY_DIGEST_PROMPT"),
-                                            filePath: Pref.explicit(Pref.dailyPromptFile, "MR_DAILY_DIGEST_PROMPT_FILE"))
-        let prompt = inline.isEmpty ? defaultDailyDigestPrompt : inline
-        guard let cmd = dailyDigestInvocation(runner: runner, prompt: prompt,
-                                              inputs: inputs, outPath: out) else { retire(.nothingToDo); return }
-        elog("digest: \(day) — \(inputs.count) inputs → \(out)")
-        SummaryStatus.shared.started("daily digest \(day)")
-        launched = true
-        runPostProcessCommand(cmd) { [weak self] status in
-            if status == 0 {
-                // Only a SUCCESSFUL run retires the day; a failure retries on the next tick.
-                elog("digest: \(day) finished (exit 0)")
-                if digestMarksDayDone(.wrote) { Pref.d.set(day, forKey: Pref.dailyDigestLastRun) }
-                SummaryStatus.shared.finished("daily digest \(day)", at: Date(), output: out)
-                Notifier.push(title: "Daily digest ready", body: "\(day) — \(inputs.count) meetings", filePath: out)
-            } else {
-                let why = reapFailedPostProcess(outPath: out)
-                // The reason belongs in the LOG too, not only in a notification the user may miss.
-                elog("digest: \(day) failed (exit \(status))" + (why.map { " — \($0)" } ?? " — no output"))
-                SummaryStatus.shared.failed("daily digest \(day)", at: Date(), reason: why)
-                Notifier.push(title: "Daily digest failed",
-                              body: why ?? "The summary command exited with code \(status) — check Settings › Summaries.")
-            }
-            DispatchQueue.main.async { self?.digestInFlight = false }
-        }
-    }
+    /// L3 of the pipeline: the digest logic lives in DigestCoordinator (extracted so the tick wiring —
+    /// where the 453-retry storm actually lived — is scenario-testable with a virtual clock).
+    private func maybeRunDailyDigest() { digestCoordinator.tick() }
 
     /// Enforce the recording schedule (~30 s tick). A manual Pause/Resume overrides until the next
     /// schedule boundary — an expiry TIMESTAMP, so it lapses even if the Mac slept across it.

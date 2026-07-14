@@ -148,7 +148,28 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
           digestMarksDayDone(.wrote)
           && digestMarksDayDone(.nothingToDo)      // no meetings — retrying finds none either
           && digestMarksDayDone(.wouldOverwrite)   // the name collides until the user changes it
-          && !digestMarksDayDone(.runnerFailed))   // no login / no network — retry on the next tick
+          && !digestMarksDayDone(.runnerFailed))   // no login / no network — retry with backoff
+    // A failed digest retried on EVERY 30 s tick: 453 claude spawns and 453 notifications in one
+    // afternoon when the CLI lost its login. Backoff bounds the retries; the notification fires once.
+    check("digest: failures back off (10m, 30m, then hourly) and notify only once per streak",
+          digestRetryDelay(afterFailures: 0) == 0
+          && digestRetryDelay(afterFailures: 1) == 600
+          && digestRetryDelay(afterFailures: 2) == 1800
+          && digestRetryDelay(afterFailures: 3) == 3600 && digestRetryDelay(afterFailures: 50) == 3600
+          && digestShouldNotifyFailure(consecutiveFailures: 1)
+          && !digestShouldNotifyFailure(consecutiveFailures: 2)
+          && !digestShouldNotifyFailure(consecutiveFailures: 453))
+    // The launchd workaround (anthropics/claude-code#77213) borrows the CLI's own token from its Keychain
+    // JSON: nested shape parses, an expired token is refused, junk is refused. Times are epoch-millis.
+    let ccNow = Date(timeIntervalSince1970: 1_800_000_000)   // fixed clock — never the machine's
+    let ccJSON = #"{"claudeAiOauth":{"accessToken":"sk-ant-oat-TEST","expiresAt":1800000000001,"refreshToken":"r"}}"#
+    let ccExpired = #"{"claudeAiOauth":{"accessToken":"sk-ant-oat-TEST","expiresAt":1799999999999}}"#
+    check("digest: claude CLI token parse — fresh nested OK, expired/malformed refused",
+          claudeCliAccessToken(fromKeychainJSON: ccJSON, now: ccNow) == "sk-ant-oat-TEST"
+          && claudeCliAccessToken(fromKeychainJSON: ccExpired, now: ccNow) == nil
+          && claudeCliAccessToken(fromKeychainJSON: #"{"accessToken":"flat-TOK"}"#, now: ccNow) == "flat-TOK"
+          && claudeCliAccessToken(fromKeychainJSON: "not json", now: ccNow) == nil
+          && claudeCliAccessToken(fromKeychainJSON: #"{"claudeAiOauth":{"expiresAt":1}}"#, now: ccNow) == nil)
     check("tray: the digest row says off, due, or already written today",
           digestMenuTitle(enabled: false, dueTime: "20:00", lastRun: "", today: "2026-07-07")
           == "Daily digest: off"
