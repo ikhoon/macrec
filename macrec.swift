@@ -119,8 +119,29 @@ enum Keychain {
     static func forgetCacheForTest() { lock.lock(); loaded = false; store = [:]; lock.unlock() }
 }
 
+/// An in-memory ring of the most recent log lines. stderr is redirected by launchd to a file whose path
+/// the app never learns, so the in-app Log window tails THIS instead — the same lines `elog` writes to
+/// stderr, kept for troubleshooting without leaving the app. Thread-safe (elog is called off many threads).
+enum LogBuffer {
+    private static let lock = NSLock()
+    private static var lines: [String] = []
+    static let cap = 4000
+
+    static func append(_ s: String) {
+        lock.lock()
+        lines.append(s)
+        if lines.count > cap { lines.removeFirst(lines.count - cap) }   // bound memory: keep the last `cap`
+        lock.unlock()
+    }
+
+    static func snapshot() -> [String] { lock.lock(); defer { lock.unlock() }; return lines }
+    static func clear() { lock.lock(); lines.removeAll(keepingCapacity: true); lock.unlock() }
+    static func countForTest() -> Int { lock.lock(); defer { lock.unlock() }; return lines.count }
+}
+
 func elog(_ s: String) {
     FileHandle.standardError.write((s + "\n").data(using: .utf8)!)
+    LogBuffer.append(s)
 }
 
 // MARK: - permissions (preflighting these prevents startCapture() from hanging under launchd)
