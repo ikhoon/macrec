@@ -511,7 +511,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
                 r("Segment length", segPopup, "Starts a new recording file on the hour."),
                 sw(systemAudioBtn, "Capture system audio", "Record other participants (system output), not only your mic."),
                 sw(echoBtn, "Reduce mic echo", "Experimental — suppress speaker sound leaking back into the mic."),
-                r("Minimum speech", voiceField, "Seconds of speech required before a segment is saved."),
+                r("Minimum speech (seconds)", voiceField, "Seconds of speech required before a segment is "
+                  + "saved. 5 = five seconds, not minutes."),
                 sw(vadBtn, "Remove noise & silence", "Voice-activity detection trims dead air from recordings."),
             ]),
             Section(header: "Excluded apps", note: nil, rows: [
@@ -615,8 +616,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         }
         pane("Live Captions", "captions.bubble", .systemTeal, [
             Section(header: nil, note: "Cloud caption engines stream audio off-device — only while the live "
-                    + "overlay runs with that engine selected. Keys are stored in the Keychain, never in "
-                    + "preferences or backups. Pick the engine in the overlay's control bar.", rows: []),
+                    + "overlay runs with that engine selected. Keys are stored in a local 0600 file "
+                    + "(~/Library/Application Support/macrec), on this Mac only. Pick the engine in the "
+                    + "overlay's control bar.", rows: []),
             Section(header: "On-device", note: nil, rows: [
                 engineRow(.apple, "Apple's on-device recognizer — lowest latency, no network.", named: true),
                 engineRow(.whisper, "whisper.cpp on the same model as the saved transcript — slower, more accurate.", named: true),
@@ -1363,7 +1365,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             for (acct, old) in previousKeys[..<i] { Keychain.set(acct, old) }   // best-effort rollback
             let a = NSAlert()
             a.messageText = "Couldn't save the \(name) API key"
-            a.informativeText = "The Keychain write failed (see the log). Settings were not applied — try saving again."
+            a.informativeText = "The credentials file could not be written (see the log). Settings were not applied — try saving again."
             a.alertStyle = .warning
             a.runModal()
             return   // keep Settings open
