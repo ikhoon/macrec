@@ -161,6 +161,18 @@ func settingsSelftests(_ check: (String, Bool) -> Void) {
           && captionTextNeedsBackplate(backdropAlpha: 0.5)
           && captionTextNeedsBackplate(backdropAlpha: 0.99)
           && !captionTextNeedsBackplate(backdropAlpha: 1.0))
+    // In-app Log window: the filter is a case-insensitive substring; a blank filter keeps everything.
+    let logSample = ["openailive[me] connecting", "echo(speex): cumIn=1", "keychain: read failed", "ECHO loud"]
+    check("log filter: case-insensitive substring, blank keeps all",
+          logLinesFiltered(logSample, filter: "openai") == ["openailive[me] connecting"]
+          && logLinesFiltered(logSample, filter: "ECHO").count == 2   // "echo(speex)" + "ECHO loud"
+          && logLinesFiltered(logSample, filter: "  ") == logSample
+          && logLinesFiltered(logSample, filter: "nomatch").isEmpty)
+    // The log ring is bounded — a flood of lines (the echo canceller prints often) can't grow it forever.
+    LogBuffer.clear()
+    for i in 0..<(LogBuffer.cap + 500) { LogBuffer.append("line \(i)") }
+    check("log buffer: bounded to its cap under a flood", LogBuffer.countForTest() == LogBuffer.cap)
+    LogBuffer.clear()
     check("live: overlay opacity spans a fully transparent backdrop to a fully opaque one",
           captionBackdropAlpha(0.0) == 0.0 && captionBackdropAlpha(1.0) == 1.0
           && captionBackdropAlpha(0.3) == 0.3

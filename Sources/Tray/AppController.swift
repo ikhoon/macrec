@@ -56,6 +56,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
             NSApp.terminate(nil); return
         }
         buildMenu()
+        NSApp.mainMenu = Self.editShortcutMenu()   // wire ⌘X/C/V/A/Z app-wide (accessory apps have no Edit menu)
+        // Credentials now live in a 0600 file (see Keychain), read lazily — no startup keychain access at
+        // all, so nothing can prompt. Existing keys are re-entered once in Settings; the old login-keychain
+        // items are simply never read again (harmless). `purgeLegacyKeychain` exists to tidy them but is NOT
+        // called at launch, so a delete can't surface an "allow access" prompt.
         let vt = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.pollVoice() }
         RunLoop.main.add(vt, forMode: .common)   // .common so the tint updates while menus track too
         voiceTimer = vt
@@ -197,6 +202,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         menu.addItem(grant)
         menu.addItem(item("Settings…", #selector(openSettings), ",", symbol: "gearshape"))
         menu.addItem(item("Open transcripts folder", #selector(openTranscripts), "o", symbol: "folder"))
+        menu.addItem(item("Show log", #selector(showLog), symbol: "text.alignleft"))
         menu.addItem(.separator())
         menu.addItem(item("Quit", #selector(quit), "q", symbol: "power"))
         menu.delegate = self
@@ -702,6 +708,27 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         let dir = EngineConfig.load().transcriptsDir
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         NSWorkspace.shared.open(dir)
+    }
+
+    @objc private func showLog() { LogWindow.shared.show() }
+
+    /// A hidden main menu carrying only the standard Edit shortcuts. A menu-bar (accessory) app shows no
+    /// menu bar, so ⌘X/C/V/A/Z reach a focused text field or text view ONLY if the main menu defines them.
+    /// Items target the first responder (nil action target), so AppKit validates + routes them to whatever
+    /// text control has focus — the log filter and log view, Settings fields, the caption window.
+    static func editShortcutMenu() -> NSMenu {
+        let main = NSMenu()
+        let editItem = NSMenuItem(); main.addItem(editItem)
+        let edit = NSMenu(title: "Edit"); editItem.submenu = edit
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        return main
     }
 
     /// Manual check (menu): ALWAYS gives visible in-app feedback — an alert for up-to-date / newer /
