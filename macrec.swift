@@ -26,116 +26,97 @@ import Compression   // zlib ratio — whisper repetition-loop detector (see Tra
 
 // MARK: - helpers
 
-/// Minimal Keychain string store for long-lived credentials (generic passwords under this app's service).
+/// Credential store for long-lived API keys (openai / deepl / …). Backed by a **0600 JSON file** under
+/// Application Support — NOT the login keychain. The keychain binds each item's ACL to the exact binary
+/// that created it, and the modern `SecItemAdd` ignores a custom all-apps ACL, so a frequently-rebuilt
+/// tool re-prompts "allow access" on every rebuild — unusable. These are low-sensitivity, user-revocable
+/// keys on the user's own Mac (the posture of `~/.aws/credentials`, `gh`, `npm`); a plaintext 0600 file
+/// never prompts. The `Keychain` name + API are kept so callers are unchanged.
 enum Keychain {
-    /// One SecItem read per account per process. `LiveEngine.isReady` is consulted from menu building,
-    /// pane building, the overlay's control bar and every Save — each read is an authorization check, and
-    /// an unsigned build (a bare `swiftc` binary) turns each one into a password prompt.
     private static let lock = NSLock()
-    private static var cache: [String: String?] = [:]
+    private static var loaded = false
+    private static var store: [String: String] = [:]
     private static var secretRequests = 0
+    private static var reads = 0
 
     /// Set by the CLI subcommands that must never touch the user's real credentials (selftest, snapshots).
     nonisolated(unsafe) static var disabled = false
+    /// Test hook: point the store at a throwaway file so a selftest can exercise real read/write/0600.
+    nonisolated(unsafe) static var fileOverrideForTest: URL?
 
-    /// Every request for a SECRET, cached or not. Asking for a secret is what raises the authorization
-    /// prompt; asking whether one exists does not. Code that only needs presence must use `exists`.
-    static var secretRequestsForTest: Int { lock.lock(); defer { lock.unlock() }; return secretRequests }
-    static func forgetCacheForTest() { lock.lock(); cache.removeAll(); lock.unlock() }
-
-    private static func query(_ account: String) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: "com.ikhoon.macrec",
-         kSecAttrAccount as String: account]
+    /// ~/Library/Application Support/macrec/credentials.json (dir 0700). The override wins under test.
+    private static var fileURL: URL {
+        if let o = fileOverrideForTest { return o }
+        let base = (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support"))
+            .appendingPathComponent("macrec", isDirectory: true)
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        return base.appendingPathComponent("credentials.json")
     }
 
-    /// Is a credential stored? An attributes-only query never hands the secret back, so it never asks the
-    /// user to authorize anything.
+    private static func loadIfNeeded() {   // caller holds lock
+        guard !loaded else { return }
+        loaded = true
+        guard let data = try? Data(contentsOf: fileURL),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String] else { return }
+        store = obj
+    }
+
+    private static func persist() {   // caller holds lock
+        guard let data = try? JSONSerialization.data(withJSONObject: store, options: [.sortedKeys, .prettyPrinted])
+        else { return }
+        let url = fileURL
+        do {
+            try data.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch { elog("cred: write '\(url.lastPathComponent)' failed: \(error)") }
+    }
+
+    /// Is a credential stored? Never prompts (a plain file read).
     static func exists(_ account: String) -> Bool {
         if disabled { return false }
-        lock.lock()
-        if let hit = cache[account] { lock.unlock(); return hit != nil }
-        lock.unlock()
-        var q = query(account)
-        q[kSecReturnAttributes as String] = true
-        q[kSecMatchLimit as String] = kSecMatchLimitOne
-        var out: CFTypeRef?
-        let status = SecItemCopyMatching(q as CFDictionary, &out)
-        if status != errSecSuccess, status != errSecItemNotFound { elog("keychain: probe '\(account)' failed (\(status))") }
-        return status == errSecSuccess
+        lock.lock(); defer { lock.unlock() }
+        loadIfNeeded()
+        return store[account]?.isEmpty == false
     }
 
     static func get(_ account: String) -> String? {
-        lock.lock(); secretRequests += 1; lock.unlock()
+        lock.lock(); defer { lock.unlock() }
+        secretRequests += 1
         if disabled { return nil }
-        lock.lock()
-        if let hit = cache[account] { lock.unlock(); return hit }
-        lock.unlock()
-        let value = read(account)
-        lock.lock(); cache[account] = value; lock.unlock()
-        return value
+        loadIfNeeded()
+        guard let v = store[account], !v.isEmpty else { return nil }
+        reads += 1
+        return v
     }
-    private static func read(_ account: String) -> String? {
-        lock.lock(); reads += 1; lock.unlock()
-        var q = query(account)
-        q[kSecReturnData as String] = true
-        q[kSecMatchLimit as String] = kSecMatchLimitOne
-        var out: CFTypeRef?
-        let status = SecItemCopyMatching(q as CFDictionary, &out)
-        if status != errSecSuccess {
-            // Absent is normal; anything else is a real Keychain problem — don't disguise it as "no key".
-            if status != errSecItemNotFound { elog("keychain: read '\(account)' failed (\(status))") }
-            return nil
-        }
-        guard let d = out as? Data, let s = String(data: d, encoding: .utf8), !s.isEmpty else { return nil }
-        return s
-    }
-    /// Empty value deletes the item. A non-empty value RECREATES it: macOS binds an item's access
-    /// control list to the process that created it, and `SecItemUpdate` never refreshes that list — so
-    /// an item created once by the wrong binary keeps asking the user to authorize the right one,
-    /// forever. Deleting and re-adding rebinds the ACL to the app doing the save.
-    ///
-    /// The old update-then-add order guarded against a failed add dropping the credential. We hold
-    /// `value` throughout, so a failed add is retried and then reported — it is never silently lost.
-    /// Returns whether the operation actually succeeded (callers migrating data must check).
+
+    /// Empty value removes the key. Never prompts (a file write).
     @discardableResult
     static func set(_ account: String, _ value: String) -> Bool {
         if disabled { return true }
-        func remember(_ v: String?) { lock.lock(); cache[account] = v; lock.unlock() }
-        func delete() -> OSStatus { SecItemDelete(query(account) as CFDictionary) }
-
-        guard !value.isEmpty else {
-            let status = delete()
-            if status != errSecSuccess && status != errSecItemNotFound { elog("keychain: delete '\(account)' failed (\(status))"); return false }
-            remember(nil)
-            return true
-        }
-        let status = delete()
-        if status != errSecSuccess && status != errSecItemNotFound {
-            elog("keychain: could not clear '\(account)' before rewriting it (\(status))"); return false
-        }
-        var q = query(account)
-        q[kSecValueData as String] = Data(value.utf8)
-        // Credential stays on THIS machine (no backup/migration restore) but is readable after login.
-        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        var add = SecItemAdd(q as CFDictionary, nil)
-        if add != errSecSuccess {
-            elog("keychain: add '\(account)' failed (\(add)) — retrying once")
-            add = SecItemAdd(q as CFDictionary, nil)
-        }
-        if add != errSecSuccess {
-            elog("keychain: save '\(account)' failed (\(add)); the previous value was removed and NOT restored")
-            remember(nil)
-            return false
-        }
-        remember(value)
+        lock.lock(); defer { lock.unlock() }
+        loadIfNeeded()
+        if value.isEmpty { store[account] = nil } else { store[account] = value }
+        persist()
         return true
     }
 
-    /// Reads that actually reached the Keychain this process. A flood of authorization prompts is a
-    /// caching bug, not a Keychain quirk.
+    /// One-time cleanup: drop any orphaned items still in the OLD login keychain. Delete does NOT read the
+    /// secret, so it does not prompt. The app no longer reads the keychain, so leaving them would be
+    /// harmless too — this just keeps things tidy.
+    static func purgeLegacyKeychain(_ accounts: [String]) {
+        guard !disabled else { return }
+        for a in accounts {
+            SecItemDelete([kSecClass as String: kSecClassGenericPassword,
+                           kSecAttrService as String: "com.ikhoon.macrec",
+                           kSecAttrAccount as String: a] as CFDictionary)
+        }
+    }
+
+    static var secretRequestsForTest: Int { lock.lock(); defer { lock.unlock() }; return secretRequests }
     static var readsForTest: Int { lock.lock(); defer { lock.unlock() }; return reads }
-    private static var reads = 0
+    static func forgetCacheForTest() { lock.lock(); loaded = false; store = [:]; lock.unlock() }
 }
 
 func elog(_ s: String) {

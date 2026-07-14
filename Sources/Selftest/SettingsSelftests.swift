@@ -366,6 +366,23 @@ func settingsSelftests(_ check: (String, Bool) -> Void) {
           tapExclusionIsStale(current: [222], live: [111])          // relaunch — the reported bug
           && tapExclusionIsStale(current: [111], live: [])          // launched after the tap was built
           && !tapExclusionIsStale(current: [111, 222], live: [222, 111]))   // same set, any order
+    // Credentials are a 0600 file now, not the login keychain (which re-prompted "allow access" on every
+    // rebuild — the modern SecItemAdd ignores a custom ACL). Exercise the real read/write path against a
+    // throwaway file: set → get round-trips, exists reflects it, empty removes, and the file is 0600.
+    do {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("mr-cred-\(UUID().uuidString).json")
+        let wasDisabled = Keychain.disabled
+        Keychain.disabled = false; Keychain.fileOverrideForTest = tmp; Keychain.forgetCacheForTest()
+        _ = Keychain.set("openai", "sk-test-123")
+        let got = Keychain.get("openai"), has = Keychain.exists("openai"), missing = Keychain.exists("deepl")
+        _ = Keychain.set("openai", "")   // empty removes the key
+        let cleared = Keychain.get("openai")
+        let perms = (try? FileManager.default.attributesOfItem(atPath: tmp.path)[.posixPermissions] as? NSNumber)??.intValue
+        try? FileManager.default.removeItem(at: tmp)
+        Keychain.fileOverrideForTest = nil; Keychain.disabled = wasDisabled; Keychain.forgetCacheForTest()
+        check("cred: 0600 file store round-trips (set/get/exists/remove), never touches the keychain",
+              got == "sk-test-123" && has && !missing && cleared == nil && perms == 0o600)
+    }
     // Sidebar selection is app state, not focus state: the accent pill must survive AppKit
     // clearing isEmphasized when focus moves to a text field (it looked like a random blue blink).
     let sidebarRow = SidebarRowView()
