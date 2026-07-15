@@ -1240,6 +1240,7 @@ func printMacrecHelp() {
       perm-status            exit 0 if System Audio Recording + Microphone are granted
       request-permission     trigger the macOS permission prompts
       mic-status             exit 0 if the default input device is in use right now
+      selftest               run the built-in assertion suite (ends "selftest: ALL PASS" or exits 1)
       settings-snapshot [dir] render every Settings pane to a PNG (UI test kit; needs a GUI session)
       icon-snapshot [dir]     render the menu-bar brand mark (recording/voice/paused) to PNGs
       caption-snapshot [dir]  render the live caption overlay at 3 opacities (UI test kit)
@@ -1400,10 +1401,43 @@ public enum App {
             let dir = URL(fileURLWithPath: args.count > 1 ? args[1] : "/tmp/macrec-library-shots")
             let app = NSApplication.shared
             app.setActivationPolicy(.accessory)
-            // The fixture entries all point at this file — give the preview pane something to show.
-            try? "# project kickoff\n\n- 10:30 fixture transcript for the snapshot harness\n- decisions and action items would appear here\n"
-                .write(toFile: "/tmp/library-fixture.md", atomically: true, encoding: .utf8)
+            // The fixture entries all point at these files — give the preview pane something to
+            // show that exercises the whole markdown subset, and a real (generated) wav so the
+            // player bar proves its wiring with an actual duration.
+            let fixtureMD = """
+            # project kickoff
+
+            > Auto-transcribed fixture (speakers: Me = microphone, Them = system audio).
+
+            - Time: 2026-03-02 14:00–15:00 (60 min)
+            - Audio: [recording](library-fixture.wav) · Model: `ggml-fixture.bin`
+            - Docs: https://example.com/kickoff-notes
+
+            ## Decisions
+
+            1. Ship **increment one** first, polish later.
+            2. Keep the tray menu; the desktop window is additive.
+               - nested detail line
+
+            ## Transcript
+
+            [14:01:12] Me: 킥오프 시작하겠습니다.
+            [14:01:30] Them: *좋습니다* — 아젠다부터 볼까요?
+
+            ```
+            raw block: -::~:~:: pasted calendar art must stay verbatim ::~:~::-
+            ```
+            """
+            try? fixtureMD.write(toFile: "/tmp/library-fixture.md", atomically: true, encoding: .utf8)
+            if let w = try? SourceWriter(url: URL(fileURLWithPath: "/tmp/library-fixture.wav")),
+               let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
+               let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 16000) {
+                buf.frameLength = 16000
+                for i in 0..<16000 { buf.floatChannelData![0][i] = sinf(Float(i) * 0.13) * 0.2 }
+                w.append(buf)   // 1 s tone → the clock should read 0:00 / 0:01
+            }
             LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
+            LibraryWindow.shared.primePlayerForTest()
             let files = LibraryWindow.shared.snapshot(to: dir)
             for f in files { print(f.path) }
             print(files.isEmpty ? "library-snapshot: FAILED (nothing rendered)" : "library-snapshot: \(files.count) shot → \(dir.path)")
