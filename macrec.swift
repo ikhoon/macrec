@@ -625,9 +625,6 @@ final class SystemAudioTap {
         // tap is unmuted by default (audio stays audible), which is exactly what we want.
         let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: exclude)
         desc.uuid = UUID(); desc.isPrivate = true
-        // EXPLICITLY unmuted: relying on the default silenced playback of every tapped app on macOS 26
-        // (sound only survived behind a router) — never trust a default the OS may move under you.
-        desc.muteBehavior = .unmuted
 
         var tap = AudioObjectID(kAudioObjectUnknown)
         var st = AudioHardwareCreateProcessTap(desc, &tap)
@@ -639,11 +636,11 @@ final class SystemAudioTap {
         let outDevID = defaultOutputDeviceID()
         let outUID = outputDeviceUID(outDevID)
         pinnedOutputUID = outUID   // remember what we pinned, so a later default-output change is detectable
-        // TAP-ONLY aggregate first: binding the PHYSICAL output device as a sub-device ran our IO on it,
-        // and on at least one USB DAC that silenced every app playing to the device directly — sound only
-        // survived when a router (SoundSource) sat in between (the "no sound without redirect" P0). A
-        // process tap intercepts app audio before routing, so it does not need the device; the tap clocks
-        // the aggregate. Fall back to the old device-bound shape if the tap-only aggregate can't start.
+        // DEVICE-BOUND aggregate (the output device is the aggregate's clock). A tap-only aggregate was
+        // tried as the fix for tapped-playback silence and it created and started fine — but its IOProc
+        // delivered nothing: every segment recorded sys≈0 until a real call went untranscribed. The
+        // silence bug was the TAP's mute default, fixed by the explicit .unmuted above, not the device
+        // binding. Measured on this codebase: device binding is required for capture.
         func makeAggregate(bindDevice: Bool) -> [String: Any] {
             var d: [String: Any] = [
                 kAudioAggregateDeviceNameKey: "macrec-tap",
@@ -659,13 +656,9 @@ final class SystemAudioTap {
             }
             return d
         }
+        deviceBound = true
         var agg = AudioObjectID(kAudioObjectUnknown)
-        st = AudioHardwareCreateAggregateDevice(makeAggregate(bindDevice: false) as CFDictionary, &agg)
-        if st != noErr || agg == kAudioObjectUnknown {
-            elog("engine: tap-only aggregate failed (\(st)) — falling back to device-bound")
-            deviceBound = true
-            st = AudioHardwareCreateAggregateDevice(makeAggregate(bindDevice: true) as CFDictionary, &agg)
-        }
+        st = AudioHardwareCreateAggregateDevice(makeAggregate(bindDevice: true) as CFDictionary, &agg)
         guard st == noErr, agg != kAudioObjectUnknown else { stop(); throw Self.err("create aggregate", st) }
         aggID = agg
 
@@ -685,21 +678,6 @@ final class SystemAudioTap {
         st = AudioDeviceCreateIOProcIDWithBlock(&procID, agg, ioQueue, ioBlock)
         guard st == noErr, let p = procID else { stop(); throw Self.err("create IOProc", st) }
         st = AudioDeviceStart(aggID, p)
-        if st != noErr, !deviceBound {
-            // The tap-only aggregate was created but won't run — retry once with the device-bound shape
-            // rather than losing capture. Playback interference is the lesser evil vs recording nothing.
-            elog("engine: tap-only aggregate start failed (\(st)) — retrying device-bound")
-            AudioDeviceDestroyIOProcID(aggID, p); procID = nil
-            AudioHardwareDestroyAggregateDevice(aggID); aggID = kAudioObjectUnknown
-            deviceBound = true
-            var agg2 = AudioObjectID(kAudioObjectUnknown)
-            st = AudioHardwareCreateAggregateDevice(makeAggregate(bindDevice: true) as CFDictionary, &agg2)
-            guard st == noErr, agg2 != kAudioObjectUnknown else { stop(); throw Self.err("create aggregate", st) }
-            aggID = agg2
-            st = AudioDeviceCreateIOProcIDWithBlock(&procID, agg2, ioQueue, ioBlock)
-            guard st == noErr, let p2 = procID else { stop(); throw Self.err("create IOProc", st) }
-            st = AudioDeviceStart(aggID, p2)
-        }
         guard st == noErr else { stop(); throw Self.err("device start", st) }
         elog("engine: system-audio tap started (\(Int(fmt.sampleRate))Hz \(fmt.channelCount)ch, excluding \(exclude.count) procs, \(deviceBound ? "device-bound" : "tap-only")) → default output '\(outputDeviceName(outDevID))'")
     }

@@ -169,6 +169,17 @@ func scenarioSelftests(_ check: (String, Bool) -> Void) {
             check("scenario S-PIPELINE(c): the meeting that fills the segment titles it; a blip cannot",
                   fm.fileExists(atPath: out.path))
         }
+        // (d) MANUAL flush: the user's explicit "Transcribe now" bypasses BOTH hygiene gates — a silent,
+        // meeting-less segment still reaches whisper, which gets the final word (a real manual flush was
+        // once discarded by the no-meeting rule; user P1).
+        if let fix = writeFixtureWAVs(voiced: false) {
+            CalendarLookup.eventsOverrideForTest = []   // no meeting either — the auto path would drop this twice
+            let engine = RecordingEngine(cfg: cfg(model: model.path, calendarTitles: true))
+            engine.process(segment(fix, start: date("2026-03-01 15:00:00")), manual: true)
+            CalendarLookup.eventsOverrideForTest = nil
+            check("scenario S-PIPELINE(d): a manual Transcribe-now bypasses the hygiene gates",
+                  fm.fileExists(atPath: tDir.appendingPathComponent("2026-03/2026-03-01-1500.md").path))
+        }
         Notifier.sinkForTest = nil
         try? fm.removeItem(at: scratch)
     }

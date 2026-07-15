@@ -83,12 +83,14 @@ func effectivePostProcessMode(rawMode: String, shellCmd: String) -> PostProcessM
     return shellCmd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .off : .shell
 }
 
-/// Whether a completed segment is worth a transcript file. A segment that overlapped a calendar MEETING
-/// is always kept; an ad-hoc recording with no meeting is kept only when there was real speech — at least
-/// `minNonMeetingSeconds` (default 3 min) — so short non-meeting blips (a hallway chat, a passing video)
-/// don't litter the notes (user rule). Pure + selftested.
-func shouldKeepTranscript(hasMeeting: Bool, speechSeconds: Double, minNonMeetingSeconds: Double = 180) -> Bool {
-    hasMeeting || speechSeconds >= minNonMeetingSeconds
+/// Whether a completed segment is worth a transcript file. A MANUAL "Transcribe now" is always kept —
+/// an explicit request outranks the hygiene rules (a manual flush once died to them; user P1). Otherwise
+/// a segment that overlapped a calendar MEETING is kept, and an ad-hoc recording needs at least
+/// `minNonMeetingSeconds` of speech — 15 s (user pick; the old 3-minute bar swallowed a real
+/// uncalendared call), enough to shed doorway blips and passing videos. Pure + selftested.
+func shouldKeepTranscript(hasMeeting: Bool, speechSeconds: Double, manual: Bool = false,
+                          minNonMeetingSeconds: Double = 15) -> Bool {
+    manual || hasMeeting || speechSeconds >= minNonMeetingSeconds
 }
 
 /// Read the post-process prefs and build the invocation for a just-saved transcript.
