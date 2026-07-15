@@ -595,6 +595,10 @@ final class SystemAudioTap {
     /// against a fresh scan to decide whether the tap must be rebuilt. Our own process is always
     /// excluded and is not part of this comparison.
     private(set) var matchedExclusions: [AudioObjectID] = []
+    /// The default output device UID the aggregate was pinned to at creation. Frozen like the exclusion
+    /// set: when the system default output moves, the aggregate keeps pulling the OLD device, so this is
+    /// compared against the live default to decide a rebuild.
+    private(set) var pinnedOutputUID: String?
 
     init(excludeBundleIds: [String], onBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
         self.excludeBundleIds = excludeBundleIds
@@ -626,7 +630,9 @@ final class SystemAudioTap {
         guard let fmt = Self.tapFormat(tap) else { stop(); throw Self.err("tap format", -1) }
         format = fmt
 
-        let outUID = outputDeviceUID(defaultOutputDeviceID())
+        let outDevID = defaultOutputDeviceID()
+        let outUID = outputDeviceUID(outDevID)
+        pinnedOutputUID = outUID   // remember what we pinned, so a later default-output change is detectable
         let dict: [String: Any] = [
             kAudioAggregateDeviceNameKey: "macrec-tap",
             kAudioAggregateDeviceUIDKey: UUID().uuidString,
@@ -658,7 +664,7 @@ final class SystemAudioTap {
         guard st == noErr, let p = procID else { stop(); throw Self.err("create IOProc", st) }
         st = AudioDeviceStart(aggID, p)
         guard st == noErr else { stop(); throw Self.err("device start", st) }
-        elog("engine: system-audio tap started (\(Int(fmt.sampleRate))Hz \(fmt.channelCount)ch, excluding \(exclude.count) procs)")
+        elog("engine: system-audio tap started (\(Int(fmt.sampleRate))Hz \(fmt.channelCount)ch, excluding \(exclude.count) procs) → default output '\(outputDeviceName(outDevID))'")
     }
 
     func stop() {
@@ -812,11 +818,17 @@ final class CaptureSession {
     /// An excluded app that launches (or relaunches with a new pid) AFTER the tap was created is not
     /// excluded by it — `CATapDescription` freezes a set of process object IDs. Rebuild the tap only
     /// when the set it should exclude has actually drifted, so an unrelated app launching costs nothing.
-    func refreshExclusionsIfStale() async {
+    func refreshTapIfStale() async {
         guard let live = tap else { return }
         let current = matchExcludedProcesses(SystemAudioTap.audioProcesses(), excludeBundleIds: excludeBundleIds)
-        guard tapExclusionIsStale(current: current, live: live.matchedExclusions) else { return }
-        elog("engine: exclusion set changed (\(live.matchedExclusions.count) → \(current.count)) — rebuilding the tap")
+        let curOut = outputDeviceUID(defaultOutputDeviceID())
+        guard shouldRebuildTap(currentExclusions: current, liveExclusions: live.matchedExclusions,
+                               currentOutputUID: curOut, liveOutputUID: live.pinnedOutputUID) else { return }
+        // Say WHICH drifted — the output case is the one that used to be missed entirely.
+        let why = tapOutputIsStale(current: curOut, live: live.pinnedOutputUID)
+            ? "default output changed (\(live.pinnedOutputUID ?? "?") → \(curOut ?? "?"))"
+            : "exclusion set changed (\(live.matchedExclusions.count) → \(current.count))"
+        elog("engine: \(why) — rebuilding the tap")
         _ = await restartStream()
     }
 
@@ -905,6 +917,22 @@ func matchExcludedProcesses(_ processes: [AudioProcessInfo], excludeBundleIds: [
 /// newly-started excluded app is simply not excluded until the tap is rebuilt. Pure + selftested.
 func tapExclusionIsStale(current: [AudioObjectID], live: [AudioObjectID]) -> Bool {
     Set(current) != Set(live)
+}
+
+/// Has the default output device the tap's aggregate was pinned to moved? The aggregate wraps a specific
+/// output device; when the system default output changes (headphones, a virtual/BlackHole device, a
+/// per-app router like SoundSource) the frozen aggregate keeps pulling from the OLD device and the tap
+/// goes silent or captures the wrong mix. Pure + selftested.
+func tapOutputIsStale(current: String?, live: String?) -> Bool { current != live }
+
+/// Rebuild the live tap when EITHER the excluded-process set OR the pinned output device has drifted — a
+/// `CATapDescription` + private aggregate freeze BOTH, so neither self-heals. The exclusion guard used to
+/// be the whole test; the output half was the missing case (a mid-meeting output switch never rebuilt).
+/// Pure + selftested.
+func shouldRebuildTap(currentExclusions: [AudioObjectID], liveExclusions: [AudioObjectID],
+                      currentOutputUID: String?, liveOutputUID: String?) -> Bool {
+    tapExclusionIsStale(current: currentExclusions, live: liveExclusions)
+        || tapOutputIsStale(current: currentOutputUID, live: liveOutputUID)
 }
 
 /// Transcript/audio file base: the START time only — "2026-07-05-2100". The end time briefly

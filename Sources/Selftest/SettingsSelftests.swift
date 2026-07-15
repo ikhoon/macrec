@@ -378,6 +378,20 @@ func settingsSelftests(_ check: (String, Bool) -> Void) {
           tapExclusionIsStale(current: [222], live: [111])          // relaunch — the reported bug
           && tapExclusionIsStale(current: [111], live: [])          // launched after the tap was built
           && !tapExclusionIsStale(current: [111, 222], live: [222, 111]))   // same set, any order
+    // The tap's aggregate is pinned to the default output at creation; a mid-meeting output switch used to
+    // be missed entirely (the guard only checked exclusions), so audio silently stopped — the SoundSource /
+    // BlackHole / headphones case. Now a changed output UID makes the tap stale and triggers a rebuild.
+    check("audio: a default-output change makes the live tap stale (mid-meeting output switch was silent)",
+          tapOutputIsStale(current: "BlackHole2ch", live: "BuiltInSpeakerDevice")
+          && tapOutputIsStale(current: nil, live: "BuiltInSpeakerDevice")
+          && !tapOutputIsStale(current: "Same", live: "Same"))
+    check("audio: shouldRebuildTap fires on EITHER an exclusion OR an output drift (not just exclusions)",
+          shouldRebuildTap(currentExclusions: [111], liveExclusions: [111],
+                           currentOutputUID: "BlackHole2ch", liveOutputUID: "BuiltInSpeaker")   // output only
+          && shouldRebuildTap(currentExclusions: [222], liveExclusions: [111],
+                              currentOutputUID: "Same", liveOutputUID: "Same")                   // exclusion only
+          && !shouldRebuildTap(currentExclusions: [111], liveExclusions: [111],
+                               currentOutputUID: "Same", liveOutputUID: "Same"))                 // neither → no churn
     // Credentials are a 0600 file now, not the login keychain (which re-prompted "allow access" on every
     // rebuild — the modern SecItemAdd ignores a custom ACL). Exercise the real read/write path against a
     // throwaway file: set → get round-trips, exists reflects it, empty removes, and the file is 0600.
