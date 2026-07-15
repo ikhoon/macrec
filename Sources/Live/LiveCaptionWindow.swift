@@ -22,19 +22,24 @@ func subtitleLine(original: String, translated: String?) -> (main: String, secon
 /// smaller than legible. Pure + selftested.
 func subtitleFontSize(_ base: CGFloat) -> CGFloat { max(18, base + 6) }
 
-/// How many lines a subtitle shows. A film shows one utterance, two lines at most — a scrolling wall of
-/// history is the thing that makes an overlay read as a log. Pure + selftested.
-let subtitleMaxLines = 2
+/// How many utterances a subtitle shows. Just the current one — a film subtitle is what's being said
+/// right now, and past sentences (available in the log view) only clutter it. Pure + selftested.
+let subtitleMaxLines = 1
 
 /// The window outline exists so a transparent LOG still reads as a window you can grab. A subtitle is
 /// not a window — a rectangle drawn around a film subtitle is exactly what breaks the illusion.
 /// Pure + selftested.
 func captionEdgeVisible(subtitle: Bool) -> Bool { !subtitle }
 
-/// Do the captions have to carry their own contrast? Only when the backdrop is too faint to provide it.
-/// A backplate behind text that already sits on a solid panel would just be a darker box on a dark box.
-/// Pure + selftested.
-func captionTextNeedsBackplate(backdropAlpha: CGFloat) -> Bool { backdropAlpha < 0.6 }
+/// The newest line is what the reader is following, so past lines are dimmed to let the eye land on it.
+/// The current line stays at full strength. Pure + selftested.
+func captionLineAlpha(isCurrent: Bool) -> CGFloat { isCurrent ? 1.0 : 0.5 }
+
+/// Do the captions have to carry their own contrast? Whenever the backdrop is anything but fully opaque:
+/// the opacity slider must fade only the window background, never the text or the solid band behind it, so
+/// the captions stay readable at every opacity. A plate over a fully-solid panel is the only redundant
+/// case (a darker box on a dark box), so it is the only one skipped. Pure + selftested.
+func captionTextNeedsBackplate(backdropAlpha: CGFloat) -> Bool { backdropAlpha < 1.0 }
 
 /// Did the overlay render to nothing? An offscreen render of a window-server-composited surface returns
 /// an empty bitmap, and a harness that writes that PNG "verifies" every bug there is. A real overlay has
@@ -83,6 +88,10 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
     private var engineChoices: [LiveEngine] = []                        // exactly what the engine popup lists
     private let enginePopup = NSPopUpButton()                           // rebuilt when Settings change
     private static let titleIcon = "🎙️"           // beautifies the "macrec live" title
+    // The window server rounds a titled window's bottom corners; the radius isn't public. Measured at 15pt
+    // on the overlay's target (macOS 26). The outline traces the same radius so a fully-transparent overlay
+    // still reads as a rounded window instead of a bare rectangle.
+    static let windowCornerRadius: CGFloat = 15
 
     @objc private func toggleControlBar() {
         setControlBar(collapsed: !(controlsAccessory?.isHidden ?? false))
@@ -194,12 +203,16 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         // The HUD panel's own dark fill, reproduced so we own its alpha. Pure black reads too heavy
         // against a bright screen at full opacity, so this matches the panel chrome's tone.
         backdrop.layer?.backgroundColor = NSColor(white: 0.10, alpha: 1).cgColor
-        backdrop.alphaValue = captionBackdropAlpha(Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 1.0))
+        // Round the fill's bottom corners to the window radius so the dark card owns its own rounded shape
+        // (matching the window's clip exactly) instead of relying on the window server — which keeps the
+        // corners consistent at every opacity and lets the offscreen snapshot show the true shape.
+        backdrop.layer?.cornerRadius = Self.windowCornerRadius
+        backdrop.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        backdrop.alphaValue = captionBackdropAlpha(Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 0.5))
         content.addSubview(backdrop)
         let scroll = NSScrollView(frame: content.bounds)
         scroll.autoresizingMask = [.width, .height]
-        scroll.hasVerticalScroller = true
-        scroll.scrollerStyle = .overlay        // auto-hiding overlay scroller (no permanent bar)
+        scroll.hasVerticalScroller = false     // the scrollbar reads as clutter on a caption overlay — hidden
         scroll.autohidesScrollers = true
         scroll.drawsBackground = false
         // Canonical scrollable NSTextView setup so vertical resizing + scrolling behave correctly.
@@ -225,6 +238,11 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         edge.wantsLayer = true
         edge.layer?.borderWidth = 1
         edge.layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
+        // Round the BOTTOM corners to the window's radius so the outline hugs the window's rounded corners —
+        // the only thing that reads as a window when the backdrop is fully transparent. The top two meet the
+        // square titlebar, so they stay sharp.
+        edge.layer?.cornerRadius = Self.windowCornerRadius
+        edge.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
         content.addSubview(edge, positioned: .above, relativeTo: scroll)
     }
 
@@ -254,6 +272,18 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         let border = edge.layer.map { $0.borderWidth > 0 && ($0.borderColor?.alpha ?? 0) > 0 } ?? false
         return (border && edge.alphaValue == 1 && !edge.isHidden,
                 edge.hitTest(NSPoint(x: 5, y: 5)) == nil)
+    }
+
+    /// BOTH corner layers must trace the window's rounded BOTTOM corners — the outline (visible when the
+    /// backdrop is transparent) and the backdrop fill (visible when it isn't) — or a transparent overlay
+    /// collapses to a bare rectangle. Wiring-level guard; the rendered shape itself is what
+    /// `caption-snapshot` shows and the eyeball checks.
+    var cornerRoundingForTest: (edgeRadius: CGFloat, edgeBottomOnly: Bool,
+                                backdropRadius: CGFloat, backdropBottomOnly: Bool) {
+        (edge.layer?.cornerRadius ?? 0,
+         edge.layer?.maskedCorners == [.layerMinXMinYCorner, .layerMaxXMinYCorner],
+         backdrop.layer?.cornerRadius ?? 0,
+         backdrop.layer?.maskedCorners == [.layerMinXMinYCorner, .layerMaxXMinYCorner])
     }
 
     /// UI TEST KIT (`macrec caption-snapshot <dir>`): render the overlay at several opacities onto a
@@ -375,7 +405,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
              "Engine — Apple: fast · Whisper: accurate. Add a key in Settings to unlock the cloud engines.",
              #selector(engineChanged(_:)))
         // Opacity drag slider, now on the top bar (was a bottom strip).
-        let opacity = NSSlider(value: Double(captionBackdropAlpha(Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 1.0))),
+        let opacity = NSSlider(value: Double(captionBackdropAlpha(Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 0.5))),
                                minValue: captionOpacityRange.lowerBound, maxValue: captionOpacityRange.upperBound,
                                target: self, action: #selector(opacityChanged(_:)))
         opacity.controlSize = .mini; opacity.toolTip = "Background opacity (captions stay readable)"
@@ -487,7 +517,9 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
                                 fontSize: CGFloat) {
         let size = subtitleFontSize(fontSize)
         let mainFont = NSFont.systemFont(ofSize: size, weight: .semibold)
-        let subFont = NSFont.systemFont(ofSize: max(11, size - 6), weight: .regular)
+        // The original is a reference line above the translation, not a footnote — keep the size gap small
+        // (a hair smaller, not half the size) so both read comfortably.
+        let subFont = NSFont.systemFont(ofSize: max(15, size - 3), weight: .regular)
         let para = NSMutableParagraphStyle()
         para.alignment = .center
         para.lineHeightMultiple = 1.15
@@ -496,8 +528,10 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         // font weight. A shadow alone is not enough: against a bright window the captions all but vanish
         // (seen in `caption-snapshot`). Centred text makes a `.backgroundColor` run hug the line, which is
         // the black band broadcast subtitles use — and it only appears when the backdrop can't do the job.
-        let plate = captionTextNeedsBackplate(backdropAlpha: captionBackdropAlpha(Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 1.0)))
-            ? NSColor.black.withAlphaComponent(0.6) : NSColor.clear
+        // Single source of truth: the slider already wrote the live value into backdrop.alphaValue —
+        // re-deriving from prefs here duplicated the lookup (and its default) in two places.
+        let plate = captionTextNeedsBackplate(backdropAlpha: backdrop.alphaValue)
+            ? NSColor.black.withAlphaComponent(0.8) : NSColor.clear
         let halo = NSShadow()
         halo.shadowColor = NSColor.black.withAlphaComponent(0.85)
         halo.shadowBlurRadius = 2
@@ -507,13 +541,18 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         for (i, l) in lines.suffix(subtitleMaxLines).enumerated() {
             if i > 0 { out.append(NSAttributedString(string: "\n")) }
             let (main, secondary) = subtitleLine(original: l.text, translated: l.translated)
+            // Color by WHAT the text is, never by its slot: the original stays white and the translation
+            // stays teal. Coloring the main line always-teal made a fresh sentence (shown as main before its
+            // translation lands) flash teal, then flip to white the instant the translation arrived and the
+            // original demoted to the secondary line. The main line is the translation only when one exists.
+            let mainIsTranslation = !(l.translated?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
             if let secondary {
                 out.append(NSAttributedString(string: secondary + "\n", attributes: [
-                    .font: subFont, .foregroundColor: NSColor.secondaryLabelColor,
+                    .font: subFont, .foregroundColor: NSColor.white,
                     .backgroundColor: plate, .shadow: halo, .paragraphStyle: para]))
             }
             out.append(NSAttributedString(string: main, attributes: [
-                .font: mainFont, .foregroundColor: NSColor.labelColor,
+                .font: mainFont, .foregroundColor: mainIsTranslation ? NSColor.systemTeal : NSColor.white,
                 .backgroundColor: plate, .shadow: halo, .paragraphStyle: para]))
         }
         textView.textStorage?.setAttributedString(out)
@@ -550,28 +589,31 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         for (i, l) in lines.enumerated() {
             if i > 0 { out.append(NSAttributedString(string: "\n")) }
             let tint: NSColor = l.mine ? .systemTeal : .systemOrange   // colors the LABEL only (both-speaker mode)
+            // Dim every line but the newest so the eye lands on what's being said now.
+            let cur = i == lines.count - 1
+            func fg(_ c: NSColor) -> NSColor { cur ? c : c.withAlphaComponent(captionLineAlpha(isCurrent: cur)) }
             if showTimestamps {
                 out.append(NSAttributedString(string: "\(tsFormatter.string(from: l.time))  ", attributes: [
-                    .font: tsFont, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
+                    .font: tsFont, .foregroundColor: fg(.secondaryLabelColor), .paragraphStyle: para]))
             }
             if showLabels {
                 out.append(NSAttributedString(string: "\(l.speaker)  ", attributes: [
-                    .font: labelFont, .foregroundColor: tint, .paragraphStyle: para]))
+                    .font: labelFont, .foregroundColor: fg(tint), .paragraphStyle: para]))
             }
             if hasPrefix { out.append(NSAttributedString(string: "\t", attributes: [.font: textFont, .paragraphStyle: para])) }
             out.append(NSAttributedString(string: l.text, attributes: [   // text stays neutral like single-speaker mode
-                .font: textFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: para]))
+                .font: textFont, .foregroundColor: fg(.labelColor), .paragraphStyle: para]))
             if l.inProgress {   // still transcribing this line → typing indicator inside the text
                 out.append(NSAttributedString(string: l.text.isEmpty ? "…" : " …", attributes: [
-                    .font: textFont, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
+                    .font: textFont, .foregroundColor: fg(.secondaryLabelColor), .paragraphStyle: para]))
             }
             if let t = l.translated, !t.isEmpty {
                 out.append(NSAttributedString(string: "\n↳ ", attributes: [
-                    .font: markFont, .foregroundColor: NSColor.tertiaryLabelColor, .paragraphStyle: trans]))
+                    .font: markFont, .foregroundColor: fg(.tertiaryLabelColor), .paragraphStyle: trans]))
                 // The translation carries the SPEAKER's tint (source text stays neutral) — the two
                 // layers separate at a glance instead of being two near-identical white lines.
                 out.append(NSAttributedString(string: t, attributes: [
-                    .font: transFont, .foregroundColor: tint.withAlphaComponent(0.95), .paragraphStyle: trans]))
+                    .font: transFont, .foregroundColor: fg(tint.withAlphaComponent(0.95)), .paragraphStyle: trans]))
             }
         }
         // Over a see-through backdrop the captions sit on whatever is behind the window — light slides,
@@ -579,8 +621,8 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
         // thin strokes, and a negative `strokeWidth` outlines the glyphs, which reads as a heavier
         // weight. Neither may touch the letterforms. So put the contrast BEHIND them, as broadcast
         // captions do: a dark plate hugging the text, drawn only when the backdrop can't do the job.
-        if captionTextNeedsBackplate(backdropAlpha: captionBackdropAlpha(Pref.dbl(Pref.liveOpacity, "MR_LIVE_OPACITY", 1.0))) {
-            out.addAttribute(.backgroundColor, value: NSColor.black.withAlphaComponent(0.55),
+        if captionTextNeedsBackplate(backdropAlpha: backdrop.alphaValue) {
+            out.addAttribute(.backgroundColor, value: NSColor.black.withAlphaComponent(0.8),
                              range: NSRange(location: 0, length: out.length))
         }
         textView.textStorage?.setAttributedString(out)
