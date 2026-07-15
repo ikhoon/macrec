@@ -1243,6 +1243,7 @@ func printMacrecHelp() {
       settings-snapshot [dir] render every Settings pane to a PNG (UI test kit; needs a GUI session)
       icon-snapshot [dir]     render the menu-bar brand mark (recording/voice/paused) to PNGs
       caption-snapshot [dir]  render the live caption overlay at 3 opacities (UI test kit)
+      library-snapshot [dir]  render the Library window over fixture data (UI test kit)
       sweep                  run one retention/archive pass (WAV→AAC tiers) and exit
                              [--audio-dir D] [--transcripts-dir D] [--raw-days N] [--keep-days N]
       tap-probe [secs]       start only the system-audio tap, play a test tone, report whether it
@@ -1274,7 +1275,8 @@ public enum App {
         // credentials and write preferences as they go. Give them neither: no Keychain (an unsigned dev
         // build would raise an authorization prompt per read) and a throwaway defaults suite (the overlay
         // persisted its opacity and subtitle mode into the user's settings).
-        if let a = args.first, ["selftest", "settings-snapshot", "icon-snapshot", "caption-snapshot"].contains(a) {
+        if let a = args.first, ["selftest", "settings-snapshot", "icon-snapshot", "caption-snapshot",
+                                "library-snapshot"].contains(a) {
             Keychain.disabled = true
             Pref.useEphemeralStoreForTest()
         }
@@ -1388,6 +1390,23 @@ public enum App {
             let files = wc.snapshotAllPanes(to: dir)
             for f in files { print(f.path) }
             print(files.isEmpty ? "snapshot: FAILED (no panes rendered)" : "snapshot: \(files.count) panes → \(dir.path)")
+            exit(files.isEmpty ? 1 : 0)
+        }
+
+        // Subcommand: library-snapshot <dir> — render the Library window over FIXTURE data to a PNG.
+        // Fixture-only on purpose: a snapshot must never leak real meeting names, and the harness
+        // must not read the user's vault.
+        if args.first == "library-snapshot" {
+            let dir = URL(fileURLWithPath: args.count > 1 ? args[1] : "/tmp/macrec-library-shots")
+            let app = NSApplication.shared
+            app.setActivationPolicy(.accessory)
+            // The fixture entries all point at this file — give the preview pane something to show.
+            try? "# project kickoff\n\n- 10:30 fixture transcript for the snapshot harness\n- decisions and action items would appear here\n"
+                .write(toFile: "/tmp/library-fixture.md", atomically: true, encoding: .utf8)
+            LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
+            let files = LibraryWindow.shared.snapshot(to: dir)
+            for f in files { print(f.path) }
+            print(files.isEmpty ? "library-snapshot: FAILED (nothing rendered)" : "library-snapshot: \(files.count) shot → \(dir.path)")
             exit(files.isEmpty ? 1 : 0)
         }
 
