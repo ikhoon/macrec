@@ -121,10 +121,14 @@ func translationSelftests(_ check: (String, Bool) -> Void) {
           inv(.off, .claude) == nil && inv(.shell, .claude) == nil)
     check("post-process: shell appends quoted path",
           inv(.shell, .claude, shell: "./x.sh") == "./x.sh '/t/a b'\\''s.md'")
-    check("post-process: claude summary template (mkdir + .partial promote)",
-          inv(.summary, .claude) == "mkdir -p '/t' && claude -p 'P' < '/t/a b'\\''s.md' "
-                                  + "> '/t/a b'\\''s-sum.md.partial' "
-                                  + "&& mv '/t/a b'\\''s-sum.md.partial' '/t/a b'\\''s-sum.md'")
+    // The summary file's H1 equals its FILE name (user rule), composed only AFTER the runner succeeds —
+    // a failed run's .partial keeps the runner's own words (the reap contract), never a header line.
+    let sumCmd = inv(.summary, .claude) ?? ""
+    check("post-process: claude summary template (mkdir + runner → .partial, H1 composed on success)",
+          sumCmd.hasPrefix("mkdir -p '/t' && claude -p 'P' < '/t/a b'\\''s.md' > '/t/a b'\\''s-sum.md.partial'")
+          && sumCmd.contains("&& { printf '# %s\\n\\n' 'a b'\\''s-sum'; cat '/t/a b'\\''s-sum.md.partial'; }")
+          && sumCmd.contains("&& mv '/t/a b'\\''s-sum.md.partial2' '/t/a b'\\''s-sum.md'")
+          && sumCmd.hasSuffix("&& rm -f '/t/a b'\\''s-sum.md.partial'"))
     check("post-process: gemini summary template",
           inv(.summary, .gemini)?.contains("gemini -p 'P'") == true)
     check("post-process: codex pipes prompt+transcript via stdin",

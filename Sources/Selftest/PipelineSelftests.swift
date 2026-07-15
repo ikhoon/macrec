@@ -294,10 +294,14 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
           == "/r/Transcripts/2026-07/2026-07-07.md"
           && dailyDigestOutputPath(day: "2026-07-07", outDir: "/d", summaryOutDir: "", transcriptsDir: "/r/T",
                                    nameTemplate: "{date}-daily.md") == "/d/2026-07/2026-07-07-daily.md")
-    check("digest: invocation cats inputs into the runner with atomic promote",
-          dailyDigestInvocation(runner: .claude, prompt: "P", inputs: ["/s/a.md", "/s/b's.md"], outPath: "/d/2026-07/x.md")
-          == "mkdir -p '/d/2026-07' && cat '/s/a.md' '/s/b'\\''s.md' | claude -p 'P' "
-           + "> '/d/2026-07/x.md.partial' && mv '/d/2026-07/x.md.partial' '/d/2026-07/x.md'"
+    // Digest files get the same file-name H1 as summaries, composed only after the runner succeeds
+    // (see titledPromoteTail — the .partial must keep the runner's own words on failure).
+    let digCmd = dailyDigestInvocation(runner: .claude, prompt: "P", inputs: ["/s/a.md", "/s/b's.md"],
+                                       outPath: "/d/2026-07/x.md") ?? ""
+    check("digest: invocation cats inputs into the runner; H1 = file name; promote on success",
+          digCmd.hasPrefix("mkdir -p '/d/2026-07' && cat '/s/a.md' '/s/b'\\''s.md' | claude -p 'P' > '/d/2026-07/x.md.partial'")
+          && digCmd.contains("&& { printf '# %s\\n\\n' 'x'; cat '/d/2026-07/x.md.partial'; }")
+          && digCmd.contains("&& mv '/d/2026-07/x.md.partial2' '/d/2026-07/x.md'")
           && dailyDigestInvocation(runner: .claude, prompt: "P", inputs: [], outPath: "/d/x.md") == nil)
     // Tail-scheduler decision — both timing regressions ("not real-time" = timer wait,
     // "second line slow" = firing while another request was in flight) lived here.
