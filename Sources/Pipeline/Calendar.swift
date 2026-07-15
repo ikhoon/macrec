@@ -105,6 +105,11 @@ enum CalendarLookup {
     /// time when one maps. See `transcriptStart`.
     struct Match { let title: String; let link: String?; let attendees: [String]; let start: Date }
 
+    /// QA seam: when set, `match` selects from these candidates instead of querying EventKit — a scenario
+    /// drives titling through the real `process()` path with deterministic events, no calendar access.
+    /// The selection still goes through the real `bestEventIndex` (floor + ranking).
+    nonisolated(unsafe) static var eventsOverrideForTest: [EventCandidate]?
+
     /// The event calendars the user chose to source titles from (by title). Empty selection — or a
     /// selection that matches nothing (e.g. a renamed calendar) — means "all calendars" (nil).
     static var selectedCalendars: [EKCalendar]? { selectedCalendars(in: store) }
@@ -141,6 +146,11 @@ enum CalendarLookup {
 
     /// Best event overlapping [start, end] — the one that fills most of it (see `bestEventIndex`).
     static func match(start: Date, end: Date) -> Match? {
+        if let ov = eventsOverrideForTest {
+            guard let i = bestEventIndex(segStart: start, segEnd: end, candidates: ov) else { return nil }
+            let c = ov[i]
+            return Match(title: c.title, link: nil, attendees: [], start: c.start)
+        }
         guard authorized else { return nil }
         let pred = store.predicateForEvents(withStart: start.addingTimeInterval(-300), end: end.addingTimeInterval(60), calendars: selectedCalendars)
         let events = store.events(matching: pred).filter { !$0.isAllDay && !($0.title ?? "").isEmpty }

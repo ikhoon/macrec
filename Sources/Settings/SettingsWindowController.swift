@@ -56,6 +56,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     private let gladiaKeyField = NSSecureTextField()
     private let elevenlabsKeyField = NSSecureTextField()  // ElevenLabs Scribe STT (best ko/ja accuracy)
     private let deeplKeyField = NSSecureTextField()        // DeepL translation key (cloud translator, opt-in)
+    private let claudeTokenField = NSSecureTextField()     // `claude setup-token` — headless auth for summaries
     private let translateProviderPopup = NSPopUpButton()   // live-translation backend: Apple (on-device) | DeepL
     private let translateProviderValues = TranslationProvider.allCases.map(\.rawValue)
     private let translateProviderTitles = TranslationProvider.allCases.map(\.title)
@@ -582,6 +583,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
                     rows: [], group: "pp.off"),
             Section(header: "Automatic summary", note: nil, rows: [
                 r("Summarize with", runnerPopup),
+                r("Claude Code token", claudeTokenField, "Usually not needed — macrec borrows the claude "
+                  + "CLI's own login automatically. Set one (from `claude setup-token`) only to use a "
+                  + "separate long-lived token instead.", wide: true),
                 r("Prompt", promptScroll, "Default asks for key points, decisions, and action items — "
                   + "answered in the transcript's language.", wide: true),
                 r("Prompt file", promptFileStack, "Overrides the text above when readable — keep the prompt "
@@ -1118,7 +1122,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         customModelField.stringValue = Pref.str(Pref.customModel, "MR_MODEL_URL", "")
         // Presence, not the secret. Prefilling the real key made opening Settings an authorization prompt
         // per engine, for a value the user never asked to see.
-        for (account, field) in [("deepgram", deepgramKeyField), ("openai", openaiKeyField), ("gladia", gladiaKeyField), ("elevenlabs", elevenlabsKeyField), ("deepl", deeplKeyField)] {
+        for (account, field) in [("deepgram", deepgramKeyField), ("openai", openaiKeyField), ("gladia", gladiaKeyField), ("elevenlabs", elevenlabsKeyField), ("deepl", deeplKeyField), ("claude", claudeTokenField)] {
             field.stringValue = Keychain.exists(account) ? Self.keyMask : ""
         }
         translateProviderPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.translateProvider) ?? "apple", translateProviderValues))
@@ -1356,7 +1360,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         // to authorize handing the old one back just to save an unrelated setting.
         let creds = [("deepgram", deepgramKeyField, "Deepgram"), ("openai", openaiKeyField, "OpenAI"),
                      ("gladia", gladiaKeyField, "Gladia"), ("elevenlabs", elevenlabsKeyField, "ElevenLabs"),
-                     ("deepl", deeplKeyField, "DeepL")]
+                     ("deepl", deeplKeyField, "DeepL"), ("claude", claudeTokenField, "Claude Code")]
             .filter { $0.1.stringValue != Self.keyMask }
         let previousKeys = creds.map { ($0.0, Keychain.get($0.0) ?? "") }
         for (i, cred) in creds.enumerated() {

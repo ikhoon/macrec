@@ -250,7 +250,9 @@ final class RecordingEngine {
         if let mdate { try? FileManager.default.setAttributes([.modificationDate: mdate], ofItemAtPath: md.path) }
     }
 
-    private func process(_ seg: CompletedSegment) {
+    // Internal (not private) so QA scenarios can push a fixture CompletedSegment through the REAL
+    // pipeline — VAD stats, transcription, titling, write — without start(), which fires TCC prompts.
+    func process(_ seg: CompletedSegment) {
         elog("engine: segment \(segFormatter().string(from: seg.start)) — voiced mic=\(String(format: "%.1f", seg.micVoicedSeconds))s sys=\(String(format: "%.1f", seg.sysVoicedSeconds))s (micPeak=\(String(format: "%.3f", seg.micPeak)) sysPeak=\(String(format: "%.3f", seg.sysPeak))) dur=\(Int(seg.durationSeconds))s")
         // Dead/misrouted input detector: the ENERGY gate says the mic was active, but nothing held
         // above the threshold for speech-length runs — clicks/hum, not a voice. Surface it instead

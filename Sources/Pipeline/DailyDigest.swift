@@ -176,6 +176,52 @@ final class SummaryStatus {
     func resetForTest() { lock.lock(); activity = .idle; lastPath = nil; lock.unlock() }
 }
 
+/// The claude CLI's current OAuth access token, parsed from its own Keychain item JSON. Works around the
+/// CLI reporting "Not logged in" whenever its process tree starts at launchd (anthropics/claude-code#77213)
+/// — the token itself authenticates fine there via CLAUDE_CODE_OAUTH_TOKEN; only the CLI's own lookup
+/// fails. nil for malformed JSON or an expired token (expiresAt is epoch-milliseconds). Pure + selftested.
+func claudeCliAccessToken(fromKeychainJSON json: String, now: Date = Date()) -> String? {
+    guard let data = json.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    let o = (obj["claudeAiOauth"] as? [String: Any]) ?? obj
+    guard let tok = o["accessToken"] as? String, !tok.isEmpty else { return nil }
+    if let exp = (o["expiresAt"] as? NSNumber)?.doubleValue, exp > 0,
+       now.timeIntervalSince1970 * 1000 >= exp { return nil }
+    return tok
+}
+
+/// Read the claude CLI's Keychain item via /usr/bin/security — empirically prompt-free (the item's ACL
+/// admits the security tool), including from launchd. Best-effort: any failure returns nil and the
+/// runner simply runs without a token (the digest backoff handles the resulting failure).
+func readClaudeCliKeychainJSON() -> String? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+    let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return nil }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else { return nil }
+    return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// How long to wait before retrying a FAILED digest. The old behavior retried on every 30 s tick —
+/// 453 claude spawns (and 453 failure notifications) in one afternoon when the CLI lost its login.
+/// Backoff: 10 min, 30 min, then hourly; the day is never given up (a fixed login still digests today).
+/// Pure + selftested.
+func digestRetryDelay(afterFailures n: Int) -> TimeInterval {
+    switch n {
+    case ..<1: return 0
+    case 1: return 600
+    case 2: return 1800
+    default: return 3600
+    }
+}
+
+/// Notify about a digest failure only ONCE per failure streak — the fix is the same whether it failed
+/// once or fifty times, and a notification per retry is spam that gets the app silenced. Pure + selftested.
+func digestShouldNotifyFailure(consecutiveFailures n: Int) -> Bool { n == 1 }
+
 /// Does this mode write a summary file at the summary path? Only the built-in `.summary` mode redirects
 /// into `<out>.partial` and promotes it. A freeform shell hook is handed the transcript and writes
 /// wherever it likes — offering to reveal `<out>` after it runs would open a file that never existed,
@@ -231,6 +277,18 @@ func runPostProcessCommand(_ command: String, completion: ((Int32) -> Void)? = n
         var env = ProcessInfo.processInfo.environment
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:\(home)/.local/bin:\(home)/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
+        // The claude CLI authenticates fine from a terminal but reports "Not logged in" when its process
+        // tree starts at launchd (anthropics/claude-code#77213). CLAUDE_CODE_OAUTH_TOKEN works there, so:
+        // an exported var wins; else an explicit Settings token; else BORROW the CLI's own current token
+        // from its Keychain item — zero user setup, same scope the CLI already holds.
+        if env["CLAUDE_CODE_OAUTH_TOKEN"] == nil, cmd.contains("claude") {
+            if let t = Keychain.get("claude"), !t.isEmpty {
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = t
+            } else if !Keychain.disabled, let json = readClaudeCliKeychainJSON(),
+                      let t = claudeCliAccessToken(fromKeychainJSON: json) {
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = t
+            }
+        }
         p.environment = env
         let out = Pipe(); p.standardOutput = out; p.standardError = out
         do {

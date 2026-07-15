@@ -33,6 +33,15 @@ Never declare a change done from the code alone. Every change goes through, in o
 3. **Selftest**: `./macrec-stage.app/Contents/MacOS/macrec selftest` — must end `selftest: ALL PASS`.
    Every new pure function / decision gets a selftest case, reproducing the real failure it fixes
    (the exact numbers/strings from the incident). One mistake is forgivable; shipping it twice is not.
+   This includes the SCENARIO suite (`Sources/Selftest/ScenarioSelftests.swift`): whole incidents
+   replayed in-process — virtual clock, injected runner/events, fixture audio — because the recurring
+   holes live in the WIRING (tick loops, pipeline plumbing), not in the pure functions. A new incident
+   gets a scenario, not only a unit check; prove a new scenario by breaking its guard once and watching
+   it fail (a gate that has never failed has never been tested).
+3b. **Tier-2 QA**: `./qa.sh` — REAL launchd + claude token + installed-binary checks, on this Mac.
+   Run it whenever the change touches the digest/summary runners, audio capture, credentials, or
+   install; always pre-release. Scenarios SKIP loudly when a precondition is missing — a SKIP is
+   never a PASS.
 4. **For ANY UI change — actually SEE it**: `./macrec-stage.app/Contents/MacOS/macrec settings-snapshot /tmp/shots`
    then open the PNGs and look. A "structurally valid" pane (grids present, selftest green) shipped
    visually destroyed twice because it was never rendered. The `settings: no pane control is
