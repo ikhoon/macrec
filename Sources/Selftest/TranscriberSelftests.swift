@@ -38,6 +38,13 @@ func transcriberSelftests(_ check: (String, Bool) -> Void) {
     check("openai base: garbage → official", oaURL("ftp://nope") == oaOfficial && oaURL("::::") == oaOfficial)
     check("openai base: gateway query kept, intent deduped", oaURL("https://gw.example/x?intent=foo&team=a") ==
           "wss://gw.example/x/v1/realtime?team=a&intent=transcription")
+    // Handshake failure hint: a custom gateway that rejects the realtime socket must say WHY — a 404
+    // (endpoint can't do realtime) reads differently from a 401/403 (bad key). Regression for the opaque
+    // "bad response from the server" that gave no status.
+    check("openai handshake hint: status → actionable reason",
+          openaiHandshakeHint(404).contains("realtime")
+          && openaiHandshakeHint(401).contains("key") && openaiHandshakeHint(403).contains("key")
+          && openaiHandshakeHint(503).contains("server") && openaiHandshakeHint(200).isEmpty)
     // ElevenLabs Scribe: realtime-message parsing. partial_transcript is the full current partial
     // (REPLACES the volatile line); committed_transcript finalizes; junk/session/error → no caption.
     var elGot: [(String, Bool)] = []

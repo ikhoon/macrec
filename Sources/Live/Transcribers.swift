@@ -371,6 +371,19 @@ final class DeepgramLiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSo
 /// over a WebSocket; the server VAD segments turns, transcript DELTAS append to the current line and
 /// `completed` finalizes it. Same rules as Deepgram: sends audio off-device ONLY while the overlay runs
 /// with this engine selected; API key in the Keychain (Settings → Live; `MR_OPENAI_KEY`). No SDK.
+/// A human hint for a non-101 realtime-transcription handshake status: it tells "fix your key" (401/403)
+/// apart from "this endpoint can't do realtime" (404) and transient server errors (429/5xx). Pure +
+/// selftested — the difference a user needs when a custom OpenAI-compatible gateway rejects the socket.
+func openaiHandshakeHint(_ code: Int) -> String {
+    switch code {
+    case 401, 403: return " — check the API key"
+    case 404: return " — this base may not support the realtime WebSocket (/v1/realtime)"
+    case 429: return " — rate limited"
+    case 500...599: return " — server error"
+    default: return ""
+    }
+}
+
 final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSocketDelegate {
     private let label: String
     private let locale: Locale
@@ -445,24 +458,28 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
 
     func start() {
         onLocale?(locale)
-        let key = Self.apiKey
-        guard !key.isEmpty else {
-            onUpdate("OpenAI API key not set — Settings → Live (or MR_OPENAI_KEY)", true)
-            elog("openailive[\(label)]: no API key — engine idle")
-            return
-        }
         let lang = locale.language.languageCode?.identifier ?? "en"
         let endpoint = Self.endpoint
-        var req = URLRequest(url: endpoint)
-        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        req.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
         q.async { [self] in
             guard !stopped else { return }   // stop() can land before this block on a quick toggle
+            // Read the key HERE, off the main thread: a Keychain read blocks its caller while the OS
+            // authorization prompt is up, and start() is called on the main thread during the engine
+            // build — so reading on main froze the whole app. The hints read (calendar/prefs) rides along.
+            let key = Self.apiKey
+            guard !key.isEmpty else {
+                onUpdate("OpenAI API key not set — Settings → Live (or MR_OPENAI_KEY)", true)
+                elog("openailive[\(label)]: no API key — engine idle")
+                return
+            }
+            var req = URLRequest(url: endpoint)
+            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            req.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
             let s = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
             let t = s.webSocketTask(with: req)
             session = s; task = t
             t.resume()
             receiveLoop(t)
+            elog("openailive[\(label)]: connecting (lang=\(lang), host=\(endpoint.host ?? "?"))")
             // Configure the transcription session: raw pcm16 in, server VAD segmenting turns. The hints
             // dictionary rides the transcription prompt (same proper nouns as the saved transcript).
             let cfg = Self.sessionConfig(lang: lang, hints: transcriptionHints(start: Date(), end: Date()))
@@ -472,7 +489,6 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
                 }
             }
         }
-        elog("openailive[\(label)]: connecting (lang=\(lang), host=\(endpoint.host ?? "?"))")
     }
 
     func feed(_ buffer: AVAudioPCMBuffer) {
@@ -562,6 +578,22 @@ final class OpenAILiveTranscriber: NSObject, LiveTranscribing, URLSessionWebSock
             elog("openailive[\(label)] error: \(text.prefix(300))")
             onUpdate("(OpenAI error — check the API key / log)", true)
         default: break   // session.created / committed / speech_started … — not caption-relevant
+        }
+    }
+
+    /// The WebSocket handshake carries an HTTP response; on a non-101 the connection error is the useless
+    /// "bad response from the server". Surface the actual status so a bad key (401/403), a wrong or
+    /// realtime-unaware endpoint (404), or a server error (5xx) are told apart — the difference between
+    /// "fix your key" and "this gateway can't do realtime transcription". `currentRequest` is redacted
+    /// (the host only): a base URL can carry credentials in its query.
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let http = task.response as? HTTPURLResponse, http.statusCode != 101 else { return }
+        let code = http.statusCode
+        let hint = openaiHandshakeHint(code)
+        q.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            elog("openailive[\(self.label)] handshake failed: HTTP \(code)\(hint) (host=\(task.currentRequest?.url?.host ?? "?"))")
+            self.onUpdate("OpenAI: HTTP \(code)\(hint)", true)
         }
     }
 }
