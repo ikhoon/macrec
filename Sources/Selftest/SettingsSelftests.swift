@@ -161,6 +161,18 @@ func settingsSelftests(_ check: (String, Bool) -> Void) {
           && captionTextNeedsBackplate(backdropAlpha: 0.5)
           && captionTextNeedsBackplate(backdropAlpha: 0.99)
           && !captionTextNeedsBackplate(backdropAlpha: 1.0))
+    // In-app Log window: the filter is a case-insensitive substring; a blank filter keeps everything.
+    let logSample = ["openailive[me] connecting", "echo(speex): cumIn=1", "keychain: read failed", "ECHO loud"]
+    check("log filter: case-insensitive substring, blank keeps all",
+          logLinesFiltered(logSample, filter: "openai") == ["openailive[me] connecting"]
+          && logLinesFiltered(logSample, filter: "ECHO").count == 2   // "echo(speex)" + "ECHO loud"
+          && logLinesFiltered(logSample, filter: "  ") == logSample
+          && logLinesFiltered(logSample, filter: "nomatch").isEmpty)
+    // The log ring is bounded — a flood of lines (the echo canceller prints often) can't grow it forever.
+    LogBuffer.clear()
+    for i in 0..<(LogBuffer.cap + 500) { LogBuffer.append("line \(i)") }
+    check("log buffer: bounded to its cap under a flood", LogBuffer.countForTest() == LogBuffer.cap)
+    LogBuffer.clear()
     check("live: overlay opacity spans a fully transparent backdrop to a fully opaque one",
           captionBackdropAlpha(0.0) == 0.0 && captionBackdropAlpha(1.0) == 1.0
           && captionBackdropAlpha(0.3) == 0.3
@@ -366,6 +378,23 @@ func settingsSelftests(_ check: (String, Bool) -> Void) {
           tapExclusionIsStale(current: [222], live: [111])          // relaunch — the reported bug
           && tapExclusionIsStale(current: [111], live: [])          // launched after the tap was built
           && !tapExclusionIsStale(current: [111, 222], live: [222, 111]))   // same set, any order
+    // Credentials are a 0600 file now, not the login keychain (which re-prompted "allow access" on every
+    // rebuild — the modern SecItemAdd ignores a custom ACL). Exercise the real read/write path against a
+    // throwaway file: set → get round-trips, exists reflects it, empty removes, and the file is 0600.
+    do {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("mr-cred-\(UUID().uuidString).json")
+        let wasDisabled = Keychain.disabled
+        Keychain.disabled = false; Keychain.fileOverrideForTest = tmp; Keychain.forgetCacheForTest()
+        _ = Keychain.set("openai", "sk-test-123")
+        let got = Keychain.get("openai"), has = Keychain.exists("openai"), missing = Keychain.exists("deepl")
+        _ = Keychain.set("openai", "")   // empty removes the key
+        let cleared = Keychain.get("openai")
+        let perms = (try? FileManager.default.attributesOfItem(atPath: tmp.path)[.posixPermissions] as? NSNumber)??.intValue
+        try? FileManager.default.removeItem(at: tmp)
+        Keychain.fileOverrideForTest = nil; Keychain.disabled = wasDisabled; Keychain.forgetCacheForTest()
+        check("cred: 0600 file store round-trips (set/get/exists/remove), never touches the keychain",
+              got == "sk-test-123" && has && !missing && cleared == nil && perms == 0o600)
+    }
     // Sidebar selection is app state, not focus state: the accent pill must survive AppKit
     // clearing isEmphasized when focus moves to a text field (it looked like a random blue blink).
     let sidebarRow = SidebarRowView()
