@@ -15,6 +15,7 @@
   <img src="https://img.shields.io/badge/privacy-on--device_by_default-2ea44f" alt="privacy: on-device by default">
   <img src="https://img.shields.io/badge/install-brew-FBB040?logo=homebrew&logoColor=white" alt="install: brew">
   <img src="https://img.shields.io/badge/transcription-whisper.cpp-4b8bbe" alt="transcription: whisper.cpp">
+  <a href="https://codecov.io/gh/ikhoon/macrec"><img src="https://codecov.io/gh/ikhoon/macrec/graph/badge.svg" alt="coverage"></a>
 </p>
 
 An always-on macOS **menu-bar app** (with a CLI) that continuously records your **microphone + system audio**, splits the day into **hourly segments**, and **transcribes** the hours that actually contain speech using `whisper.cpp` with **Voice Activity Detection**. Transcripts land as timestamped Markdown in a folder you choose.

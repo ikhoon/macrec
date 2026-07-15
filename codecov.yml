@@ -1,0 +1,23 @@
+# Coverage is INFORMATIONAL, not a merge gate. macrec is heavy on AppKit / CoreAudio / EventKit / network
+# integration that XCTest cannot drive headlessly, so a large part of the tree is structurally untestable in
+# CI. Codecov tracks the pure-logic layer (the <module>Selftests closures, surfaced via the XCTest bridge)
+# so a regression THERE is visible on the PR — without failing PRs on the untestable integration code.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "reach, diff, files"
+  require_changes: false
+
+# Not production code: the selftest closures ARE the tests (the shipped `macrec selftest` runs them, XCTest
+# bridges to them); the thin @main and the XCTest target aren't under test themselves.
+ignore:
+  - "Tests"
+  - "Sources/Selftest"
+  - "Cli"
