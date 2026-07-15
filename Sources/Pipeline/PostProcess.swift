@@ -22,7 +22,10 @@ enum SummaryRunner: String, CaseIterable { case claude, codex, gemini }
 
 /// The built-in summary prompt — the turn-key default (editable in Settings). Answering in the
 /// transcript's own language keeps it correct for mixed ko/en/ja meetings.
-let defaultSummaryPrompt = "Summarize this meeting transcript: key points, decisions made, and action items with owners. Answer in the same language as the transcript."
+let defaultSummaryPrompt = "Summarize this meeting transcript: key points, decisions made, and action items "
+    + "with owners. If the file includes a calendar meeting-notes section, use it as context (agenda, "
+    + "attendees, terminology) and note anything planned there that was not discussed. Answer in the same "
+    + "language as the transcript."
 
 /// Where the automatic summary lands. A dedicated output dir mirrors the transcripts' monthly
 /// layout with the PLAIN transcript name (`<dir>/YYYY-MM/<name>.md` — the folder already says

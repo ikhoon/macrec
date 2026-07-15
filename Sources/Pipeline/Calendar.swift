@@ -60,6 +60,14 @@ func meetingActiveNow(_ events: [EventCandidate], now: Date, padding: TimeInterv
 
 /// The calendar gate's padding in seconds, clamped to [0, 24h] so a huge pref value can't overflow the
 /// `Int × 60` (Swift traps on overflow) nor make the gate absurdly always-on. Pure + selftested.
+/// The calendar event's notes, prepared for embedding in a transcript: trimmed, nil when empty, and
+/// capped — meeting invites often carry pages of dial-in boilerplate that would drown the transcript.
+/// Pure + selftested.
+func calendarNotesForTranscript(_ raw: String?, cap: Int = 4000) -> String? {
+    guard let t = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return nil }
+    return t.count <= cap ? t : String(t.prefix(cap)) + "…"
+}
+
 func calendarPadSeconds(_ minutes: Int) -> TimeInterval {
     TimeInterval(max(0, min(minutes, 1440)) * 60)
 }
@@ -102,8 +110,9 @@ enum CalendarLookup {
     }
 
     /// `start` is the EVENT's start (not the segment's) — a transcript stamps itself with the meeting's
-    /// time when one maps. See `transcriptStart`.
-    struct Match { let title: String; let link: String?; let attendees: [String]; let start: Date }
+    /// time when one maps. See `transcriptStart`. `notes` is the event's body (agenda/메모), attached to
+    /// the transcript so the summarizer gets the meeting's context alongside what was said.
+    struct Match { let title: String; let link: String?; let attendees: [String]; let start: Date; let notes: String? }
 
     /// QA seam: when set, `match` selects from these candidates instead of querying EventKit — a scenario
     /// drives titling through the real `process()` path with deterministic events, no calendar access.
@@ -149,7 +158,7 @@ enum CalendarLookup {
         if let ov = eventsOverrideForTest {
             guard let i = bestEventIndex(segStart: start, segEnd: end, candidates: ov) else { return nil }
             let c = ov[i]
-            return Match(title: c.title, link: nil, attendees: [], start: c.start)
+            return Match(title: c.title, link: nil, attendees: [], start: c.start, notes: nil)
         }
         guard authorized else { return nil }
         let pred = store.predicateForEvents(withStart: start.addingTimeInterval(-300), end: end.addingTimeInterval(60), calendars: selectedCalendars)
@@ -174,6 +183,7 @@ enum CalendarLookup {
         guard let i = bestEventIndex(segStart: start, segEnd: end, candidates: candidates) else { return nil }
         let chosen = events[i]
         let names = (chosen.attendees ?? []).compactMap { $0.name }.filter { !$0.isEmpty }
-        return Match(title: chosen.title, link: link(chosen), attendees: names, start: chosen.startDate)
+        return Match(title: chosen.title, link: link(chosen), attendees: names, start: chosen.startDate,
+                     notes: chosen.notes)
     }
 }
