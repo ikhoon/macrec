@@ -201,6 +201,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         grantItem = grant
         menu.addItem(grant)
         menu.addItem(item("Settings…", #selector(openSettings), ",", symbol: "gearshape"))
+        menu.addItem(item("Library…", #selector(openLibrary), "l", symbol: "books.vertical"))
         menu.addItem(item("Open transcripts folder", #selector(openTranscripts), "o", symbol: "folder"))
         menu.addItem(item("Show log", #selector(showLog), symbol: "text.alignleft"))
         menu.addItem(.separator())
@@ -352,6 +353,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
                 self?.lastSavedLine.title = "✓ \(msg)"; self?.lastSavedLine.isHidden = false
                 if self?.paused == false { self?.statusLine.title = "● Recording · mic + system audio" }
                 self?.pushFlushOutcomeIfNeeded(msg)
+                LibraryWindow.shared.noteLibraryChanged()   // a new file just landed — refresh the open library
             }
         }
         engine = eng
@@ -393,6 +395,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         case .noMeeting: return "no live calendar meeting"
         }
     }
+
+    @objc private func openLibrary() { LibraryWindow.shared.show() }
 
     @objc private func flushNow() {
         guard engine != nil, !paused, !flushBusy else { return }   // busy = one flush at a time
