@@ -76,6 +76,13 @@ concise and specific to macrec; don't pad the file with generic advice.
    folder, a file name, a prompt, a schedule — must be overridable in Settings. Design the UX so the
    default is visible (as a placeholder / prefilled value) and the override is one control away.
    macrec's job is to create the month folder, not to choose where it lives or what the file is called.
+11. **A fixture must share the physics of the real input.** A signal-analysis test fed synthetic data
+   proves nothing unless the data behaves like the real thing. The speech-run metric was pinned green
+   for weeks by `Array(repeating: 0.5, …)` fixtures — DC steps that sit above the threshold forever —
+   while every REAL signal crosses zero each half-cycle, so the metric scored all real audio 0 s and
+   every uncalendared call was silently discarded. Audio fixtures oscillate (sines, bursts, pops);
+   before pinning a detector, run it once against a real capture and check the answer is even possible.
+   *(speechSeconds ≡ 0; the 180 s → 15 s "fix" changed nothing because 0 < 15.)*
 
 ## 3. CS fundamentals we hold ourselves to
 
