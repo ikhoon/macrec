@@ -257,7 +257,7 @@ final class RecordingEngine {
     // speech, no-meeting cutoff) step aside — an explicit request is honored, and only a genuinely
     // empty transcription is still discarded. A manual flush once died to the no-meeting rule (user P1).
     func process(_ seg: CompletedSegment, manual: Bool = false) {
-        elog("engine: segment \(segFormatter().string(from: seg.start)) — voiced mic=\(String(format: "%.1f", seg.micVoicedSeconds))s sys=\(String(format: "%.1f", seg.sysVoicedSeconds))s (micPeak=\(String(format: "%.3f", seg.micPeak)) sysPeak=\(String(format: "%.3f", seg.sysPeak))) dur=\(Int(seg.durationSeconds))s")
+        elog("engine: segment \(segFormatter().string(from: seg.start)) — voiced mic=\(String(format: "%.1f", seg.micVoicedSeconds))s sys=\(String(format: "%.1f", seg.sysVoicedSeconds))s speech mic=\(String(format: "%.1f", seg.micSpeechSeconds))s sys=\(String(format: "%.1f", seg.sysSpeechSeconds))s (micPeak=\(String(format: "%.3f", seg.micPeak)) sysPeak=\(String(format: "%.3f", seg.sysPeak))) dur=\(Int(seg.durationSeconds))s")
         // Dead/misrouted input detector: the ENERGY gate says the mic was active, but nothing held
         // above the threshold for speech-length runs — clicks/hum, not a voice. Surface it instead
         // of silently discarding "no speech" segments for hours (the jack-input incident).

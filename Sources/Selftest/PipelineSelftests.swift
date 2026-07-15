@@ -442,20 +442,39 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
                          now: schedDate("2026-07-08 10:30")) == .distantFuture                             // calendar-only: Resume must hold
           && overrideExpiry(RecordSchedule.from(enabled: true, days: "mon-fri", hours: "10:00-19:00"),
                             now: schedDate("2026-07-08 10:30")) != .distantFuture)                         // real schedule DOES flip
-    // Dead-mic detection — the jack-input incident: hours of segments "voiced" by clicks
-    // (energy-gate trips) while containing zero speech-length runs, all discarded silently.
-    check("mic guard: speech-run accounting (clicks never qualify, speech does)",
-          speechlikeFrames(Array(repeating: 0.5, count: 799) + [0.0]) == 0        // 49.9 ms — just under
-          && speechlikeFrames(Array(repeating: 0.5, count: 800)) == 800           // 50 ms run qualifies fully
-          && speechlikeFrames(Array(repeating: 0.5, count: 1200)) == 1200
-          && speechlikeFrames((0..<8000).map { $0 % 100 < 8 ? 0.5 : 0.0 }) == 0   // click train
-          && speechlikeFrames(Array(repeating: 0.5, count: 900) + Array(repeating: 0.0, count: 100)
-                              + Array(repeating: 0.5, count: 900)) == 1800)       // two syllables
+    // Speech-run accounting — MUST be fed oscillating audio, not DC steps. The 2026-07-15 incident:
+    // the old per-sample run metric was pinned green with Array(repeating: 0.5, …) fixtures, which
+    // never cross zero — real audio does every half-cycle, so the metric scored every real recording
+    // 0 s (a real meeting's longest sample run: 83 samples = 5 ms) and every uncalendared call was
+    // discarded by the no-meeting gate. The envelope metric must pass a sine where samples fail.
+    let sine: (Int) -> [Float] = { n in (0..<n).map { sinf(Float($0) * 0.13) * 0.3 } }   // ~331 Hz, amp 0.3
+    check("mic guard: envelope speech-run accounting (sine qualifies, clicks and blips never)",
+          speechlikeFrames(sine(16000)) == 15872                                  // 1 s sine = 62 full blocks, all speech
+          && speechlikeFrames(sine(15 * 256) + [Float](repeating: 0, count: 256)) == 0   // 240 ms — just under the run bar
+          && speechlikeFrames(sine(16 * 256)) == 16 * 256                          // 256 ms — qualifies exactly
+          && speechlikeFrames((0..<80000).map { $0 % 3200 == 0 ? 0.9 : 0.0 }) == 0 // isolated pops (jack incident)
+          && speechlikeFrames((0..<16000).map { sinf(Float($0) * 0.13) * 0.01 }) == 0   // below the energy floor
+          && speechlikeFrames(sine(6400) + [Float](repeating: 0, count: 1600) + sine(6400)) == 12800)  // two utterances
+    // DENSE click train — 8 hot samples in every 100: its block RMS clears the energy bar, so the
+    // review round proved RMS-only scoring would count 99% of it as speech. The ≥¼-of-samples duty
+    // floor is what rejects it (voiced speech keeps ≥ half its samples above the floor). And a
+    // corrupt sample must poison nothing in either direction: a NaN inside real speech keeps the
+    // block voiced; a stray Inf in silence must not fabricate one.
+    var nanSpeech = sine(16 * 256); nanSpeech[100] = .nan
+    var infSilence = [Float](repeating: 0, count: 16 * 256)
+    for i in stride(from: 0, to: infSilence.count, by: 256) { infSilence[i] = .infinity }
+    check("mic guard: dense click trains, NaN and Inf never score as speech",
+          speechlikeFrames((0..<8000).map { $0 % 100 < 8 ? 0.5 : 0.0 }) == 0
+          && speechlikeFrames(nanSpeech) == 16 * 256
+          && speechlikeFrames(infSilence) == 0)
     check("mic guard: dead-input verdict (energy without speech runs)",
-          micLooksDead(voiced: 44.1, speech: 0.1)      // the real incident segment
-          && !micLooksDead(voiced: 22.4, speech: 8.0)  // real speech
-          && !micLooksDead(voiced: 3.0, speech: 0.0)   // quiet hour — no verdict
-          && !micLooksDead(voiced: 6.0, speech: 0.6))  // borderline but speech present
+          micLooksDead(voiced: 44.1, speech: 0.1)       // the real incident segment
+          && micLooksDead(voiced: 14.7, speech: 0.0)    // 2026-07-15 22:00 — clicks, caught live
+          && !micLooksDead(voiced: 22.4, speech: 8.0)   // real speech
+          && !micLooksDead(voiced: 52.1, speech: 35.2)  // 2026-07-15 standup — the metric bug made this warn
+          && !micLooksDead(voiced: 3.0, speech: 0.0)    // quiet hour — no verdict
+          && !micLooksDead(voiced: 8.0, speech: 0.0)    // backchannel-only hour (short utterances) — no cry-wolf
+          && !micLooksDead(voiced: 6.0, speech: 0.6))   // borderline but speech present
     // Hallucination scrubbing — the exact failure classes from our junk transcripts:
     // a broadcast hour where one sentence repeated for 15 minutes, YouTube-outro
     // boilerplate on quiet rooms, "oh oh oh…" degeneration. Real speech must survive.

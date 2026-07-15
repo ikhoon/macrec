@@ -88,22 +88,23 @@ func scenarioSelftests(_ check: (String, Bool) -> Void) {
                          audioRawDays: 0, audioRetentionDays: 0, transcriptRetentionDays: 0,
                          excludeBundleIds: [])
         }
-        // Speech-shaped fixture: 10 s of 0.3-amplitude sine bursts (200 ms on / 100 ms off) through the
-        // REAL SourceWriter VAD; the sys side stays silent. Stats come from the writers, not hand-picked.
-        func writeFixtureWAVs(voiced: Bool) -> (mic: URL, sys: URL, micVoiced: Double, micSpeech: Double, micPeak: Float)? {
+        // Speech-shaped fixture: 0.3-amplitude sine bursts (400 ms on / 100 ms off — utterance-length,
+        // so the envelope speech detector sees them) through the REAL SourceWriter VAD; the sys side
+        // stays silent. Stats come from the writers, not hand-picked. reps × 500 ms of audio.
+        func writeFixtureWAVs(voiced: Bool, reps: Int = 20) -> (mic: URL, sys: URL, micVoiced: Double, micSpeech: Double, micPeak: Float)? {
             let micURL = wDir.appendingPathComponent("fix-\(UUID().uuidString).mic.wav")
             let sysURL = wDir.appendingPathComponent("fix-\(UUID().uuidString).sys.wav")
             guard let micW = try? SourceWriter(url: micURL), let sysW = try? SourceWriter(url: sysURL),
                   let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
-                  let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 4800) else { return nil }
-            buf.frameLength = 4800   // 300 ms: 200 ms burst + 100 ms silence
-            for rep in 0..<33 {      // ~10 s
-                for i in 0..<4800 {
-                    let inBurst = i < 3200
-                    buf.floatChannelData![0][i] = (voiced && inBurst) ? sinf(Float(rep * 4800 + i) * 0.13) * 0.3 : 0
+                  let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 8000) else { return nil }
+            buf.frameLength = 8000   // 500 ms: 400 ms burst + 100 ms silence
+            for rep in 0..<reps {
+                for i in 0..<8000 {
+                    let inBurst = i < 6400
+                    buf.floatChannelData![0][i] = (voiced && inBurst) ? sinf(Float(rep * 8000 + i) * 0.13) * 0.3 : 0
                 }
                 micW.append(buf)
-                for i in 0..<4800 { buf.floatChannelData![0][i] = 0 }
+                for i in 0..<8000 { buf.floatChannelData![0][i] = 0 }
                 sysW.append(buf)
             }
             return (micURL, sysURL, micW.voicedSeconds, micW.speechSeconds, micW.peak)
@@ -179,6 +180,23 @@ func scenarioSelftests(_ check: (String, Bool) -> Void) {
             CalendarLookup.eventsOverrideForTest = nil
             check("scenario S-PIPELINE(d): a manual Transcribe-now bypasses the hygiene gates",
                   fm.fileExists(atPath: tDir.appendingPathComponent("2026-03/2026-03-01-1500.md").path))
+        }
+        // (e) THE lost-call incident, auto path: an uncalendared segment with ~16 s of real oscillating
+        // speech must be KEPT by the no-meeting gate — no manual bypass. The old per-sample speech-run
+        // metric scored ALL real audio 0 s (a sine crosses the threshold every half-cycle, so a 50 ms
+        // sample run is physically impossible) and every uncalendared call was silently discarded, even
+        // after the bar dropped 180 s → 15 s. The stats here come from the REAL SourceWriter.
+        if let fix = writeFixtureWAVs(voiced: true, reps: 50) {   // 25 s: 20 s of bursts → ~20 s speech-run
+            CalendarLookup.eventsOverrideForTest = []   // no meeting overlaps the segment
+            let engine = RecordingEngine(cfg: cfg(model: model.path, calendarTitles: true))
+            engine.process(segment(fix, start: date("2026-03-01 16:00:00")))
+            CalendarLookup.eventsOverrideForTest = nil
+            let out = tDir.appendingPathComponent("2026-03/2026-03-01-1600.md")
+            let body = (try? String(contentsOf: out, encoding: .utf8)) ?? ""
+            // ≥18 s: the fixture really measures ~20.6 s — a bound near the 15 s gate would let an
+            // accounting regression that undercounts by a quarter slip through green.
+            check("scenario S-PIPELINE(e): an uncalendared call with real speech is kept by the auto path",
+                  fix.micSpeech >= 18 && body.contains("안녕하세요"))
         }
         Notifier.sinkForTest = nil
         try? fm.removeItem(at: scratch)
