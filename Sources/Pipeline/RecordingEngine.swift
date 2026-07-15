@@ -397,7 +397,8 @@ final class RecordingEngine {
             modelName: URL(fileURLWithPath: cfg.whisperModel).lastPathComponent,
             audioLine: audioLine, meta: meta, excludes: cfg.excludeBundleIds.joined(separator: ", "),
             bodyMine: bodyMine, bodyTheirs: bodyTheirs,
-            body: body)
+            body: body,
+            eventNotes: calendarNotesForTranscript(event?.notes))
         let mdURL = monthDir.appendingPathComponent("\(slug).md")
         try doc.markdown(l10n).write(to: mdURL, atomically: true, encoding: .utf8)
         elog("engine:   → transcript saved: \(mdURL.path)")

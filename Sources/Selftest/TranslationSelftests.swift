@@ -85,7 +85,7 @@ func translationSelftests(_ check: (String, Bool) -> Void) {
     let tDoc = TranscriptDoc(title: "T", day: "2026-07-05", hmStart: "10:00", hmEnd: "11:00", mins: 60,
                              micVoiced: 1.0, sysVoiced: 2.0, modelName: "m.bin",
                              audioLine: "- x", meta: "", excludes: "com.spotify.client",
-                             bodyMine: "나", bodyTheirs: "상대", body: "hello")
+                             bodyMine: "나", bodyTheirs: "상대", body: "hello", eventNotes: nil)
     let mdKo = tDoc.markdown(.forLanguage("ko")), mdEn = tDoc.markdown(.forLanguage("en")), mdJa = tDoc.markdown(.forLanguage("ja"))
     check("transcript md: section localized",
           mdKo.contains("## 전사 (transcript)") && mdEn.contains("## Transcript") && mdJa.contains("## 文字起こし"))
@@ -95,6 +95,19 @@ func translationSelftests(_ check: (String, Bool) -> Void) {
           mdEn.contains("나 = microphone") && mdEn.contains("Excluded: com.spotify.client"))
     check("transcript md: workflow footer removed",
           !mdKo.contains("자동 생성") && !mdKo.contains("topics/") && !mdEn.contains("topics/"))
+    // Calendar meeting notes ride the transcript (context for the reader AND the summarizer): a localized
+    // section when the event has notes, and no stray heading when it doesn't.
+    var tDocN = tDoc; tDocN.eventNotes = "agenda: ship v2"
+    check("transcript md: calendar notes get a localized section, absent notes leave no heading",
+          tDocN.markdown(.forLanguage("ko")).contains("## 미팅 노트 (calendar)\n\nagenda: ship v2")
+          && tDocN.markdown(.forLanguage("en")).contains("## Meeting notes (calendar)\n\nagenda: ship v2")
+          && !mdEn.contains("Meeting notes"))
+    // The notes are trimmed, nil when empty, and capped so invite boilerplate can't drown the transcript.
+    check("transcript md: calendar notes trimmed / empty→nil / capped",
+          calendarNotesForTranscript("  agenda \n") == "agenda"
+          && calendarNotesForTranscript("   \n ") == nil && calendarNotesForTranscript(nil) == nil
+          && calendarNotesForTranscript(String(repeating: "a", count: 5000))!.count == 4001
+          && calendarNotesForTranscript(String(repeating: "a", count: 5000))!.hasSuffix("…"))
     check("transcript l10n: failure + unknown lang fallback",
           TranscriptL10n.forLanguage("ko").failureNote(model: "m").contains("전사 실패")
           && TranscriptL10n.forLanguage("fr").section == "## Transcript"

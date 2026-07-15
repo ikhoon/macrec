@@ -1093,18 +1093,22 @@ struct TranscriptL10n {
     let audio: String, audioNotKept: String
     let meetingLink: String, attendees: String, tags: String
     let section: String              // the transcript heading ("## …")
+    let notesSection: String         // the calendar meeting-notes heading ("## …")
 
     static func forLanguage(_ raw: String?) -> TranscriptL10n {
         switch raw.map({ String($0.lowercased().prefix(2)) }) {
         case "ko": return .init(code: "ko", autoTitle: "자동 전사", time: "시각", speech: "발화", model: "모델",
                                 audio: "오디오", audioNotKept: "_(보관 안 함)_", meetingLink: "회의 링크",
-                                attendees: "참석자", tags: "태그", section: "## 전사 (transcript)")
+                                attendees: "참석자", tags: "태그", section: "## 전사 (transcript)",
+                                notesSection: "## 미팅 노트 (calendar)")
         case "ja": return .init(code: "ja", autoTitle: "自動文字起こし", time: "時刻", speech: "発話", model: "モデル",
                                 audio: "音声", audioNotKept: "_(保存なし)_", meetingLink: "会議リンク",
-                                attendees: "参加者", tags: "タグ", section: "## 文字起こし (transcript)")
+                                attendees: "参加者", tags: "タグ", section: "## 文字起こし (transcript)",
+                                notesSection: "## ミーティングノート (calendar)")
         default:   return .init(code: "en", autoTitle: "Auto transcript", time: "Time", speech: "Speech", model: "Model",
                                 audio: "Audio", audioNotKept: "_(not kept)_", meetingLink: "Meeting link",
-                                attendees: "Attendees", tags: "Tags", section: "## Transcript")
+                                attendees: "Attendees", tags: "Tags", section: "## Transcript",
+                                notesSection: "## Meeting notes (calendar)")
         }
     }
     /// The configured code: an EXPLICITLY saved value (even empty = "follow the system language")
@@ -1153,9 +1157,11 @@ struct TranscriptDoc {
     var audioLine: String, meta: String, excludes: String
     var bodyMine: String, bodyTheirs: String
     var body: String
+    var eventNotes: String?   // the calendar event's notes — context the summarizer reads too
 
     func markdown(_ t: TranscriptL10n) -> String {
-        """
+        let notesBlock = eventNotes.map { "\n\(t.notesSection)\n\n\($0)\n" } ?? ""
+        return """
         # \(day) \(hmStart)–\(hmEnd) — \(title)
 
         \(t.recordingNote(mine: bodyMine, theirs: bodyTheirs, excludes: excludes))
@@ -1164,7 +1170,7 @@ struct TranscriptDoc {
         - \(t.speech): mic \(String(format: "%.1f", micVoiced))s · sys \(String(format: "%.1f", sysVoiced))s · \(t.model): `\(modelName)`
         \(audioLine)\(meta)
         - \(t.tags): #transcript #auto
-
+        \(notesBlock)
         \(t.section)
 
         \(body)
