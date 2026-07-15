@@ -92,6 +92,18 @@ func dailyDigestOutputPath(day: String, outDir: String, summaryOutDir: String, t
         .appendingPathComponent(dailyDigestFileName(day: day, template: nameTemplate)).path
 }
 
+/// The `> .partial && promote` tail shared by the summary and digest invocations, now prepending an H1
+/// equal to the FILE name (user rule: the runner's output carries no reliable title of its own). The H1
+/// is composed only AFTER the runner succeeds — a failed run's .partial must keep the runner's own words
+/// for reapFailedPostProcess, not a header line masquerading as the reason. Pure + selftested.
+func titledPromoteTail(runnerCmd: String, outPath: String) -> String {
+    let title = URL(fileURLWithPath: outPath).deletingPathExtension().lastPathComponent
+    let partial = outPath + ".partial", staged = outPath + ".partial2"
+    return "\(runnerCmd) > \(shq(partial))"
+        + " && { printf '# %s\\n\\n' \(shq(title)); cat \(shq(partial)); } > \(shq(staged))"
+        + " && mv \(shq(staged)) \(shq(outPath)) && rm -f \(shq(partial))"
+}
+
 /// Shell invocation for the digest: cat the day's inputs into the summary runner, atomic promote.
 /// Same runner CLI templates and .partial contract as the per-meeting summary. Pure + testable.
 func dailyDigestInvocation(runner: SummaryRunner, prompt: String, inputs: [String], outPath: String) -> String? {
@@ -104,8 +116,7 @@ func dailyDigestInvocation(runner: SummaryRunner, prompt: String, inputs: [Strin
     case .gemini: runnerCmd = "\(cat) | gemini -p \(shq(prompt))"
     case .codex:  runnerCmd = "{ printf '%s\\n\\n' \(shq(prompt)); \(cat); } | codex exec -"
     }
-    return "mkdir -p \(shq(dir)) && \(runnerCmd) "
-         + "> \(shq(outPath + ".partial")) && mv \(shq(outPath + ".partial")) \(shq(outPath))"
+    return "mkdir -p \(shq(dir)) && " + titledPromoteTail(runnerCmd: runnerCmd, outPath: outPath)
 }
 
 /// What post-processing is doing right now. Without this the pipeline is a black box: a summary runs

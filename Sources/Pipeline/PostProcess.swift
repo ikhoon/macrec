@@ -69,8 +69,9 @@ func postProcessInvocation(mode: PostProcessMode, runner: SummaryRunner, prompt:
         case .codex:  runnerCmd = "{ printf '%s\\n\\n' \(shq(effective)); cat \(shq(transcriptPath)); } | codex exec -"
         }
         // The output dir may not exist (review finding: the redirect just failed); and a failed run
-        // must not leave a misleading empty .summary.md — write .partial, promote only on success.
-        return "mkdir -p \(shq(dir)) && \(runnerCmd) > \(shq(out + ".partial")) && mv \(shq(out + ".partial")) \(shq(out))"
+        // must not leave a misleading empty summary — write .partial, promote (with the file-name H1)
+        // only on success. See titledPromoteTail.
+        return "mkdir -p \(shq(dir)) && " + titledPromoteTail(runnerCmd: runnerCmd, outPath: out)
     }
 }
 
