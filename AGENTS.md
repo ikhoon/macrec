@@ -83,6 +83,12 @@ concise and specific to macrec; don't pad the file with generic advice.
    every uncalendared call was silently discarded. Audio fixtures oscillate (sines, bursts, pops);
    before pinning a detector, run it once against a real capture and check the answer is even possible.
    *(speechSeconds ≡ 0; the 180 s → 15 s "fix" changed nothing because 0 < 15.)*
+12. **A P0 fix lands WITH the test that pins it — in the same commit, no exceptions.** #132's
+   `muteBehavior = .unmuted` (the one line keeping every tapped app audible on macOS 26) shipped
+   without a guard and was swept away by a revert-refactor within hours — Zoom played to a dead
+   speaker for an evening, and the wedged output route survived a coreaudiod restart. An unpinned
+   fix is one refactor away from re-shipping its P0; "the comment explains it" is not a pin — the
+   comment survived while the line it described was deleted.
 
 ## 3. CS fundamentals we hold ourselves to
 
