@@ -117,10 +117,15 @@ func effectivePostProcessMode(rawMode: String, shellCmd: String) -> PostProcessM
 /// an explicit request outranks the hygiene rules (a manual flush once died to them; user P1). Otherwise
 /// a segment that overlapped a calendar MEETING is kept, and an ad-hoc recording needs at least
 /// `minNonMeetingSeconds` of speech — 15 s (user pick; the old 3-minute bar swallowed a real
-/// uncalendared call), enough to shed doorway blips and passing videos. Pure + selftested.
-func shouldKeepTranscript(hasMeeting: Bool, speechSeconds: Double, manual: Bool = false,
-                          minNonMeetingSeconds: Double = 15) -> Bool {
+/// uncalendared call), enough to shed doorway blips and passing videos. The compound arm covers
+/// the sparse-utterance PHONE CALL (measured 2026-07-16: a real call scored voiced 65.3 s but
+/// only 8.0 s of ≥256 ms speech runs — short backchannels — and was discarded): genuine sustained
+/// speech exists (≥5 s, clicks score ~0) AND the mic was busy for ≥45 s. The click-hour incident
+/// (voiced 14–50 s, speech ≈0) still fails the speech arm. Pure + selftested with those numbers.
+func shouldKeepTranscript(hasMeeting: Bool, speechSeconds: Double, voicedSeconds: Double = 0,
+                          manual: Bool = false, minNonMeetingSeconds: Double = 15) -> Bool {
     manual || hasMeeting || speechSeconds >= minNonMeetingSeconds
+        || (speechSeconds >= 5 && voicedSeconds >= 45)
 }
 
 /// Read the post-process prefs and build the invocation for a just-saved transcript.

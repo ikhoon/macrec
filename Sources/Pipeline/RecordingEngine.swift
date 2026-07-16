@@ -301,8 +301,10 @@ final class RecordingEngine {
             ? CalendarLookup.match(start: seg.start, end: seg.start.addingTimeInterval(seg.durationSeconds))
             : nil
         if cfg.useCalendarTitles {
-            guard shouldKeepTranscript(hasMeeting: meeting != nil, speechSeconds: seg.speechSeconds, manual: manual) else {
-                elog("engine:   → no meeting & speech \(String(format: "%.0f", seg.speechSeconds))s < 15s — discarding")
+            guard shouldKeepTranscript(hasMeeting: meeting != nil, speechSeconds: seg.speechSeconds,
+                                       voicedSeconds: seg.voicedSeconds, manual: manual) else {
+                elog("engine:   → no meeting & speech \(String(format: "%.0f", seg.speechSeconds))s < 15s"
+                    + " (voiced \(String(format: "%.0f", seg.voicedSeconds))s < 45s) — discarding")
                 onSegmentResult?("No meeting · short — skipped")
                 return
             }
@@ -364,6 +366,13 @@ final class RecordingEngine {
         guard let summaryOut, FileManager.default.fileExists(atPath: summaryOut) else { return }
         let stem = transcript.deletingPathExtension().lastPathComponent
         guard isUntitledStem(stem) else { return }
+        // A near-empty summary has nothing to name (a manual flush of a silent segment produced a
+        // garbage English title in production) — the runner also answers NONE, but don't even ask.
+        let bytes = ((try? FileManager.default.attributesOfItem(atPath: summaryOut))?[.size] as? Int) ?? 0
+        guard bytes >= 200 else {
+            elog("title: summary too small (\(bytes) B) — leaving \(stem) untitled")
+            return
+        }
         let runner = SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude
         let cmd = titleExtractionInvocation(runner: runner, summaryPath: summaryOut)
         runCommandCapturingOutput(cmd) { [weak self] status, raw in

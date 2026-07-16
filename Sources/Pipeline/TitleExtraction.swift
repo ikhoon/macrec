@@ -34,6 +34,9 @@ func cleanExtractedTitle(_ raw: String) -> String? {
     while let l = t.last, "\"'“”‘’.。!?*`「」[](){}".contains(l) { t.removeLast() }
     t = t.split(separator: " ").joined(separator: " ")
     guard !t.isEmpty, t.count <= 80, t.contains(where: { $0.isLetter || $0.isNumber }) else { return nil }
+    // The prompt's no-content protocol — an empty recording once got literally named
+    // "Empty-recording-no-meeting-content" in production; NONE means leave it untitled.
+    guard t.uppercased() != "NONE" else { return nil }
     return t
 }
 
@@ -41,7 +44,8 @@ func cleanExtractedTitle(_ raw: String) -> String? {
 /// (and the same PATH/auth environment) as the summary itself.
 func titleExtractionInvocation(runner: SummaryRunner, summaryPath: String) -> String {
     let prompt = "Reply with ONLY a concise title (2-6 words) for this meeting note, in the note's "
-        + "own language. No quotes, no trailing punctuation, no explanations."
+        + "own language. No quotes, no trailing punctuation, no explanations. If the note has no "
+        + "meaningful meeting content, reply with exactly: NONE"
     let cat = "cat \(shq(summaryPath))"
     switch runner {
     case .claude: return "\(cat) | claude -p \(shq(prompt))"

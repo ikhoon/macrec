@@ -287,7 +287,10 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
               && cleanExtractedTitle("# Title!") == "Title"
               && cleanExtractedTitle("") == nil
               && cleanExtractedTitle("!!! …") == nil
-              && cleanExtractedTitle(String(repeating: "x", count: 200)) == nil)
+              && cleanExtractedTitle("NONE") == nil // the no-content protocol (live: an empty flush got named)
+              && cleanExtractedTitle("\"none.\"") == nil
+              && cleanExtractedTitle(String(repeating: "x", count: 200)) == nil
+              && titleExtractionInvocation(runner: .claude, summaryPath: "/s.md").contains("NONE"))
     do {
         let files = ["/t/2026-03/2026-03-01-1600.md", "/s/2026-03/2026-03-01-1600-sum.md",
                      "/a/2026-03/2026-03-01-1600.wav"]
