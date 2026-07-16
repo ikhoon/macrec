@@ -1419,6 +1419,16 @@ public enum App {
             2. Keep the tray menu; the desktop window is additive.
                - nested detail line
 
+            ## Action items
+
+            - [ ] draft the rollout plan — alex
+            - [x] book the follow-up — sam
+
+            | Owner | Item | Due |
+            |---|---|---|
+            | alex | rollout plan | Fri |
+            | sam | follow-up | done |
+
             ## Transcript
 
             [14:01:12] Me: 킥오프 시작하겠습니다.

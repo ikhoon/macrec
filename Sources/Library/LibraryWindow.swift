@@ -8,16 +8,23 @@ func libraryDayLabel(day: String, today: String, yesterday: String) -> String {
     day == today ? "Today — \(day)" : day == yesterday ? "Yesterday — \(day)" : day
 }
 
-/// One row's display text. The digest row names itself; a transcript row is time + title, with
-/// markers for what else exists ("which meetings got summarized / kept audio" reads at a glance);
-/// an audio-only row says so.
-func libraryRowText(_ e: LibraryEntry) -> String {
-    if e.kind == .digest { return "Daily digest" }
-    let name = e.title ?? "(untitled)"
-    if e.kind == .audio { return "\(e.time ?? "--:--")  \(name)  ♪ audio only" }
-    let sum = e.summaryURL != nil ? "  ✓ summary" : ""
-    let aud = e.audioURL != nil ? "  ♪" : ""
-    return "\(e.time ?? "--:--")  \(name)\(sum)\(aud)"
+/// One row's visual spec: a leading KIND icon (digest / meeting / audio-only read apart at a
+/// glance), the text, and trailing status icons ("summarized" sparkles, "audio kept" waveform).
+/// Pure so the icon/text decisions are selftested; the cell just materializes SF Symbols.
+struct LibraryRowSpec: Equatable {
+    var icon: String // SF Symbol name — the entry's kind
+    var text: String
+    var trailing: [String] // SF Symbol names — what else exists for this entry
+}
+
+func libraryRowSpec(_ e: LibraryEntry) -> LibraryRowSpec {
+    if e.kind == .digest { return LibraryRowSpec(icon: "newspaper", text: "Daily digest", trailing: []) }
+    let text = "\(e.time ?? "--:--")  \(e.title ?? "(untitled)")"
+    if e.kind == .audio { return LibraryRowSpec(icon: "waveform", text: text, trailing: []) }
+    var trailing: [String] = []
+    if e.summaryURL != nil { trailing.append("sparkles") }
+    if e.audioURL != nil { trailing.append("waveform") }
+    return LibraryRowSpec(icon: "text.bubble", text: text, trailing: trailing)
 }
 
 /// mm:ss (or h:mm:ss) for the player clock. Pure + selftested.
@@ -51,7 +58,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     private let searchField = NSSearchField()
     private let textView = NSTextView()
     private let headerLabel = NSTextField(labelWithString: "")
-    private let docPicker = NSSegmentedControl(labels: ["Transcript", "Summary"],
+    private let docPicker = NSSegmentedControl(labels: ["Summary", "Transcript"],
                                                trackingMode: .selectOne, target: nil, action: nil)
     private let openBtn = NSButton(title: "Open", target: nil, action: nil)
     private let revealBtn = NSButton(title: "Reveal in Finder", target: nil, action: nil)
@@ -107,7 +114,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     // MARK: build
 
     private func build() {
-        let w = EditKeyWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 540),
+        let w = EditKeyWindow(contentRect: NSRect(x: 0, y: 0, width: 1160, height: 720),
                               styleMask: [.titled, .closable, .resizable, .miniaturizable],
                               backing: .buffered, defer: false)
         w.title = "macrec library"
@@ -115,6 +122,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         w.isReleasedWhenClosed = false
         w.delegate = self
         w.minSize = NSSize(width: 640, height: 360)
+        // The 1160×720 default is a suggestion — the user's own size/position wins across opens.
+        w.setFrameAutosaveName("libraryWindow")
         let content = NSView()
 
         searchField.translatesAutoresizingMaskIntoConstraints = false
@@ -281,20 +290,23 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
                                   yesterday: Self.dayString(Date().addingTimeInterval(-86400)))
         // The sidebar already shows the day — the header spends its width on the title (the
         // "day · time" prefix squeezed real titles down to four characters next to the buttons).
-        headerLabel.stringValue = libraryRowText(e)
-        headerLabel.toolTip = "\(day) · \(libraryRowText(e))"
+        let spec = libraryRowSpec(e)
+        headerLabel.stringValue = spec.text
+        headerLabel.toolTip = "\(day) · \(spec.text)"
         docPicker.isHidden = e.summaryURL == nil
-        if docPicker.selectedSegment < 0 { docPicker.selectedSegment = 0 }
+        // Summary first: the distilled note is what the user reaches for; the raw transcript is
+        // the appendix. The picker defaults to Summary whenever one exists (segment 0 = Summary).
+        if !docPicker.isHidden { docPicker.selectedSegment = 0 }
         playerBar.isHidden = e.audioURL == nil
         openBtn.isEnabled = true
         revealBtn.isEnabled = true
         loadDoc()
     }
 
-    /// The URL the right pane is currently showing (transcript or its summary).
+    /// The URL the right pane is currently showing (summary first — segment 0 — or the transcript).
     private func currentDocURL() -> URL? {
         guard let e = selected else { return nil }
-        if !docPicker.isHidden, docPicker.selectedSegment == 1, let s = e.summaryURL { return s }
+        if !docPicker.isHidden, docPicker.selectedSegment == 0, let s = e.summaryURL { return s }
         return e.url
     }
 
@@ -462,28 +474,53 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         let cell = v.makeView(withIdentifier: id, owner: nil) as? NSTableCellView ?? {
             let c = NSTableCellView()
             c.identifier = id
+            let icon = NSImageView()
+            icon.translatesAutoresizingMaskIntoConstraints = false
+            icon.contentTintColor = .secondaryLabelColor
             let t = NSTextField(labelWithString: "")
             t.translatesAutoresizingMaskIntoConstraints = false
             t.lineBreakMode = .byTruncatingTail
+            c.addSubview(icon)
             c.addSubview(t)
+            c.imageView = icon
             c.textField = t
             NSLayoutConstraint.activate([
-                t.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 2),
+                icon.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 2),
+                icon.centerYAnchor.constraint(equalTo: c.centerYAnchor),
+                icon.widthAnchor.constraint(equalToConstant: 16),
+                t.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
                 t.trailingAnchor.constraint(equalTo: c.trailingAnchor, constant: -2),
                 t.centerYAnchor.constraint(equalTo: c.centerYAnchor),
             ])
             return c
         }()
         if let day = item as? LibraryDay {
+            cell.imageView?.image = nil
             cell.textField?.stringValue = libraryDayLabel(
                 day: day.day, today: Self.dayString(Date()),
                 yesterday: Self.dayString(Date().addingTimeInterval(-86400)))
             cell.textField?.font = NSFont.systemFont(ofSize: 11, weight: .bold)
             cell.textField?.textColor = .secondaryLabelColor
         } else if let e = item as? LibraryEntry {
-            cell.textField?.stringValue = libraryRowText(e)
-            cell.textField?.font = NSFont.systemFont(ofSize: 12)
-            cell.textField?.textColor = .labelColor
+            let spec = libraryRowSpec(e)
+            cell.imageView?.image = NSImage(systemSymbolName: spec.icon, accessibilityDescription: e.kind.rawValue)
+            let font = NSFont.systemFont(ofSize: 12)
+            let text = NSMutableAttributedString(string: spec.text, attributes: [
+                .font: font, .foregroundColor: NSColor.labelColor,
+            ])
+            // Trailing status icons ride inline as attachments, tinted like secondary text.
+            for symbol in spec.trailing {
+                let img = NSImage(systemSymbolName: symbol, accessibilityDescription: symbol)?
+                    .withSymbolConfiguration(.init(pointSize: 10, weight: .regular)
+                        .applying(.init(paletteColors: [.secondaryLabelColor])))
+                guard let img = img else { continue }
+                let att = NSTextAttachment()
+                att.image = img
+                att.bounds = NSRect(x: 0, y: -1, width: img.size.width, height: img.size.height)
+                text.append(NSAttributedString(string: "  "))
+                text.append(NSAttributedString(attachment: att))
+            }
+            cell.textField?.attributedStringValue = text
         }
         return cell
     }
