@@ -38,8 +38,11 @@ enum MarkdownRender {
             : text
         let out = NSMutableAttributedString()
         var inFence = false
-        for rawLine in normalized.components(separatedBy: "\n") {
-            let line = rawLine
+        let lines = normalized.components(separatedBy: "\n")
+        var i = 0
+        while i < lines.count {
+            let line = lines[i]
+            i += 1
             let trimmed = line.trimmingCharacters(in: .whitespaces)
 
             if trimmed.hasPrefix("```") {   // fence markers toggle the block and are not shown
@@ -64,6 +67,23 @@ enum MarkdownRender {
                 out.append(NSAttributedString(string: "──────────\n", attributes: [
                     .font: body, .foregroundColor: NSColor.separatorColor,
                 ]))
+                continue
+            }
+            // Pipe table: a |-row whose NEXT line is the |---|---| separator starts one; body rows
+            // follow until the first non-|-row. Anything malformed falls through to plain text.
+            if isTableRow(trimmed), i < lines.count,
+               isTableSeparator(lines[i].trimmingCharacters(in: .whitespaces)),
+               parseTableRow(lines[i].trimmingCharacters(in: .whitespaces)).count == parseTableRow(trimmed).count {
+                var rows = [parseTableRow(trimmed)]
+                var j = i + 1   // skip the separator line
+                while j < lines.count {
+                    let t = lines[j].trimmingCharacters(in: .whitespaces)
+                    guard isTableRow(t) else { break }
+                    rows.append(parseTableRow(t))
+                    j += 1
+                }
+                out.append(renderTable(rows, baseURL: baseURL))
+                i = j
                 continue
             }
             // Heading: 1–6 hashes, a space, then text.
@@ -95,10 +115,21 @@ enum MarkdownRender {
                 let indent = CGFloat(item.level) * 16
                 let para = style(firstIndent: indent, headIndent: indent + 18)
                 para.paragraphSpacing = 2
-                let marker = NSMutableAttributedString(string: item.marker + "  ", attributes: [
+                // Task-list items: "- [ ] track me" / "- [x] done" become checkbox rows — the
+                // summarizer emits action items in this shape so they stay trackable in the vault.
+                var markerGlyph = item.marker
+                var bodyText = item.text
+                var bodyColor = NSColor.labelColor
+                if bodyText.hasPrefix("[ ] ") {
+                    markerGlyph = "☐"; bodyText = String(bodyText.dropFirst(4))
+                } else if bodyText.lowercased().hasPrefix("[x] ") {
+                    markerGlyph = "☑"; bodyText = String(bodyText.dropFirst(4))
+                    bodyColor = .secondaryLabelColor   // done items read as done
+                }
+                let marker = NSMutableAttributedString(string: markerGlyph + "  ", attributes: [
                     .font: body, .foregroundColor: NSColor.secondaryLabelColor,
                 ])
-                marker.append(inline(item.text, font: body, color: .labelColor, baseURL: baseURL))
+                marker.append(inline(bodyText, font: body, color: bodyColor, baseURL: baseURL))
                 out.append(applying(para, to: marker))
                 out.append(NSAttributedString(string: "\n"))
                 continue
@@ -112,6 +143,60 @@ enum MarkdownRender {
             para.paragraphSpacing = 2
             out.append(applying(para, to: inline(trimmed, font: body, color: .labelColor, baseURL: baseURL)))
             out.append(NSAttributedString(string: "\n"))
+        }
+        return out
+    }
+
+    // MARK: tables
+
+    /// Any line with a pipe can be a row — it only BECOMES a table when the next line is a
+    /// separator with a matching cell count (checked at the call site), so prose with a stray
+    /// "|" never turns into a grid.
+    static func isTableRow(_ s: String) -> Bool { s.contains("|") }
+
+    /// The |---|:---:|---| row. Every cell is dashes with optional alignment colons.
+    static func isTableSeparator(_ s: String) -> Bool {
+        let cells = parseTableRow(s)
+        return !cells.isEmpty && cells.allSatisfy { c in
+            c.contains("-") && c.allSatisfy { "-:".contains($0) }
+        }
+    }
+
+    /// "| a | b |" → ["a", "b"] (outer pipes optional, cells trimmed).
+    static func parseTableRow(_ s: String) -> [String] {
+        var t = s
+        if t.hasPrefix("|") { t.removeFirst() }
+        if t.hasSuffix("|") { t.removeLast() }
+        return t.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// Rows → a real NSTextTable (bordered cells, shaded semibold header). Ragged body rows pad
+    /// or truncate to the header's column count.
+    private static func renderTable(_ rows: [[String]], baseURL: URL?) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let table = NSTextTable()
+        let cols = max(rows[0].count, 1)
+        table.numberOfColumns = cols
+        let cellFont = NSFont.systemFont(ofSize: 12.5)
+        let headFont = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
+        for (r, row) in rows.enumerated() {
+            for c in 0..<cols {
+                let block = NSTextTableBlock(table: table, startingRow: r, rowSpan: 1,
+                                             startingColumn: c, columnSpan: 1)
+                block.setBorderColor(NSColor.separatorColor)
+                block.setWidth(0.5, type: .absoluteValueType, for: .border)
+                block.setWidth(5, type: .absoluteValueType, for: .padding)
+                if r == 0 { block.backgroundColor = NSColor.labelColor.withAlphaComponent(0.05) }
+                let para = NSMutableParagraphStyle()
+                para.textBlocks = [block]
+                let content = NSMutableAttributedString(attributedString: inline(
+                    c < row.count ? row[c] : "", font: r == 0 ? headFont : cellFont,
+                    color: .labelColor, baseURL: baseURL))
+                content.append(NSAttributedString(string: "\n", attributes: [.font: cellFont]))
+                content.addAttribute(.paragraphStyle, value: para,
+                                     range: NSRange(location: 0, length: content.length))
+                out.append(content)
+            }
         }
         return out
     }

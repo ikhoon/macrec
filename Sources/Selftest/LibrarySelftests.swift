@@ -172,6 +172,27 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         let flooded = MarkdownRender.render(String(repeating: "[", count: 8000), baseURL: nil)
         check("markdown: a pathological bracket flood renders plain instead of hanging",
               flooded.string.contains("[[[") && flooded.length >= 8000)
+        // Tables: header + separator + ragged rows become real NSTextTable blocks; a |-line
+        // without a matching separator stays plain prose.
+        func blocksAt(_ s: NSAttributedString, _ needle: String) -> Int {
+            let r = (s.string as NSString).range(of: needle)
+            guard r.location != NSNotFound,
+                  let p = s.attribute(.paragraphStyle, at: r.location, effectiveRange: nil) as? NSParagraphStyle
+            else { return -1 }
+            return p.textBlocks.count
+        }
+        let table = MarkdownRender.render(
+            "| Owner | Item |\n|---|---|\n| alex | **rollout** plan |\n| sam |\ntail prose", baseURL: nil)
+        check("markdown: pipe tables become bordered table blocks, prose stays prose",
+              blocksAt(table, "Owner") == 1 && blocksAt(table, "rollout") == 1
+                  && !table.string.contains("|") && !table.string.contains("**")
+                  && table.string.contains("tail prose") && blocksAt(table, "tail prose") == 0
+                  && MarkdownRender.render("| x | y |\nno separator", baseURL: nil).string.contains("| x | y |"))
+        // Task-list checkboxes — the summarizer emits action items in this shape.
+        let tasks = MarkdownRender.render("- [ ] call the vendor\n- [x] send minutes", baseURL: nil)
+        check("markdown: task-list items render as checkboxes",
+              tasks.string.contains("☐  call the vendor") && tasks.string.contains("☑  send minutes")
+                  && !tasks.string.contains("[ ]") && !tasks.string.lowercased().contains("[x]"))
     }
     check("library: player clock formatting",
           libraryClock(0) == "0:00" && libraryClock(61) == "1:01" && libraryClock(3599) == "59:59"
@@ -183,11 +204,11 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
           libraryDayLabel(day: "2026-03-02", today: "2026-03-02", yesterday: "2026-03-01") == "Today — 2026-03-02"
               && libraryDayLabel(day: "2026-03-01", today: "2026-03-02", yesterday: "2026-03-01") == "Yesterday — 2026-03-01"
               && libraryDayLabel(day: "2026-02-14", today: "2026-03-02", yesterday: "2026-03-01") == "2026-02-14"
-              && libraryRowText(fix[0].entries[0]) == "Daily digest"
-              && libraryRowText(fix[0].entries[1]) == "14:00  project kickoff  ✓ summary  ♪"
-              && libraryRowText(fix[0].entries[2]) == "10:30  daily standup"
-              && libraryRowText(fix[1].entries[0]) == "17:52  (untitled)  ♪ audio only"
-              && libraryRowText(fix[1].entries[1]) == "16:00  (untitled)  ♪")
+              && libraryRowSpec(fix[0].entries[0]) == LibraryRowSpec(icon: "newspaper", text: "Daily digest", trailing: [])
+              && libraryRowSpec(fix[0].entries[1]) == LibraryRowSpec(icon: "text.bubble", text: "14:00  project kickoff", trailing: ["sparkles", "waveform"])
+              && libraryRowSpec(fix[0].entries[2]) == LibraryRowSpec(icon: "text.bubble", text: "10:30  daily standup", trailing: [])
+              && libraryRowSpec(fix[1].entries[0]) == LibraryRowSpec(icon: "waveform", text: "17:52  (untitled)", trailing: [])
+              && libraryRowSpec(fix[1].entries[1]) == LibraryRowSpec(icon: "text.bubble", text: "16:00  (untitled)", trailing: ["waveform"]))
     check("library: filter keeps matching rows and drops empty days",
           libraryFiltered(fix, filter: "kickoff").count == 1
               && libraryFiltered(fix, filter: "kickoff").first?.entries.count == 1
