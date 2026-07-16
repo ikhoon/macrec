@@ -12,19 +12,23 @@ func libraryDayLabel(day: String, today: String, yesterday: String) -> String {
 /// glance), the text, and trailing status icons ("summarized" sparkles, "audio kept" waveform).
 /// Pure so the icon/text decisions are selftested; the cell just materializes SF Symbols.
 struct LibraryRowSpec: Equatable {
+    enum Tint: String { case orange, blue, purple } // semantic — the cell maps to NSColors
     var icon: String // SF Symbol name — the entry's kind
+    var tint: Tint
     var text: String
     var trailing: [String] // SF Symbol names — what else exists for this entry
 }
 
 func libraryRowSpec(_ e: LibraryEntry) -> LibraryRowSpec {
-    if e.kind == .digest { return LibraryRowSpec(icon: "newspaper", text: "Daily digest", trailing: []) }
+    if e.kind == .digest {
+        return LibraryRowSpec(icon: "newspaper", tint: .orange, text: "Daily digest", trailing: [])
+    }
     let text = "\(e.time ?? "--:--")  \(e.title ?? "(untitled)")"
-    if e.kind == .audio { return LibraryRowSpec(icon: "waveform", text: text, trailing: []) }
+    if e.kind == .audio { return LibraryRowSpec(icon: "waveform", tint: .purple, text: text, trailing: []) }
     var trailing: [String] = []
     if e.summaryURL != nil { trailing.append("sparkles") }
     if e.audioURL != nil { trailing.append("waveform") }
-    return LibraryRowSpec(icon: "text.bubble", text: text, trailing: trailing)
+    return LibraryRowSpec(icon: "text.bubble", tint: .blue, text: text, trailing: trailing)
 }
 
 /// mm:ss (or h:mm:ss) for the player clock. Pure + selftested.
@@ -250,6 +254,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         content.layoutSubtreeIfNeeded()
         split.setPosition(300, ofDividerAt: 0)   // list ≈ a third, document gets the rest
         window = w
+        showEntry(nil)   // the right pane starts EMPTY — no ghost picker/player before a selection
     }
 
     // MARK: data → view
@@ -481,6 +486,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             let t = NSTextField(labelWithString: "")
             t.translatesAutoresizingMaskIntoConstraints = false
             t.lineBreakMode = .byTruncatingTail
+            t.maximumNumberOfLines = 1   // rows are one line, whatever the attributed text says
+            t.cell?.truncatesLastVisibleLine = true
             c.addSubview(icon)
             c.addSubview(t)
             c.imageView = icon
@@ -505,9 +512,19 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         } else if let e = item as? LibraryEntry {
             let spec = libraryRowSpec(e)
             cell.imageView?.image = NSImage(systemSymbolName: spec.icon, accessibilityDescription: e.kind.rawValue)
+            switch spec.tint {
+            case .orange: cell.imageView?.contentTintColor = .systemOrange
+            case .blue: cell.imageView?.contentTintColor = .systemBlue
+            case .purple: cell.imageView?.contentTintColor = .systemPurple
+            }
             let font = NSFont.systemFont(ofSize: 12)
+            // Attributed text carries its OWN paragraph style — without an explicit truncating
+            // one it WRAPS, and a long real title overlapped the next row (fixture titles were
+            // all short, so only real data showed it).
+            let oneLine = NSMutableParagraphStyle()
+            oneLine.lineBreakMode = .byTruncatingTail
             let text = NSMutableAttributedString(string: spec.text, attributes: [
-                .font: font, .foregroundColor: NSColor.labelColor,
+                .font: font, .foregroundColor: NSColor.labelColor, .paragraphStyle: oneLine,
             ])
             // Trailing status icons ride inline as attachments, tinted like secondary text.
             for symbol in spec.trailing {
