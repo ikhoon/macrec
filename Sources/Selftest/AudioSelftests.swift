@@ -119,6 +119,13 @@ func audioSelftests(_ check: (String, Bool) -> Void) {
         try? FileManager.default.removeItem(at: swURL)
         check("writer ↔ reference: envelope accounting agrees across irregular buffer boundaries", agreed)
     }
+    // The tap description MUST be explicitly unmuted: on macOS 26 the default mute behavior
+    // silences the tapped playback of every app system-wide (#132). The .unmuted line was silently
+    // dropped once in a refactor and Zoom played to a dead speaker for an evening — this check
+    // makes that class of regression a build failure, not a discovery mid-call.
+    let tapDesc = SystemAudioTap.tapDescription(excludeObjects: [])
+    check("tap description: explicitly unmuted (never trust the OS default) and private",
+          tapDesc.muteBehavior == .unmuted && tapDesc.isPrivate)
     // tap-probe verdict — the 2026-07-15 numbers: a healthy tap measured 0 buffers in silence (the
     // probe's first version called that "aggregate not running") and 369 buffers / peak 0.14 with a
     // tone playing. Zero buffers may only condemn the tap when the probe KNOWS its tone played.

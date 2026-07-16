@@ -636,10 +636,7 @@ final class SystemAudioTap {
         for bid in excludeBundleIds where !procs.contains(where: { $0.bundleID == bid }) {
             elog("engine: exclude '\(bid)' — no audio process with that bundle id right now")
         }
-        // stereoGlobalTapButExcludeProcesses = the whole system mix minus these processes; a global
-        // tap is unmuted by default (audio stays audible), which is exactly what we want.
-        let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: exclude)
-        desc.uuid = UUID(); desc.isPrivate = true
+        let desc = Self.tapDescription(excludeObjects: exclude)
 
         var tap = AudioObjectID(kAudioObjectUnknown)
         var st = AudioHardwareCreateProcessTap(desc, &tap)
@@ -695,6 +692,17 @@ final class SystemAudioTap {
         st = AudioDeviceStart(aggID, p)
         guard st == noErr else { stop(); throw Self.err("device start", st) }
         elog("engine: system-audio tap started (\(Int(fmt.sampleRate))Hz \(fmt.channelCount)ch, excluding \(exclude.count) procs, \(deviceBound ? "device-bound" : "tap-only")) → default output '\(outputDeviceName(outDevID))'")
+    }
+
+    /// The tap description, in one selftested place. stereoGlobalTapButExcludeProcesses = the whole
+    /// system mix minus these processes. muteBehavior is EXPLICITLY .unmuted: on macOS 26 the
+    /// default silences the tapped playback of every app system-wide (#132) — and the line was once
+    /// lost in a refactor, which put Zoom on mute for a whole evening. The selftest pins it now.
+    static func tapDescription(excludeObjects: [AudioObjectID]) -> CATapDescription {
+        let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: excludeObjects)
+        desc.uuid = UUID(); desc.isPrivate = true
+        desc.muteBehavior = .unmuted
+        return desc
     }
 
     func stop() {
