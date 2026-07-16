@@ -8,8 +8,38 @@ import Foundation
 
 let defaultDailyDigestPrompt = "These are summaries (or transcripts) of one day's meetings, in "
     + "chronological order. Write a daily digest: an overview of the day, highlights per meeting, "
-    + "and a combined list of decisions and action items with owners. Answer in the same language "
-    + "as the input."
+    + "and a combined list of decisions and action items with owners. Format every action item as "
+    + "a markdown checkbox line: \"- [ ] item — owner\". Answer in the same language as the input."
+
+/// Named digest STYLES for the Settings template picker. Picking one prefills the editable prompt
+/// — the default is a suggestion, never a decision; edits flip the picker to Custom and win.
+/// Every style keeps the two invariants: checkbox action items and answer-in-input-language.
+let digestPromptTemplates: [(name: String, prompt: String)] = [
+    ("Standard", defaultDailyDigestPrompt),
+    ("Compact bullets",
+     "These are summaries (or transcripts) of one day's meetings, in chronological order. Write a "
+         + "terse daily digest as short bullets only — no prose paragraphs: 3–6 bullets for the "
+         + "day's key events, then decisions, then action items, each action item as a markdown "
+         + "checkbox line: \"- [ ] item — owner\". Answer in the same language as the input."),
+    ("Executive brief",
+     "These are summaries (or transcripts) of one day's meetings, in chronological order. Write an "
+         + "executive brief: a 3–5 sentence narrative of the day emphasizing outcomes, risks and "
+         + "needed escalations, then the decisions, then action items as markdown checkbox lines: "
+         + "\"- [ ] item — owner (due date if mentioned)\". Answer in the same language as the input."),
+    ("Action tracker",
+     "These are summaries (or transcripts) of one day's meetings, in chronological order. Produce "
+         + "an action-first digest: a markdown table of every action item (columns: owner, item, "
+         + "due, source meeting), the same items as markdown checkbox lines \"- [ ] item — owner\", "
+         + "then a one-paragraph overview of the day and the decisions. Answer in the same language "
+         + "as the input."),
+]
+
+/// Which template a prompt text is — nil means Custom. Trimmed so a trailing newline doesn't
+/// flip the picker.
+func digestTemplateIndex(for prompt: String) -> Int? {
+    let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    return digestPromptTemplates.firstIndex { $0.prompt == p }
+}
 
 /// Is the daily digest due? True once `now` passes today's HH:mm deadline and today's digest
 /// hasn't run yet. The last-run marker (not a fired timer) is what makes a slept-through deadline
@@ -276,6 +306,27 @@ func postProcessInvocationFromPrefs(transcriptPath: String) -> String? {
 /// (`zsh -lc`) so PATH/brew/rc setup apply (agent CLIs like `claude` just work). Output (both
 /// streams) is read to EOF BEFORE waiting on exit — reading after would deadlock once the pipe
 /// buffer fills. `completion` receives the exit status (or -1 when the launch failed); selftest uses it.
+/// The runner environment: PATH covers the common CLI install dirs (`zsh -l` reads
+/// .zprofile/.zshenv but NOT .zshrc — where many users export PATH), and claude gets
+/// CLAUDE_CODE_OAUTH_TOKEN under launchd. The claude CLI authenticates fine from a terminal but
+/// reports "Not logged in" when its process tree starts at launchd (anthropics/claude-code#77213):
+/// an exported var wins; else an explicit Settings token; else BORROW the CLI's own current token
+/// from its Keychain item — zero user setup, same scope the CLI already holds.
+func postProcessEnvironment(for cmd: String) -> [String: String] {
+    var env = ProcessInfo.processInfo.environment
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:\(home)/.local/bin:\(home)/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
+    if env["CLAUDE_CODE_OAUTH_TOKEN"] == nil, cmd.contains("claude") {
+        if let t = Keychain.get("claude"), !t.isEmpty {
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = t
+        } else if !Keychain.disabled, let json = readClaudeCliKeychainJSON(),
+                  let t = claudeCliAccessToken(fromKeychainJSON: json) {
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = t
+        }
+    }
+    return env
+}
+
 func runPostProcessCommand(_ command: String, completion: ((Int32) -> Void)? = nil) {
     let cmd = command.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !cmd.isEmpty else { return }
@@ -283,24 +334,7 @@ func runPostProcessCommand(_ command: String, completion: ((Int32) -> Void)? = n
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
         p.arguments = ["-lc", cmd]
-        // `zsh -l` reads .zprofile/.zshenv but NOT .zshrc — where many users export PATH. Prepend the
-        // common CLI install dirs so `claude`/`gemini`/`codex` resolve regardless of rc-file layout.
-        var env = ProcessInfo.processInfo.environment
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:\(home)/.local/bin:\(home)/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
-        // The claude CLI authenticates fine from a terminal but reports "Not logged in" when its process
-        // tree starts at launchd (anthropics/claude-code#77213). CLAUDE_CODE_OAUTH_TOKEN works there, so:
-        // an exported var wins; else an explicit Settings token; else BORROW the CLI's own current token
-        // from its Keychain item — zero user setup, same scope the CLI already holds.
-        if env["CLAUDE_CODE_OAUTH_TOKEN"] == nil, cmd.contains("claude") {
-            if let t = Keychain.get("claude"), !t.isEmpty {
-                env["CLAUDE_CODE_OAUTH_TOKEN"] = t
-            } else if !Keychain.disabled, let json = readClaudeCliKeychainJSON(),
-                      let t = claudeCliAccessToken(fromKeychainJSON: json) {
-                env["CLAUDE_CODE_OAUTH_TOKEN"] = t
-            }
-        }
-        p.environment = env
+        p.environment = postProcessEnvironment(for: cmd)
         let out = Pipe(); p.standardOutput = out; p.standardError = out
         do {
             try p.run()

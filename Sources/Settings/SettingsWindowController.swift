@@ -77,6 +77,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     private let dailyPromptView = NSTextView()    // digest prompt — same text-area treatment as summary
     private let dailyPromptScroll = PassthroughScrollView()
     private let dailyPromptFileField = NSTextField()
+    private let digestTemplatePopup = NSPopUpButton()   // digest style — prefills the prompt below
     /// One switch per live-caption engine. The overlay's picker offers an engine only when its switch is
     /// on AND the engine is ready (key present / binary installed) — see `selectableLiveEngines`.
     private let engineSwitches: [(engine: LiveEngine, box: NSSwitch)] =
@@ -239,6 +240,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         dailyPromptView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         dailyPromptView.textContainer?.widthTracksTextView = true
         dailyPromptScroll.documentView = dailyPromptView
+        // Digest style templates: the popup PREFILLS the prompt; the prompt text stays the single
+        // source of truth (the popup is derived from it, so the two can never disagree).
+        digestTemplatePopup.addItems(withTitles: digestPromptTemplates.map(\.name) + ["Custom"])
+        digestTemplatePopup.target = self
+        digestTemplatePopup.action = #selector(digestTemplatePicked)
+        NotificationCenter.default.addObserver(self, selector: #selector(dailyPromptEdited),
+                                               name: NSText.didChangeNotification, object: dailyPromptView)
         dailyPromptFileField.translatesAutoresizingMaskIntoConstraints = false
         dailyPromptFileField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         dailyPromptFileField.placeholderString = "empty = the prompt above"
@@ -596,6 +604,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             Section(header: "Daily digest", note: nil, rows: [
                 sw(dailyBtn, "Write a daily digest", "Roll the day's meeting summaries into one file."),
                 r("Write at", dailyTimePicker),
+                r("Style", digestTemplatePopup, "Picking a style fills the prompt below — edit it "
+                  + "freely; edits show as Custom."),
                 r("Prompt", dailyPromptScroll, wide: true),
                 r("Prompt file", dailyPromptFileStack, "Overrides the text above when readable.", wide: true),
                 r("Save digest to", dailyStack, "Once a day, the day's summaries roll up into a monthly "
@@ -1142,6 +1152,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         updateBtn.state = Pref.bool(Pref.autoUpdateCheck, "MR_AUTO_UPDATE_CHECK", true) ? .on : .off
         let savedDaily = Pref.explicit(Pref.dailyPrompt, "MR_DAILY_DIGEST_PROMPT")
         dailyPromptView.string = savedDaily.isEmpty ? defaultDailyDigestPrompt : savedDaily
+        syncDigestTemplatePopup()
         dailyPromptFileField.stringValue = Pref.explicit(Pref.dailyPromptFile, "MR_DAILY_DIGEST_PROMPT_FILE")
         dailyOutField.stringValue = Pref.explicit(Pref.dailyDigestOut, "MR_DAILY_DIGEST_OUT")
         dailyNameField.stringValue = Pref.explicit(Pref.dailyDigestName, "MR_DAILY_DIGEST_NAME")
@@ -1208,6 +1219,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     // A prompt/hints file is picked in Finder like any other path.
     @objc private func choosePromptFile()      { choosePath(into: promptFileField, files: true) }
     @objc private func chooseDailyPromptFile() { choosePath(into: dailyPromptFileField, files: true) }
+
+    /// Picking a style fills the prompt; "Custom" (the last item) keeps whatever is there.
+    @objc private func digestTemplatePicked() {
+        let i = digestTemplatePopup.indexOfSelectedItem
+        guard i >= 0, i < digestPromptTemplates.count else { return }
+        dailyPromptView.string = digestPromptTemplates[i].prompt
+    }
+
+    @objc private func dailyPromptEdited() { syncDigestTemplatePopup() }
+
+    /// The popup is DERIVED from the prompt text (single source of truth) — never the reverse.
+    private func syncDigestTemplatePopup() {
+        digestTemplatePopup.selectItem(
+            at: digestTemplateIndex(for: dailyPromptView.string) ?? digestPromptTemplates.count)
+    }
     @objc private func chooseHintsFile()       { choosePath(into: hintsFileField, files: true) }
 
     /// The one picker behind every "Choose…" button — a folder picker (`files: false`) or a file

@@ -253,6 +253,87 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
                             transcripts: ["/t/2026-07-07-1400.md", "/t/2026-07-06-1000.md", "/t/2026-07-07-1000-standup.md"],
                             summaries: ["/s/2026-07-07-1000-standup.md"])
           == ["/s/2026-07-07-1000-standup.md", "/t/2026-07-07-1400.md"])
+    // Digest style templates: named, unique, and every style keeps the invariants — checkbox
+    // action items (so the vault can track them) and answer-in-input-language.
+    check("digest templates: unique names, checkbox action items everywhere, Standard is the default",
+          Set(digestPromptTemplates.map(\.name)).count == digestPromptTemplates.count
+              && digestPromptTemplates.allSatisfy { $0.prompt.contains("- [ ]") }
+              && digestPromptTemplates.allSatisfy { $0.prompt.contains("same language") }
+              && digestPromptTemplates.first?.prompt == defaultDailyDigestPrompt
+              && defaultSummaryPrompt.contains("- [ ]")
+              && digestTemplateIndex(for: defaultDailyDigestPrompt + "\n") == 0
+              && digestTemplateIndex(for: "my own prompt") == nil)
+    // Legacy-default prompt migration: a stored prompt equal to a PAST default clears (the improved
+    // default applies); a real customization is never touched.
+    do {
+        let d = Pref.d   // ephemeral suite under selftest
+        d.set(legacyDefaultPrompts[0], forKey: Pref.summaryPrompt)
+        d.set("my custom digest prompt", forKey: Pref.dailyPrompt)
+        migrateLegacyDefaultPrompts(d)
+        check("prompt migration: stale default cleared, customization untouched",
+              d.string(forKey: Pref.summaryPrompt) == nil
+                  && d.string(forKey: Pref.dailyPrompt) == "my custom digest prompt")
+        d.removeObject(forKey: Pref.dailyPrompt)
+    }
+    // Title extraction for untitled recordings — every layer around the one runner call is pure.
+    check("title: untitled-stem detection",
+          isUntitledStem("2026-03-01-1600")
+              && !isUntitledStem("2026-03-01-1600-project-kickoff")
+              && !isUntitledStem("2026-03-01")
+              && !isUntitledStem("notes-2026-03-01-1600"))
+    check("title: runner replies clean into usable titles, garbage stays nil",
+          cleanExtractedTitle("\"프로젝트 킥오프.\"") == "프로젝트 킥오프"
+              && cleanExtractedTitle("\n\n  Weekly sync notes  \nBecause you asked…") == "Weekly sync notes"
+              && cleanExtractedTitle("# Title!") == "Title"
+              && cleanExtractedTitle("") == nil
+              && cleanExtractedTitle("!!! …") == nil
+              && cleanExtractedTitle(String(repeating: "x", count: 200)) == nil)
+    do {
+        let files = ["/t/2026-03/2026-03-01-1600.md", "/s/2026-03/2026-03-01-1600-sum.md",
+                     "/a/2026-03/2026-03-01-1600.wav"]
+        let plan = titleRenamePlan(files: files, stem: "2026-03-01-1600", slug: "kickoff",
+                                   exists: { files.contains($0) })
+        check("title: rename plan covers the set, keeps the -sum suffix, refuses anything unsafe",
+              plan?.count == 3
+                  && plan?.contains { $0.to == "/s/2026-03/2026-03-01-1600-kickoff-sum.md" } == true
+                  && plan?.contains { $0.to == "/t/2026-03/2026-03-01-1600-kickoff.md" } == true
+                  && titleRenamePlan(files: files, stem: "2026-03-01-1600", slug: "kickoff",
+                                     exists: { files.contains($0) || $0.hasSuffix("-kickoff.md") }) == nil // collision
+                  && titleRenamePlan(files: ["/x/other.md"], stem: "2026-03-01-1600", slug: "k",
+                                     exists: { _ in true }) == nil                                          // non-sibling
+                  && titleRenamePlan(files: files, stem: "2026-03-01-1600-titled", slug: "k",
+                                     exists: { _ in true }) == nil)                                         // already titled
+    }
+    // The apply step, end to end on a real (temp) tree: renames + audio-link + summary-H1 fixups.
+    do {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("mr-title-\(UUID().uuidString)")
+        let t = root.appendingPathComponent("t/2026-03")
+        let s = root.appendingPathComponent("s/2026-03")
+        let a = root.appendingPathComponent("a/2026-03")
+        for d in [t, s, a] { try? fm.createDirectory(at: d, withIntermediateDirectories: true) }
+        let tp = t.appendingPathComponent("2026-03-01-1600.md").path
+        try? "# 2026-03-01 16:00\n- Audio: [2026-03-01-1600.wav](../../a/2026-03/2026-03-01-1600.wav)\nbody"
+            .write(toFile: tp, atomically: true, encoding: .utf8)
+        let sp = s.appendingPathComponent("2026-03-01-1600.md").path
+        try? "# 2026-03-01-1600\n\nsummary body".write(toFile: sp, atomically: true, encoding: .utf8)
+        fm.createFile(atPath: a.appendingPathComponent("2026-03-01-1600.wav").path, contents: Data("x".utf8))
+        let r = applyExtractedTitle(transcriptPath: tp, summaryPath: sp,
+                                    audioDir: root.appendingPathComponent("a").path, title: "Project Kickoff")
+        let newT = (try? String(contentsOfFile: r?.transcript ?? "", encoding: .utf8)) ?? ""
+        let newS = (try? String(contentsOfFile: r?.summary ?? "", encoding: .utf8)) ?? ""
+        check("title: apply renames the set and rewrites the audio link + summary H1",
+              r?.transcript.hasSuffix("2026-03-01-1600-Project-Kickoff.md") == true
+                  && fm.fileExists(atPath: a.appendingPathComponent("2026-03-01-1600-Project-Kickoff.wav").path)
+                  && !fm.fileExists(atPath: tp)
+                  && newT.contains("2026-03-01-1600-Project-Kickoff.wav")
+                  && !newT.contains("2026-03-01-1600.wav")
+                  && newS.hasPrefix("# 2026-03-01-1600-Project-Kickoff"))
+        check("title: a titled recording is never re-renamed",
+              applyExtractedTitle(transcriptPath: r?.transcript ?? "", summaryPath: r?.summary,
+                                  audioDir: root.appendingPathComponent("a").path, title: "Again") == nil)
+        try? fm.removeItem(at: root)
+    }
     // A digest lands in the SAME month folder as the day's notes, and `2026-07-07.md` carries the
     // very day-prefix the input filter matches — without the exclusion it would feed itself its
     // own previous output. Compared by standardized path (`/t/./x.md` is the same file as `/t/x.md`).

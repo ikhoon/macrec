@@ -1281,6 +1281,8 @@ public enum App {
             Keychain.disabled = true
             Pref.useEphemeralStoreForTest()
         }
+        // One-time pref migrations (harmless on the ephemeral test store).
+        migrateLegacyDefaultPrompts()
 
         // Subcommands: help / version (accept the common flag spellings too).
         if let a = args.first, ["help", "--help", "-h"].contains(a) { printMacrecHelp(); exit(0) }

@@ -340,8 +340,12 @@ final class RecordingEngine {
                 let out = postProcessWritesSummaryFile(mode)
                     ? summaryOutputPath(transcriptPath: url.path, outDir: Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT"))
                     : nil
-                runPostProcessCommand(cmd) { status in
-                    guard status != 0 else { SummaryStatus.shared.finished(file, at: Date(), output: out); return }
+                runPostProcessCommand(cmd) { [weak self] status in
+                    guard status != 0 else {
+                        SummaryStatus.shared.finished(file, at: Date(), output: out)
+                        self?.extractTitleIfUntitled(transcript: url, summaryOut: out)
+                        return
+                    }
                     let why = out.flatMap { reapFailedPostProcess(outPath: $0) }
                     SummaryStatus.shared.failed(file, at: Date(), reason: why)
                     elog("engine: post-process exited \(status) for \(file)" + (why.map { " — \($0)" } ?? ""))
@@ -350,6 +354,31 @@ final class RecordingEngine {
                 }
             }
         } catch { elog("engine: writeTranscript: \(error)") }
+    }
+
+    /// A recording with no calendar title gets one from its OWN summary: same runner, one short
+    /// extra call, then the whole set (transcript + summary + kept audio) renames to the titled
+    /// stem. Best-effort — any failure leaves the untitled names in place; the pure layers
+    /// (clean/plan/apply) are selftested, only the runner call itself is not.
+    private func extractTitleIfUntitled(transcript: URL, summaryOut: String?) {
+        guard let summaryOut, FileManager.default.fileExists(atPath: summaryOut) else { return }
+        let stem = transcript.deletingPathExtension().lastPathComponent
+        guard isUntitledStem(stem) else { return }
+        let runner = SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude
+        let cmd = titleExtractionInvocation(runner: runner, summaryPath: summaryOut)
+        runCommandCapturingOutput(cmd) { [weak self] status, raw in
+            guard status == 0, let title = cleanExtractedTitle(raw) else {
+                elog("title: extraction skipped for \(stem) (exit \(status), reply \(String(raw.prefix(80))))")
+                return
+            }
+            guard let renamed = applyExtractedTitle(transcriptPath: transcript.path,
+                                                    summaryPath: summaryOut,
+                                                    audioDir: self?.cfg.audioDir.path,
+                                                    title: title) else { return }
+            let newName = (renamed.transcript as NSString).lastPathComponent
+            SummaryStatus.shared.finished(newName, at: Date(), output: renamed.summary)
+            self?.onTranscriptSaved?("Titled: \(newName)")
+        }
     }
 
     @discardableResult
