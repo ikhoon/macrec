@@ -128,6 +128,7 @@ final class RecordingEngine {
         elog("engine: recording (segment=\(Int(cfg.segmentSeconds))s, voiceMin=\(Int(cfg.voiceMinSeconds))s, exclude=\(cfg.excludeBundleIds.joined(separator: ",")))")
         if !audioOK { waitForAudioGrantThenRestart() }   // rebuild the muted tap once the user allows
         processQueue.async { [weak self] in self?.cleanupRetention() }   // tidy old files on start
+        adoptOrphanSegments()   // a previous run's unprocessed segment files get their turn now
         // Sleep/wake: stop capture cleanly on sleep and resume on wake.
         let wc = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification] {
@@ -270,15 +271,25 @@ final class RecordingEngine {
                               body: "The mic records energy but nothing speech-like. Check System Settings → Sound → Input.")
             }
         }
-        // debugKeepTrackAudio: keep the PER-TRACK mic/sys wavs (normally deleted after the mix) in
-        // workDir — transcription-quality A/B work (echo-dedup validation against real meetings)
-        // needs the separated tracks, and the mixed wav can't be un-mixed. Off by default; workDir
-        // lives under /tmp, so leftovers vanish on reboot regardless.
+        // debugKeepTrackAudio: keep the PER-TRACK mic/sys wavs (normally deleted after the mix) —
+        // transcription-quality A/B work (echo-dedup validation against real meetings) needs the
+        // separated tracks, and the mixed wav can't be un-mixed. Kept files move into processed/
+        // so orphan ADOPTION can never mistake handled segments for a dead run's leftovers.
+        // Off by default; workDir lives under /tmp, so leftovers vanish on reboot regardless.
         let keepTracks = Pref.bool("debugKeepTrackAudio", "MR_DEBUG_KEEP_TRACKS", false)
         defer {
-            if !keepTracks {
-                try? FileManager.default.removeItem(at: seg.sysURL)
-                try? FileManager.default.removeItem(at: seg.micURL)
+            let fm = FileManager.default
+            if keepTracks {
+                let pen = cfg.workDir.appendingPathComponent("processed", isDirectory: true)
+                try? fm.createDirectory(at: pen, withIntermediateDirectories: true)
+                for f in [seg.sysURL, seg.micURL] where fm.fileExists(atPath: f.path) {
+                    let dst = pen.appendingPathComponent(f.lastPathComponent)
+                    try? fm.removeItem(at: dst)
+                    try? fm.moveItem(at: f, to: dst)
+                }
+            } else {
+                try? fm.removeItem(at: seg.sysURL)
+                try? fm.removeItem(at: seg.micURL)
             }
         }
 
@@ -301,8 +312,10 @@ final class RecordingEngine {
             ? CalendarLookup.match(start: seg.start, end: seg.start.addingTimeInterval(seg.durationSeconds))
             : nil
         if cfg.useCalendarTitles {
-            guard shouldKeepTranscript(hasMeeting: meeting != nil, speechSeconds: seg.speechSeconds, manual: manual) else {
-                elog("engine:   → no meeting & speech \(String(format: "%.0f", seg.speechSeconds))s < 15s — discarding")
+            guard shouldKeepTranscript(hasMeeting: meeting != nil, speechSeconds: seg.speechSeconds,
+                                       voicedSeconds: seg.voicedSeconds, manual: manual) else {
+                elog("engine:   → no meeting & speech \(String(format: "%.0f", seg.speechSeconds))s < 15s"
+                    + " (voiced \(String(format: "%.0f", seg.voicedSeconds))s < 45s) — discarding")
                 onSegmentResult?("No meeting · short — skipped")
                 return
             }
@@ -340,8 +353,12 @@ final class RecordingEngine {
                 let out = postProcessWritesSummaryFile(mode)
                     ? summaryOutputPath(transcriptPath: url.path, outDir: Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT"))
                     : nil
-                runPostProcessCommand(cmd) { status in
-                    guard status != 0 else { SummaryStatus.shared.finished(file, at: Date(), output: out); return }
+                runPostProcessCommand(cmd) { [weak self] status in
+                    guard status != 0 else {
+                        SummaryStatus.shared.finished(file, at: Date(), output: out)
+                        self?.extractTitleIfUntitled(transcript: url, summaryOut: out)
+                        return
+                    }
                     let why = out.flatMap { reapFailedPostProcess(outPath: $0) }
                     SummaryStatus.shared.failed(file, at: Date(), reason: why)
                     elog("engine: post-process exited \(status) for \(file)" + (why.map { " — \($0)" } ?? ""))
@@ -350,6 +367,100 @@ final class RecordingEngine {
                 }
             }
         } catch { elog("engine: writeTranscript: \(error)") }
+    }
+
+    /// Adopt orphaned segment files a previous run left behind (see SegmentAdoption.swift) — a
+    /// restart used to discard the in-flight partial, which once ate the head of a real call.
+    /// Candidates are MOVED into workDir/adopted/ before processing so nothing adopts twice; the
+    /// first run with this feature sweeps the pre-existing backlog into processed/ untouched
+    /// (debug track-keeping used to leave handled files in place — re-transcribing a week of
+    /// history is not a recovery).
+    func adoptOrphanSegments() {
+        processQueue.async { [weak self] in
+            guard let self else { return }
+            let fm = FileManager.default
+            let marker = self.cfg.workDir.appendingPathComponent(".adoption-enabled")
+            let names = ((try? fm.contentsOfDirectory(atPath: self.cfg.workDir.path)) ?? [])
+                .filter { $0.hasSuffix(".mic.wav") || $0.hasSuffix(".sys.wav") }
+            guard fm.fileExists(atPath: marker.path) else {
+                let pen = self.cfg.workDir.appendingPathComponent("processed", isDirectory: true)
+                try? fm.createDirectory(at: pen, withIntermediateDirectories: true)
+                for n in names {
+                    try? fm.moveItem(at: self.cfg.workDir.appendingPathComponent(n),
+                                     to: pen.appendingPathComponent(n))
+                }
+                fm.createFile(atPath: marker.path, contents: nil)
+                if !names.isEmpty { elog("engine: adoption enabled — \(names.count) pre-existing track files swept to processed/") }
+                return
+            }
+            let stems = orphanSegmentStems(names: names, modified: { n in
+                (try? fm.attributesOfItem(atPath: self.cfg.workDir.appendingPathComponent(n).path))?[.modificationDate] as? Date
+            }, now: Date())
+            guard !stems.isEmpty else { return }
+            let pen = self.cfg.workDir.appendingPathComponent("adopted", isDirectory: true)
+            try? fm.createDirectory(at: pen, withIntermediateDirectories: true)
+            for stem in stems {
+                guard let start = orphanSegmentStart(stem) else { continue }
+                for suffix in [".sys.wav", ".mic.wav"] {
+                    let src = self.cfg.workDir.appendingPathComponent(stem + suffix)
+                    if fm.fileExists(atPath: src.path) {
+                        try? fm.moveItem(at: src, to: pen.appendingPathComponent(stem + suffix))
+                    }
+                }
+                let sysURL = pen.appendingPathComponent(stem + ".sys.wav")
+                let micURL = pen.appendingPathComponent(stem + ".mic.wav")
+                guard fm.fileExists(atPath: sysURL.path), fm.fileExists(atPath: micURL.path) else {
+                    elog("engine: orphan \(stem) is missing a track — skipped")
+                    continue
+                }
+                let mic = scanWavStats(micURL, scratchDir: self.cfg.workDir)
+                let sys = scanWavStats(sysURL, scratchDir: self.cfg.workDir)
+                let dur = max(mic?.duration ?? 0, sys?.duration ?? 0)
+                guard dur >= 10 else { continue }   // sub-10 s scraps can't clear any gate
+                let seg = CompletedSegment(start: start, sysURL: sysURL, micURL: micURL,
+                                           micVoicedSeconds: mic?.voiced ?? 0, sysVoicedSeconds: sys?.voiced ?? 0,
+                                           micSpeechSeconds: mic?.speech ?? 0, sysSpeechSeconds: sys?.speech ?? 0,
+                                           sysPeak: sys?.peak ?? 0, micPeak: mic?.peak ?? 0,
+                                           durationSeconds: dur)
+                elog("engine: adopting orphaned segment \(stem) (dur \(Int(dur))s)")
+                self.process(seg)
+            }
+        }
+    }
+
+    /// Selftest hook: block until everything queued on the process queue (adoption included) ran.
+    func drainProcessQueueForTest() { processQueue.sync {} }
+
+    /// A recording with no calendar title gets one from its OWN summary: same runner, one short
+    /// extra call, then the whole set (transcript + summary + kept audio) renames to the titled
+    /// stem. Best-effort — any failure leaves the untitled names in place; the pure layers
+    /// (clean/plan/apply) are selftested, only the runner call itself is not.
+    private func extractTitleIfUntitled(transcript: URL, summaryOut: String?) {
+        guard let summaryOut, FileManager.default.fileExists(atPath: summaryOut) else { return }
+        let stem = transcript.deletingPathExtension().lastPathComponent
+        guard isUntitledStem(stem) else { return }
+        // A near-empty summary has nothing to name (a manual flush of a silent segment produced a
+        // garbage English title in production) — the runner also answers NONE, but don't even ask.
+        let bytes = ((try? FileManager.default.attributesOfItem(atPath: summaryOut))?[.size] as? Int) ?? 0
+        guard bytes >= 200 else {
+            elog("title: summary too small (\(bytes) B) — leaving \(stem) untitled")
+            return
+        }
+        let runner = SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude
+        let cmd = titleExtractionInvocation(runner: runner, summaryPath: summaryOut)
+        runCommandCapturingOutput(cmd) { [weak self] status, raw in
+            guard status == 0, let title = cleanExtractedTitle(raw) else {
+                elog("title: extraction skipped for \(stem) (exit \(status), reply \(String(raw.prefix(80))))")
+                return
+            }
+            guard let renamed = applyExtractedTitle(transcriptPath: transcript.path,
+                                                    summaryPath: summaryOut,
+                                                    audioDir: self?.cfg.audioDir.path,
+                                                    title: title) else { return }
+            let newName = (renamed.transcript as NSString).lastPathComponent
+            SummaryStatus.shared.finished(newName, at: Date(), output: renamed.summary)
+            self?.onTranscriptSaved?("Titled: \(newName)")
+        }
     }
 
     @discardableResult

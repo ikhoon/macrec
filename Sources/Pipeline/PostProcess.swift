@@ -21,11 +21,41 @@ enum PostProcessMode: String { case off, summary, shell }
 enum SummaryRunner: String, CaseIterable { case claude, codex, gemini }
 
 /// The built-in summary prompt — the turn-key default (editable in Settings). Answering in the
-/// transcript's own language keeps it correct for mixed ko/en/ja meetings.
+/// transcript's own language keeps it correct for mixed ko/en/ja meetings; checkbox action items
+/// stay trackable in the vault (Obsidian renders and toggles them).
 let defaultSummaryPrompt = "Summarize this meeting transcript: key points, decisions made, and action items "
     + "with owners. If the file includes a calendar meeting-notes section, use it as context (agenda, "
-    + "attendees, terminology) and note anything planned there that was not discussed. Answer in the same "
-    + "language as the transcript."
+    + "attendees, terminology) and note anything planned there that was not discussed. Format every action "
+    + "item as a markdown checkbox line: \"- [ ] item — owner\". Answer in the same language as the "
+    + "transcript."
+
+/// Stored prompts byte-identical to a PAST default were never customized — clear them once so an
+/// improved default applies. A real customization never matches and is never touched.
+let legacyDefaultPrompts: [String] = [
+    // summary, before the calendar-notes sentence:
+    "Summarize this meeting transcript: key points, decisions made, and action items with owners. "
+        + "Answer in the same language as the transcript.",
+    // summary, before the checkbox instruction:
+    "Summarize this meeting transcript: key points, decisions made, and action items with owners. "
+        + "If the file includes a calendar meeting-notes section, use it as context (agenda, attendees, "
+        + "terminology) and note anything planned there that was not discussed. Answer in the same "
+        + "language as the transcript.",
+    // digest, before the checkbox instruction:
+    "These are summaries (or transcripts) of one day's meetings, in chronological order. Write a "
+        + "daily digest: an overview of the day, highlights per meeting, and a combined list of "
+        + "decisions and action items with owners. Answer in the same language as the input.",
+]
+
+/// One-time at startup: drop stored prompt prefs that are just stale copies of an old default.
+func migrateLegacyDefaultPrompts(_ d: UserDefaults = Pref.d) {
+    for key in [Pref.summaryPrompt, Pref.dailyPrompt] {
+        if let s = d.string(forKey: key),
+           legacyDefaultPrompts.contains(s.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            d.removeObject(forKey: key)
+            elog("prefs: \(key) matched an old built-in default — cleared so the improved default applies")
+        }
+    }
+}
 
 /// Where the automatic summary lands. A dedicated output dir mirrors the transcripts' monthly
 /// layout with the PLAIN transcript name (`<dir>/YYYY-MM/<name>.md` — the folder already says
@@ -87,10 +117,15 @@ func effectivePostProcessMode(rawMode: String, shellCmd: String) -> PostProcessM
 /// an explicit request outranks the hygiene rules (a manual flush once died to them; user P1). Otherwise
 /// a segment that overlapped a calendar MEETING is kept, and an ad-hoc recording needs at least
 /// `minNonMeetingSeconds` of speech — 15 s (user pick; the old 3-minute bar swallowed a real
-/// uncalendared call), enough to shed doorway blips and passing videos. Pure + selftested.
-func shouldKeepTranscript(hasMeeting: Bool, speechSeconds: Double, manual: Bool = false,
-                          minNonMeetingSeconds: Double = 15) -> Bool {
+/// uncalendared call), enough to shed doorway blips and passing videos. The compound arm covers
+/// the sparse-utterance PHONE CALL (measured 2026-07-16: a real call scored voiced 65.3 s but
+/// only 8.0 s of ≥256 ms speech runs — short backchannels — and was discarded): genuine sustained
+/// speech exists (≥5 s, clicks score ~0) AND the mic was busy for ≥45 s. The click-hour incident
+/// (voiced 14–50 s, speech ≈0) still fails the speech arm. Pure + selftested with those numbers.
+func shouldKeepTranscript(hasMeeting: Bool, speechSeconds: Double, voicedSeconds: Double = 0,
+                          manual: Bool = false, minNonMeetingSeconds: Double = 15) -> Bool {
     manual || hasMeeting || speechSeconds >= minNonMeetingSeconds
+        || (speechSeconds >= 5 && voicedSeconds >= 45)
 }
 
 /// Read the post-process prefs and build the invocation for a just-saved transcript.

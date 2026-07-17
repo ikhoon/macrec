@@ -453,6 +453,13 @@ func settingsSelftests(_ check: (String, Bool) -> Void) {
           shouldKeepTranscript(hasMeeting: true, speechSeconds: 5)
           && shouldKeepTranscript(hasMeeting: false, speechSeconds: 15)
           && shouldKeepTranscript(hasMeeting: false, speechSeconds: 240)
+          // The 2026-07-16 phone call, verbatim: sparse backchannels — speech 8.0 s, voiced 65.3 s —
+          // must be KEPT by the compound arm; the same day's ambient segments and yesterday's
+          // click-hours must still drop.
+          && shouldKeepTranscript(hasMeeting: false, speechSeconds: 8.0, voicedSeconds: 65.3)   // the salvaged call
+          && !shouldKeepTranscript(hasMeeting: false, speechSeconds: 9.3, voicedSeconds: 18.7)  // 14:00 ambient
+          && !shouldKeepTranscript(hasMeeting: false, speechSeconds: 4.3, voicedSeconds: 25.1)  // 09:00 muttering
+          && !shouldKeepTranscript(hasMeeting: false, speechSeconds: 0.1, voicedSeconds: 44.1)  // click hour
           && !shouldKeepTranscript(hasMeeting: false, speechSeconds: 14)
           && !shouldKeepTranscript(hasMeeting: false, speechSeconds: 0)
           && shouldKeepTranscript(hasMeeting: false, speechSeconds: 0, manual: true))

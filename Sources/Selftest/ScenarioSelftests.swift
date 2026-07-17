@@ -201,4 +201,72 @@ func scenarioSelftests(_ check: (String, Bool) -> Void) {
         Notifier.sinkForTest = nil
         try? fm.removeItem(at: scratch)
     }
+
+    // ---- S-ADOPT — a dead run's segment files get their turn on the next start ----
+    // The restart-eats-the-partial incident: the files survive the process, the in-memory stats
+    // don't. Adoption re-derives them from the files and pushes a NORMAL segment through the
+    // NORMAL gates. First run must sweep the pre-existing backlog aside, not re-transcribe it.
+    do {
+        let scratch = fm.temporaryDirectory.appendingPathComponent("mr-adopt-\(UUID().uuidString)")
+        let tDir = scratch.appendingPathComponent("t"), aDir = scratch.appendingPathComponent("a")
+        let wDir = scratch.appendingPathComponent("w")
+        for d in [tDir, aDir, wDir] { try? fm.createDirectory(at: d, withIntermediateDirectories: true) }
+        let stub = scratch.appendingPathComponent("stub-whisper.sh")
+        try? "#!/bin/sh\necho \"[00:00:01.000 --> 00:00:04.000] 입양된 세그먼트\"\n".write(to: stub, atomically: true, encoding: .utf8)
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
+        let model = scratch.appendingPathComponent("model.bin")
+        fm.createFile(atPath: model.path, contents: Data([0]))
+        let cfg = EngineConfig(segmentSeconds: 3600, voiceMinSeconds: 5,
+                               transcriptsDir: tDir, audioDir: aDir, workDir: wDir,
+                               whisperCli: stub.path, whisperModel: model.path, vadModel: "", vadEnabled: false,
+                               useCalendarTitles: false, whisperLang: "ko", keepAudio: false,
+                               audioRawDays: 0, audioRetentionDays: 0, transcriptRetentionDays: 0,
+                               excludeBundleIds: [])
+        func writeOrphanPair(_ stem: String, voiced: Bool, ageSeconds: TimeInterval) {
+            guard let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
+                  let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 8000) else { return }
+            for suffix in ["mic", "sys"] {
+                let url = wDir.appendingPathComponent("\(stem).\(suffix).wav")
+                do {   // narrow scope: the writer's deinit FLUSHES the file (touching its mtime),
+                    // so it must run BEFORE the backdating below or the file looks fresh.
+                    guard let w = try? SourceWriter(url: url) else { continue }
+                    buf.frameLength = 8000
+                    for rep in 0..<24 {   // 12 s — clears the adopter's 10 s floor
+                        for i in 0..<8000 {
+                            let on = voiced && suffix == "mic" && i < 6400
+                            buf.floatChannelData![0][i] = on ? sinf(Float(rep * 8000 + i) * 0.13) * 0.3 : 0
+                        }
+                        w.append(buf)
+                    }
+                }
+                try? fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -ageSeconds)],
+                                      ofItemAtPath: url.path)
+            }
+        }
+        let engine = RecordingEngine(cfg: cfg)
+        // (a) first run: the backlog sweeps to processed/, nothing is transcribed.
+        writeOrphanPair("seg-2026-03-05-100000", voiced: true, ageSeconds: 600)
+        engine.adoptOrphanSegments()
+        engine.drainProcessQueueForTest()
+        check("scenario S-ADOPT(a): first run sweeps the backlog aside instead of re-transcribing it",
+              fm.fileExists(atPath: wDir.appendingPathComponent("processed/seg-2026-03-05-100000.mic.wav").path)
+                  && !fm.fileExists(atPath: tDir.appendingPathComponent("2026-03/2026-03-05-1000.md").path))
+        // (b) a NEW orphan (dead run's partial) is adopted → transcript through the normal gates.
+        writeOrphanPair("seg-2026-03-05-110000", voiced: true, ageSeconds: 300)
+        engine.adoptOrphanSegments()
+        engine.drainProcessQueueForTest()
+        let adopted = tDir.appendingPathComponent("2026-03/2026-03-05-1100.md")
+        check("scenario S-ADOPT(b): an orphaned voiced segment becomes a transcript on the next start",
+              fm.fileExists(atPath: adopted.path)
+                  && ((try? String(contentsOf: adopted, encoding: .utf8)) ?? "").contains("입양된 세그먼트")
+                  && !fm.fileExists(atPath: wDir.appendingPathComponent("seg-2026-03-05-110000.mic.wav").path))
+        // (c) FRESH files (a live writer is flushing them) are never touched.
+        writeOrphanPair("seg-2026-03-05-120000", voiced: true, ageSeconds: 0)
+        engine.adoptOrphanSegments()
+        engine.drainProcessQueueForTest()
+        check("scenario S-ADOPT(c): fresh files stay untouched; adoption is idempotent",
+              fm.fileExists(atPath: wDir.appendingPathComponent("seg-2026-03-05-120000.mic.wav").path)
+                  && !fm.fileExists(atPath: tDir.appendingPathComponent("2026-03/2026-03-05-1200.md").path))
+        try? fm.removeItem(at: scratch)
+    }
 }

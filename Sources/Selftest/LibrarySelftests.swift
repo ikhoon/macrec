@@ -21,6 +21,11 @@ func libraryFixtureDays() -> [LibraryDay] {
                          summaryURL: nil, audioURL: a),
             LibraryEntry(day: "2026-03-01", time: "16:00", title: nil, kind: .transcript,
                          url: u, summaryURL: nil, audioURL: a),
+            // Real titles run long and once WRAPPED over the next row (attributed text ignores the
+            // field's truncation) — the fixture keeps one so the harness renders that case forever.
+            LibraryEntry(day: "2026-03-01", time: "09:00",
+                         title: "이번 분기 오케스트레이션 개발 워크숍 시리즈 세 번째 세션 사전 준비 회의",
+                         kind: .transcript, url: u, summaryURL: u, audioURL: nil),
         ]),
     ]
 }
@@ -204,11 +209,11 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
           libraryDayLabel(day: "2026-03-02", today: "2026-03-02", yesterday: "2026-03-01") == "Today — 2026-03-02"
               && libraryDayLabel(day: "2026-03-01", today: "2026-03-02", yesterday: "2026-03-01") == "Yesterday — 2026-03-01"
               && libraryDayLabel(day: "2026-02-14", today: "2026-03-02", yesterday: "2026-03-01") == "2026-02-14"
-              && libraryRowSpec(fix[0].entries[0]) == LibraryRowSpec(icon: "newspaper", text: "Daily digest", trailing: [])
-              && libraryRowSpec(fix[0].entries[1]) == LibraryRowSpec(icon: "text.bubble", text: "14:00  project kickoff", trailing: ["sparkles", "waveform"])
-              && libraryRowSpec(fix[0].entries[2]) == LibraryRowSpec(icon: "text.bubble", text: "10:30  daily standup", trailing: [])
-              && libraryRowSpec(fix[1].entries[0]) == LibraryRowSpec(icon: "waveform", text: "17:52  (untitled)", trailing: [])
-              && libraryRowSpec(fix[1].entries[1]) == LibraryRowSpec(icon: "text.bubble", text: "16:00  (untitled)", trailing: ["waveform"]))
+              && libraryRowSpec(fix[0].entries[0]) == LibraryRowSpec(icon: "newspaper", tint: .orange, text: "Daily digest", trailing: [])
+              && libraryRowSpec(fix[0].entries[1]) == LibraryRowSpec(icon: "text.bubble", tint: .blue, text: "14:00  project kickoff", trailing: ["sparkles", "waveform"])
+              && libraryRowSpec(fix[0].entries[2]) == LibraryRowSpec(icon: "text.bubble", tint: .blue, text: "10:30  daily standup", trailing: [])
+              && libraryRowSpec(fix[1].entries[0]) == LibraryRowSpec(icon: "waveform", tint: .purple, text: "17:52  (untitled)", trailing: [])
+              && libraryRowSpec(fix[1].entries[1]) == LibraryRowSpec(icon: "text.bubble", tint: .blue, text: "16:00  (untitled)", trailing: ["waveform"]))
     check("library: filter keeps matching rows and drops empty days",
           libraryFiltered(fix, filter: "kickoff").count == 1
               && libraryFiltered(fix, filter: "kickoff").first?.entries.count == 1
