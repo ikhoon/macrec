@@ -462,7 +462,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     func outlineView(_ v: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
         if item == nil { return shownDays[index] }
-        return (item as! LibraryDay).entries[index]
+        guard let day = item as? LibraryDay else { return shownDays[index] }
+        return day.entries[index]
     }
 
     func outlineView(_ v: NSOutlineView, isItemExpandable item: Any) -> Bool { item is LibraryDay }

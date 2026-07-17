@@ -246,13 +246,20 @@ enum MarkdownRender {
     // URL, closing brackets) never rides along. Link URLs allow ONE level of balanced parentheses
     // (Wikipedia-style "..._(disambiguation)") — CommonMark's full nesting isn't worth the regex.
     private static let urlClass = "(?:[^()\\s]|\\([^()\\s]*\\))+"
-    private static let inlineRx = try! NSRegularExpression(pattern:
+    /// The patterns are static and covered by selftests — an invalid one is a programmer error,
+    /// caught at first render in any test run (this beats `try!`, which the linter rightly bans).
+    private static func rx(_ pattern: String) -> NSRegularExpression {
+        do { return try NSRegularExpression(pattern: pattern) }
+        catch { preconditionFailure("MarkdownRender: invalid pattern \(pattern) — \(error)") }
+    }
+
+    private static let inlineRx = rx(
         "(`[^`\\n]+`)"
             + "|(\\[[^\\]\\n]+\\]\\(" + urlClass + "\\))"
             + "|(\\*\\*[^*\\n]+\\*\\*)"
             + "|(?<![\\w*])\\*([^*\\n]+)\\*(?![\\w*])"
             + "|(https?://[A-Za-z0-9\\-._~:/?#@!$&'+,;=%]+)")
-    private static let linkRx = try! NSRegularExpression(pattern: "\\[([^\\]\\n]+)\\]\\((" + urlClass + ")\\)")
+    private static let linkRx = rx("\\[([^\\]\\n]+)\\]\\((" + urlClass + ")\\)")
     /// A single line longer than this skips inline styling: the link alternation backtracks
     /// quadratically on pathological bracket floods (measured: 33 s at 40k chars), and no real
     /// document has a 4k-char LINE that needs styling.
