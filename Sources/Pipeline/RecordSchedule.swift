@@ -144,20 +144,36 @@ struct RecordSchedule: Equatable {
 }
 
 /// Dead/misrouted-input verdict: plenty of ENERGY-gate "voiced" time but almost none of it in
-/// sustained speech-length runs. Real speech always forms >=50 ms runs; electrical clicks and hum
-/// from a mic-less input never do. Pure + testable.
+/// sustained speech-length envelope runs. Real speech forms ≥256 ms envelope runs; electrical
+/// clicks and hum from a mic-less input never do. The voiced bar sits at 12 s because this is a
+/// warning-only heuristic: real click incidents measured 14–50 s voiced per segment, while an hour
+/// of short-backchannel speech (each utterance under the run bar) stays below it — crying "dead
+/// mic" during a real conversation costs more than a missed warning. Pure + testable.
 func micLooksDead(voiced: Double, speech: Double) -> Bool {
-    voiced >= 5 && speech < 0.5
+    voiced >= 12 && speech < 0.5
 }
 
-/// Reference implementation of the writer's speech-run accounting (samples inside >=minRun
-/// contiguous above-threshold runs) — selftests pin the semantics here.
-func speechlikeFrames(_ samples: [Float], threshold: Float = 0.02, minRun: Int = 800) -> Int {
+/// Reference implementation of the writer's envelope speech-run accounting — selftests pin the
+/// semantics here, and a selftest feeds the SAME signal to the real SourceWriter to prove the two
+/// never drift. A 16 ms block (256 samples) is voiced when its RMS clears the threshold AND ≥ ¼ of
+/// its samples do (RMS alone lets dense click trains through); speech = samples inside ≥ 16
+/// consecutive voiced blocks (~256 ms). Works on the envelope, NOT on raw samples: audio crosses
+/// zero every half-cycle, so a per-sample run metric scores all real audio 0.
+func speechlikeFrames(_ samples: [Float], threshold: Float = 0.02,
+                      blockFrames: Int = 256, minRunBlocks: Int = 16) -> Int {
     var total = 0, run = 0
-    for a in samples.map({ abs($0) }) {
-        if a > threshold {
+    for b in stride(from: 0, through: samples.count - blockFrames, by: blockFrames) {
+        var sumSq = 0.0, above = 0
+        for i in b..<(b + blockFrames) {
+            let raw = abs(samples[i])
+            let a = raw.isFinite ? raw : 0   // mirror the writer: corrupt samples poison nothing
+            sumSq += Double(a) * Double(a)
+            if a > threshold { above += 1 }
+        }
+        if sumSq / Double(blockFrames) > Double(threshold * threshold), above * 4 >= blockFrames {
             run += 1
-            if run == minRun { total += run } else if run > minRun { total += 1 }
+            if run == minRunBlocks { total += run * blockFrames }
+            else if run > minRunBlocks { total += blockFrames }
         } else { run = 0 }
     }
     return total

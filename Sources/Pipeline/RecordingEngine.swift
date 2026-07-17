@@ -28,10 +28,11 @@ final class RecordingEngine {
         self.session = CaptureSession(excludeBundleIds: cfg.excludeBundleIds, workDir: cfg.workDir)
     }
 
-    /// Cut what's recorded so far and transcribe/save it immediately, without waiting for the on-the-hour rotation (tray "Transcribe now").
+    /// Cut what's recorded so far and transcribe/save it immediately, without waiting for the on-the-hour
+    /// rotation (tray "Transcribe now"). Manual = the hygiene gates step aside (see process).
     func flushNow() {
         guard running, let seg = session.rotate() else { return }
-        processQueue.async { self.process(seg) }
+        processQueue.async { self.process(seg, manual: true) }
     }
 
     /// On sleep: stop the system-audio stream so we don't hold the display/audio while it powers down.
@@ -252,8 +253,11 @@ final class RecordingEngine {
 
     // Internal (not private) so QA scenarios can push a fixture CompletedSegment through the REAL
     // pipeline — VAD stats, transcription, titling, write — without start(), which fires TCC prompts.
-    func process(_ seg: CompletedSegment) {
-        elog("engine: segment \(segFormatter().string(from: seg.start)) — voiced mic=\(String(format: "%.1f", seg.micVoicedSeconds))s sys=\(String(format: "%.1f", seg.sysVoicedSeconds))s (micPeak=\(String(format: "%.3f", seg.micPeak)) sysPeak=\(String(format: "%.3f", seg.sysPeak))) dur=\(Int(seg.durationSeconds))s")
+    // `manual` = the user explicitly clicked "Transcribe now": the automatic hygiene gates (minimum
+    // speech, no-meeting cutoff) step aside — an explicit request is honored, and only a genuinely
+    // empty transcription is still discarded. A manual flush once died to the no-meeting rule (user P1).
+    func process(_ seg: CompletedSegment, manual: Bool = false) {
+        elog("engine: segment \(segFormatter().string(from: seg.start)) — voiced mic=\(String(format: "%.1f", seg.micVoicedSeconds))s sys=\(String(format: "%.1f", seg.sysVoicedSeconds))s speech mic=\(String(format: "%.1f", seg.micSpeechSeconds))s sys=\(String(format: "%.1f", seg.sysSpeechSeconds))s (micPeak=\(String(format: "%.3f", seg.micPeak)) sysPeak=\(String(format: "%.3f", seg.sysPeak))) dur=\(Int(seg.durationSeconds))s")
         // Dead/misrouted input detector: the ENERGY gate says the mic was active, but nothing held
         // above the threshold for speech-length runs — clicks/hum, not a voice. Surface it instead
         // of silently discarding "no speech" segments for hours (the jack-input incident).
@@ -279,23 +283,26 @@ final class RecordingEngine {
         }
 
         // Transcribe if anyone spoke — my mic or the other side (system) — including listen-only meetings.
-        guard seg.voicedSeconds >= cfg.voiceMinSeconds else {
+        // A MANUAL flush skips this gate: the user said "transcribe", so whisper gets the final word
+        // (a truly empty transcription is still discarded below).
+        guard manual || seg.voicedSeconds >= cfg.voiceMinSeconds else {
             elog("engine:   → no speech (\(String(format: "%.1f", seg.voicedSeconds))s < \(Int(cfg.voiceMinSeconds))s), discarding")
             onSegmentResult?("No speech — skipped")
             return
         }
         // Short-blip filter (user rule): when calendar titling is on, a segment with NO overlapping
-        // meeting and under 3 min of speech isn't worth a file — meetings are always kept. Gate BEFORE
-        // transcription so throwaway blips never reach whisper. (Only when titling is on: without a
-        // calendar we can't tell "no meeting" from "a meeting we couldn't see", so we don't discard.)
+        // meeting and only seconds of speech isn't worth a file — meetings are always kept, and an
+        // uncalendared CALL clears the 15 s bar easily (a real call was lost to the old 3-minute bar).
+        // Gate BEFORE transcription so throwaway blips never reach whisper. (Only when titling is on:
+        // without a calendar we can't tell "no meeting" from "a meeting we couldn't see".)
         // ONE calendar query per segment: whisper runs for minutes between the gate and the write, and
         // two queries can return different answers.
         let meeting = cfg.useCalendarTitles
             ? CalendarLookup.match(start: seg.start, end: seg.start.addingTimeInterval(seg.durationSeconds))
             : nil
         if cfg.useCalendarTitles {
-            guard shouldKeepTranscript(hasMeeting: meeting != nil, speechSeconds: seg.speechSeconds) else {
-                elog("engine:   → no meeting & speech \(String(format: "%.0f", seg.speechSeconds))s < 180s — discarding")
+            guard shouldKeepTranscript(hasMeeting: meeting != nil, speechSeconds: seg.speechSeconds, manual: manual) else {
+                elog("engine:   → no meeting & speech \(String(format: "%.0f", seg.speechSeconds))s < 15s — discarding")
                 onSegmentResult?("No meeting · short — skipped")
                 return
             }

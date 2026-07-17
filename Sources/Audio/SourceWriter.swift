@@ -19,12 +19,23 @@ final class SourceWriter {
     var recentLevel: Float = 0   // peak of the most recent buffer — for the live menu meter
     var voicedFrames: AVAudioFramePosition = 0   // # samples above the voice threshold
     static let voiceThreshold: Float = 0.02      // ~-34 dBFS — speech-ish floor
-    // Speech-RUN accounting: real speech holds above the threshold for ≥50 ms at a time; electrical
-    // clicks/pops from a dead or misrouted input (the mic-less jack incident: hours of segments
-    // "voiced" by clicks, every one transcribing to nothing) never form such runs.
-    static let speechRunFrames = 800             // 50 ms @ 16 kHz
-    var speechFrames: AVAudioFramePosition = 0   // samples inside ≥50 ms voiced runs
-    private var voicedRun = 0                    // current contiguous run length
+    // Speech-RUN accounting works on the ENVELOPE, not on raw samples: audio oscillates through zero
+    // every half-cycle, so |sample| > threshold can never hold for 50 ms of consecutive SAMPLES — the
+    // old per-sample run metric scored every real recording 0 s (measured on a real meeting: longest
+    // sample run 5 ms) and every uncalendared call was silently discarded by the no-meeting gate.
+    // A block is voiced when its 16 ms RMS clears the floor AND at least a quarter of its samples do
+    // (RMS alone lets a dense electrical click train — 8 hot samples in every 100 — score as speech;
+    // voiced speech keeps ≥ half its samples above the floor). Speech = blocks inside ≥ 256 ms of
+    // consecutive voiced blocks; isolated clicks/pops (the mic-less jack incident) still count 0.
+    // KNOWN LIMIT: a continuous pure tone (mains hum) passes both tests — telling hum from speech
+    // needs spectral features; the voiced-bar on micLooksDead and whisper's empty output backstop it.
+    static let envBlockFrames = 256              // 16 ms @ 16 kHz
+    static let envSpeechRunBlocks = 16           // 16 blocks = 256 ms sustained envelope
+    var speechFrames: AVAudioFramePosition = 0   // samples inside speech-length envelope runs
+    private var envSumSq: Double = 0             // running Σs² of the block being filled
+    private var envAbove = 0                     // samples above the floor in the block being filled
+    private var envFill = 0                      // samples in the block so far
+    private var envRun = 0                       // current consecutive voiced-block run
 
     /// Seconds of "voiced" (above-threshold) audio — used to decide if a segment is worth transcribing.
     var voicedSeconds: Double { Double(voicedFrames) / canon.sampleRate }
@@ -82,19 +93,31 @@ final class SourceWriter {
         guard outBuf.frameLength > 0 else { return }
         if let p = outBuf.floatChannelData?[0] {
             var bufMax: Float = 0
+            let blockFrames = SourceWriter.envBlockFrames
+            let runBlocks = SourceWriter.envSpeechRunBlocks
             for i in 0..<Int(outBuf.frameLength) {
-                let a = abs(p[i])
+                let raw = abs(p[i])
+                let a = raw.isFinite ? raw : 0   // one corrupt sample must not poison a whole block
                 if a > bufMax { bufMax = a }
-                if a > SourceWriter.voiceThreshold {
-                    voicedFrames += 1
-                    voicedRun += 1
-                    if voicedRun == SourceWriter.speechRunFrames {
-                        speechFrames += AVAudioFramePosition(voicedRun)   // run qualified — count it all
-                    } else if voicedRun > SourceWriter.speechRunFrames {
-                        speechFrames += 1
+                if a > SourceWriter.voiceThreshold { voicedFrames += 1; envAbove += 1 }
+                envSumSq += Double(a) * Double(a)
+                envFill += 1
+                if envFill == blockFrames {   // block complete — envelope decision (state spans buffers)
+                    let voicedBlock = envSumSq / Double(blockFrames) > Double(SourceWriter.voiceThreshold * SourceWriter.voiceThreshold)
+                        && envAbove * 4 >= blockFrames
+                    if voicedBlock {
+                        envRun += 1
+                        if envRun == runBlocks {
+                            speechFrames += AVAudioFramePosition(runBlocks * blockFrames)   // run qualified — count it all
+                        } else if envRun > runBlocks {
+                            speechFrames += AVAudioFramePosition(blockFrames)
+                        }
+                    } else {
+                        envRun = 0
                     }
-                } else {
-                    voicedRun = 0
+                    envSumSq = 0
+                    envAbove = 0
+                    envFill = 0
                 }
             }
             if bufMax > peak { peak = bufMax }

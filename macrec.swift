@@ -563,14 +563,14 @@ struct CompletedSegment {
     let micURL: URL
     let micVoicedSeconds: Double
     let sysVoicedSeconds: Double
-    let micSpeechSeconds: Double   // voiced time inside sustained (>=50 ms) runs — clicks contribute ~0
+    let micSpeechSeconds: Double   // time inside sustained (>=256 ms) envelope runs — clicks contribute ~0
     let sysSpeechSeconds: Double
     let sysPeak: Float
     let micPeak: Float
     let durationSeconds: Double
     /// Either side speaking is worth transcribing (covers listen-only meetings where only sys speaks).
     var voicedSeconds: Double { max(micVoicedSeconds, sysVoicedSeconds) }
-    var speechSeconds: Double { max(micSpeechSeconds, sysSpeechSeconds) }   // sustained speech only (clicks ≈ 0)
+    var speechSeconds: Double { max(micSpeechSeconds, sysSpeechSeconds) }   // sustained envelope only (clicks ≈ 0)
 }
 
 func segFormatter() -> DateFormatter {
@@ -582,6 +582,21 @@ func segFormatter() -> DateFormatter {
 /// Captures the system audio mix via a Core Audio process tap + private aggregate device (macOS
 /// 14.4+). Needs only kTCCServiceAudioCapture — no Screen Recording, no orange dot. Excludes our
 /// own process (and any excluded apps, e.g. Spotify) so we don't record ourselves / that app.
+/// Verdict for `macrec tap-probe`. A tap aggregate delivers NO IOProc callbacks while no tapped
+/// process renders audio — so zero buffers in silence is NOT "aggregate dead" (the probe's first
+/// version said exactly that and misdiagnosed a healthy tap). Only a missing callback stream WHILE
+/// our own test tone played condemns the aggregate; callbacks carrying only zeros mean the tap
+/// itself is muted/broken (the tap-mute P0's signature). Pure + testable.
+func tapProbeVerdict(buffers: Int, peak: Float, tonePlayed: Bool) -> (line: String, code: Int32) {
+    if buffers == 0 {
+        return tonePlayed
+            ? ("NO CALLBACKS while the test tone played — aggregate/tap dead", 2)
+            : ("no callbacks, and the test tone could not play — inconclusive; play any audio and re-run", 4)
+    }
+    if peak < 0.001 { return ("callbacks but SILENCE — tap delivers empty audio", 3) }
+    return ("AUDIO CAPTURED", 0)
+}
+
 final class SystemAudioTap {
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggID = AudioObjectID(kAudioObjectUnknown)
@@ -621,13 +636,7 @@ final class SystemAudioTap {
         for bid in excludeBundleIds where !procs.contains(where: { $0.bundleID == bid }) {
             elog("engine: exclude '\(bid)' — no audio process with that bundle id right now")
         }
-        // stereoGlobalTapButExcludeProcesses = the whole system mix minus these processes; a global
-        // tap is unmuted by default (audio stays audible), which is exactly what we want.
-        let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: exclude)
-        desc.uuid = UUID(); desc.isPrivate = true
-        // EXPLICITLY unmuted: relying on the default silenced playback of every tapped app on macOS 26
-        // (sound only survived behind a router) — never trust a default the OS may move under you.
-        desc.muteBehavior = .unmuted
+        let desc = Self.tapDescription(excludeObjects: exclude)
 
         var tap = AudioObjectID(kAudioObjectUnknown)
         var st = AudioHardwareCreateProcessTap(desc, &tap)
@@ -639,11 +648,11 @@ final class SystemAudioTap {
         let outDevID = defaultOutputDeviceID()
         let outUID = outputDeviceUID(outDevID)
         pinnedOutputUID = outUID   // remember what we pinned, so a later default-output change is detectable
-        // TAP-ONLY aggregate first: binding the PHYSICAL output device as a sub-device ran our IO on it,
-        // and on at least one USB DAC that silenced every app playing to the device directly — sound only
-        // survived when a router (SoundSource) sat in between (the "no sound without redirect" P0). A
-        // process tap intercepts app audio before routing, so it does not need the device; the tap clocks
-        // the aggregate. Fall back to the old device-bound shape if the tap-only aggregate can't start.
+        // DEVICE-BOUND aggregate (the output device is the aggregate's clock). A tap-only aggregate was
+        // tried as the fix for tapped-playback silence and it created and started fine — but its IOProc
+        // delivered nothing: every segment recorded sys≈0 until a real call went untranscribed. The
+        // silence bug was the TAP's mute default, fixed by the explicit .unmuted above, not the device
+        // binding. Measured on this codebase: device binding is required for capture.
         func makeAggregate(bindDevice: Bool) -> [String: Any] {
             var d: [String: Any] = [
                 kAudioAggregateDeviceNameKey: "macrec-tap",
@@ -659,13 +668,9 @@ final class SystemAudioTap {
             }
             return d
         }
+        deviceBound = true
         var agg = AudioObjectID(kAudioObjectUnknown)
-        st = AudioHardwareCreateAggregateDevice(makeAggregate(bindDevice: false) as CFDictionary, &agg)
-        if st != noErr || agg == kAudioObjectUnknown {
-            elog("engine: tap-only aggregate failed (\(st)) — falling back to device-bound")
-            deviceBound = true
-            st = AudioHardwareCreateAggregateDevice(makeAggregate(bindDevice: true) as CFDictionary, &agg)
-        }
+        st = AudioHardwareCreateAggregateDevice(makeAggregate(bindDevice: true) as CFDictionary, &agg)
         guard st == noErr, agg != kAudioObjectUnknown else { stop(); throw Self.err("create aggregate", st) }
         aggID = agg
 
@@ -685,27 +690,24 @@ final class SystemAudioTap {
         st = AudioDeviceCreateIOProcIDWithBlock(&procID, agg, ioQueue, ioBlock)
         guard st == noErr, let p = procID else { stop(); throw Self.err("create IOProc", st) }
         st = AudioDeviceStart(aggID, p)
-        if st != noErr, !deviceBound {
-            // The tap-only aggregate was created but won't run — retry once with the device-bound shape
-            // rather than losing capture. Playback interference is the lesser evil vs recording nothing.
-            elog("engine: tap-only aggregate start failed (\(st)) — retrying device-bound")
-            AudioDeviceDestroyIOProcID(aggID, p); procID = nil
-            AudioHardwareDestroyAggregateDevice(aggID); aggID = kAudioObjectUnknown
-            deviceBound = true
-            var agg2 = AudioObjectID(kAudioObjectUnknown)
-            st = AudioHardwareCreateAggregateDevice(makeAggregate(bindDevice: true) as CFDictionary, &agg2)
-            guard st == noErr, agg2 != kAudioObjectUnknown else { stop(); throw Self.err("create aggregate", st) }
-            aggID = agg2
-            st = AudioDeviceCreateIOProcIDWithBlock(&procID, agg2, ioQueue, ioBlock)
-            guard st == noErr, let p2 = procID else { stop(); throw Self.err("create IOProc", st) }
-            st = AudioDeviceStart(aggID, p2)
-        }
         guard st == noErr else { stop(); throw Self.err("device start", st) }
         elog("engine: system-audio tap started (\(Int(fmt.sampleRate))Hz \(fmt.channelCount)ch, excluding \(exclude.count) procs, \(deviceBound ? "device-bound" : "tap-only")) → default output '\(outputDeviceName(outDevID))'")
     }
 
+    /// The tap description, in one selftested place. stereoGlobalTapButExcludeProcesses = the whole
+    /// system mix minus these processes. muteBehavior is EXPLICITLY .unmuted: on macOS 26 the
+    /// default silences the tapped playback of every app system-wide (#132) — and the line was once
+    /// lost in a refactor, which put Zoom on mute for a whole evening. The selftest pins it now.
+    static func tapDescription(excludeObjects: [AudioObjectID]) -> CATapDescription {
+        let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: excludeObjects)
+        desc.uuid = UUID(); desc.isPrivate = true
+        desc.muteBehavior = .unmuted
+        return desc
+    }
+
     func stop() {
         if aggID != kAudioObjectUnknown, let p = procID { AudioDeviceStop(aggID, p); AudioDeviceDestroyIOProcID(aggID, p) }
+        ioQueue.sync {}   // drain in-flight IO blocks so counters read after stop() are final
         procID = nil
         if aggID != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(aggID); aggID = kAudioObjectUnknown }
         if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID); tapID = kAudioObjectUnknown }
@@ -1243,6 +1245,8 @@ func printMacrecHelp() {
       caption-snapshot [dir]  render the live caption overlay at 3 opacities (UI test kit)
       sweep                  run one retention/archive pass (WAV→AAC tiers) and exit
                              [--audio-dir D] [--transcripts-dir D] [--raw-days N] [--keep-days N]
+      tap-probe [secs]       start only the system-audio tap, play a test tone, report whether it
+                             captured (QA; exit 0 = captured, non-zero = see the verdict)
       version, --version     print the version and exit
       help,    --help        show this help
 
@@ -1278,6 +1282,70 @@ public enum App {
         // Subcommands: help / version (accept the common flag spellings too).
         if let a = args.first, ["help", "--help", "-h"].contains(a) { printMacrecHelp(); exit(0) }
         if let a = args.first, ["version", "--version", "-v"].contains(a) { print("macrec \(macrecVersion)"); exit(0) }
+
+        // Subcommand: tap-probe [seconds] — QA/diagnostic: start ONLY the system-audio tap and report
+        // whether its IOProc delivers anything — built for the day capture went silent and nothing in
+        // the logs could say WHERE the audio path died. The aggregate delivers NOTHING while no tapped
+        // process renders audio (measured 2026-07-15: 2 s probe in silence → 0 buffers; the same probe
+        // with a sound playing → 369 buffers), so the probe plays its own test tone — via CHILD afplay
+        // processes, because the tap always excludes our own pid. See tapProbeVerdict for the outcomes.
+        if args.first == "tap-probe" {
+            if args.count > 1, Double(args[1]) == nil {
+                print("tap-probe: ignoring non-numeric duration '\(args[1])' — using 6s")
+            }
+            let secs = max(args.count > 1 ? (Double(args[1]) ?? 6) : 6, 1)   // <1 s can't even play the tone
+            let lock = NSLock()
+            var buffers = 0
+            var peak: Float = 0
+            let tap = SystemAudioTap(excludeBundleIds: []) { buf in
+                lock.lock(); defer { lock.unlock() }
+                buffers += 1
+                if let ch = buf.floatChannelData?[0] {
+                    for i in 0..<Int(buf.frameLength) { peak = max(peak, abs(ch[i])) }
+                }
+            }
+            do { try tap.start() } catch { print("tap-probe: start failed — \(error)"); exit(1) }
+            var tonePlayed = false
+            var toneErrorShown = false
+            let deadline = Date().addingTimeInterval(secs)
+            while true {
+                let remaining = deadline.timeIntervalSinceNow
+                if remaining < 0.2 { break }
+                let play = Process()
+                play.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+                // -v 0.3: loud enough for the tap (captured peak ~0.1 ≫ the 0.001 silence bar), quiet
+                // enough not to blast a sonar ping at whoever is next to a live call.
+                play.arguments = ["-v", "0.3", "-t", String(format: "%.1f", min(remaining, 1.5)),
+                                  "/System/Library/Sounds/Submarine.aiff"]
+                let began = Date()
+                do { try play.run() } catch {
+                    print("tap-probe: could not launch afplay — \(error)")   // a diagnostic must diagnose itself
+                    break
+                }
+                // Watchdog: a wedged afplay must not hang the probe — the audio stack is exactly what
+                // this tool exists to diagnose, so assume the worst of it.
+                let killer = DispatchWorkItem { if play.isRunning { play.terminate() } }
+                DispatchQueue.global().asyncAfter(deadline: .now() + min(remaining, 1.5) + 2.0, execute: killer)
+                play.waitUntilExit()
+                killer.cancel()
+                if play.terminationStatus == 0, Date().timeIntervalSince(began) >= 0.3 {
+                    tonePlayed = true
+                } else {
+                    if !toneErrorShown {   // first failure: say WHY the tone isn't playing, once
+                        toneErrorShown = true
+                        print("tap-probe: afplay exited \(play.terminationStatus) after "
+                            + String(format: "%.2fs", Date().timeIntervalSince(began)))
+                    }
+                    Thread.sleep(forTimeInterval: 0.3)   // afplay unusable — report it, don't spin
+                }
+            }
+            tap.stop()
+            lock.lock(); let b = buffers, p = peak; lock.unlock()
+            let v = tapProbeVerdict(buffers: b, peak: p, tonePlayed: tonePlayed)
+            print(String(format: "tap-probe: %.1fs — buffers=%d peak=%.4f tone=%@ → %@",
+                         secs, b, p, tonePlayed ? "played" : "UNPLAYABLE", v.line))
+            exit(v.code)
+        }
 
         // Subcommand: sweep — run one retention/archive pass now (WAV→AAC tiers + expiry) and exit.
         // The tray app does this on start and after each segment; this is for manual runs and the

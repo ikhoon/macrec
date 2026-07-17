@@ -87,4 +87,52 @@ func audioSelftests(_ check: (String, Bool) -> Void) {
     Pref.d.removeObject(forKey: Pref.echoReduce)
     EchoCanceller.shared.reset()
     check("AEC reference gating: live full-mix tap suppresses the filtered-mix reference push", gatedOff && gatedOn)
+    // Writer ↔ reference speech accounting must never drift. speechlikeFrames is what the fixture
+    // tests pin; SourceWriter.append is what production runs — and the incident class is exactly
+    // "state across buffer boundaries", so the writer gets the SAME signal in irregular chunk sizes
+    // (nothing 256-aligned) and must land within one envelope block of the reference.
+    do {
+        var sig: [Float] = []
+        for burst in 0..<3 {   // three utterances with gaps, then isolated pops
+            sig += (0..<11200).map { sinf(Float(burst * 11200 + $0) * 0.13) * 0.3 }   // 700 ms on
+            sig += [Float](repeating: 0, count: 6400)                                 // 400 ms off
+        }
+        sig += (0..<16000).map { $0 % 3200 == 0 ? 0.9 : 0.0 }
+        let expect = Double(speechlikeFrames(sig)) / 16000
+        let swURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sw-sync-\(UUID().uuidString).wav")
+        var agreed = false
+        if let sw = try? SourceWriter(url: swURL) {
+            var i = 0, c = 0
+            let chunks = [173, 480, 997, 31, 1024, 555]
+            while i < sig.count {
+                let n = min(chunks[c % chunks.count], sig.count - i)
+                c += 1
+                let b = AVAudioPCMBuffer(pcmFormat: ecFmt, frameCapacity: AVAudioFrameCount(n))!
+                b.frameLength = AVAudioFrameCount(n)
+                for j in 0..<n { b.floatChannelData![0][j] = sig[i + j] }
+                sw.append(b)
+                i += n
+            }
+            agreed = abs(sw.speechSeconds - expect) <= 0.017 && expect > 1.5
+        }
+        try? FileManager.default.removeItem(at: swURL)
+        check("writer ↔ reference: envelope accounting agrees across irregular buffer boundaries", agreed)
+    }
+    // The tap description MUST be explicitly unmuted: on macOS 26 the default mute behavior
+    // silences the tapped playback of every app system-wide (#132). The .unmuted line was silently
+    // dropped once in a refactor and Zoom played to a dead speaker for an evening — this check
+    // makes that class of regression a build failure, not a discovery mid-call.
+    let tapDesc = SystemAudioTap.tapDescription(excludeObjects: [])
+    check("tap description: explicitly unmuted (never trust the OS default) and private",
+          tapDesc.muteBehavior == .unmuted && tapDesc.isPrivate)
+    // tap-probe verdict — the 2026-07-15 numbers: a healthy tap measured 0 buffers in silence (the
+    // probe's first version called that "aggregate not running") and 369 buffers / peak 0.14 with a
+    // tone playing. Zero buffers may only condemn the tap when the probe KNOWS its tone played.
+    check("tap-probe verdict: silence is inconclusive, tone-and-nothing is dead, zeros are muted",
+          tapProbeVerdict(buffers: 369, peak: 0.1422, tonePlayed: true).code == 0     // the healthy tap
+          && tapProbeVerdict(buffers: 0, peak: 0, tonePlayed: false).code == 4        // silence ≠ dead
+          && tapProbeVerdict(buffers: 0, peak: 0, tonePlayed: true).code == 2         // tone played, nothing came
+          && tapProbeVerdict(buffers: 300, peak: 0.0, tonePlayed: true).code == 3     // the tap-mute P0 shape
+          && tapProbeVerdict(buffers: 0, peak: 0, tonePlayed: true).line.contains("test tone"))
 }

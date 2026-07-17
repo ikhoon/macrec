@@ -446,13 +446,16 @@ func settingsSelftests(_ check: (String, Bool) -> Void) {
           brandMarkHasContent(recording: true, voice: true)
           && brandMarkHasContent(recording: true, voice: false)
           && brandMarkHasContent(recording: false, voice: false))
-    // Short-blip filter: no overlapping meeting + under 3 min of speech → no file (user rule).
-    check("keep transcript: meeting always kept; no meeting needs ≥3 min speech",
+    // Short-blip filter: no overlapping meeting + under 15 s of speech → no file. An uncalendared CALL
+    // was lost to the old 3-minute bar (user P1), and a MANUAL "Transcribe now" is always kept — the
+    // explicit request outranks the hygiene rules.
+    check("keep transcript: meeting or manual always kept; no meeting needs ≥15 s speech",
           shouldKeepTranscript(hasMeeting: true, speechSeconds: 5)
-          && shouldKeepTranscript(hasMeeting: false, speechSeconds: 180)
+          && shouldKeepTranscript(hasMeeting: false, speechSeconds: 15)
           && shouldKeepTranscript(hasMeeting: false, speechSeconds: 240)
-          && !shouldKeepTranscript(hasMeeting: false, speechSeconds: 179)
-          && !shouldKeepTranscript(hasMeeting: false, speechSeconds: 0))
+          && !shouldKeepTranscript(hasMeeting: false, speechSeconds: 14)
+          && !shouldKeepTranscript(hasMeeting: false, speechSeconds: 0)
+          && shouldKeepTranscript(hasMeeting: false, speechSeconds: 0, manual: true))
     // Summaries Mode is a real TAB — it SHOWS only the selected mode's sections (not readonly
     // greying). Switch each mode and confirm only that group is visible.
     sw.setPPModeForTest("summary")
