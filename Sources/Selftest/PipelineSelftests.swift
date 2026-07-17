@@ -275,6 +275,42 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
                   && d.string(forKey: Pref.dailyPrompt) == "my custom digest prompt")
         d.removeObject(forKey: Pref.dailyPrompt)
     }
+    // Orphan-segment adoption: stem parsing, pairing, the fresh-file veto, and the file-scan
+    // stats matching the live writer (same rules by construction — streamed through SourceWriter).
+    check("adopt: stem dates parse, stems pair, one fresh file vetoes the stem",
+          orphanSegmentStart("seg-2026-03-05-100000") != nil
+              && orphanSegmentStart("seg-garbage") == nil && orphanSegmentStart("notes") == nil
+              && orphanSegmentStems(names: ["seg-2026-03-05-100000.mic.wav", "seg-2026-03-05-100000.sys.wav",
+                                            "stray.wav", "seg-2026-03-05-110000.mic.wav"],
+                                    modified: { _ in Date(timeIntervalSinceNow: -600) }, now: Date())
+              == ["seg-2026-03-05-100000", "seg-2026-03-05-110000"]
+              && orphanSegmentStems(names: ["seg-2026-03-05-100000.mic.wav", "seg-2026-03-05-100000.sys.wav"],
+                                    modified: { $0.hasSuffix(".sys.wav") ? Date() : Date(timeIntervalSinceNow: -600) },
+                                    now: Date()).isEmpty)
+    do {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("mr-scan-\(UUID().uuidString)")
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let wav = dir.appendingPathComponent("sig.wav")
+        var expect: (voiced: Double, speech: Double, peak: Float) = (0, 0, 0)
+        if let w = try? SourceWriter(url: wav),
+           let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
+           let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 8000) {
+            buf.frameLength = 8000
+            for rep in 0..<6 {
+                for i in 0..<8000 { buf.floatChannelData![0][i] = i < 6400 ? sinf(Float(rep * 8000 + i) * 0.13) * 0.3 : 0 }
+                w.append(buf)
+            }
+            expect = (w.voicedSeconds, w.speechSeconds, w.peak)
+        }
+        let got = scanWavStats(wav, scratchDir: dir)
+        check("adopt: file-scan stats match the live writer's",
+              got != nil && abs((got?.voiced ?? -1) - expect.voiced) < 0.02
+                  && abs((got?.speech ?? -1) - expect.speech) < 0.02
+                  && abs((got?.peak ?? -1) - expect.peak) < 0.001
+                  && (got?.duration ?? 0) > 2.5)   // the converter buffers a tail; scan sees what the file holds
+        try? fm.removeItem(at: dir)
+    }
     // Title extraction for untitled recordings — every layer around the one runner call is pure.
     check("title: untitled-stem detection",
           isUntitledStem("2026-03-01-1600")

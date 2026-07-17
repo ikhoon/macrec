@@ -128,6 +128,7 @@ final class RecordingEngine {
         elog("engine: recording (segment=\(Int(cfg.segmentSeconds))s, voiceMin=\(Int(cfg.voiceMinSeconds))s, exclude=\(cfg.excludeBundleIds.joined(separator: ",")))")
         if !audioOK { waitForAudioGrantThenRestart() }   // rebuild the muted tap once the user allows
         processQueue.async { [weak self] in self?.cleanupRetention() }   // tidy old files on start
+        adoptOrphanSegments()   // a previous run's unprocessed segment files get their turn now
         // Sleep/wake: stop capture cleanly on sleep and resume on wake.
         let wc = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification] {
@@ -270,15 +271,25 @@ final class RecordingEngine {
                               body: "The mic records energy but nothing speech-like. Check System Settings → Sound → Input.")
             }
         }
-        // debugKeepTrackAudio: keep the PER-TRACK mic/sys wavs (normally deleted after the mix) in
-        // workDir — transcription-quality A/B work (echo-dedup validation against real meetings)
-        // needs the separated tracks, and the mixed wav can't be un-mixed. Off by default; workDir
-        // lives under /tmp, so leftovers vanish on reboot regardless.
+        // debugKeepTrackAudio: keep the PER-TRACK mic/sys wavs (normally deleted after the mix) —
+        // transcription-quality A/B work (echo-dedup validation against real meetings) needs the
+        // separated tracks, and the mixed wav can't be un-mixed. Kept files move into processed/
+        // so orphan ADOPTION can never mistake handled segments for a dead run's leftovers.
+        // Off by default; workDir lives under /tmp, so leftovers vanish on reboot regardless.
         let keepTracks = Pref.bool("debugKeepTrackAudio", "MR_DEBUG_KEEP_TRACKS", false)
         defer {
-            if !keepTracks {
-                try? FileManager.default.removeItem(at: seg.sysURL)
-                try? FileManager.default.removeItem(at: seg.micURL)
+            let fm = FileManager.default
+            if keepTracks {
+                let pen = cfg.workDir.appendingPathComponent("processed", isDirectory: true)
+                try? fm.createDirectory(at: pen, withIntermediateDirectories: true)
+                for f in [seg.sysURL, seg.micURL] where fm.fileExists(atPath: f.path) {
+                    let dst = pen.appendingPathComponent(f.lastPathComponent)
+                    try? fm.removeItem(at: dst)
+                    try? fm.moveItem(at: f, to: dst)
+                }
+            } else {
+                try? fm.removeItem(at: seg.sysURL)
+                try? fm.removeItem(at: seg.micURL)
             }
         }
 
@@ -357,6 +368,68 @@ final class RecordingEngine {
             }
         } catch { elog("engine: writeTranscript: \(error)") }
     }
+
+    /// Adopt orphaned segment files a previous run left behind (see SegmentAdoption.swift) — a
+    /// restart used to discard the in-flight partial, which once ate the head of a real call.
+    /// Candidates are MOVED into workDir/adopted/ before processing so nothing adopts twice; the
+    /// first run with this feature sweeps the pre-existing backlog into processed/ untouched
+    /// (debug track-keeping used to leave handled files in place — re-transcribing a week of
+    /// history is not a recovery).
+    func adoptOrphanSegments() {
+        processQueue.async { [weak self] in
+            guard let self else { return }
+            let fm = FileManager.default
+            let marker = self.cfg.workDir.appendingPathComponent(".adoption-enabled")
+            let names = ((try? fm.contentsOfDirectory(atPath: self.cfg.workDir.path)) ?? [])
+                .filter { $0.hasSuffix(".mic.wav") || $0.hasSuffix(".sys.wav") }
+            guard fm.fileExists(atPath: marker.path) else {
+                let pen = self.cfg.workDir.appendingPathComponent("processed", isDirectory: true)
+                try? fm.createDirectory(at: pen, withIntermediateDirectories: true)
+                for n in names {
+                    try? fm.moveItem(at: self.cfg.workDir.appendingPathComponent(n),
+                                     to: pen.appendingPathComponent(n))
+                }
+                fm.createFile(atPath: marker.path, contents: nil)
+                if !names.isEmpty { elog("engine: adoption enabled — \(names.count) pre-existing track files swept to processed/") }
+                return
+            }
+            let stems = orphanSegmentStems(names: names, modified: { n in
+                (try? fm.attributesOfItem(atPath: self.cfg.workDir.appendingPathComponent(n).path))?[.modificationDate] as? Date
+            }, now: Date())
+            guard !stems.isEmpty else { return }
+            let pen = self.cfg.workDir.appendingPathComponent("adopted", isDirectory: true)
+            try? fm.createDirectory(at: pen, withIntermediateDirectories: true)
+            for stem in stems {
+                guard let start = orphanSegmentStart(stem) else { continue }
+                for suffix in [".sys.wav", ".mic.wav"] {
+                    let src = self.cfg.workDir.appendingPathComponent(stem + suffix)
+                    if fm.fileExists(atPath: src.path) {
+                        try? fm.moveItem(at: src, to: pen.appendingPathComponent(stem + suffix))
+                    }
+                }
+                let sysURL = pen.appendingPathComponent(stem + ".sys.wav")
+                let micURL = pen.appendingPathComponent(stem + ".mic.wav")
+                guard fm.fileExists(atPath: sysURL.path), fm.fileExists(atPath: micURL.path) else {
+                    elog("engine: orphan \(stem) is missing a track — skipped")
+                    continue
+                }
+                let mic = scanWavStats(micURL, scratchDir: self.cfg.workDir)
+                let sys = scanWavStats(sysURL, scratchDir: self.cfg.workDir)
+                let dur = max(mic?.duration ?? 0, sys?.duration ?? 0)
+                guard dur >= 10 else { continue }   // sub-10 s scraps can't clear any gate
+                let seg = CompletedSegment(start: start, sysURL: sysURL, micURL: micURL,
+                                           micVoicedSeconds: mic?.voiced ?? 0, sysVoicedSeconds: sys?.voiced ?? 0,
+                                           micSpeechSeconds: mic?.speech ?? 0, sysSpeechSeconds: sys?.speech ?? 0,
+                                           sysPeak: sys?.peak ?? 0, micPeak: mic?.peak ?? 0,
+                                           durationSeconds: dur)
+                elog("engine: adopting orphaned segment \(stem) (dur \(Int(dur))s)")
+                self.process(seg)
+            }
+        }
+    }
+
+    /// Selftest hook: block until everything queued on the process queue (adoption included) ran.
+    func drainProcessQueueForTest() { processQueue.sync {} }
 
     /// A recording with no calendar title gets one from its OWN summary: same runner, one short
     /// extra call, then the whole set (transcript + summary + kept audio) renames to the titled
