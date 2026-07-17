@@ -69,6 +69,10 @@ s1() {
 PLIST
   launchctl bootout "gui/$(id -u)/$QA_LABEL" 2>/dev/null || true
   if ! launchctl bootstrap "gui/$(id -u)" "$SCRATCH/qa.plist"; then fail "s1: launchctl bootstrap failed"; return; fi
+  # RunAtLoad does NOT fire when bootstrapping from a non-login shell context (verified with a
+  # trivial echo job: bootstrap alone never spawned it, kickstart ran it instantly) — so kick
+  # explicitly instead of waiting 120 s for a launch that never comes.
+  launchctl kickstart "gui/$(id -u)/$QA_LABEL" 2>/dev/null || true
   local waited=0
   while [[ ! -s "$SCRATCH/out" && $waited -lt 120 ]]; do sleep 3; waited=$((waited+3)); done
   launchctl bootout "gui/$(id -u)/$QA_LABEL" 2>/dev/null || true
