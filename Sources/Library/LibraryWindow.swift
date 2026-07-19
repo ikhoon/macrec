@@ -61,6 +61,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     private var window: NSWindow?
     private let outline = NSOutlineView()
     private let searchField = NSSearchField()
+    private let scopePicker = NSSegmentedControl()   // All | Daily (digests only)
     private let textView = NSTextView()
     private let headerLabel = NSTextField(labelWithString: "")
     private let docPicker = NSSegmentedControl(labels: ["Summary", "Transcript"],
@@ -152,9 +153,20 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         searchField.target = self
         searchField.action = #selector(filterChanged)
 
+        // Scope: All vs Daily digests only — the fastest way to answer "what did each day boil down
+        // to?" without scrolling past every meeting. Composes with the text filter.
+        scopePicker.segmentCount = 2
+        scopePicker.setLabel("All", forSegment: 0)
+        scopePicker.setLabel("Daily", forSegment: 1)
+        scopePicker.selectedSegment = 0
+        scopePicker.segmentStyle = .texturedRounded
+        scopePicker.target = self
+        scopePicker.action = #selector(filterChanged)
+        scopePicker.setContentHuggingPriority(.required, for: .horizontal)
+
         let refreshBtn = NSButton(title: "Refresh", target: self, action: #selector(refreshClicked))
         refreshBtn.bezelStyle = .rounded
-        let bar = NSStackView(views: [searchField, refreshBtn])
+        let bar = NSStackView(views: [searchField, scopePicker, refreshBtn])
         bar.orientation = .horizontal
         bar.spacing = 8
         bar.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 6, right: 10)
@@ -297,12 +309,18 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     @objc private func refreshClicked() { refresh() }
 
     private func applyFilter() {
-        shownDays = libraryFiltered(allDays, filter: searchField.stringValue)
+        let onlyKind: LibraryEntry.Kind? = scopePicker.selectedSegment == 1 ? .digest : nil
+        shownDays = libraryFiltered(allDays, filter: searchField.stringValue, onlyKind: onlyKind)
         outline.reloadData()
         outline.expandItem(nil, expandChildren: true)
         emptyLabel.isHidden = !shownDays.isEmpty
+        // The daily-specific copy only when the SCOPE, not an active text filter, emptied the list —
+        // a digest has no searchable title, so any real query hides them and "no digests yet" would
+        // lie (review finding).
+        let filterActive = !searchField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty
         emptyLabel.stringValue = allDays.isEmpty
             ? "Nothing here yet — transcripts appear as meetings are recorded."
+            : (onlyKind == .digest && !filterActive) ? "No daily digests yet — they're written once a day."
             : "No match for the current filter."
         // Keep the preview in sync: the selected file may be gone after a rescan.
         if let sel = selected,
@@ -800,6 +818,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     /// Snapshot harness hook: open the audio player so the bar shows a real duration in the PNG.
     func primePlayerForTest() { _ = loadPlayerIfNeeded() }
+
+    /// Snapshot/selftest hook: drive the scope segment (0 = All, 1 = Daily) like a click.
+    func setScopeForTest(_ segment: Int) { scopePicker.selectedSegment = segment; applyFilter() }
+    var shownDayCountForTest: Int { shownDays.count }
 
     /// Swap the fixture WITHOUT rebuilding or reselecting — lets a test change what the next
     /// refresh() "rescans" (e.g. a summary appearing mid-run), like the real disk would.

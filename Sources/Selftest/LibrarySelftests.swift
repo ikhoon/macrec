@@ -220,6 +220,24 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
               && libraryFiltered(fix, filter: "").count == 2
               && libraryFiltered(fix, filter: "digest").first?.entries.first?.kind == .digest
               && libraryFiltered(fix, filter: "zzz").isEmpty)
+    // Daily-only scope: keeps ONLY digest rows, drops days without one, and still composes with text.
+    let txScoped = libraryFiltered(fix, filter: "", onlyKind: .transcript)
+    check("library: onlyKind scope keeps digests, composes with the text filter",
+          libraryFiltered(fix, filter: "", onlyKind: .digest).count == 1                     // only 2026-03-02 has a digest
+              && libraryFiltered(fix, filter: "", onlyKind: .digest).first?.entries.allSatisfy { $0.kind == .digest } == true
+              && libraryFiltered(fix, filter: "", onlyKind: .digest).first?.entries.count == 1  // the meetings are dropped
+              && libraryFiltered(fix, filter: "kickoff", onlyKind: .digest).isEmpty            // kickoff is a meeting, not a digest
+              && txScoped.count == 2                                                            // both days keep transcripts (not vacuous)
+              && txScoped.flatMap(\.entries).count >= 3
+              && txScoped.allSatisfy { $0.entries.allSatisfy { $0.kind == .transcript } })     // and audio-only rows are dropped
+    // The WINDOW wiring: segment 1 → digest-only, 0 → all (the mapping the pure test can't see).
+    let lw = LibraryWindow.shared
+    lw.loadFixtureForTest(libraryFixtureDays())
+    lw.setScopeForTest(1)
+    let dailyScoped = lw.shownDayCountForTest == 1
+    lw.setScopeForTest(0)
+    let allScoped = lw.shownDayCountForTest == 2
+    check("library: scope segment 1 → digest-only, 0 → all (window wiring)", dailyScoped && allScoped)
     // Layout guard, same class of check as the Settings panes: nothing collapsed, nothing overlapping.
     LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
     let issues = LibraryWindow.shared.layoutIssues()
