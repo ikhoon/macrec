@@ -83,7 +83,12 @@ concise and specific to macrec; don't pad the file with generic advice.
    every uncalendared call was silently discarded. Audio fixtures oscillate (sines, bursts, pops);
    before pinning a detector, run it once against a real capture and check the answer is even possible.
    *(speechSeconds ≡ 0; the 180 s → 15 s "fix" changed nothing because 0 < 15.)*
-12. **A P0 fix lands WITH the test that pins it — in the same commit, no exceptions.** #132's
+12. **When a deliberate break doesn't turn the guard red, suspect the BREAK, not the guard.** Proving
+   a guard means watching it fail — but a break can silently not take (autolayout dropped a
+   "crush the label" width constraint as conflicting, so the guard looked proven and wasn't; the
+   real crush laid out at 5 pt, under the guard's 4 pt bar). Render/observe the broken state before
+   trusting the red — or the green.
+13. **A P0 fix lands WITH the test that pins it — in the same commit, no exceptions.** #132's
    `muteBehavior = .unmuted` (the one line keeping every tapped app audible on macOS 26) shipped
    without a guard and was swept away by a revert-refactor within hours — Zoom played to a dead
    speaker for an evening, and the wedged output route survived a coreaudiod restart. An unpinned

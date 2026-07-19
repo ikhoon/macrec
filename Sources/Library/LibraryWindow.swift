@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import UniformTypeIdentifiers
 
 // MARK: - pure decisions (selftested)
 
@@ -55,7 +56,7 @@ func libraryRoots(transcripts: String, summaryOut: String, dailyOut: String, aud
 /// answering "what did macrec catch today?" used to mean digging through Finder. Left: days and
 /// entries; right: the selected transcript/summary, with Open / Reveal for the real file.
 final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate,
-    NSSplitViewDelegate, AVAudioPlayerDelegate {
+    NSSplitViewDelegate, AVAudioPlayerDelegate, NSTextViewDelegate {
     static let shared = LibraryWindow()
     private var window: NSWindow?
     private let outline = NSOutlineView()
@@ -66,6 +67,16 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
                                                trackingMode: .selectOne, target: nil, action: nil)
     private let openBtn = NSButton(title: "Open", target: nil, action: nil)
     private let revealBtn = NSButton(title: "Reveal in Finder", target: nil, action: nil)
+    private let exportBtn = NSButton(title: "Export…", target: nil, action: nil)
+    // Re-run-summary slot (its own row — squeezed into the header strip it crushed the title):
+    // button OR spinner+label, derived in applyHeaderActions (one decision).
+    private var summaryBar: NSStackView!
+    private let rerunBtn = NSButton(title: "Re-run summary", target: nil, action: nil)
+    private let rerunSpinner = NSProgressIndicator()
+    private let rerunStatus = NSTextField(labelWithString: "")
+    private var rerunPhase: [URL: LibraryRerunPhase] = [:]
+    private var exportPanel: NSSavePanel?
+    private let exportFormatPopup = NSPopUpButton()
     private let emptyLabel = NSTextField(wrappingLabelWithString:
         "Nothing here yet — transcripts appear as meetings are recorded.")
     // Audio player bar — exists only while the selected entry has audio.
@@ -170,16 +181,32 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         openBtn.action = #selector(openDoc)
         revealBtn.target = self
         revealBtn.action = #selector(revealDoc)
-        for b in [openBtn, revealBtn] { b.bezelStyle = .rounded }
-        let head = NSStackView(views: [headerLabel, NSView(), docPicker, openBtn, revealBtn])
+        exportBtn.target = self
+        exportBtn.action = #selector(exportClicked)
+        rerunBtn.target = self
+        rerunBtn.action = #selector(rerunClicked)
+        for b in [openBtn, revealBtn, exportBtn, rerunBtn] { b.bezelStyle = .rounded }
+        rerunSpinner.style = .spinning
+        rerunSpinner.controlSize = .small
+        rerunSpinner.isDisplayedWhenStopped = false
+        rerunStatus.font = NSFont.systemFont(ofSize: 11)
+        rerunStatus.textColor = .secondaryLabelColor
+        rerunStatus.lineBreakMode = .byTruncatingTail
+        rerunStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let head = NSStackView(views: [headerLabel, NSView(), docPicker, exportBtn, openBtn, revealBtn])
         head.orientation = .horizontal
         head.spacing = 8
         head.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 6, right: 10)
         headerLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         headerLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        summaryBar = NSStackView(views: [rerunBtn, rerunSpinner, rerunStatus, NSView()])
+        summaryBar.orientation = .horizontal
+        summaryBar.spacing = 8
+        summaryBar.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 6, right: 10)
 
         textView.isEditable = false
         textView.isSelectable = true
+        textView.delegate = self   // intercepts macrec-seek: stamp clicks (clickedOnLink below)
         textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         textView.textContainerInset = NSSize(width: 10, height: 10)
         textView.isVerticallyResizable = true
@@ -209,11 +236,12 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         playerBar.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 6, right: 10)
         seekSlider.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let right = NSStackView(views: [head, playerBar, rightScroll])
+        let right = NSStackView(views: [head, summaryBar, playerBar, rightScroll])
         right.orientation = .vertical
         right.spacing = 0
         right.distribution = .fill
         head.setContentHuggingPriority(.required, for: .vertical)
+        summaryBar.setContentHuggingPriority(.required, for: .vertical)
         playerBar.setContentHuggingPriority(.required, for: .vertical)
 
         let split = NSSplitView()
@@ -273,6 +301,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         // Keep the preview in sync: the selected file may be gone after a rescan.
         if let sel = selected,
            !shownDays.contains(where: { $0.entries.contains(sel) }) { showEntry(nil) }
+        // Prefs may have changed since the header was drawn (Settings saved, then the window
+        // refocused → refresh) — re-derive the action strip on every rescan.
+        applyHeaderActions()
     }
 
     /// The one decision for the right pane: which entry, and which of its documents. Everything —
@@ -288,6 +319,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             playerBar.isHidden = true
             openBtn.isEnabled = false
             revealBtn.isEnabled = false
+            applyHeaderActions()
             setPlainDoc("")
             return
         }
@@ -305,6 +337,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         playerBar.isHidden = e.audioURL == nil
         openBtn.isEnabled = true
         revealBtn.isEnabled = true
+        applyHeaderActions()
         loadDoc()
     }
 
@@ -327,7 +360,13 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             let capped = data.prefix(2_000_000)
             let text = String(decoding: capped, as: UTF8.self)
                 + (data.count > capped.count ? "\n\n… (truncated view — Open shows the full file)" : "")
-            textView.textStorage?.setAttributedString(MarkdownRender.render(text, baseURL: url))
+            // Seek links only on the TRANSCRIPT view of a row that has audio: the line stamps and
+            // the stem's start minute are both wall-clock, so their difference is the play offset.
+            let showingTranscript = docPicker.isHidden || docPicker.selectedSegment == 1
+            let start = (e.kind == .transcript && showingTranscript && e.audioURL != nil)
+                ? libraryStartSeconds(e.time) : nil
+            textView.textStorage?.setAttributedString(
+                MarkdownRender.render(text, baseURL: url, transcriptStart: start))
         } else {
             setPlainDoc("(could not read \(url.path))")
         }
@@ -451,6 +490,170 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         if let u = currentDocURL() { NSWorkspace.shared.activateFileViewerSelecting([u]) }
     }
 
+    // MARK: seek links (a rendered "[HH:MM:SS]" stamp → the player)
+
+    /// A transcript stamp was clicked: seek the lazily loaded player there and play. Foreign links
+    /// return false → NSTextView's default handling (NSWorkspace) — macrec-seek: never reaches it.
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        guard let secs = macrecSeekSeconds(link) else { return false }
+        guard let p = loadPlayerIfNeeded() else { return true }   // failure is on the clock label
+        p.currentTime = min(secs, max(p.duration - 0.05, 0))      // a stamp past EOF lands at the end
+        if !p.isPlaying {
+            p.play()
+            playBtn.title = "⏸"
+            startPlayerTimer()
+        }
+        updatePlayerClock()
+        return true
+    }
+
+    // MARK: preview-header actions (Export… / Re-run summary)
+
+    /// Materialize the ONE decision (librarySummarySlot + libraryExportEnabled) into the strip.
+    /// Called whenever an input moves: selection, a rescan, a run starting/ending.
+    private func applyHeaderActions() {
+        exportBtn.isEnabled = libraryExportEnabled(selected?.kind)
+        let slot = currentSummarySlot()
+        summaryBar.isHidden = slot.buttonTitle == nil && !slot.spinning && slot.status == nil
+        rerunBtn.isHidden = slot.buttonTitle == nil
+        if let t = slot.buttonTitle { rerunBtn.title = t }
+        rerunSpinner.isHidden = !slot.spinning
+        if slot.spinning { rerunSpinner.startAnimation(nil) } else { rerunSpinner.stopAnimation(nil) }
+        rerunStatus.isHidden = slot.status == nil
+        rerunStatus.stringValue = slot.status ?? ""
+        rerunStatus.toolTip = slot.status   // the label truncates; the full reason lives here
+    }
+
+    private func currentSummarySlot() -> LibrarySummarySlot {
+        guard let e = selected else {
+            return librarySummarySlot(kind: nil, hasInvocation: false, writesSummaryFile: false,
+                                      hasSummary: false, phase: .idle)
+        }
+        let mode = effectivePostProcessMode(
+            rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
+            shellCmd: Pref.postProcessCommand)
+        let inv = e.kind == .transcript ? postProcessInvocationFromPrefs(transcriptPath: e.url.path) : nil
+        return librarySummarySlot(kind: e.kind, hasInvocation: inv != nil,
+                                  writesSummaryFile: postProcessWritesSummaryFile(mode),
+                                  hasSummary: e.summaryURL != nil,
+                                  phase: rerunPhase[e.url] ?? .idle)
+    }
+
+    /// Test seam: selftests inject a stub so the wiring is driven without spawning a real agent CLI
+    /// (a test that runs the machine's `claude` fails on someone else's machine). nil = the real runner.
+    var runCommandForTest: ((String, @escaping (Int32) -> Void) -> Void)?
+
+    @objc private func rerunClicked() {
+        guard let e = selected, e.kind == .transcript, rerunPhase[e.url] != .running else { return }
+        // Re-derive at click time: prefs may have changed since the header was drawn — a stale
+        // button re-hides the slot instead of dead-ending.
+        let mode = effectivePostProcessMode(
+            rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
+            shellCmd: Pref.postProcessCommand)
+        guard postProcessWritesSummaryFile(mode),
+              let cmd = postProcessInvocationFromPrefs(transcriptPath: e.url.path) else {
+            applyHeaderActions()
+            return
+        }
+        let target = e.url
+        let file = target.lastPathComponent
+        let out = summaryOutputPath(transcriptPath: target.path,
+                                    outDir: Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT"))
+        rerunPhase[target] = .running
+        applyHeaderActions()
+        SummaryStatus.shared.started(file)   // the tray row mirrors the run, like an automatic one
+        let run = runCommandForTest ?? { c, done in runPostProcessCommand(c, completion: done) }
+        run(cmd) { [weak self] status in
+            DispatchQueue.main.async { self?.rerunFinished(target: target, file: file, out: out, status: status) }
+        }
+    }
+
+    private func rerunFinished(target: URL, file: String, out: String, status: Int32) {
+        if status == 0 {
+            rerunPhase[target] = nil
+            SummaryStatus.shared.finished(file, at: Date(), output: out)
+            // The fresh summary must show up: rescan, then re-select the same file — the selected
+            // VALUE is stale (it just gained a summaryURL) and would otherwise clear the preview.
+            let wasSelected = selected?.url == target
+            refresh()
+            if wasSelected { reselect(url: target, kind: .transcript) }
+        } else {
+            let why = reapFailedPostProcess(outPath: out) ?? "exit \(status)"
+            rerunPhase[target] = .failed(why)
+            SummaryStatus.shared.failed(file, at: Date(), reason: why)
+            elog("library: re-run summary exited \(status) for \(file) — \(why)")
+            applyHeaderActions()
+        }
+    }
+
+    /// Find the (fresh) entry for a file after a rescan and keep the user's place on it. The kind
+    /// disambiguates: a digest row can share a day with the transcript being summarized.
+    private func reselect(url: URL, kind: LibraryEntry.Kind) {
+        for row in 0..<outline.numberOfRows {
+            if let e = outline.item(atRow: row) as? LibraryEntry, e.url == url, e.kind == kind {
+                outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                showEntry(e)
+                return
+            }
+        }
+    }
+
+    @objc private func exportClicked() {
+        guard let e = selected, libraryExportEnabled(e.kind), let win = window else { return }
+        let md: String
+        do { md = try String(contentsOf: e.url, encoding: .utf8) }
+        catch {
+            presentExportError("Could not read \(e.url.lastPathComponent) — \(error.localizedDescription)")
+            return
+        }
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        exportFormatPopup.removeAllItems()
+        exportFormatPopup.addItems(withTitles: TranscriptExportFormat.allCases.map(\.label))
+        exportFormatPopup.target = self
+        exportFormatPopup.action = #selector(exportFormatChanged)
+        exportFormatPopup.selectItem(at: 0)
+        let acc = NSStackView(views: [NSTextField(labelWithString: "Format:"), exportFormatPopup])
+        acc.orientation = .horizontal
+        acc.spacing = 6
+        acc.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        acc.translatesAutoresizingMaskIntoConstraints = true
+        acc.frame = NSRect(origin: .zero, size: acc.fittingSize)
+        panel.accessoryView = acc
+        panel.nameFieldStringValue = e.url.deletingPathExtension().lastPathComponent + ".md"
+        if let t = UTType(filenameExtension: "md") { panel.allowedContentTypes = [t] }
+        exportPanel = panel
+        let start = libraryStartSeconds(e.time)
+        panel.beginSheetModal(for: win) { [weak self] resp in
+            guard let self else { return }
+            self.exportPanel = nil
+            guard resp == .OK, let dest = panel.url else { return }
+            let fmt = TranscriptExportFormat.allCases[max(0, self.exportFormatPopup.indexOfSelectedItem)]
+            let content = transcriptExportContent(md, format: fmt, startSeconds: start)
+            do { try content.write(to: dest, atomically: true, encoding: .utf8) }
+            catch { self.presentExportError("Could not write \(dest.lastPathComponent) — \(error.localizedDescription)") }
+        }
+    }
+
+    /// Keep the proposed file name's extension in step with the chosen format.
+    @objc private func exportFormatChanged() {
+        guard let panel = exportPanel else { return }
+        let fmt = TranscriptExportFormat.allCases[max(0, exportFormatPopup.indexOfSelectedItem)]
+        let base = (panel.nameFieldStringValue as NSString).deletingPathExtension
+        if let t = UTType(filenameExtension: fmt.ext) { panel.allowedContentTypes = [t] }
+        panel.nameFieldStringValue = base + "." + fmt.ext
+    }
+
+    private func presentExportError(_ msg: String) {
+        elog("library: export failed — \(msg)")
+        guard let win = window else { return }
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "Export failed"
+        a.informativeText = msg
+        a.beginSheetModal(for: win)
+    }
+
     private static func dayString(_ d: Date) -> String {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -570,6 +773,22 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     var docTextForTest: String { textView.string }
     var clockTextForTest: String { clockLabel.stringValue }
     var seekMaxForTest: Double { seekSlider.maxValue }
+    // Increment-2 hooks: header actions + seek links, driven like a user but without panels/audio.
+    var exportEnabledForTest: Bool { exportBtn.isEnabled }
+    var rerunButtonTitleForTest: String? { rerunBtn.isHidden ? nil : rerunBtn.title }
+    var rerunSpinningForTest: Bool { !rerunSpinner.isHidden }
+    var rerunStatusForTest: String? { rerunStatus.isHidden ? nil : rerunStatus.stringValue }
+    var playerTimeForTest: Double { player?.currentTime ?? -1 }
+    var playerPlayingForTest: Bool { player?.isPlaying ?? false }
+    var docAttributedForTest: NSAttributedString { textView.attributedString() }
+    func rerunClickForTest() { rerunClicked() }
+    func mutePlayerForTest() { player?.volume = 0 }
+    func clickLinkForTest(_ link: Any) -> Bool { textView(textView, clickedOnLink: link, at: 0) }
+    func pickDocForTest(_ segment: Int) {
+        guard !docPicker.isHidden else { return }
+        docPicker.selectedSegment = segment
+        loadDoc()
+    }
 
     /// AUTOMATED LAYOUT GUARD (selftest): any control collapsed to ~zero or overlapping another.
     func layoutIssues() -> [String] {
@@ -593,10 +812,22 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             if v.isHidden { return }
             if v is NSScroller { return }
             if v is NSControl || v is NSTextView {
-                let f = visibleRect(v)
-                if f.isEmpty { return }   // scrolled out of view — nothing to assert
                 let name = "\(type(of: v))(\((v as? NSButton)?.title ?? (v as? NSTextField)?.stringValue ?? ""))"
-                if f.width < 4 || f.height < 4 { issues.append("library: \(name) collapsed to \(f)") }
+                // Collapse is judged on the RAW frame, before clipping: a control crushed to ~zero
+                // also has an empty visible rect, and the old visible-only check skipped it as
+                // "scrolled out of view" (the header label shipped crushed to 0 width, guard green).
+                let raw = v.convert(v.bounds, to: content)
+                // A control that SHOWS text needs readable width — the crushed header label
+                // measured 5 pt (bezel padding only) and sailed under a flat 4 pt bar.
+                let hasText = ((v as? NSTextField)?.stringValue.isEmpty == false)
+                    || ((v as? NSButton)?.title.isEmpty == false)
+                let minSide: CGFloat = hasText ? 12 : 4
+                if raw.width < minSide || raw.height < minSide {
+                    issues.append("library: \(name) collapsed to \(raw)")
+                    return
+                }
+                let f = visibleRect(v)
+                if f.isEmpty { return }   // scrolled out of view — nothing to assert about overlap
                 for (on, of) in rects where of.intersects(f) && of.intersection(f).width > 8
                     && of.intersection(f).height > 8 {
                     issues.append("library: \(name) overlaps \(on)")
@@ -611,10 +842,12 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     }
 
     /// UI TEST KIT (see `macrec library-snapshot`): render the fixture-filled window to a PNG.
+    /// Taller than the layout guard's 860×540 on purpose: the fixture document's transcript section
+    /// (the seek-link stamps) sits at the bottom, and the eyeball check must actually see it.
     func snapshot(to dir: URL) -> [URL] {
         guard let win = window, let content = win.contentView else { return [] }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        win.setContentSize(NSSize(width: 860, height: 540))
+        win.setContentSize(NSSize(width: 860, height: 960))
         content.layoutSubtreeIfNeeded()
         RunLoop.current.run(until: Date().addingTimeInterval(0.08))
         let bounds = content.bounds

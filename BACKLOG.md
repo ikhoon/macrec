@@ -70,8 +70,9 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
 - [ ] Settings: warn before Close discards unsaved edits (#35).
 - [ ] UI consistency pass across all Settings panes (#26).
 - [ ] **Inline transcript editing** — fix STT errors in place (improves the saved log). *(MacWhisper Editor)*
-- [ ] **Playback sync** — click a transcript line → jump to that point in the recorded audio (post-session
-      review). *(MacWhisper)*
+- [x] **Playback sync** — click a transcript line → jump to that point in the recorded audio (post-session
+      review). *(MacWhisper)* Done in the Library preview (Increment 2), with transcript Export…
+      (md/txt/SRT/VTT) and a Re-run summary header action.
 
 ## Bugs / edges
 

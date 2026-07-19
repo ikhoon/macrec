@@ -1452,8 +1452,14 @@ public enum App {
                 for i in 0..<16000 { buf.floatChannelData![0][i] = sinf(Float(i) * 0.13) * 0.2 }
                 w.append(buf)   // 1 s tone → the clock should read 0:00 / 0:01
             }
+            // Built-in summary mode (in the throwaway test store): the Re-run summary button must
+            // be laid out in the shot — hidden-by-prefs would leave the new control unseen forever.
+            Pref.d.set("summary", forKey: Pref.postProcessMode)
             LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
             LibraryWindow.shared.primePlayerForTest()
+            // Show the TRANSCRIPT view (not the default summary): the stamped lines render their
+            // macrec-seek links there, and the PNG must show them.
+            LibraryWindow.shared.pickDocForTest(1)
             let files = LibraryWindow.shared.snapshot(to: dir)
             for f in files { print(f.path) }
             print(files.isEmpty ? "library-snapshot: FAILED (nothing rendered)" : "library-snapshot: \(files.count) shot → \(dir.path)")

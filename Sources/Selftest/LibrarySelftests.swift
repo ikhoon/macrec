@@ -262,4 +262,217 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         try? fm.removeItem(at: wav)
         LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore the rich default
     }
+    // Transcript stamps: parsing, the clock→offset decision, and the seek-link scheme.
+    check("transcript: stamp parsing accepts the saved shape, rejects whisper ranges/garbage",
+          transcriptLineStamp("[14:01:12] Me: hi")?.clockSeconds == 50472
+              && transcriptLineStamp("[00:00:00]")?.length == 10
+              && transcriptLineStamp("[14:01:12.500 --> 14:01:14.000] raw whisper") == nil
+              && transcriptLineStamp("[25:00:00] x") == nil
+              && transcriptLineStamp("[14:61:00] x") == nil
+              && transcriptLineStamp("14:01:12 no bracket") == nil
+              && transcriptLineStamp("[hh:mm:ss] x") == nil
+              && transcriptLineStamp("") == nil)
+    check("transcript: clock→offset — normal, before start → 0, across midnight",
+          transcriptSeekOffset(lineSeconds: 50472, startSeconds: 50400) == 72     // 14:01:12 in a 14:00 file
+              && transcriptSeekOffset(lineSeconds: 50398, startSeconds: 50400) == 0 // 13:59:58 stamped early
+              && transcriptSeekOffset(lineSeconds: 300, startSeconds: 85800) == 900 // 23:50 file, 00:05 line
+              && libraryStartSeconds("14:00") == 50400 && libraryStartSeconds(nil) == nil
+              && libraryStartSeconds("1400") == nil && libraryStartSeconds("24:00") == nil)
+    check("transcript: macrec-seek links round-trip; foreign/negative/garbage parse nil",
+          macrecSeekLink(offsetSeconds: 72.4)?.absoluteString == "macrec-seek:72"
+              && macrecSeekSeconds(URL(string: "macrec-seek:72")!) == 72
+              && macrecSeekSeconds("macrec-seek:0") == 0
+              && macrecSeekSeconds(URL(string: "https://example.com")!) == nil
+              && macrecSeekSeconds("macrec-seek:-5") == nil
+              && macrecSeekSeconds("macrec-seek:abc") == nil
+              && MarkdownRender.resolveLink("macrec-seek:12", baseURL: nil) == nil) // never a normal link
+    // Stamp → link rendering: minted only when the caller passes the recording's start clock.
+    do {
+        func linkAt(_ s: NSAttributedString, _ needle: String) -> URL? {
+            let r = (s.string as NSString).range(of: needle)
+            guard r.location != NSNotFound else { return nil }
+            return s.attribute(.link, at: r.location, effectiveRange: nil) as? URL
+        }
+        let tmd = "## Transcript\n\n[14:01:12] Me: kickoff begins\n[13:59:58] Me: stamped early"
+        let linked = MarkdownRender.render(tmd, transcriptStart: 50400)
+        check("markdown: transcript stamps become macrec-seek links only with a start clock",
+              linkAt(linked, "[14:01:12]")?.absoluteString == "macrec-seek:72"
+                  && linkAt(linked, "[13:59:58]")?.absoluteString == "macrec-seek:0"
+                  && linked.string.contains("Me: kickoff begins")
+                  && linkAt(MarkdownRender.render(tmd), "[14:01:12]") == nil)
+    }
+    // Export conversions — realistic-shaped fixture lines, invented content only.
+    do {
+        let srtIn = """
+        # 2026-03-02 10:00–11:00 — project kickoff
+
+        - Time: 2026-03-02 10:00–11:00 (60 min)
+
+        ## Transcript
+
+        [10:00:05] Me: kickoff starts
+        [10:00:12] Them: agenda first?
+        [10:01:00] Me: closing note
+        """
+        let wantSRT = """
+        1
+        00:00:05,000 --> 00:00:12,000
+        Me: kickoff starts
+
+        2
+        00:00:12,000 --> 00:01:00,000
+        Them: agenda first?
+
+        3
+        00:01:00,000 --> 00:01:05,000
+        Me: closing note
+        """ + "\n"
+        check("export: SRT cues chain to the next line, last runs +5 s, speaker prefix kept",
+              transcriptToSRT(srtIn, start: 36000) == wantSRT)
+        let vtt = transcriptToVTT(srtIn, start: 36000)
+        check("export: VTT carries the header and dot-millis clocks",
+              vtt.hasPrefix("WEBVTT\n\n00:00:05.000 --> 00:00:12.000\nMe: kickoff starts\n")
+                  && vtt.contains("00:01:00.000 --> 00:01:05.000") && !vtt.contains(","))
+        let edge = transcriptCues("[10:00:05] Me: a\n[10:00:05] Them: b\nprose\n[10:00:20] Me: c",
+                                  startSeconds: 36000)
+        let anchored = transcriptCues("[10:00:05] Me: a\n[10:00:09] Them: b", startSeconds: nil)
+        let wrapped = transcriptCues("[23:59:58] Me: a\n[00:00:06] Them: b", startSeconds: 85800)
+        check("export: cue edges — same-second keeps 1 s, prose carries no cue, nil start anchors at 0, midnight wraps",
+              edge == [TranscriptCue(start: 5, end: 6, text: "Me: a"),
+                       TranscriptCue(start: 5, end: 20, text: "Them: b"),
+                       TranscriptCue(start: 20, end: 25, text: "Me: c")]
+                  && anchored.first?.start == 0 && anchored.last?.start == 4
+                  && wrapped == [TranscriptCue(start: 598, end: 606, text: "Me: a"),
+                                 TranscriptCue(start: 606, end: 611, text: "Them: b")])
+        let plainIn = """
+        # 2026-03-02 14:00 — project kickoff
+        > a note
+        - bullet **bold** and `code`
+        [audio](../a/x.wav) plus https://example.com/page
+        | Owner | Item |
+        |---|---|
+        | alex | plan |
+        ```
+        raw fence art
+        ```
+        [14:01:12] Me: *emphasis* stays readable
+        """
+        let plain = transcriptToPlainText(plainIn)
+        check("export: plain text strips markdown, keeps text, lists and stamps",
+              plain.contains("2026-03-02 14:00 — project kickoff") && !plain.contains("# ")
+                  && plain.contains("a note") && !plain.contains("> ")
+                  && plain.contains("- bullet bold and code")
+                  && plain.contains("audio plus https://example.com/page")
+                  && plain.contains("| Owner | Item |") && !plain.contains("|---|")
+                  && plain.contains("raw fence art") && !plain.contains("```")
+                  && plain.contains("[14:01:12] Me: emphasis stays readable")
+                  && transcriptExportContent(plainIn, format: .markdown, startSeconds: nil) == plainIn)
+    }
+    // The preview-header decisions: one pure function per control (enablement IS the action).
+    check("library: summary slot — hidden unless a transcript + built-in summary + an invocation",
+          librarySummarySlot(kind: .transcript, hasInvocation: true, writesSummaryFile: true,
+                             hasSummary: true, phase: .idle)
+              == LibrarySummarySlot(buttonTitle: "Re-run summary", spinning: false, status: nil)
+              && librarySummarySlot(kind: .transcript, hasInvocation: true, writesSummaryFile: true,
+                                    hasSummary: false, phase: .idle).buttonTitle == "Summarize"
+              && librarySummarySlot(kind: .transcript, hasInvocation: true, writesSummaryFile: true,
+                                    hasSummary: true, phase: .running)
+              == LibrarySummarySlot(buttonTitle: nil, spinning: true, status: "Summarizing…")
+              && librarySummarySlot(kind: .transcript, hasInvocation: true, writesSummaryFile: true,
+                                    hasSummary: true, phase: .failed("not logged in")).status
+              == "Summary failed — not logged in"
+              && librarySummarySlot(kind: .digest, hasInvocation: true, writesSummaryFile: true,
+                                    hasSummary: false, phase: .idle).buttonTitle == nil
+              && librarySummarySlot(kind: .audio, hasInvocation: true, writesSummaryFile: true,
+                                    hasSummary: false, phase: .idle)
+              == LibrarySummarySlot(buttonTitle: nil, spinning: false, status: nil)
+              && librarySummarySlot(kind: .transcript, hasInvocation: false, writesSummaryFile: true,
+                                    hasSummary: true, phase: .idle).buttonTitle == nil
+              && librarySummarySlot(kind: .transcript, hasInvocation: true, writesSummaryFile: false,
+                                    hasSummary: true, phase: .idle).buttonTitle == nil
+              && librarySummarySlot(kind: nil, hasInvocation: false, writesSummaryFile: false,
+                                    hasSummary: false, phase: .idle).buttonTitle == nil
+              && libraryExportEnabled(.transcript) && !libraryExportEnabled(.digest)
+              && !libraryExportEnabled(.audio) && !libraryExportEnabled(nil))
+    // Header-action wiring, driven like a user (scenario-style: the holes live in the wiring).
+    do {
+        let lw = LibraryWindow.shared
+        let fix = libraryFixtureDays()
+        // Prefs OFF (the ephemeral store's default): no slot anywhere; Export tracks the row kind.
+        lw.loadFixtureForTest(fix)   // selects the rich transcript row
+        let offHidden = lw.rerunButtonTitleForTest == nil && lw.exportEnabledForTest
+        lw.selectForTest(fix[0].entries[0])   // digest
+        let digestOff = lw.rerunButtonTitleForTest == nil && !lw.exportEnabledForTest
+        // Built-in summary mode: the slot appears on transcript rows only, titled by summary presence.
+        Pref.d.set("summary", forKey: Pref.postProcessMode)
+        lw.selectForTest(fix[0].entries[1])   // transcript with a summary
+        let ready = lw.rerunButtonTitleForTest == "Re-run summary" && !lw.rerunSpinningForTest
+            && lw.rerunStatusForTest == nil
+        lw.selectForTest(fix[0].entries[2])   // transcript without one
+        let readyNoSum = lw.rerunButtonTitleForTest == "Summarize"
+        lw.selectForTest(fix[0].entries[0])   // digest — still hidden with the mode on
+        let digestOn = lw.rerunButtonTitleForTest == nil
+        let layoutOK = lw.layoutIssues().isEmpty   // the widened strip still lays out cleanly
+        check("library: export/re-run enablement derives from the row + prefs (one decision)",
+              offHidden && digestOff && ready && readyNoSum && digestOn && layoutOK)
+
+        func pump(_ cond: () -> Bool) {
+            let deadline = Date().addingTimeInterval(2)
+            while !cond(), Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
+        }
+        // A run: spinner while running; success rescans and keeps the user's place on the row.
+        lw.selectForTest(fix[0].entries[1])
+        var ranCmd: String?
+        lw.runCommandForTest = { cmd, done in ranCmd = cmd; done(0) }
+        lw.rerunClickForTest()
+        let spinning = lw.rerunSpinningForTest && lw.rerunButtonTitleForTest == nil
+            && lw.rerunStatusForTest == "Summarizing…"
+        pump { !lw.rerunSpinningForTest }
+        let succeeded = lw.rerunButtonTitleForTest == "Re-run summary" && lw.rerunStatusForTest == nil
+            && lw.openEnabledForTest   // the selection survived the refresh
+            && (ranCmd?.contains("library-fixture") ?? false)
+        // A failing run: the reason (the runner's own words, from its .partial) lands in the header.
+        let out = summaryOutputPath(transcriptPath: fix[0].entries[1].url.path, outDir: "")
+        lw.runCommandForTest = { _, done in
+            try? "fixture: not logged in".write(toFile: out + ".partial", atomically: true, encoding: .utf8)
+            done(1)
+        }
+        lw.rerunClickForTest()
+        pump { !lw.rerunSpinningForTest && lw.rerunStatusForTest != nil }
+        let failed = lw.rerunStatusForTest == "Summary failed — fixture: not logged in"
+            && lw.rerunButtonTitleForTest == "Re-run summary"   // retry stays one click away
+            && !FileManager.default.fileExists(atPath: out + ".partial")   // the orphan was reaped
+        check("library: re-run summary — spinner while running, refresh keeps the place, failure names the reason",
+              spinning && succeeded && failed)
+        lw.runCommandForTest = nil
+        SummaryStatus.shared.resetForTest()
+        Pref.d.removeObject(forKey: Pref.postProcessMode)
+    }
+    // Seek links drive the player (wiring): click → lazy-load, seek (clamped), play — muted here.
+    do {
+        let fm = FileManager.default
+        let wav = fm.temporaryDirectory.appendingPathComponent("lib-seek-\(UUID().uuidString).wav")
+        if let w = try? SourceWriter(url: wav),
+           let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
+           let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 16000) {
+            buf.frameLength = 16000
+            for i in 0..<16000 { buf.floatChannelData![0][i] = sinf(Float(i) * 0.13) * 0.2 }
+            w.append(buf)   // exactly 1 s
+        }
+        let lw = LibraryWindow.shared
+        lw.selectForTest(LibraryEntry(day: "2026-03-02", time: "14:00", title: "project kickoff",
+                                      kind: .transcript, url: URL(fileURLWithPath: "/tmp/library-fixture.md"),
+                                      summaryURL: nil, audioURL: wav))
+        lw.primePlayerForTest()
+        lw.mutePlayerForTest()
+        let seeked = lw.clickLinkForTest(URL(string: "macrec-seek:600")!)
+        let clamped = lw.playerTimeForTest > 0.5 && lw.playerPlayingForTest // 600 s clamps into the 1 s file
+        let foreign = !lw.clickLinkForTest(URL(string: "https://example.com/x")!)
+        let zero = lw.clickLinkForTest("macrec-seek:0") && lw.playerTimeForTest < 0.5
+        lw.selectForTest(nil)
+        check("library: a stamp click loads, seeks (clamped) and plays; foreign links fall through",
+              seeked && clamped && foreign && zero && !lw.playerActiveForTest)
+        try? fm.removeItem(at: wav)
+        LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore the rich default
+    }
 }
