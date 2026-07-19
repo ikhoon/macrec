@@ -266,16 +266,22 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     check("transcript: stamp parsing accepts the saved shape, rejects whisper ranges/garbage",
           transcriptLineStamp("[14:01:12] Me: hi")?.clockSeconds == 50472
               && transcriptLineStamp("[00:00:00]")?.length == 10
+              && transcriptLineStamp("[23:59:59] x")?.clockSeconds == 86399   // upper boundary
               && transcriptLineStamp("[14:01:12.500 --> 14:01:14.000] raw whisper") == nil
+              && transcriptLineStamp("[24:00:00] x") == nil
               && transcriptLineStamp("[25:00:00] x") == nil
               && transcriptLineStamp("[14:61:00] x") == nil
               && transcriptLineStamp("14:01:12 no bracket") == nil
+              && transcriptLineStamp("한[14:01:12] shifted") == nil   // multi-byte prefix, not a stamp
               && transcriptLineStamp("[hh:mm:ss] x") == nil
               && transcriptLineStamp("") == nil)
-    check("transcript: clock→offset — normal, before start → 0, across midnight",
+    check("transcript: clock→offset — normal, before start → 0, across midnight, long same-day kept",
           transcriptSeekOffset(lineSeconds: 50472, startSeconds: 50400) == 72     // 14:01:12 in a 14:00 file
               && transcriptSeekOffset(lineSeconds: 50398, startSeconds: 50400) == 0 // 13:59:58 stamped early
               && transcriptSeekOffset(lineSeconds: 300, startSeconds: 85800) == 900 // 23:50 file, 00:05 line
+              // 08:00 file, 21:00 line: 13 h SAME-DAY is a real offset — the clamp is wrap-only
+              // (review counterexample: the old unconditional ≥12 h clamp zeroed this).
+              && transcriptSeekOffset(lineSeconds: 75600, startSeconds: 28800) == 46800
               && libraryStartSeconds("14:00") == 50400 && libraryStartSeconds(nil) == nil
               && libraryStartSeconds("1400") == nil && libraryStartSeconds("24:00") == nil)
     check("transcript: macrec-seek links round-trip; foreign/negative/garbage parse nil",
@@ -285,6 +291,7 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
               && macrecSeekSeconds(URL(string: "https://example.com")!) == nil
               && macrecSeekSeconds("macrec-seek:-5") == nil
               && macrecSeekSeconds("macrec-seek:abc") == nil
+              && macrecSeekSeconds("macrec-seek:inf") == nil
               && MarkdownRender.resolveLink("macrec-seek:12", baseURL: nil) == nil) // never a normal link
     // Stamp → link rendering: minted only when the caller passes the recording's start clock.
     do {
@@ -295,11 +302,16 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         }
         let tmd = "## Transcript\n\n[14:01:12] Me: kickoff begins\n[13:59:58] Me: stamped early"
         let linked = MarkdownRender.render(tmd, transcriptStart: 50400)
+        // A stamped line with a "|" followed by a separator-looking line must STAY a seek line —
+        // the table branch once ran first and swallowed it (review counterexample).
+        let piped = MarkdownRender.render("[14:01:12] Me: status | update\n|---|---|", transcriptStart: 50400)
         check("markdown: transcript stamps become macrec-seek links only with a start clock",
               linkAt(linked, "[14:01:12]")?.absoluteString == "macrec-seek:72"
                   && linkAt(linked, "[13:59:58]")?.absoluteString == "macrec-seek:0"
                   && linked.string.contains("Me: kickoff begins")
-                  && linkAt(MarkdownRender.render(tmd), "[14:01:12]") == nil)
+                  && linkAt(MarkdownRender.render(tmd), "[14:01:12]") == nil
+                  && linkAt(piped, "[14:01:12]")?.absoluteString == "macrec-seek:72"
+                  && piped.string.contains("status | update"))
     }
     // Export conversions — realistic-shaped fixture lines, invented content only.
     do {
@@ -333,17 +345,25 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         check("export: VTT carries the header and dot-millis clocks",
               vtt.hasPrefix("WEBVTT\n\n00:00:05.000 --> 00:00:12.000\nMe: kickoff starts\n")
                   && vtt.contains("00:01:00.000 --> 00:01:05.000") && !vtt.contains(","))
-        let edge = transcriptCues("[10:00:05] Me: a\n[10:00:05] Them: b\nprose\n[10:00:20] Me: c",
+        let edge = transcriptCues("[10:00:05] Me: a\n[10:00:05] Them: b\nprose\n[10:00:07]   \n[10:00:20] Me: c",
                                   startSeconds: 36000)
         let anchored = transcriptCues("[10:00:05] Me: a\n[10:00:09] Them: b", startSeconds: nil)
         let wrapped = transcriptCues("[23:59:58] Me: a\n[00:00:06] Them: b", startSeconds: 85800)
-        check("export: cue edges — same-second keeps 1 s, prose carries no cue, nil start anchors at 0, midnight wraps",
+        check("export: cue edges — same-second keeps 1 s, prose/empty lines carry no cue, nil start anchors at 0, midnight wraps",
               edge == [TranscriptCue(start: 5, end: 6, text: "Me: a"),
                        TranscriptCue(start: 5, end: 20, text: "Them: b"),
                        TranscriptCue(start: 20, end: 25, text: "Me: c")]
                   && anchored.first?.start == 0 && anchored.last?.start == 4
                   && wrapped == [TranscriptCue(start: 598, end: 606, text: "Me: a"),
                                  TranscriptCue(start: 606, end: 611, text: "Them: b")])
+        // The SRT/VTT of a stamp-less file would be empty — the panel must refuse, not write it.
+        check("export: subtitle formats refuse a stamp-less document; markdown/plain never do",
+              transcriptExportIssue("just prose, no stamps", format: .srt) != nil
+                  && transcriptExportIssue("just prose, no stamps", format: .vtt) != nil
+                  && transcriptExportIssue("just prose, no stamps", format: .markdown) == nil
+                  && transcriptExportIssue("just prose, no stamps", format: .plainText) == nil
+                  && transcriptExportIssue("[10:00:05] Me: a", format: .srt) == nil
+                  && subtitleClock(.nan, millisSeparator: ",") == "00:00:00,000")   // garbage must not trap
         let plainIn = """
         # 2026-03-02 14:00 — project kickoff
         > a note
@@ -367,6 +387,18 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
                   && plain.contains("raw fence art") && !plain.contains("```")
                   && plain.contains("[14:01:12] Me: emphasis stays readable")
                   && transcriptExportContent(plainIn, format: .markdown, startSeconds: nil) == plainIn)
+        // Fenced content is DATA — its markers survive verbatim (review: they were being stripped);
+        // a pathological long line skips the quadratic link regex instead of beachballing (13.8 s
+        // at 40k chars when this guard was missing).
+        let fenced = transcriptToPlainText("```\n# code heading\n> code quote\n**still code**\n```")
+        let flood = String(repeating: "[", count: 8000)
+        let floodStart = Date()
+        let floodOut = transcriptToPlainText(flood)
+        check("export: plain text keeps fenced content verbatim and caps the regex line length",
+              fenced.contains("# code heading") && fenced.contains("> code quote")
+                  && fenced.contains("**still code**")
+                  && floodOut.contains(flood)   // returned untouched…
+                  && Date().timeIntervalSince(floodStart) < 1.0)   // …and fast
     }
     // The preview-header decisions: one pure function per control (enablement IS the action).
     check("library: summary slot — hidden unless a transcript + built-in summary + an invocation",
@@ -394,6 +426,18 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
                                     hasSummary: false, phase: .idle).buttonTitle == nil
               && libraryExportEnabled(.transcript) && !libraryExportEnabled(.digest)
               && !libraryExportEnabled(.audio) && !libraryExportEnabled(nil))
+    // Feedback for a run already in flight (or its failure) outranks the prefs gate — flipping the
+    // mode mid-run must not vanish the spinner or the failure reason (review finding).
+    check("library: summary slot — running/failed feedback survives a prefs flip",
+          librarySummarySlot(kind: .transcript, hasInvocation: false, writesSummaryFile: false,
+                             hasSummary: false, phase: .running)
+              == LibrarySummarySlot(buttonTitle: nil, spinning: true, status: "Summarizing…")
+              && librarySummarySlot(kind: .transcript, hasInvocation: false, writesSummaryFile: false,
+                                    hasSummary: true, phase: .failed("not logged in"))
+              == LibrarySummarySlot(buttonTitle: nil, spinning: false,
+                                    status: "Summary failed — not logged in")
+              && librarySummarySlot(kind: .digest, hasInvocation: false, writesSummaryFile: false,
+                                    hasSummary: false, phase: .running).spinning == false)
     // Header-action wiring, driven like a user (scenario-style: the holes live in the wiring).
     do {
         let lw = LibraryWindow.shared
@@ -420,16 +464,30 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
             let deadline = Date().addingTimeInterval(2)
             while !cond(), Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
         }
-        // A run: spinner while running; success rescans and keeps the user's place on the row.
-        lw.selectForTest(fix[0].entries[1])
+        // A run: spinner while running; success RESCANS (the fixture gains its summary mid-run,
+        // like the real disk would) and re-finds the user's row — proving reselect, not merely
+        // that the selection was never at risk (review: the old fixture never changed).
+        SummaryStatus.shared.resetForTest()
+        var noSum = libraryFixtureDays()
+        noSum[0].entries[1].summaryURL = nil
+        lw.setFixtureForTest(noSum)
+        lw.refresh()
+        lw.selectForTest(noSum[0].entries[1])
+        let readyBefore = lw.rerunButtonTitleForTest == "Summarize"
         var ranCmd: String?
-        lw.runCommandForTest = { cmd, done in ranCmd = cmd; done(0) }
+        lw.runCommandForTest = { cmd, done in
+            ranCmd = cmd
+            lw.setFixtureForTest(libraryFixtureDays())   // the summary "appears on disk"
+            done(0)
+        }
         lw.rerunClickForTest()
         let spinning = lw.rerunSpinningForTest && lw.rerunButtonTitleForTest == nil
             && lw.rerunStatusForTest == "Summarizing…"
+        let layoutRunning = lw.layoutIssues().isEmpty   // the spinner is walked by the guard now
         pump { !lw.rerunSpinningForTest }
-        let succeeded = lw.rerunButtonTitleForTest == "Re-run summary" && lw.rerunStatusForTest == nil
-            && lw.openEnabledForTest   // the selection survived the refresh
+        let succeeded = lw.rerunButtonTitleForTest == "Re-run summary"   // fresh entry HAS a summary
+            && lw.rerunStatusForTest == nil
+            && lw.openEnabledForTest   // …and the selection survived the rescan via reselect
             && (ranCmd?.contains("library-fixture") ?? false)
         // A failing run: the reason (the runner's own words, from its .partial) lands in the header.
         let out = summaryOutputPath(transcriptPath: fix[0].entries[1].url.path, outDir: "")
@@ -442,9 +500,30 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         let failed = lw.rerunStatusForTest == "Summary failed — fixture: not logged in"
             && lw.rerunButtonTitleForTest == "Re-run summary"   // retry stays one click away
             && !FileManager.default.fileExists(atPath: out + ".partial")   // the orphan was reaped
-        check("library: re-run summary — spinner while running, refresh keeps the place, failure names the reason",
-              spinning && succeeded && failed)
+        check("library: re-run summary — spinner while running, refresh re-finds the row, failure names the reason",
+              readyBefore && spinning && layoutRunning && succeeded && failed)
+        // The ENGINE's in-flight run for the same file parks the button — one registry, no second
+        // racing run onto the same .partial files (review P0).
+        SummaryStatus.shared.resetForTest()
+        lw.resetRerunForTest()
+        SummaryStatus.shared.beginRun(path: fix[0].entries[1].url.path)
+        lw.selectForTest(fix[0].entries[1])
+        let engineParked = lw.rerunSpinningForTest && lw.rerunButtonTitleForTest == nil
+        var racedDuringEngineRun = false
+        lw.runCommandForTest = { _, done in racedDuringEngineRun = true; done(0) }
+        lw.rerunClickForTest()   // must refuse — the engine already owns this file
+        SummaryStatus.shared.endRun(path: fix[0].entries[1].url.path)
+        lw.selectForTest(fix[0].entries[1])
+        let engineDone = lw.rerunButtonTitleForTest == "Re-run summary" && !lw.rerunSpinningForTest
+        // An engine failure recorded in SummaryStatus surfaces here too — an overnight "Summary
+        // failed" must be visible in the Library, not only as a long-dismissed notification.
+        SummaryStatus.shared.failed(fix[0].entries[1].url.lastPathComponent, at: Date(), reason: "no runner")
+        lw.selectForTest(fix[0].entries[1])
+        let engineFailShown = lw.rerunStatusForTest == "Summary failed — no runner"
+        check("library: the engine's run parks the button; its failure surfaces in the header",
+              engineParked && !racedDuringEngineRun && engineDone && engineFailShown)
         lw.runCommandForTest = nil
+        lw.resetRerunForTest()
         SummaryStatus.shared.resetForTest()
         Pref.d.removeObject(forKey: Pref.postProcessMode)
     }

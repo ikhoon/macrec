@@ -67,9 +67,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
                                                trackingMode: .selectOne, target: nil, action: nil)
     private let openBtn = NSButton(title: "Open", target: nil, action: nil)
     private let revealBtn = NSButton(title: "Reveal in Finder", target: nil, action: nil)
-    private let exportBtn = NSButton(title: "Export…", target: nil, action: nil)
-    // Re-run-summary slot (its own row — squeezed into the header strip it crushed the title):
-    // button OR spinner+label, derived in applyHeaderActions (one decision).
+    private let exportBtn = NSButton(title: "Export Transcript…", target: nil, action: nil)
+    // Transcript-actions row (its own row — squeezed into the header strip they crushed the title):
+    // Export + the re-run slot (button OR spinner+label), derived in applyHeaderActions (one decision).
     private var summaryBar: NSStackView!
     private let rerunBtn = NSButton(title: "Re-run summary", target: nil, action: nil)
     private let rerunSpinner = NSProgressIndicator()
@@ -77,6 +77,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     private var rerunPhase: [URL: LibraryRerunPhase] = [:]
     private var exportPanel: NSSavePanel?
     private let exportFormatPopup = NSPopUpButton()
+    private var lastExportFormat = 0 // the format popup remembers the user's pick across exports
     private let emptyLabel = NSTextField(wrappingLabelWithString:
         "Nothing here yet — transcripts appear as meetings are recorded.")
     // Audio player bar — exists only while the selected entry has audio.
@@ -103,6 +104,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// index is a snapshot, and these are the events that invalidate it.
     func refresh() {
         allDays = fixtureDays ?? scanReal()
+        // Prune re-run state for files the scan no longer sees (deleted/renamed) — in-flight runs
+        // keep their entry so a completion can still land its failure reason.
+        let urls = Set(allDays.flatMap(\.entries).map(\.url))
+        rerunPhase = rerunPhase.filter { $0.value == .running || urls.contains($0.key) }
         applyFilter()
     }
 
@@ -183,6 +188,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         revealBtn.action = #selector(revealDoc)
         exportBtn.target = self
         exportBtn.action = #selector(exportClicked)
+        exportBtn.toolTip = "Save the transcript as Markdown, plain text, SRT or VTT"
         rerunBtn.target = self
         rerunBtn.action = #selector(rerunClicked)
         for b in [openBtn, revealBtn, exportBtn, rerunBtn] { b.bezelStyle = .rounded }
@@ -193,13 +199,13 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         rerunStatus.textColor = .secondaryLabelColor
         rerunStatus.lineBreakMode = .byTruncatingTail
         rerunStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let head = NSStackView(views: [headerLabel, NSView(), docPicker, exportBtn, openBtn, revealBtn])
+        let head = NSStackView(views: [headerLabel, NSView(), docPicker, openBtn, revealBtn])
         head.orientation = .horizontal
         head.spacing = 8
         head.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 6, right: 10)
         headerLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         headerLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        summaryBar = NSStackView(views: [rerunBtn, rerunSpinner, rerunStatus, NSView()])
+        summaryBar = NSStackView(views: [rerunBtn, exportBtn, rerunSpinner, rerunStatus, NSView()])
         summaryBar.orientation = .horizontal
         summaryBar.spacing = 8
         summaryBar.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 6, right: 10)
@@ -334,6 +340,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         // Summary first: the distilled note is what the user reaches for; the raw transcript is
         // the appendix. The picker defaults to Summary whenever one exists (segment 0 = Summary).
         if !docPicker.isHidden { docPicker.selectedSegment = 0 }
+        // Discoverability: seek links live on the Transcript view only — say so where the switch is.
+        docPicker.setToolTip(e.audioURL != nil ? "Timestamps here play the recording" : nil, forSegment: 1)
         playerBar.isHidden = e.audioURL == nil
         openBtn.isEnabled = true
         revealBtn.isEnabled = true
@@ -512,9 +520,11 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// Materialize the ONE decision (librarySummarySlot + libraryExportEnabled) into the strip.
     /// Called whenever an input moves: selection, a rescan, a run starting/ending.
     private func applyHeaderActions() {
-        exportBtn.isEnabled = libraryExportEnabled(selected?.kind)
+        let exportOn = libraryExportEnabled(selected?.kind)
+        exportBtn.isEnabled = exportOn
+        exportBtn.isHidden = !exportOn   // non-transcript rows have nothing to convert — no dead chrome
         let slot = currentSummarySlot()
-        summaryBar.isHidden = slot.buttonTitle == nil && !slot.spinning && slot.status == nil
+        summaryBar.isHidden = !exportOn && slot.buttonTitle == nil && !slot.spinning && slot.status == nil
         rerunBtn.isHidden = slot.buttonTitle == nil
         if let t = slot.buttonTitle { rerunBtn.title = t }
         rerunSpinner.isHidden = !slot.spinning
@@ -536,7 +546,19 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         return librarySummarySlot(kind: e.kind, hasInvocation: inv != nil,
                                   writesSummaryFile: postProcessWritesSummaryFile(mode),
                                   hasSummary: e.summaryURL != nil,
-                                  phase: rerunPhase[e.url] ?? .idle)
+                                  phase: currentPhase(for: e))
+    }
+
+    /// This transcript's run state, from EVERY source that can know about one: the Library's own
+    /// runs (rerunPhase), the engine's in-flight automatic run (the SummaryStatus registry — the
+    /// button must never offer a second, racing run), and the engine's LAST failure (so an
+    /// overnight "Summary failed" is visible here, not only as a long-dismissed notification).
+    private func currentPhase(for e: LibraryEntry) -> LibraryRerunPhase {
+        if SummaryStatus.shared.isRunning(path: e.url.path) { return .running }   // any runner, any surface
+        if let p = rerunPhase[e.url] { return p }
+        if case .failed(let file, _, let reason) = SummaryStatus.shared.current,
+           file == e.url.lastPathComponent { return .failed(reason ?? "see the log") }
+        return .idle
     }
 
     /// Test seam: selftests inject a stub so the wiring is driven without spawning a real agent CLI
@@ -545,12 +567,14 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     @objc private func rerunClicked() {
         guard let e = selected, e.kind == .transcript, rerunPhase[e.url] != .running else { return }
-        // Re-derive at click time: prefs may have changed since the header was drawn — a stale
-        // button re-hides the slot instead of dead-ending.
+        // Re-derive at click time: prefs may have changed since the header was drawn, and the
+        // ENGINE may have started its own run for this file (registry) — a stale button re-hides
+        // or re-derives the slot instead of dead-ending or racing onto the same .partial files.
         let mode = effectivePostProcessMode(
             rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
             shellCmd: Pref.postProcessCommand)
-        guard postProcessWritesSummaryFile(mode),
+        guard !SummaryStatus.shared.isRunning(path: e.url.path),
+              postProcessWritesSummaryFile(mode),
               let cmd = postProcessInvocationFromPrefs(transcriptPath: e.url.path) else {
             applyHeaderActions()
             return
@@ -562,6 +586,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         rerunPhase[target] = .running
         applyHeaderActions()
         SummaryStatus.shared.started(file)   // the tray row mirrors the run, like an automatic one
+        SummaryStatus.shared.beginRun(path: target.path)
         let run = runCommandForTest ?? { c, done in runPostProcessCommand(c, completion: done) }
         run(cmd) { [weak self] status in
             DispatchQueue.main.async { self?.rerunFinished(target: target, file: file, out: out, status: status) }
@@ -569,6 +594,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     }
 
     private func rerunFinished(target: URL, file: String, out: String, status: Int32) {
+        SummaryStatus.shared.endRun(path: target.path)
         if status == 0 {
             rerunPhase[target] = nil
             SummaryStatus.shared.finished(file, at: Date(), output: out)
@@ -599,20 +625,16 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     }
 
     @objc private func exportClicked() {
-        guard let e = selected, libraryExportEnabled(e.kind), let win = window else { return }
-        let md: String
-        do { md = try String(contentsOf: e.url, encoding: .utf8) }
-        catch {
-            presentExportError("Could not read \(e.url.lastPathComponent) — \(error.localizedDescription)")
-            return
-        }
+        guard let e = selected, libraryExportEnabled(e.kind), let win = window,
+              exportPanel == nil else { return }   // one panel: a second click must not steal the popup
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
+        panel.message = "Export the transcript — Markdown as saved, or converted."
         exportFormatPopup.removeAllItems()
         exportFormatPopup.addItems(withTitles: TranscriptExportFormat.allCases.map(\.label))
         exportFormatPopup.target = self
         exportFormatPopup.action = #selector(exportFormatChanged)
-        exportFormatPopup.selectItem(at: 0)
+        exportFormatPopup.selectItem(at: lastExportFormat)   // the user's last pick, not a reset
         let acc = NSStackView(views: [NSTextField(labelWithString: "Format:"), exportFormatPopup])
         acc.orientation = .horizontal
         acc.spacing = 6
@@ -620,8 +642,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         acc.translatesAutoresizingMaskIntoConstraints = true
         acc.frame = NSRect(origin: .zero, size: acc.fittingSize)
         panel.accessoryView = acc
-        panel.nameFieldStringValue = e.url.deletingPathExtension().lastPathComponent + ".md"
-        if let t = UTType(filenameExtension: "md") { panel.allowedContentTypes = [t] }
+        let fmt0 = TranscriptExportFormat.allCases[lastExportFormat]
+        panel.nameFieldStringValue = e.url.deletingPathExtension().lastPathComponent + "." + fmt0.ext
+        if let t = UTType(filenameExtension: fmt0.ext) { panel.allowedContentTypes = [t] }
         exportPanel = panel
         let start = libraryStartSeconds(e.time)
         panel.beginSheetModal(for: win) { [weak self] resp in
@@ -629,6 +652,20 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             self.exportPanel = nil
             guard resp == .OK, let dest = panel.url else { return }
             let fmt = TranscriptExportFormat.allCases[max(0, self.exportFormatPopup.indexOfSelectedItem)]
+            self.lastExportFormat = max(0, self.exportFormatPopup.indexOfSelectedItem)
+            // Read at SAVE time (the file can be retitled/rewritten while the sheet sits open),
+            // decoding lossily like the preview does — a stray byte must not fail the export.
+            guard let data = try? Data(contentsOf: e.url) else {
+                self.presentExportError("Could not read \(e.url.lastPathComponent)")
+                return
+            }
+            let md = String(decoding: data, as: UTF8.self)
+            // An SRT/VTT of a file with no stamped lines would be an empty subtitle file — refuse
+            // loudly instead of writing a reassuring nothing.
+            if let issue = transcriptExportIssue(md, format: fmt) {
+                self.presentExportError(issue)
+                return
+            }
             let content = transcriptExportContent(md, format: fmt, startSeconds: start)
             do { try content.write(to: dest, atomically: true, encoding: .utf8) }
             catch { self.presentExportError("Could not write \(dest.lastPathComponent) — \(error.localizedDescription)") }
@@ -764,6 +801,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// Snapshot harness hook: open the audio player so the bar shows a real duration in the PNG.
     func primePlayerForTest() { _ = loadPlayerIfNeeded() }
 
+    /// Swap the fixture WITHOUT rebuilding or reselecting — lets a test change what the next
+    /// refresh() "rescans" (e.g. a summary appearing mid-run), like the real disk would.
+    func setFixtureForTest(_ days: [LibraryDay]) { fixtureDays = days }
+
     // Selection-driven state, readable by selftests: drive rows like a user, assert the derivation
     // (player bar visibility, lazy load, resets) without audible playback.
     func selectForTest(_ e: LibraryEntry?) { showEntry(e) }
@@ -782,6 +823,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     var playerPlayingForTest: Bool { player?.isPlaying ?? false }
     var docAttributedForTest: NSAttributedString { textView.attributedString() }
     func rerunClickForTest() { rerunClicked() }
+    func resetRerunForTest() { rerunPhase.removeAll() }
     func mutePlayerForTest() { player?.volume = 0 }
     func clickLinkForTest(_ link: Any) -> Bool { textView(textView, clickedOnLink: link, at: 0) }
     func pickDocForTest(_ segment: Int) {
@@ -811,7 +853,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         func walk(_ v: NSView) {
             if v.isHidden { return }
             if v is NSScroller { return }
-            if v is NSControl || v is NSTextView {
+            // NSProgressIndicator is an NSView, NOT an NSControl — without the explicit clause the
+            // spinner would be invisible to this guard (review finding: a crushed spinner, green suite).
+            if v is NSControl || v is NSTextView || v is NSProgressIndicator {
                 let name = "\(type(of: v))(\((v as? NSButton)?.title ?? (v as? NSTextField)?.stringValue ?? ""))"
                 // Collapse is judged on the RAW frame, before clipping: a control crushed to ~zero
                 // also has an empty visible rect, and the old visible-only check skipped it as

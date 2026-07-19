@@ -25,13 +25,17 @@ func libraryStartSeconds(_ hhmm: String?) -> Int? {
 
 /// Wall-clock line time → seconds into the recording. Both clocks are time-of-day, so a recording
 /// that crosses midnight reads hugely negative (23:50 start, 00:05 line → -85 500 s) and +24 h
-/// restores the real 900 s. No segment runs 12 h, so an offset that lands ≥ 12 h after the wrap is
-/// really a clock slightly BEFORE the stem's minute (whisper stamps can precede the minute-precision
-/// stem) — clamped to 0 rather than seeking a day ahead. Pure + selftested with those numbers.
+/// restores the real 900 s. A WRAPPED offset ≥ 12 h is really a clock slightly BEFORE the stem's
+/// minute (whisper stamps can precede the minute-precision stem) — clamped to 0 rather than seeking
+/// a day ahead. The clamp applies only after a wrap: a same-day 13 h line is a legitimate (if huge)
+/// offset, and the player clamps to the file's duration anyway. Pure + selftested with those numbers.
 func transcriptSeekOffset(lineSeconds: Int, startSeconds: Int) -> Double {
     var off = lineSeconds - startSeconds
-    if off < 0 { off += 24 * 3600 }
-    return off >= 12 * 3600 ? 0 : Double(off)
+    if off < 0 {
+        off += 24 * 3600
+        if off >= 12 * 3600 { return 0 }
+    }
+    return Double(off)
 }
 
 // MARK: - seek links (the renderer mints them, the Library player consumes them)
@@ -109,6 +113,7 @@ func transcriptCues(_ markdown: String, startSeconds: Int?) -> [TranscriptCue] {
 
 /// "HH:MM:SS<sep>mmm" — SRT separates milliseconds with a comma, VTT with a dot.
 func subtitleClock(_ seconds: Double, millisSeparator: String) -> String {
+    guard seconds.isFinite else { return "00:00:00" + millisSeparator + "000" }   // NaN/inf must not trap
     let total = Int((max(seconds, 0) * 1000).rounded())
     return String(format: "%02d:%02d:%02d", total / 3_600_000, total / 60000 % 60, total / 1000 % 60)
         + millisSeparator + String(format: "%03d", total % 1000)
@@ -130,11 +135,19 @@ func transcriptToVTT(_ markdown: String, start: Int?) -> String {
 
 /// Markdown → readable plain text: heading hashes, blockquote bars, emphasis/code markers, link
 /// syntax and fence/table-separator lines go; the text, list markers and stamped lines stay.
+/// Fenced content survives VERBATIM (its markers are data, not markdown), and a line past
+/// MarkdownRender.inlineLineCap skips the regexes — the link alternation backtracks quadratically
+/// on bracket floods (measured 13.8 s at 40k chars), same guard as the renderer's.
 func transcriptToPlainText(_ markdown: String) -> String {
     var out: [String] = []
+    var inFence = false
     for raw in markdown.components(separatedBy: "\n") {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasPrefix("```") { continue }   // fence markers go, the fenced content stays
+        if trimmed.hasPrefix("```") { inFence.toggle(); continue }   // markers go, the content stays
+        if inFence || (raw as NSString).length > MarkdownRender.inlineLineCap {
+            out.append(raw)
+            continue
+        }
         if trimmed.contains("|"), MarkdownRender.isTableSeparator(trimmed) { continue }
         var line = raw
         for (pattern, tmpl) in [
@@ -150,6 +163,18 @@ func transcriptToPlainText(_ markdown: String) -> String {
         out.append(line)
     }
     return out.joined(separator: "\n")
+}
+
+/// Why an export would be useless, or nil when it can proceed. SRT/VTT need stamped lines —
+/// writing an empty subtitle file would be a silent failure. Pure + selftested.
+func transcriptExportIssue(_ markdown: String, format: TranscriptExportFormat) -> String? {
+    switch format {
+    case .srt, .vtt:
+        return transcriptCues(markdown, startSeconds: nil).isEmpty
+            ? "No \"[HH:MM:SS]\" transcript lines to convert — use Markdown or plain text." : nil
+    case .markdown, .plainText:
+        return nil
+    }
 }
 
 /// The exported bytes for one format — the single dispatch the save panel calls. Pure + selftested.
@@ -178,19 +203,20 @@ struct LibrarySummarySlot: Equatable {
     var status: String? // nil = no label
 }
 
-/// The slot exists only when clicking could actually produce a summary: a transcript row, the
+/// The BUTTON exists only when clicking could actually produce a summary: a transcript row, the
 /// built-in summary mode (a freeform shell hook writes nowhere we could refresh or reap), and a
-/// buildable invocation. Everything else hides the whole slot — never a dead button. Pure + selftested.
+/// buildable invocation — never a dead button. The spinner/status of a run already IN FLIGHT (or
+/// its failure) outrank that gate: feedback for an action the user (or the engine) already started
+/// must not vanish because prefs changed underneath it. Pure + selftested.
 func librarySummarySlot(kind: LibraryEntry.Kind?, hasInvocation: Bool, writesSummaryFile: Bool,
                         hasSummary: Bool, phase: LibraryRerunPhase) -> LibrarySummarySlot {
-    guard kind == .transcript, hasInvocation, writesSummaryFile else {
-        return LibrarySummarySlot(buttonTitle: nil, spinning: false, status: nil)
+    guard kind == .transcript else { return LibrarySummarySlot(buttonTitle: nil, spinning: false, status: nil) }
+    if case .running = phase {
+        return LibrarySummarySlot(buttonTitle: nil, spinning: true, status: "Summarizing…")
     }
-    let title = hasSummary ? "Re-run summary" : "Summarize"
-    switch phase {
-    case .idle: return LibrarySummarySlot(buttonTitle: title, spinning: false, status: nil)
-    case .running: return LibrarySummarySlot(buttonTitle: nil, spinning: true, status: "Summarizing…")
-    case .failed(let why):
+    let title = hasInvocation && writesSummaryFile ? (hasSummary ? "Re-run summary" : "Summarize") : nil
+    if case .failed(let why) = phase {
         return LibrarySummarySlot(buttonTitle: title, spinning: false, status: "Summary failed — \(why)")
     }
+    return LibrarySummarySlot(buttonTitle: title, spinning: false, status: nil)
 }

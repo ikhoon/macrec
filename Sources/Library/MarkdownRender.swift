@@ -72,6 +72,32 @@ enum MarkdownRender {
                 ]))
                 continue
             }
+            // Transcript stamp: with the recording's start clock in hand, "[HH:MM:SS]" becomes a
+            // macrec-seek: link the Library player intercepts — click a line, hear that moment.
+            // Checked BEFORE the table branch: a stamped line containing a "|" must stay a seek
+            // line even when the next line happens to look like a table separator.
+            if let startSec = transcriptStart, let stamp = transcriptLineStamp(trimmed) {
+                let para = style(firstIndent: 0, headIndent: 0)
+                para.paragraphSpacing = 2
+                let stampText = String(trimmed.prefix(stamp.length))
+                let offset = transcriptSeekOffset(lineSeconds: stamp.clockSeconds, startSeconds: startSec)
+                let lineOut = NSMutableAttributedString()
+                if let link = macrecSeekLink(offsetSeconds: offset) {
+                    lineOut.append(NSAttributedString(string: stampText, attributes: [
+                        .font: mono, .foregroundColor: NSColor.linkColor, .link: link,
+                        .toolTip: "Play from here",
+                    ]))
+                } else {
+                    lineOut.append(NSAttributedString(string: stampText, attributes: [
+                        .font: mono, .foregroundColor: NSColor.secondaryLabelColor,
+                    ]))
+                }
+                lineOut.append(inline(String(trimmed.dropFirst(stamp.length)),
+                                      font: body, color: .labelColor, baseURL: baseURL))
+                out.append(applying(para, to: lineOut))
+                out.append(NSAttributedString(string: "\n"))
+                continue
+            }
             // Pipe table: a |-row whose NEXT line is the |---|---| separator starts one; body rows
             // follow until the first non-|-row. Anything malformed falls through to plain text.
             if isTableRow(trimmed), i < lines.count,
@@ -134,30 +160,6 @@ enum MarkdownRender {
                 ])
                 marker.append(inline(bodyText, font: body, color: bodyColor, baseURL: baseURL))
                 out.append(applying(para, to: marker))
-                out.append(NSAttributedString(string: "\n"))
-                continue
-            }
-            // Transcript stamp: with the recording's start clock in hand, "[HH:MM:SS]" becomes a
-            // macrec-seek: link the Library player intercepts — click a line, hear that moment.
-            if let startSec = transcriptStart, let stamp = transcriptLineStamp(trimmed) {
-                let para = style(firstIndent: 0, headIndent: 0)
-                para.paragraphSpacing = 2
-                let stampText = String(trimmed.prefix(stamp.length))
-                let offset = transcriptSeekOffset(lineSeconds: stamp.clockSeconds, startSeconds: startSec)
-                let lineOut = NSMutableAttributedString()
-                if let link = macrecSeekLink(offsetSeconds: offset) {
-                    lineOut.append(NSAttributedString(string: stampText, attributes: [
-                        .font: mono, .foregroundColor: NSColor.linkColor, .link: link,
-                        .toolTip: "Play from here",
-                    ]))
-                } else {
-                    lineOut.append(NSAttributedString(string: stampText, attributes: [
-                        .font: mono, .foregroundColor: NSColor.secondaryLabelColor,
-                    ]))
-                }
-                lineOut.append(inline(String(trimmed.dropFirst(stamp.length)),
-                                      font: body, color: .labelColor, baseURL: baseURL))
-                out.append(applying(para, to: lineOut))
                 out.append(NSAttributedString(string: "\n"))
                 continue
             }
