@@ -76,4 +76,26 @@ func evalSelftests(_ check: (String, Bool) -> Void) {
     // Equal-CER ties break deterministically by engine name (both perfect → A before B, input order B,A).
     let tie = runEval(samples: samples, engines: ["B", "A"], transcribe: { s, _ in s.reference })
     check("eval runner: equal-CER ties sort by engine name", tie.map { $0.engine } == ["A", "B"])
+    // CLI plumbing for `macrec eval`: corpus discovery, engine specs, template substitution.
+    let refs = ["standup.ko.txt": "회의 시작하겠습니다", "empty.ja.txt": "  "]
+    let corpus = evalCorpus(names: ["standup.ko.wav", "empty.ja.wav", "noref.ja.wav",
+                                    "cover.mp3", "readme.txt", "bad.en.wav"],
+                            read: { refs[$0] })
+    check("eval corpus: pairs wav+txt, blank/missing refs stay nil, non-ko/ja skipped",
+          corpus.map(\.id) == ["cover", "empty", "noref", "standup"].filter { $0 != "cover" }   // sorted ids
+          && corpus.count == 3
+          && corpus.first { $0.id == "standup" }?.reference == "회의 시작하겠습니다"
+          && corpus.first { $0.id == "empty" }?.reference == nil
+          && corpus.first { $0.id == "noref" }?.reference == nil
+          && !corpus.contains { $0.language == "en" })
+    check("eval engines: spec parsing and safe substitution",
+          parseEngineSpec("sv=transcribe-cli -q -m m.gguf {wav}")?.name == "sv"
+          && parseEngineSpec("noequals") == nil
+          && parseEngineSpec("x=cmd without placeholder") == nil
+          && evalCommand(template: "run -l {lang} {wav}", wav: "/a/b c.ko.wav", lang: "ko")
+          == "run -l ko '/a/b c.ko.wav'")
+    check("eval timing: RTF table sorts fastest first",
+          evalTimingReport([(engine: "slow", seconds: 20, audioSeconds: 60),
+                            (engine: "fast", seconds: 5, audioSeconds: 60)])
+              .contains("fast     5.0s     12.0×"))
 }

@@ -1288,6 +1288,10 @@ public enum App {
         if let a = args.first, ["help", "--help", "-h"].contains(a) { printMacrecHelp(); exit(0) }
         if let a = args.first, ["version", "--version", "-v"].contains(a) { print("macrec \(macrecVersion)"); exit(0) }
 
+        // Subcommand: eval <corpusDir> --engine 'name=cmd {wav}' … — ko/ja STT quality (CER) and
+        // speed (RTF) on OUR audio, engines as shell templates so any CLI can compete. See EvalCLI.
+        if args.first == "eval" { runEvalSubcommand(Array(args.dropFirst())); exit(0) }
+
         // Subcommand: tap-probe [seconds] — QA/diagnostic: start ONLY the system-audio tap and report
         // whether its IOProc delivers anything — built for the day capture went silent and nothing in
         // the logs could say WHERE the audio path died. The aggregate delivers NOTHING while no tapped

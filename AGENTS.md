@@ -169,6 +169,14 @@ only `./macrec-stage.app/Contents/MacOS/macrec` (signed by `install.sh`). The te
 
 ## 5. Decisions & preferences the maintainer has stated once — don't ask again
 
+- **QA before every PR — Must (2026-07-19).** Updating `qa.sh` for the change AND a passing run are
+  hard preconditions for opening ANY PR. When no Tier-2 scenario can apply (pure-UI change), the PR
+  body says so and why. A SKIP is never a PASS.
+- **Autonomous loop authorized (2026-07-19).** Merge green PRs without asking (squash; stacked PRs
+  in order — never delete a branch that is another PR's base before retargeting it). When the
+  maintainer is silent, keep working: pick the next BACKLOG.md item (VISION order — quality first),
+  ship it as a small PR through the full gates, tick it off in BACKLOG.md, repeat.
+
 - **Queue my tangential opinions; don't detour.** When I spot something worth doing that isn't the
   current task — a refactor, a build-tool idea, a follow-up — I add it to `BACKLOG.md` and keep going on
   what was asked. I don't stop to present options or ask "which first?" for my *own* suggestions; I surface

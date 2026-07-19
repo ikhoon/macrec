@@ -105,8 +105,37 @@ s3() {
   print -r -- "  (static+state checks — an observed zero-prompt run still needs a human eye)"
 }
 
+# ---- s4 — eval runner end-to-end (real binary, real shell engines, tiny generated corpus) ----------
+s4() {
+  print -r -- "s4: macrec eval — corpus discovery, template engines, CER + RTF report"
+  local bin=".build/debug/macrec"
+  [[ -x "$bin" ]] || bin="/Applications/macrec.app/Contents/MacOS/macrec"
+  if [[ ! -x "$bin" ]]; then skip "s4: no macrec binary (swift build first)"; return; fi
+  local dir="$SCRATCH/eval"
+  mkdir -p "$dir"
+  # A 1-second silent 16 kHz wav is enough — the ENGINES are stubs; s4 proves the harness plumbing.
+  python3 - "$dir/clip.ko.wav" <<'PY'
+import struct, sys
+n = 16000
+with open(sys.argv[1], 'wb') as f:
+    f.write(b'RIFF' + struct.pack('<I', 36 + n*2) + b'WAVEfmt ' + struct.pack('<IHHIIHH', 16, 1, 1, 16000, 32000, 2, 16))
+    f.write(b'data' + struct.pack('<I', n*2) + b'\x00' * (n*2))
+PY
+  print -r -- "회의 시작하겠습니다" > "$dir/clip.ko.txt"
+  local out
+  out=$("$bin" eval "$dir" \
+        --engine 'perfect=echo 회의 시작하겠습니다 # {wav}' \
+        --engine 'wrong=echo 전부 틀린 답변입니다 # {wav}' 2>&1)
+  if print -r -- "$out" | grep -q "perfect" && print -r -- "$out" | grep -q "0.0%" \
+     && print -r -- "$out" | grep -qE "RTF" && [[ -s "$dir/out/clip.ko.perfect.txt" ]]; then
+    pass "s4: eval scored a perfect stub at 0.0% CER and dumped hypotheses"
+  else
+    fail "s4: eval output unexpected — $(print -r -- "$out" | head -3 | tr '\n' ' ')"
+  fi
+}
+
 print -r -- "macrec QA (tier 2) — scratch: $SCRATCH"
-if [[ $# -eq 0 ]]; then s1; s3; else for s in "$@"; do "$s"; done; fi
+if [[ $# -eq 0 ]]; then s1; s3; s4; else for s in "$@"; do "$s"; done; fi
 print -r -- ""
 print -r -- "qa: $PASS passed, $FAIL failed, $SKIP skipped"
 [[ $FAIL -eq 0 ]] || exit 1
