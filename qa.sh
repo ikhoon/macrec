@@ -161,8 +161,42 @@ PY
   fi
 }
 
+# ---- s5 — retention sweep end-to-end (real binary, real afconvert, backdated tiers) ----------------
+s5() {
+  print -r -- "s5: macrec sweep — wav→m4a archival and expiry on a backdated fixture library"
+  local bin=".build/debug/macrec"
+  [[ -x "$bin" ]] || bin="/Applications/macrec.app/Contents/MacOS/macrec"
+  if [[ ! -x "$bin" ]]; then skip "s5: no macrec binary (swift build first)"; return; fi
+  local lib="$SCRATCH/audio/2026-03"
+  mkdir -p "$lib"
+  # Three tiers: fresh (stays wav), old (archives to m4a), ancient (expires entirely).
+  python3 - "$lib/2026-03-20-1000-fresh.wav" "$lib/2026-03-10-1000-old.wav" "$lib/2026-03-01-1000-ancient.wav" <<'PY'
+import math, struct, sys
+for p in sys.argv[1:]:
+    n = 16000
+    with open(p, 'wb') as f:
+        f.write(b'RIFF' + struct.pack('<I', 36 + n*2) + b'WAVEfmt ' + struct.pack('<IHHIIHH', 16, 1, 1, 16000, 32000, 2, 16))
+        f.write(b'data' + struct.pack('<I', n*2))
+        f.write(b''.join(struct.pack('<h', int(9000*math.sin(i*0.13))) for i in range(n)))
+PY
+  touch -t "$(date -v-2d +%Y%m%d%H%M)" "$lib/2026-03-20-1000-fresh.wav"
+  touch -t "$(date -v-10d +%Y%m%d%H%M)" "$lib/2026-03-10-1000-old.wav"
+  touch -t "$(date -v-40d +%Y%m%d%H%M)" "$lib/2026-03-01-1000-ancient.wav"
+  "$bin" sweep --audio-dir "$SCRATCH/audio" --raw-days 7 --keep-days 30 > "$SCRATCH/s5.log" 2>&1
+  local ok=1
+  [[ -f "$lib/2026-03-20-1000-fresh.wav" ]] || { ok=0; print -r -- "  fresh wav vanished"; }
+  [[ -f "$lib/2026-03-10-1000-old.m4a" && ! -f "$lib/2026-03-10-1000-old.wav" ]] || { ok=0; print -r -- "  old wav not archived to m4a"; }
+  [[ ! -f "$lib/2026-03-01-1000-ancient.wav" && ! -f "$lib/2026-03-01-1000-ancient.m4a" ]] || { ok=0; print -r -- "  ancient file survived expiry"; }
+  if [[ $ok -eq 1 ]]; then
+    pass "s5: tiers held — fresh kept, old archived, ancient expired"
+  else
+    fail "s5: retention tiers wrong — sweep log follows"
+    head -5 "$SCRATCH/s5.log" | sed 's/^/      /'
+  fi
+}
+
 print -r -- "macrec QA (tier 2) — scratch: $SCRATCH"
-if [[ $# -eq 0 ]]; then s1; s2; s3; s4; else for s in "$@"; do "$s"; done; fi
+if [[ $# -eq 0 ]]; then s1; s2; s3; s4; s5; else for s in "$@"; do "$s"; done; fi
 print -r -- ""
 print -r -- "qa: $PASS passed, $FAIL failed, $SKIP skipped"
 [[ $FAIL -eq 0 ]] || exit 1
