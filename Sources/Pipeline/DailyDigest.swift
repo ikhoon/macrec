@@ -200,6 +200,10 @@ final class SummaryStatus {
     private let lock = NSLock()
     private var activity: SummaryActivity = .idle
     private var lastPath: String?
+    // Transcript paths with a summary run IN FLIGHT — the mutual-exclusion registry. The single
+    // `activity` slot only remembers the LAST run, so the engine's automatic run and the Library's
+    // Re-run button need this set to keep from racing each other onto the same .partial files.
+    private var running = Set<String>()
 
     var current: SummaryActivity { lock.lock(); defer { lock.unlock() }; return activity }
     var lastOutput: String? { lock.lock(); defer { lock.unlock() }; return lastPath }
@@ -214,7 +218,12 @@ final class SummaryStatus {
     func failed(_ file: String, at date: Date, reason: String?) {
         lock.lock(); activity = .failed(file, date, reason: reason); lock.unlock()
     }
-    func resetForTest() { lock.lock(); activity = .idle; lastPath = nil; lock.unlock() }
+
+    func beginRun(path: String) { lock.lock(); running.insert(path); lock.unlock() }
+    func endRun(path: String) { lock.lock(); running.remove(path); lock.unlock() }
+    func isRunning(path: String) -> Bool { lock.lock(); defer { lock.unlock() }; return running.contains(path) }
+
+    func resetForTest() { lock.lock(); activity = .idle; lastPath = nil; running.removeAll(); lock.unlock() }
 }
 
 /// The claude CLI's current OAuth access token, parsed from its own Keychain item JSON. Works around the

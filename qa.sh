@@ -85,6 +85,33 @@ PLIST
   fi
 }
 
+# ---- s2 — summary-shaped claude run (the seam the Library Re-run and the engine auto-summary share) --
+s2() {
+  print -r -- "s2: summary-shaped claude run through the runner invocation shape (login shell, real CLI)"
+  local token; token=$(claude_token)
+  if [[ -z "$token" ]]; then skip "no claude token (credentials.json or CLI keychain)"; return; fi
+  print -r -- '[10:00:05] Me: project kickoff begins' > "$SCRATCH/t.md"   # mock fixture only
+  local stem="2026-03-02-1000-project-kickoff"
+  local out="$SCRATCH/sum/$stem.md"
+  # Mirrors postProcessInvocation(.summary, .claude) + titledPromoteTail in shape: mkdir -p, stdin
+  # redirect, .partial → titled promote → rm. The Library Re-run button and the engine's automatic
+  # run both execute exactly this command via runPostProcessCommand (zsh -lc + the token env).
+  local cmd="mkdir -p '$SCRATCH/sum' && claude -p 'Reply with the single word OK' < '$SCRATCH/t.md' > '$out.partial' && { printf '# %s\n\n' '$stem'; cat '$out.partial'; } > '$out.partial2' && mv '$out.partial2' '$out' && rm -f '$out.partial'"
+  if CLAUDE_CODE_OAUTH_TOKEN="$token" PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:$PATH" \
+     /bin/zsh -lc "$cmd" > "$SCRATCH/s2.log" 2>&1; then
+    local head1; head1=$(head -1 "$out" 2>/dev/null)
+    if [[ "$head1" == "# $stem" && ! -f "$out.partial" && -s "$out" ]]; then
+      pass "s2: promote contract held (H1 title, partial reaped, body: $(sed -n '3p' "$out" | head -c 40 | tr -d '\n'))"
+    else
+      fail "s2: output malformed — head1='$head1' partial-left=$([[ -f "$out.partial" ]] && echo yes || echo no)"
+    fi
+  else
+    fail "s2: runner exited non-zero — reason follows (the .partial keeps the runner's words)"
+    [[ -f "$out.partial" ]] && head -3 "$out.partial" | sed 's/^/      /'
+    head -3 "$SCRATCH/s2.log" | sed 's/^/      /'
+  fi
+}
+
 # ---- s3 — keychain-prompt-free (guards the per-rebuild "allow access" storm) ------------------------
 s3() {
   print -r -- "s3: credentials store is file-backed — the binary cannot prompt (static+state checks)"
@@ -135,7 +162,7 @@ PY
 }
 
 print -r -- "macrec QA (tier 2) — scratch: $SCRATCH"
-if [[ $# -eq 0 ]]; then s1; s3; s4; else for s in "$@"; do "$s"; done; fi
+if [[ $# -eq 0 ]]; then s1; s2; s3; s4; else for s in "$@"; do "$s"; done; fi
 print -r -- ""
 print -r -- "qa: $PASS passed, $FAIL failed, $SKIP skipped"
 [[ $FAIL -eq 0 ]] || exit 1

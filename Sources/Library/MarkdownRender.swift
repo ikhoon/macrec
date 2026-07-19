@@ -24,7 +24,10 @@ enum MarkdownRender {
         }
     }
 
-    static func render(_ text: String, baseURL: URL? = nil) -> NSAttributedString {
+    /// `transcriptStart` (seconds since midnight, from the file stem's minute) turns each line's
+    /// leading "[HH:MM:SS]" stamp into a macrec-seek: link — pass it only for a transcript that
+    /// HAS audio; nil renders stamps as plain text.
+    static func render(_ text: String, baseURL: URL? = nil, transcriptStart: Int? = nil) -> NSAttributedString {
         guard !text.isEmpty else { return NSAttributedString() }
         guard text.count <= renderCap else {
             return NSAttributedString(string: text, attributes: [.font: mono, .foregroundColor: NSColor.labelColor])
@@ -67,6 +70,32 @@ enum MarkdownRender {
                 out.append(NSAttributedString(string: "──────────\n", attributes: [
                     .font: body, .foregroundColor: NSColor.separatorColor,
                 ]))
+                continue
+            }
+            // Transcript stamp: with the recording's start clock in hand, "[HH:MM:SS]" becomes a
+            // macrec-seek: link the Library player intercepts — click a line, hear that moment.
+            // Checked BEFORE the table branch: a stamped line containing a "|" must stay a seek
+            // line even when the next line happens to look like a table separator.
+            if let startSec = transcriptStart, let stamp = transcriptLineStamp(trimmed) {
+                let para = style(firstIndent: 0, headIndent: 0)
+                para.paragraphSpacing = 2
+                let stampText = String(trimmed.prefix(stamp.length))
+                let offset = transcriptSeekOffset(lineSeconds: stamp.clockSeconds, startSeconds: startSec)
+                let lineOut = NSMutableAttributedString()
+                if let link = macrecSeekLink(offsetSeconds: offset) {
+                    lineOut.append(NSAttributedString(string: stampText, attributes: [
+                        .font: mono, .foregroundColor: NSColor.linkColor, .link: link,
+                        .toolTip: "Play from here",
+                    ]))
+                } else {
+                    lineOut.append(NSAttributedString(string: stampText, attributes: [
+                        .font: mono, .foregroundColor: NSColor.secondaryLabelColor,
+                    ]))
+                }
+                lineOut.append(inline(String(trimmed.dropFirst(stamp.length)),
+                                      font: body, color: .labelColor, baseURL: baseURL))
+                out.append(applying(para, to: lineOut))
+                out.append(NSAttributedString(string: "\n"))
                 continue
             }
             // Pipe table: a |-row whose NEXT line is the |---|---| separator starts one; body rows

@@ -347,6 +347,7 @@ final class RecordingEngine {
             if let cmd = postProcessInvocationFromPrefs(transcriptPath: url.path) {
                 let file = url.lastPathComponent
                 SummaryStatus.shared.started(file)
+                SummaryStatus.shared.beginRun(path: url.path)   // the Library's Re-run must not race this
                 let mode = effectivePostProcessMode(rawMode: Pref.explicit(Pref.postProcessMode, "MR_POST_PROCESS_MODE"),
                                                     shellCmd: Pref.postProcessCommand)
                 // A shell hook writes nowhere we know, so there is no file to reveal and no partial to reap.
@@ -354,6 +355,7 @@ final class RecordingEngine {
                     ? summaryOutputPath(transcriptPath: url.path, outDir: Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT"))
                     : nil
                 runPostProcessCommand(cmd) { [weak self] status in
+                    SummaryStatus.shared.endRun(path: url.path)
                     guard status != 0 else {
                         SummaryStatus.shared.finished(file, at: Date(), output: out)
                         self?.extractTitleIfUntitled(transcript: url, summaryOut: out)
