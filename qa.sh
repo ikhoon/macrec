@@ -153,9 +153,12 @@ PY
   out=$("$bin" eval "$dir" \
         --engine 'perfect=echo 회의 시작하겠습니다 # {wav}' \
         --engine 'wrong=echo 전부 틀린 답변입니다 # {wav}' 2>&1)
-  if print -r -- "$out" | grep -q "perfect" && print -r -- "$out" | grep -q "0.0%" \
+  # Anchored + discriminating (review finding): the perfect ROW must read 0.0% AND the wrong
+  # row must NOT — a scorer that collapses everything to zero must turn this red.
+  if print -r -- "$out" | grep -qE 'perfect[^0-9]*0\.0%' \
+     && ! print -r -- "$out" | grep -qE 'wrong[^0-9]*0\.0%' \
      && print -r -- "$out" | grep -qE "RTF" && [[ -s "$dir/out/clip.ko.perfect.txt" ]]; then
-    pass "s4: eval scored a perfect stub at 0.0% CER and dumped hypotheses"
+    pass "s4: eval scored perfect=0.0%, wrong>0%, and dumped hypotheses"
   else
     fail "s4: eval output unexpected — $(print -r -- "$out" | head -3 | tr '\n' ' ')"
   fi
@@ -184,7 +187,7 @@ PY
   touch -t "$(date -v-40d +%Y%m%d%H%M)" "$lib/2026-03-01-1000-ancient.wav"
   "$bin" sweep --audio-dir "$SCRATCH/audio" --raw-days 7 --keep-days 30 > "$SCRATCH/s5.log" 2>&1
   local ok=1
-  [[ -f "$lib/2026-03-20-1000-fresh.wav" ]] || { ok=0; print -r -- "  fresh wav vanished"; }
+  [[ -f "$lib/2026-03-20-1000-fresh.wav" && ! -f "$lib/2026-03-20-1000-fresh.m4a" ]] || { ok=0; print -r -- "  fresh tier wrong (archived early or vanished)"; }
   [[ -f "$lib/2026-03-10-1000-old.m4a" && ! -f "$lib/2026-03-10-1000-old.wav" ]] || { ok=0; print -r -- "  old wav not archived to m4a"; }
   [[ ! -f "$lib/2026-03-01-1000-ancient.wav" && ! -f "$lib/2026-03-01-1000-ancient.m4a" ]] || { ok=0; print -r -- "  ancient file survived expiry"; }
   if [[ $ok -eq 1 ]]; then

@@ -52,6 +52,10 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
 - [ ] Debug visibility for cloud API traffic (#24) — partly done (DeepL error body logged).
 - [ ] **N-speaker diarization** within "them" — today speakers are the me/them 2-way (mic vs system
       audio); MacWhisper labels + names N speakers. Accuracy work, model-dependent. *(MacWhisper gap)*
+      Evaluated 2026-07-19: MOSS-Transcribe-Diarize (transcribe.cpp, 46× RTF) is **en/zh only** —
+      empty output on real ko clips, so it can't close the gap yet. The SHAPE is right (inline
+      diarization in the ASR pass); revisit when a ko/ja-capable diarizing model lands. Our
+      dual-channel truth (mic=me, sys=them) can score any candidate automatically.
 
 ## Infra / refactor
 

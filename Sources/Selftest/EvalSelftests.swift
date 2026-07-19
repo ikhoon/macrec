@@ -82,18 +82,27 @@ func evalSelftests(_ check: (String, Bool) -> Void) {
                                     "cover.mp3", "readme.txt", "bad.en.wav"],
                             read: { refs[$0] })
     check("eval corpus: pairs wav+txt, blank/missing refs stay nil, non-ko/ja skipped",
-          corpus.map(\.id) == ["cover", "empty", "noref", "standup"].filter { $0 != "cover" }   // sorted ids
-          && corpus.count == 3
+          corpus.map(\.id) == ["empty", "noref", "standup"]   // cover.mp3/readme.txt/bad.en.wav all skipped
           && corpus.first { $0.id == "standup" }?.reference == "회의 시작하겠습니다"
           && corpus.first { $0.id == "empty" }?.reference == nil
           && corpus.first { $0.id == "noref" }?.reference == nil
           && !corpus.contains { $0.language == "en" })
+    // Review round: ids containing ".wav" or dots must keep a lossless id and the RIGHT reference
+    // name (a global ".wav"→".txt" replace once silently unscored such clips).
+    let dotty = evalCorpus(names: ["a.wav.demo.ko.wav", "b..ja.wav"],
+                           read: { ["a.wav.demo.ko.txt": "정답"][$0] })
+    check("eval corpus: dotted ids parse losslessly and find their references",
+          dotty.map(\.id) == ["a.wav.demo", "b."]
+          && dotty.first { $0.id == "a.wav.demo" }?.reference == "정답")
     check("eval engines: spec parsing and safe substitution",
           parseEngineSpec("sv=transcribe-cli -q -m m.gguf {wav}")?.name == "sv"
           && parseEngineSpec("noequals") == nil
           && parseEngineSpec("x=cmd without placeholder") == nil
+          && parseEngineSpec("bad/name=cmd {wav}") == nil   // names become out/ file names
           && evalCommand(template: "run -l {lang} {wav}", wav: "/a/b c.ko.wav", lang: "ko")
-          == "run -l ko '/a/b c.ko.wav'")
+          == "run -l ko '/a/b c.ko.wav'"
+          && evalCommand(template: "run {wav}", wav: "/x/{lang}/c.ko.wav", lang: "ko")
+          == "run '/x/{lang}/c.ko.wav'")   // {lang} inside the path survives ({lang} substitutes first)
     check("eval timing: RTF table sorts fastest first",
           evalTimingReport([(engine: "slow", seconds: 20, audioSeconds: 60),
                             (engine: "fast", seconds: 5, audioSeconds: 60)])
