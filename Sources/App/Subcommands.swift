@@ -179,9 +179,13 @@ func runLibrarySnapshotSubcommand(_ args: [String]) -> Never {
     // Show the TRANSCRIPT view (not the default summary): the stamped lines render their
     // macrec-seek links there, and the PNG must show them.
     LibraryWindow.shared.pickDocForTest(1)
-    let files = LibraryWindow.shared.snapshot(to: dir)
+    var files = LibraryWindow.shared.snapshot(to: dir)
+    // Daily-only scope: the list must collapse to digest rows — a second shot proves the filter.
+    LibraryWindow.shared.setScopeForTest(1)
+    files += LibraryWindow.shared.snapshot(to: dir.appendingPathComponent("daily"))
+    LibraryWindow.shared.setScopeForTest(0)
     for f in files { print(f.path) }
-    print(files.isEmpty ? "library-snapshot: FAILED (nothing rendered)" : "library-snapshot: \(files.count) shot → \(dir.path)")
+    print(files.isEmpty ? "library-snapshot: FAILED (nothing rendered)" : "library-snapshot: \(files.count) shots → \(dir.path)")
     exit(files.isEmpty ? 1 : 0)
 }
 
