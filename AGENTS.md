@@ -174,19 +174,21 @@ only `./macrec-stage.app/Contents/MacOS/macrec` (signed by `install.sh`). The te
 
 ## 5. Decisions & preferences the maintainer has stated once — don't ask again
 
-- **QA before every PR — Must (2026-07-19).** Updating `qa.sh` for the change AND a passing run are
+- **QA before every PR — Must.** Updating `qa.sh` for the change AND a passing run are
   hard preconditions for opening ANY PR. When no Tier-2 scenario can apply (pure-UI change), the PR
   body says so and why. A SKIP is never a PASS.
-- **Autonomous loop authorized (2026-07-19).** Merge green PRs without asking (squash; stacked PRs
+- **Autonomous loop authorized.** Merge green PRs without asking (squash; stacked PRs
   in order — never delete a branch that is another PR's base before retargeting it). When the
   maintainer is silent, keep working: pick the next BACKLOG.md item (VISION order — quality first),
-  ship it as a small PR through the full gates, tick it off in BACKLOG.md, repeat.
-- **Refactor as you grow (2026-07-19).** Growth without pruning is decay: every few loop iterations
+  ship it as a small PR through the full gates, tick it off in BACKLOG.md, repeat. "Full gates"
+  INCLUDES the §4 review protocol — loop PRs skipped it once (#140/#142 were reviewed only
+  retroactively); a PR is not ready to open until its review round ran and its findings are fixed.
+- **Refactor as you grow.** Growth without pruning is decay: every few loop iterations
   (or whenever a file/module has visibly bloated) spend one iteration on a refactoring-only PR —
   extract oversized files along existing seams, collapse duplication, delete dead code. Mechanical
   moves stay byte-identical where possible (the Sources/ modularization precedent); behavior
   changes never hide inside a refactor PR.
-- **QA scenarios must keep getting deeper (2026-07-19).** qa.sh grows WITH the product: each loop
+- **QA scenarios must keep getting deeper.** qa.sh grows WITH the product: each loop
   iteration considers a new Tier-2 scenario, and scenarios trend toward realistic multi-step flows
   (pipeline day-simulation, crash→adopt, device churn, runner races) — not just single-seam
   checks. A QA suite that stays simple while the code compounds is a QA suite going stale.

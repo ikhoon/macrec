@@ -1249,6 +1249,8 @@ func printMacrecHelp() {
                              [--audio-dir D] [--transcripts-dir D] [--raw-days N] [--keep-days N]
       tap-probe [secs]       start only the system-audio tap, play a test tone, report whether it
                              captured (QA; exit 0 = captured, non-zero = see the verdict)
+      eval <dir> --engine 'name=cmd {wav}'   score STT engines on your own ko/ja clips — CER
+                             where <id>.<lang>.txt ground truth exists, RTF always (see docs)
       version, --version     print the version and exit
       help,    --help        show this help
 

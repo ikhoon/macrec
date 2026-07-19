@@ -59,34 +59,41 @@ struct EvalClip: Equatable {
 }
 
 /// Discover clips from a directory listing: `<id>.<ko|ja>.wav`, reference read via `read` (nil =
-/// missing/empty). Junk names are skipped. Sorted by id for a stable report.
+/// missing/empty). Junk names are skipped. Parsing slices around the LAST dots — never a global
+/// substring replace and never a component split that collapses empties — so an id containing
+/// ".wav" or consecutive dots keeps a lossless id and a correctly-derived reference name
+/// (review round: the old global ".wav"→".txt" replace silently unscored such clips).
 func evalCorpus(names: [String], read: (String) -> String?) -> [EvalClip] {
     names.filter { $0.hasSuffix(".wav") }.compactMap { wav -> EvalClip? in
-        let parts = wav.dropLast(4).split(separator: ".")
-        guard parts.count >= 2, let lang = parts.last.map(String.init), ["ko", "ja"].contains(lang)
-        else { return nil }
-        let id = parts.dropLast().joined(separator: ".")
-        let ref = read(wav.replacingOccurrences(of: ".wav", with: ".txt"))?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let stem = String(wav.dropLast(4))
+        guard let dot = stem.lastIndex(of: ".") else { return nil }
+        let lang = String(stem[stem.index(after: dot)...])
+        let id = String(stem[..<dot])
+        guard !id.isEmpty, ["ko", "ja"].contains(lang) else { return nil }
+        let ref = read(stem + ".txt")?.trimmingCharacters(in: .whitespacesAndNewlines)
         return EvalClip(id: id, language: lang, wav: wav, reference: (ref?.isEmpty ?? true) ? nil : ref)
     }
     .sorted { $0.id != $1.id ? $0.id < $1.id : $0.language < $1.language }
 }
 
 /// "--engine name=cmd … {wav} …" → (name, template). The command must print the transcript to
-/// stdout; {wav} is replaced with the clip's absolute path. nil when malformed.
+/// stdout; {wav} is replaced with the clip's absolute path. Names are path-safe identifiers
+/// ([A-Za-z0-9._-], no separators) because they become out/ file names. nil when malformed.
 func parseEngineSpec(_ s: String) -> (name: String, template: String)? {
     guard let eq = s.firstIndex(of: "=") else { return nil }
     let name = String(s[..<eq]).trimmingCharacters(in: .whitespaces)
     let template = String(s[s.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
-    guard !name.isEmpty, template.contains("{wav}") else { return nil }
+    guard !name.isEmpty, template.contains("{wav}"),
+          name.allSatisfy({ $0.isLetter || $0.isNumber || "._-".contains($0) })
+    else { return nil }
     return (name, template)
 }
 
-/// Substitute the clip path (shell-quoted) and language code into an engine template.
+/// Substitute the language code and the clip path (shell-quoted) into an engine template —
+/// {lang} FIRST, so a pathological "{lang}" inside the substituted path is never rewritten.
 func evalCommand(template: String, wav: String, lang: String) -> String {
-    template.replacingOccurrences(of: "{wav}", with: shq(wav))
-        .replacingOccurrences(of: "{lang}", with: lang)
+    template.replacingOccurrences(of: "{lang}", with: lang)
+        .replacingOccurrences(of: "{wav}", with: shq(wav))
 }
 
 /// Speed table: total wall seconds per engine and RTF (audio seconds ÷ wall seconds — higher is

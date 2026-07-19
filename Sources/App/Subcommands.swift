@@ -5,8 +5,9 @@ import Foundation
 // MARK: - diagnostic / test-kit subcommands (bodies moved verbatim out of App.main)
 
 // App.main had grown into a 300-line switchboard with every subcommand inlined; each body now
-// lives here as a Never-returning function and main stays a thin dispatcher. Pure moves — any
-// behavior change in this file's history that isn't byte-identical is a review flag.
+// lives here as a Never-returning function and main stays a thin dispatcher. Behavior-preserving
+// moves (headers became /// docs and the formatter reflowed whitespace — the executable tokens,
+// indexing and exit codes are unchanged); semantic drift in this file's history is a review flag.
 
 /// tap-probe [seconds] — QA/diagnostic: start ONLY the system-audio tap and report whether its
 /// IOProc delivers anything — built for the day capture went silent and nothing in the logs could
