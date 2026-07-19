@@ -46,6 +46,65 @@ func runEval(samples: [EvalSample], engines: [String],
     .sorted { $0.cer != $1.cer ? $0.cer < $1.cer : $0.engine < $1.engine }
 }
 
+// MARK: - corpus + engine plumbing for the `macrec eval` subcommand (pure; the shell layer injects IO)
+
+/// One corpus clip on disk: "<id>.<lang>.wav" with an optional "<id>.<lang>.txt" ground truth.
+/// A clip without a reference is still transcribed (its hypotheses are dumped for the human to
+/// correct INTO a reference) — it just can't be CER-scored yet.
+struct EvalClip: Equatable {
+    let id: String
+    let language: String
+    let wav: String // file name, not path — the caller owns the directory
+    let reference: String?
+}
+
+/// Discover clips from a directory listing: `<id>.<ko|ja>.wav`, reference read via `read` (nil =
+/// missing/empty). Junk names are skipped. Sorted by id for a stable report.
+func evalCorpus(names: [String], read: (String) -> String?) -> [EvalClip] {
+    names.filter { $0.hasSuffix(".wav") }.compactMap { wav -> EvalClip? in
+        let parts = wav.dropLast(4).split(separator: ".")
+        guard parts.count >= 2, let lang = parts.last.map(String.init), ["ko", "ja"].contains(lang)
+        else { return nil }
+        let id = parts.dropLast().joined(separator: ".")
+        let ref = read(wav.replacingOccurrences(of: ".wav", with: ".txt"))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return EvalClip(id: id, language: lang, wav: wav, reference: (ref?.isEmpty ?? true) ? nil : ref)
+    }
+    .sorted { $0.id != $1.id ? $0.id < $1.id : $0.language < $1.language }
+}
+
+/// "--engine name=cmd … {wav} …" → (name, template). The command must print the transcript to
+/// stdout; {wav} is replaced with the clip's absolute path. nil when malformed.
+func parseEngineSpec(_ s: String) -> (name: String, template: String)? {
+    guard let eq = s.firstIndex(of: "=") else { return nil }
+    let name = String(s[..<eq]).trimmingCharacters(in: .whitespaces)
+    let template = String(s[s.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+    guard !name.isEmpty, template.contains("{wav}") else { return nil }
+    return (name, template)
+}
+
+/// Substitute the clip path (shell-quoted) and language code into an engine template.
+func evalCommand(template: String, wav: String, lang: String) -> String {
+    template.replacingOccurrences(of: "{wav}", with: shq(wav))
+        .replacingOccurrences(of: "{lang}", with: lang)
+}
+
+/// Speed table: total wall seconds per engine and RTF (audio seconds ÷ wall seconds — higher is
+/// faster; 1.0 = real time).
+func evalTimingReport(_ rows: [(engine: String, seconds: Double, audioSeconds: Double)]) -> String {
+    guard !rows.isEmpty else { return "(no timings)" }
+    let w = max(6, rows.map { $0.engine.count }.max() ?? 6)
+    let posix = Locale(identifier: "en_US_POSIX")
+    func pad(_ s: String, _ n: Int) -> String { s.padding(toLength: max(n, s.count), withPad: " ", startingAt: 0) }
+    var lines = ["speed — \(String(format: "%.0f", locale: posix, rows.first?.audioSeconds ?? 0)) s of audio (RTF = audio÷wall; higher is faster)", "",
+                 "\(pad("engine", w))   wall     RTF"]
+    for r in rows.sorted(by: { $0.seconds < $1.seconds }) {
+        let rtf = r.seconds > 0 ? r.audioSeconds / r.seconds : 0
+        lines.append("\(pad(r.engine, w))   \(pad(String(format: "%.1fs", locale: posix, r.seconds), 7))  \(String(format: "%.1f×", locale: posix, rtf))")
+    }
+    return lines.joined(separator: "\n")
+}
+
 /// A fixed-width leaderboard — engines best-CER first, CER as a percentage. `title` heads the table.
 func evalReport(_ scores: [EngineScore], title: String = "ko/ja STT — CER (lower is better)") -> String {
     guard !scores.isEmpty else { return "\(title)\n(no engines scored)" }

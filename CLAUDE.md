@@ -39,9 +39,10 @@ Never declare a change done from the code alone. Every change goes through, in o
    gets a scenario, not only a unit check; prove a new scenario by breaking its guard once and watching
    it fail (a gate that has never failed has never been tested).
 3b. **Tier-2 QA**: `./qa.sh` — REAL launchd + claude token + installed-binary checks, on this Mac.
-   Run it whenever the change touches the digest/summary runners, audio capture, credentials, or
-   install; always pre-release. Scenarios SKIP loudly when a precondition is missing — a SKIP is
-   never a PASS.
+   **Updating qa.sh for the change AND a passing run are a HARD precondition for every PR (maintainer
+   rule, 2026-07-19: "QA 업데이트와 통과는 모든 PR을 만들기 전 필수 조건이다").** If no Tier-2 scenario
+   can apply to the change, the PR body must say so and why. Scenarios SKIP loudly when a
+   precondition is missing — a SKIP is never a PASS.
 4. **For ANY UI change — actually SEE it**: `./macrec-stage.app/Contents/MacOS/macrec settings-snapshot /tmp/shots`
    then open the PNGs and look. A "structurally valid" pane (grids present, selftest green) shipped
    visually destroyed twice because it was never rendered. The `settings: no pane control is

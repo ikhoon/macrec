@@ -17,3 +17,4 @@ config.sh
 *.log
 *.p12
 .DS_Store
+.claude/
