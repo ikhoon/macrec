@@ -1257,6 +1257,8 @@ func printMacrecHelp() {
                              captured (QA; exit 0 = captured, non-zero = see the verdict)
       eval <dir> --engine 'name=cmd {wav}'   score STT engines on your own ko/ja clips — CER
                              where <id>.<lang>.txt ground truth exists, RTF always (see docs)
+      eval-fetch <url> --lang ko|ja   build one eval clip from a YouTube video — audio (16 kHz WAV)
+                             + caption reference — into a corpus `eval` scores (needs yt-dlp+ffmpeg)
       version, --version     print the version and exit
       help,    --help        show this help
 
@@ -1299,6 +1301,10 @@ public enum App {
         // Subcommand: eval <corpusDir> --engine 'name=cmd {wav}' … — ko/ja STT quality (CER) and
         // speed (RTF) on OUR audio, engines as shell templates so any CLI can compete. See EvalCLI.
         if args.first == "eval" { runEvalSubcommand(Array(args.dropFirst())); exit(0) }
+
+        // Subcommand: eval-fetch <youtube-url> --lang ko|ja — build a corpus clip (16 kHz WAV + caption
+        // reference) so ko/ja transcription quality can be MEASURED against real speech. See EvalFetch.
+        if args.first == "eval-fetch" { runEvalFetchSubcommand(Array(args.dropFirst())) }
 
         // Diagnostic / UI-test-kit subcommands — bodies live in Sources/App/Subcommands.swift.
         if args.first == "tap-probe" { runTapProbeSubcommand(args) }
