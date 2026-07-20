@@ -38,6 +38,7 @@ final class TodayWindow: NSObject, NSWindowDelegate {
 
     /// Engine hook: a transcript just landed — the Today counts changed.
     func noteChanged() { if let w = window, w.isVisible { render() } }
+    var isVisible: Bool { window?.isVisible ?? false }   // #32: skip background alerts while it's open
 
     func windowDidBecomeKey(_ notification: Notification) { render() }
     func windowWillClose(_ notification: Notification) { stopTimer() }

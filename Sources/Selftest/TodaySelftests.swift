@@ -114,6 +114,36 @@ func todaySelftests(_ check: (String, Bool) -> Void) {
               && tw.actionButtonTitleForTest(rowTitle: "Recorder was down earlier") == "Open log"   // not a dead affordance
               && tw.actionButtonTitleForTest(rowTitle: "Microphone") == nil)   // granted → no button
     for i in issues { elog("selftest: \(i)") }
+
+    // #32: a closed window still warns — BAD conditions become notifications, DEBOUNCED (bad on two
+    // consecutive samples) so a one-tick transient (an engine restart on schedule/calendar resume) never
+    // alerts; deduped so a persistent one alerts once; a cleared condition can recur; rows that
+    // self-surface (permissions via the OS prompt, Summary FAILED via the pipeline) never alert.
+    let notRec = HealthRow(group: "Capture", title: "Not recording", detail: "The engine isn't capturing.", level: .bad, action: .none)
+    let toolBad = HealthRow(group: "Pipeline", title: "whisper-cli", detail: "Not found on PATH.", level: .bad, action: .openSettings(pane: "Transcripts"))
+    let micBad = HealthRow(group: "Permissions", title: "Microphone", detail: "Denied.", level: .bad, action: .grantPermissions, suppressBackgroundAlert: true)
+    let sumFail = HealthRow(group: "Pipeline", title: "Summary FAILED", detail: "x — boom", level: .bad, action: .retrySummary, suppressBackgroundAlert: true)
+    let paused = HealthRow(group: "Capture", title: "Paused", detail: "Recording is paused.", level: .warn, action: .none)
+    let all = [notRec, toolBad, micBad, sumFail, paused]
+    let (t1, bad1, al1) = healthAlerts(rows: all, lastBad: [], alerted: [])              // first sight: debounce holds
+    let (t2, bad2, al2) = healthAlerts(rows: all, lastBad: bad1, alerted: al1)           // 2nd consecutive: confirm+alert
+    let (t3, bad3, al3) = healthAlerts(rows: [notRec, toolBad], lastBad: bad2, alerted: al2)   // persistent: no repeat
+    let (t4, bad4, al4) = healthAlerts(rows: [toolBad], lastBad: bad3, alerted: al3)     // notRec clears → drops
+    let (t5, bad5, al5) = healthAlerts(rows: [notRec, toolBad], lastBad: bad4, alerted: al4)   // notRec recurs (1 tick)
+    let (t6, _, _) = healthAlerts(rows: [notRec, toolBad], lastBad: bad5, alerted: al5)  // 2nd tick → re-alert
+    check("health alerts: debounced (2 ticks), deduped, clear-then-recur, suppressed rows never alert",
+          t1.isEmpty                                                     // one sample only → nothing yet
+              && bad1 == ["Capture/Not recording", "Pipeline/whisper-cli"]   // mic + sumFail suppressed, paused warn
+              && Set(t2.map(\.title)) == ["Not recording", "whisper-cli"]    // confirmed on 2nd tick
+              && t3.isEmpty                                              // persistent → no repeat
+              && al4 == ["Pipeline/whisper-cli"]                        // cleared notRec drops from alerted
+              && t5.isEmpty                                             // recurrence needs 2 ticks again
+              && t6.map(\.title) == ["Not recording"])                  // re-alerts after 2 consecutive
+    // P0 regression (review): a ONE-tick transient — engine==nil for a single tick during a legitimate
+    // schedule/calendar resume — must NEVER alert, because it clears before the debounce confirms it.
+    let (x1, xbad1, xal1) = healthAlerts(rows: [notRec], lastBad: [], alerted: [])   // tick: transient bad
+    let (x2, _, _) = healthAlerts(rows: [], lastBad: xbad1, alerted: xal1)           // next tick: gone
+    check("health alerts: a one-tick transient (engine restarting) never alerts", x1.isEmpty && x2.isEmpty)
 }
 
 private func dateAt(hour: Int, minute: Int) -> Date {
