@@ -189,6 +189,28 @@ func runLibrarySnapshotSubcommand(_ args: [String]) -> Never {
     exit(files.isEmpty ? 1 : 0)
 }
 
+/// today-snapshot <dir> — render the Today dashboard over FIXTURE health rows (a mix of ok/warn/bad
+/// so the PNG shows every level and every action button). No live app read.
+@MainActor
+func runTodaySnapshotSubcommand(_ args: [String]) -> Never {
+    let dir = URL(fileURLWithPath: args.count > 1 ? args[1] : "/tmp/macrec-today-shots")
+    NSApplication.shared.setActivationPolicy(.accessory)
+    var i = HealthInputs()
+    i.audioGranted = true; i.micGranted = true; i.calendarGranted = false   // one warn
+    i.recording = true; i.captureTest = .silent            // one bad (confirmed muted tap)
+    i.micLevel = 0.4; i.sysLevel = 0
+    i.modelReady = true; i.modelName = "large-v3"; i.whisperResolved = true
+    i.runnerResolved = true; i.runnerName = "claude"
+    i.summary = .failed("2026-07-19-1400.md", i.now, reason: "Not logged in")   // one bad + Retry
+    i.transcriptsToday = 3; i.summariesToday = 2
+    i.digestEnabled = true; i.digestTime = "20:00"
+    TodayWindow.shared.loadFixtureForTest(todayHealth(i))
+    let files = TodayWindow.shared.snapshot(to: dir)
+    for f in files { print(f.path) }
+    print(files.isEmpty ? "today-snapshot: FAILED (nothing rendered)" : "today-snapshot: \(files.count) shot → \(dir.path)")
+    exit(files.isEmpty ? 1 : 0)
+}
+
 /// caption-snapshot — render the live overlay at several opacities over a checkerboard.
 /// The one thing to LOOK for: the background fades, the captions never do.
 @MainActor

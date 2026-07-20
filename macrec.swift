@@ -398,6 +398,7 @@ final class ModelStore: NSObject, URLSessionDownloadDelegate {
     var onProgress: ((Double) -> Void)?
     private var session: URLSession?
     private var downloadingSpec: WhisperModelSpec?   // spec currently downloading (nil = idle)
+    var isDownloading: Bool { downloadingSpec != nil }   // Today dashboard: model row = downloading vs absent
 
     var dir: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -1279,7 +1280,7 @@ public enum App {
         // build would raise an authorization prompt per read) and a throwaway defaults suite (the overlay
         // persisted its opacity and subtitle mode into the user's settings).
         if let a = args.first, ["selftest", "settings-snapshot", "icon-snapshot", "caption-snapshot",
-                                "library-snapshot"].contains(a) {
+                                "library-snapshot", "today-snapshot"].contains(a) {
             Keychain.disabled = true
             Pref.useEphemeralStoreForTest()
         }
@@ -1299,6 +1300,7 @@ public enum App {
         if args.first == "sweep" { runSweepSubcommand(args) }
         if args.first == "settings-snapshot" { runSettingsSnapshotSubcommand(args) }
         if args.first == "library-snapshot" { runLibrarySnapshotSubcommand(args) }
+        if args.first == "today-snapshot" { runTodaySnapshotSubcommand(args) }
         if args.first == "caption-snapshot" { runCaptionSnapshotSubcommand(args) }
         if args.first == "icon-snapshot" { runIconSnapshotSubcommand(args) }
 
