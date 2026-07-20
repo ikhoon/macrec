@@ -33,6 +33,9 @@ struct HealthInputs {
     var digestEnabled = false
     var digestTime = "20:00"
     var digestRanToday = false
+    // A silent outage detected on this run's start (the recorder was dead for a stretch while the mac
+    // was awake) — seconds, or 0 when there's nothing to report. Surfaced so a past gap isn't invisible.
+    var outageSeconds: Double = 0
     var now = Date()
 }
 
@@ -52,6 +55,7 @@ enum HealthAction: Equatable {
     case openSettings(pane: String)
     case retrySummary
     case testCapture
+    case showLog   // open the app log (where the #27 "was DOWN" detail lives)
 }
 
 struct HealthRow: Equatable {
@@ -84,6 +88,13 @@ func todayHealth(_ i: HealthInputs) -> [HealthRow] {
         rows.append(HealthRow(group: "Capture", title: "Recording",
                               detail: String(format: "mic %.0f%% · system %.0f%%%@", i.micLevel * 100, i.sysLevel * 100, tested),
                               level: .ok, action: .testCapture))
+    }
+    // A past outage detected today — recording is fine NOW, but a gap earlier was invisible until this
+    // row (#27). Warn, not bad: the current state is healthy; this is a heads-up that a window was missed.
+    if i.outageSeconds > 0 {
+        rows.append(HealthRow(group: "Capture", title: "Recorder was down earlier",
+                              detail: "No recording for ~\(humanDuration(i.outageSeconds)) today — a meeting in that window may not have been captured. Open the log for details.",
+                              level: .warn, action: .showLog))
     }
 
     // ---- Permissions ----

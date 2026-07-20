@@ -228,8 +228,56 @@ PY
   fi
 }
 
+# ---- s7 — recorder silent-outage detection on the REAL binary + REAL system uptime (#27) -----------
+s7() {
+  print -r -- "s7: outage-check — the real binary reads the real system uptime and decides an 18h gap"
+  local bin=".build/debug/macrec"
+  [[ -x "$bin" ]] || bin="/Applications/macrec.app/Contents/MacOS/macrec"
+  if [[ ! -x "$bin" ]]; then skip "s7: no macrec binary (swift build first)"; return; fi
+  # The detector calls an 18h gap benign if the mac REBOOTED during it (uptime < gap) — so a real
+  # outage can only be proven when the mac has been up longer than the gap we inject. Read boot time
+  # and pick a gap safely under it; if the mac just booted, SKIP loudly (never a false PASS).
+  local uptime; uptime=$("$bin" outage-check --heartbeat-ago 1 | sed -nE 's/.*uptime=([0-9]+).*/\1/p')
+  if [[ -z "$uptime" || "$uptime" -lt 5400 ]]; then skip "s7: mac up only ${uptime:-?}s (<90m) — can't out-span a real gap"; return; fi
+  # A gap the mac was awake across → a real outage; a 1-second gap → benign. Both on the real uptime.
+  local big small
+  big=$("$bin" outage-check --heartbeat-ago 3600 | sed -nE 's/.*outage=([a-z0-9]+).*/\1/p')
+  small=$("$bin" outage-check --heartbeat-ago 1 | sed -nE 's/.*outage=([a-z0-9]+).*/\1/p')
+  if [[ "$big" == "3600" && "$small" == "none" ]]; then
+    pass "s7: real binary flagged a 1h awake-mac gap (outage=$big) and cleared a 1s blip"
+  else
+    fail "s7: outage-check wrong — 1h gap→'$big' (want 3600), 1s→'$small' (want none), uptime=${uptime}s"
+  fi
+}
+
+# ---- s8 — outage persistence is read back across a SEPARATE process launch (#27) ------------------
+s8() {
+  print -r -- "s8: a persisted outage written by one process is read back by a fresh outage-check launch"
+  local bin="/Applications/macrec.app/Contents/MacOS/macrec"
+  [[ -x "$bin" ]] || bin=".build/debug/macrec"
+  if [[ ! -x "$bin" ]]; then skip "s8: no macrec binary"; return; fi
+  local suite="com.ikhoon.macrec.prefs"
+  # Snapshot + restore the real keys so a running recorder isn't disturbed (the incident's own seam:
+  # a stamp written by a dead process must survive to the next launch).
+  local savedAt savedSecs
+  savedAt=$(defaults read "$suite" recorderOutageAt 2>/dev/null || echo "")
+  savedSecs=$(defaults read "$suite" recorderOutageSeconds 2>/dev/null || echo "")
+  local now; now=$(date +%s)
+  defaults write "$suite" recorderOutageAt -float "$now"
+  defaults write "$suite" recorderOutageSeconds -float 64800   # 18h
+  local out; out=$("$bin" outage-check | sed -nE 's/.*last-outage-today=([a-z0-9]+).*/\1/p')
+  # Restore (or clear) so we leave the tester's prefs exactly as found.
+  if [[ -n "$savedAt" ]]; then defaults write "$suite" recorderOutageAt -float "$savedAt"; else defaults delete "$suite" recorderOutageAt 2>/dev/null; fi
+  if [[ -n "$savedSecs" ]]; then defaults write "$suite" recorderOutageSeconds -float "$savedSecs"; else defaults delete "$suite" recorderOutageSeconds 2>/dev/null; fi
+  if [[ "$out" == "64800" ]]; then
+    pass "s8: fresh process read back the persisted same-day outage (last-outage-today=$out)"
+  else
+    fail "s8: cross-process read-back wrong — got '$out' (want 64800)"
+  fi
+}
+
 print -r -- "macrec QA (tier 2) — scratch: $SCRATCH"
-if [[ $# -eq 0 ]]; then s1; s2; s3; s4; s5; s6; else for s in "$@"; do "$s"; done; fi
+if [[ $# -eq 0 ]]; then s1; s2; s3; s4; s5; s6; s7; s8; else for s in "$@"; do "$s"; done; fi
 print -r -- ""
 print -r -- "qa: $PASS passed, $FAIL failed, $SKIP skipped"
 [[ $FAIL -eq 0 ]] || exit 1

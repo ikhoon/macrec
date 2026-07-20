@@ -43,6 +43,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private var checkingForUpdates = false   // a manual update check is in flight — don't stack modal alerts
     private var settingsWC: SettingsWindowController?
     private var levelTimer: Timer?
+    private let heartbeatQueue = DispatchQueue(label: "com.ikhoon.macrec.heartbeat")   // #27: process-liveness beat
+    private var outageLine: NSMenuItem!   // shown only after a same-day silent outage (durable surface)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Single instance: if a copy is already running (the LaunchAgent one), just tell it to open
@@ -73,6 +75,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
             forName: .init("com.ikhoon.macrec.openMenu"), object: nil, queue: .main
         ) { [weak self] _ in self?.openMenu() }
         UNUserNotificationCenter.current().delegate = self   // click a completion push → open the file
+        checkRecorderOutage()   // #27: was the process dead across a stretch while the mac was awake? say so LOUDLY
+        // Process-liveness heartbeat for the whole run, independent of the engine (a paused/parked
+        // recorder keeps the process alive, so an intentional idle never reads as a gap). Beat on wake
+        // too, so a post-sleep death is measured from wake, not from before the sleep.
+        RecorderHeartbeat.start(queue: heartbeatQueue)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [hbq = heartbeatQueue] _ in hbq.async { RecorderHeartbeat.beat() } }   // single-writer: all beats on hbq
         CalendarLookup.requestAccess()   // one-time Calendar prompt (for titling transcripts)
         setupModelDownload()             // first-run: fetch the large model, show progress in the menu
         LoginItem.autoEnableOnceIfDistributed()   // distributed app: enable 24/7 autostart on first run
@@ -160,8 +170,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         summaryLine = NSMenuItem(title: "", action: #selector(revealLastSummary), keyEquivalent: "")
         summaryLine.target = self
         digestLine = NSMenuItem(title: "", action: nil, keyEquivalent: ""); digestLine.isEnabled = false
+        // #27: a durable, always-visible outage line for the menu-bar-only user (who may never open the
+        // Today panel). Clicking it opens the log where the "was DOWN" detail lives. Hidden until there's
+        // a same-day outage to report.
+        outageLine = NSMenuItem(title: "", action: #selector(showLog), keyEquivalent: "")
+        outageLine.target = self; outageLine.isHidden = true
         menu.addItem(statusLine); menu.addItem(levelItem); menu.addItem(lastSavedLine); menu.addItem(modelLine)
-        menu.addItem(summaryLine); menu.addItem(digestLine)
+        menu.addItem(summaryLine); menu.addItem(digestLine); menu.addItem(outageLine)
         menu.addItem(.separator())
         // Transcribe now — view-backed so the click does NOT dismiss the menu (user pick, round 2:
         // stay open and watch the row's spinner in place). MenuHoverView supplies the native-style
@@ -229,6 +244,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
                                            dueTime: Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00"),
                                            lastRun: Pref.explicit(Pref.dailyDigestLastRun, ""),
                                            today: day.string(from: Date()))
+        let outageTitle = outageMenuTitle(outageSeconds: RecorderHeartbeat.outageForToday())
+        outageLine.title = outageTitle; outageLine.isHidden = outageTitle.isEmpty
     }
 
     /// Drives the REAL buildMenu + menuWillOpen and reports the two post-process rows. A deleted call to
@@ -245,6 +262,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         menu.cancelTracking()
         guard let s = summaryLine, let d = digestLine else { return nil }
         return (s.title, d.title, s.isEnabled)
+    }
+
+    /// #27: drives the REAL menu build + open and reports the outage line's rendered state — proves the
+    /// durable menu-bar surface is actually WIRED (title set, un-hidden, clickable) from the persisted
+    /// outage, not just that outageMenuTitle returns a string. Reads the live pref, so set it first.
+    func outageMenuLineAfterMenuOpenForTest() -> (title: String, hidden: Bool, enabled: Bool)? {
+        buildMenu()
+        guard let menu = statusItem.menu else { return nil }
+        menuWillOpen(menu)
+        menu.update()   // AppKit re-validates target/action items — read isEnabled AFTER, as the user sees it
+        menu.cancelTracking()
+        guard let o = outageLine else { return nil }
+        return (o.title, o.isHidden, o.isEnabled)
     }
 
     /// Clicking the summary row: reveal what it wrote, or explain why it didn't. Never nothing.
@@ -407,6 +437,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         t.onOpenSettings = { [weak self] _ in self?.openSettings() }
         t.onRetrySummary = { [weak self] in self?.flushNow() }
         t.onTestCapture = { [weak self] in self?.runCaptureTest() }
+        t.onShowLog = { [weak self] in self?.showLog() }
         t.onWillRefresh = { [weak self] in self?.refreshToolCacheAsync() }
         refreshToolCacheAsync()   // warm the cache before the first render
         t.show()
@@ -476,6 +507,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         h.digestEnabled = Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false)
         h.digestTime = Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00")
         h.digestRanToday = Pref.explicit(Pref.dailyDigestLastRun, "") == todayString()
+        h.outageSeconds = RecorderHeartbeat.outageForToday()
         h.now = Date()
         return h
     }
@@ -885,7 +917,30 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
 
     func applicationWillTerminate(_ notification: Notification) { stopEngineSync() }
 
-    @objc private func quit() { stopEngineSync(); NSApp.terminate(nil) }
+    // Only the explicit menu Quit is a "the user chose to stop" event — NOT applicationWillTerminate
+    // (which also fires on logout / SIGTERM / bootout, the very deaths #27 must surface). So the
+    // forgiving clean-stop marker is written here alone.
+    @objc private func quit() { RecorderHeartbeat.noteUserQuit(); stopEngineSync(); NSApp.terminate(nil) }
+
+    /// #27: at launch, if the prior run's heartbeat shows the PROCESS was dead for a real stretch while
+    /// the mac was awake (not a reboot, not a deliberate Quit), surface it — the silent 18-hour outage
+    /// that dropped a morning meeting must never be invisible again. Loud = log + notification + a
+    /// durable Today row / menu line (persisted by checkOutageOnStart); shorter gaps are logged only.
+    private func checkRecorderOutage() {
+        if let secs = RecorderHeartbeat.checkOutageOnStart() {
+            let now = Date(), from = now.addingTimeInterval(-secs)
+            let window = outageWindowText(from: from, to: now)
+            elog("app: recorder was DOWN ~\(humanDuration(secs)) (\(window)) — a meeting in that window may not have been captured")
+            Notifier.push(title: "macrec wasn't recording",
+                          body: "Down ~\(humanDuration(secs)) (\(window)). A meeting in that window may not have been captured.",
+                          openWindow: "log")
+        } else if RecorderHeartbeat.outageForToday() > 0 {
+            // A same-day outage carried over from an earlier process (this run restarted) still shows in
+            // the menu line / Today row via the persisted seconds — re-emit the detail so the log those
+            // surfaces point to isn't empty in this fresh process (LogBuffer is in-memory, per-launch).
+            elog("app: recorder was down ~\(humanDuration(RecorderHeartbeat.outageForToday())) earlier today — a meeting in that window may not have been captured")
+        }
+    }
 }
 
 extension AppController: UNUserNotificationCenterDelegate {
@@ -902,7 +957,13 @@ extension AppController: UNUserNotificationCenterDelegate {
         // Web links ride under "url" (https-only — sanitized at push time, re-checked here); local
         // transcript paths ride under "file". Keeping them distinct means a URL is never opened as a
         // file path, nor a path as a URL (the old shared "file" key + hasPrefix("http") did both).
-        if let s = info["url"] as? String, let u = URL(string: s), u.scheme?.lowercased() == "https" {
+        if let w = info["open"] as? String {   // an in-app window (the #27 outage alert opens the log)
+            switch w {
+            case "today": openToday()
+            case "library": openLibrary()
+            default: showLog()
+            }
+        } else if let s = info["url"] as? String, let u = URL(string: s), u.scheme?.lowercased() == "https" {
             NSWorkspace.shared.open(u)
         } else if let p = info["file"] as? String {
             NSWorkspace.shared.open(URL(fileURLWithPath: p))
