@@ -204,6 +204,7 @@ func runTodaySnapshotSubcommand(_ args: [String]) -> Never {
     i.summary = .failed("2026-07-19-1400.md", i.now, reason: "Not logged in")   // one bad + Retry
     i.transcriptsToday = 3; i.summariesToday = 2
     i.digestEnabled = true; i.digestTime = "20:00"
+    i.notificationsDenied = true   // #33: exercise the "Notifications off" warn row + its Settings… button
     TodayWindow.shared.loadFixtureForTest(todayHealth(i))
     let files = TodayWindow.shared.snapshot(to: dir)
     for f in files { print(f.path) }

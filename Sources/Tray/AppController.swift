@@ -48,6 +48,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private var alertedHealth: Set<String> = []   // #32: BAD conditions already pushed (dedup, re-alert on recurrence)
     private var lastBadHealth: Set<String> = []   // #32: BAD keys from the previous tick (2-tick debounce)
     private let launchedAt = Date()               // #32: startup grace so transient boot states don't alert
+    private var notifDenied = false               // #33: notification auth is definitively denied (alerts won't arrive)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Single instance: if a copy is already running (the LaunchAgent one), just tell it to open
@@ -441,8 +442,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         t.onRetrySummary = { [weak self] in self?.flushNow() }
         t.onTestCapture = { [weak self] in self?.runCaptureTest() }
         t.onShowLog = { [weak self] in self?.showLog() }
+        t.onOpenNotificationSettings = {
+            if let u = URL(string: "x-apple.systempreferences:com.apple.preference.notifications") { NSWorkspace.shared.open(u) }
+        }
         t.onWillRefresh = { [weak self] in self?.refreshToolCacheAsync() }
         refreshToolCacheAsync()   // warm the cache before the first render
+        refreshNotifAuth()        // and the notification-auth verdict (#33)
         t.show()
     }
 
@@ -475,11 +480,27 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         }
     }
 
+    /// #33: cache whether notification auth is DEFINITIVELY denied (async — the system settings query
+    /// has a completion handler). Only `.denied` counts; `.notDetermined` will still be prompted, so it
+    /// must not warn. Cheap; refreshed on the health tick + window open. Re-renders Today on a change.
+    private func refreshNotifAuth() {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] s in
+            let denied = s.authorizationStatus == .denied
+            DispatchQueue.main.async {
+                guard let self, self.notifDenied != denied else { return }
+                self.notifDenied = denied
+                elog("notify: authorization \(denied ? "denied — alerts won't reach the user" : "allowed")")
+                TodayWindow.shared.noteChanged()
+            }
+        }
+    }
+
     /// #32: a closed Today window used to hide every silent failure it exists to surface. Every 30 s
     /// (the schedule tick), if a BAD health condition is present, push it as a notification — deduped so
     /// a persistent one alerts once, re-alerting only if it clears and recurs. A startup grace skips
     /// transient boot states; an open window is already showing them, so don't double-signal.
     private func checkHealthAlerts() {
+        refreshNotifAuth()   // keep the "notifications off" verdict fresh even while the window is closed
         guard Date().timeIntervalSince(launchedAt) > 90, !TodayWindow.shared.isVisible else { return }
         // Keep whisper/runner resolution warm so "not found" can alert too — but on a 5-min window, not
         // the interactive 30s one: a resolved tool almost never un-resolves mid-run, so re-spawning two
@@ -529,6 +550,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         h.digestTime = Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00")
         h.digestRanToday = Pref.explicit(Pref.dailyDigestLastRun, "") == todayString()
         h.outageSeconds = RecorderHeartbeat.outageForToday()
+        h.notificationsDenied = notifDenied
         h.now = Date()
         return h
     }
