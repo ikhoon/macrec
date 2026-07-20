@@ -216,6 +216,16 @@ func overallHealth(_ rows: [HealthRow]) -> (level: HealthLevel, line: String) {
     }
 }
 
+/// The tray menu's one-line health verdict for the menu-bar user who may never open Today — and, with
+/// notifications off, gets no push either (the menu is the surface they DO see). The worst BAD
+/// condition by name, with a count when several; "" when nothing is broken (the row then hides, so a
+/// healthy menu stays clean). Only `.bad` (broken, act-now) — warns live in Today. Pure + selftested.
+func menuHealthLine(_ rows: [HealthRow]) -> String {
+    let bad = rows.filter { $0.level == .bad }
+    guard let worst = bad.first else { return "" }
+    return bad.count == 1 ? "⚠︎ \(worst.title)" : "⚠︎ \(worst.title) (+\(bad.count - 1) more)"
+}
+
 /// The digest is overdue when now is past today's HH:mm and it hasn't run yet. Pure (mirrors
 /// dailyDigestDue's boundary without the last-run string coupling).
 func digestOverdue(now: Date, time: String, ranToday: Bool, calendar: Calendar = .current) -> Bool {
