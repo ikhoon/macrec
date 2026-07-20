@@ -175,6 +175,17 @@ func requestPermissions() -> (audio: Bool, mic: Bool) {
     return (audioCaptureAuthorized(), mic)
 }
 
+/// The System Settings privacy pane to open when a capture permission is still missing after the
+/// prompt (the OS won't re-prompt a denied grant, so the Grant button must lead somewhere). The
+/// system-audio grant is fatal to capture, so it wins; else the microphone. nil when both are granted.
+/// Pure + selftested — a Grant button that opens the wrong pane (or none when mic-only is denied) is
+/// the dead-affordance the codebase forbids.
+func permissionDeepLinkPane(audioOK: Bool, micOK: Bool) -> String? {
+    if !audioOK { return "Privacy_AudioCapture" }
+    if !micOK { return "Privacy_Microphone" }
+    return nil
+}
+
 /// Canonical processing format used everywhere: 16 kHz, mono, float32 (what Whisper wants).
 let canon = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
 
