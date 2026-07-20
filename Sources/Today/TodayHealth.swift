@@ -64,6 +64,10 @@ struct HealthRow: Equatable {
     let detail: String
     let level: HealthLevel
     let action: HealthAction
+    // #32: this condition already has its OWN proactive surface (the pipeline's failure notification;
+    // the OS permission prompt + tray Grant item), so the closed-window health alert must NOT also push
+    // it — else it double-signals. Data-driven so a new self-surfacing row opts out at construction.
+    var suppressBackgroundAlert = false
 }
 
 /// The whole panel, derived purely. Rows are grouped Capture / Permissions / Pipeline / Today.
@@ -106,7 +110,11 @@ func todayHealth(_ i: HealthInputs) -> [HealthRow] {
         rows.append(HealthRow(group: "Permissions", title: name,
                               detail: granted ? "Granted." : (fatal ? "Denied — capture can't work." : "Denied — transcripts won't get calendar titles."),
                               level: granted ? .ok : (fatal ? .bad : .warn),
-                              action: granted ? .none : .grantPermissions))
+                              action: granted ? .none : .grantPermissions,
+                              // The OS prompt fires the moment a grant is missing, and the tray Grant item
+                              // stays visible — a background push would double-signal (and can't tell a
+                              // still-open prompt from a real denial). Let those surfaces own it.
+                              suppressBackgroundAlert: true))
     }
 
     // ---- Pipeline ----
@@ -137,7 +145,8 @@ func todayHealth(_ i: HealthInputs) -> [HealthRow] {
                               level: .ok, action: .none))
     case .failed(let f, _, let reason):
         rows.append(HealthRow(group: "Pipeline", title: "Summary FAILED",
-                              detail: "\(f) — \(reason ?? "unknown reason")", level: .bad, action: .retrySummary))
+                              detail: "\(f) — \(reason ?? "unknown reason")", level: .bad, action: .retrySummary,
+                              suppressBackgroundAlert: true))   // the pipeline already pushes its own "Summary failed"
     }
 
     // ---- Today ----
@@ -152,6 +161,25 @@ func todayHealth(_ i: HealthInputs) -> [HealthRow] {
                               level: overdue ? .warn : .ok, action: .none))
     }
     return rows
+}
+
+/// Which BAD health conditions are NEW alerts to push so a CLOSED Today window still warns (#32).
+/// DEBOUNCED: a condition must be bad on TWO consecutive samples before it alerts, so a legitimate
+/// transient — an engine restart on a schedule/calendar resume momentarily has `engine == nil`, a boot
+/// state still settling — rides over without a false alert (it clears by the next tick and is never
+/// confirmed). A condition alerts once; it must clear and recur to alert again (no spam). Rows that
+/// self-surface elsewhere (`suppressBackgroundAlert`: the pipeline's own failure push, the OS
+/// permission prompt) never alert here. Returns the new alerts + the two sets to carry forward.
+/// Pure + selftested; the caller adds a startup grace and suppresses while the window is visible.
+func healthAlerts(rows: [HealthRow], lastBad: Set<String>, alerted: Set<String>)
+    -> (new: [HealthRow], bad: Set<String>, alerted: Set<String>) {
+    func key(_ r: HealthRow) -> String { "\(r.group)/\(r.title)" }
+    let badRows = rows.filter { $0.level == .bad && !$0.suppressBackgroundAlert }
+    let bad = Set(badRows.map(key))
+    let confirmed = bad.intersection(lastBad)                       // bad for two consecutive samples
+    let new = badRows.filter { confirmed.contains(key($0)) && !alerted.contains(key($0)) }
+    let stillAlerted = alerted.intersection(bad).union(Set(new.map(key)))   // a cleared condition drops → can re-alert
+    return (new, bad, stillAlerted)
 }
 
 private func pipelineRunnerRow(_ i: HealthInputs, detail: String) -> HealthRow {

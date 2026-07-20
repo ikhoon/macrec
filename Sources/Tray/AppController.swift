@@ -45,6 +45,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private var levelTimer: Timer?
     private let heartbeatQueue = DispatchQueue(label: "com.ikhoon.macrec.heartbeat")   // #27: process-liveness beat
     private var outageLine: NSMenuItem!   // shown only after a same-day silent outage (durable surface)
+    private var alertedHealth: Set<String> = []   // #32: BAD conditions already pushed (dedup, re-alert on recurrence)
+    private var lastBadHealth: Set<String> = []   // #32: BAD keys from the previous tick (2-tick debounce)
+    private let launchedAt = Date()               // #32: startup grace so transient boot states don't alert
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Single instance: if a copy is already running (the LaunchAgent one), just tell it to open
@@ -67,7 +70,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         RunLoop.main.add(vt, forMode: .common)   // .common so the tint updates while menus track too
         voiceTimer = vt
         let st = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
-            DispatchQueue.main.async { self?.checkSchedule(); self?.maybeRunDailyDigest(); self?.maybeCheckForUpdates() }   // timer runs in .common; engine state is main-confined
+            DispatchQueue.main.async { self?.checkSchedule(); self?.maybeRunDailyDigest(); self?.maybeCheckForUpdates(); self?.checkHealthAlerts() }   // timer runs in .common; engine state is main-confined
         }
         RunLoop.main.add(st, forMode: .common)
         schedTimer = st
@@ -472,6 +475,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         }
     }
 
+    /// #32: a closed Today window used to hide every silent failure it exists to surface. Every 30 s
+    /// (the schedule tick), if a BAD health condition is present, push it as a notification — deduped so
+    /// a persistent one alerts once, re-alerting only if it clears and recurs. A startup grace skips
+    /// transient boot states; an open window is already showing them, so don't double-signal.
+    private func checkHealthAlerts() {
+        guard Date().timeIntervalSince(launchedAt) > 90, !TodayWindow.shared.isVisible else { return }
+        // Keep whisper/runner resolution warm so "not found" can alert too — but on a 5-min window, not
+        // the interactive 30s one: a resolved tool almost never un-resolves mid-run, so re-spawning two
+        // login shells every tick forever is wasted background churn (review finding).
+        refreshToolCacheAsync(maxAge: 300)
+        let (new, bad, alerted) = healthAlerts(rows: todayHealth(sampleHealth()), lastBad: lastBadHealth, alerted: alertedHealth)
+        lastBadHealth = bad; alertedHealth = alerted
+        for row in new {
+            elog("health: alerting (window closed) — \(row.title): \(row.detail)")
+            Notifier.push(title: "macrec: \(row.title)", body: row.detail, openWindow: "today")
+        }
+    }
+
     /// Sample the live app into the dashboard's pure inputs (see TodayHealth). Cheap — re-run each tick.
     private func sampleHealth() -> HealthInputs {
         var h = HealthInputs()
@@ -527,10 +548,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     // Tool resolution result, refreshed on a BACKGROUND queue (each check spawns a login shell) so
     // the render path never blocks. nil until the first refresh completes.
     private var toolCache: (value: (whisper: Bool, runner: Bool), at: Date)?
-    /// Resolve the whisper + runner CLIs off the main thread, cache the result, and re-render.
-    /// Called on window open and coalesced to at most once / 30 s.
-    private func refreshToolCacheAsync() {
-        if let c = toolCache, Date().timeIntervalSince(c.at) < 30 { return }
+    private var toolCacheRefreshing = false   // in-flight guard: a hung spawn must not pile up more (review)
+    /// Resolve the whisper + runner CLIs off the main thread, cache the result, and re-render. Coalesced
+    /// to at most once / `maxAge` s (the interactive window open uses 30 s; the background alert poll a
+    /// longer window, since a resolved tool almost never un-resolves mid-run).
+    private func refreshToolCacheAsync(maxAge: TimeInterval = 30) {
+        if toolCacheRefreshing { return }
+        if let c = toolCache, Date().timeIntervalSince(c.at) < maxAge { return }
+        toolCacheRefreshing = true
         let whisper = Pref.str("whisperCli", "MR_WHISPER_CLI", BundledTools.whisperCli ?? "whisper-cli")
         let runner = (SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude).rawValue
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -538,6 +563,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
             let w = self.toolResolves(whisper), r = self.toolResolves(runner)
             DispatchQueue.main.async {
                 self.toolCache = ((w, r), Date())
+                self.toolCacheRefreshing = false
                 TodayWindow.shared.noteChanged()
             }
         }
