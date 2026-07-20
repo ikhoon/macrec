@@ -21,6 +21,7 @@ final class TodayWindow: NSObject, NSWindowDelegate {
     var onOpenSettings: ((String) -> Void)?
     var onRetrySummary: (() -> Void)?
     var onTestCapture: (() -> Void)?
+    var onShowLog: (() -> Void)?
     var onWillRefresh: (() -> Void)? // let the app refresh cheap-but-off-main caches before a sample
 
     func toggle() {
@@ -183,6 +184,7 @@ final class TodayWindow: NSObject, NSWindowDelegate {
         case .openSettings: return ("Settings…", #selector(doSettings))
         case .retrySummary: return ("Retry", #selector(doRetry))
         case .testCapture: return ("Test…", #selector(doTest))
+        case .showLog: return ("Open log", #selector(doShowLog))
         }
     }
 
@@ -199,6 +201,7 @@ final class TodayWindow: NSObject, NSWindowDelegate {
 
     @objc private func doRetry() { onRetrySummary?() }
     @objc private func doTest() { onTestCapture?() }
+    @objc private func doShowLog() { onShowLog?() }
 
     private static func color(_ level: HealthLevel) -> NSColor {
         switch level {

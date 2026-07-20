@@ -106,6 +106,19 @@ concise and specific to macrec; don't pad the file with generic advice.
    it, the QA step did not happen. *(claude-not-found, day-header misalignment, filter spinner,
    18-hour recorder outage — all found by the maintainer, none by the suite.)*
 
+15. **A "forgiveness" marker that fires on more paths than the one intent, and never expires, swallows
+   the failure it was meant to allow.** #27's outage detector first wrote a `cleanStop` marker on
+   EVERY engine stop (pause, schedule-park, settings-restart, SIGTERM/bootout) and suppressed the
+   next outage whenever that marker sat adjacent to the last heartbeat — which it always did, by
+   construction. So a genuine 18-hour bootout death (a SIGTERM path) wrote the same "forgiven" marker
+   a deliberate Quit would, and the detector silently swallowed the exact incident it existed to
+   catch. A review lens caught it before it shipped. The rule: scope a suppression marker to the ONE
+   intent it forgives (only the menu Quit writes it — not the shared teardown path), and prove the
+   thing it must STILL fire on (the bootout death, `cleanStop == nil`) with its own test that goes red
+   when the scoping regresses. Relatedly, move liveness proof to the level that actually owns the
+   invariant: the heartbeat proves the *process* is alive (a paused recorder still beats), not the
+   engine — so an intentional idle never reads as a gap without needing a forgiveness marker at all.
+
 ## 3. CS fundamentals we hold ourselves to
 
 The bugs here have been fundamentals, not exotica: unhandled states, controls bound to nothing,

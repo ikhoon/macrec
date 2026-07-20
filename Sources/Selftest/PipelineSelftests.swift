@@ -309,6 +309,91 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
                   && d.string(forKey: Pref.dailyPrompt) == "my custom digest prompt")
         d.removeObject(forKey: Pref.dailyPrompt)
     }
+    // Silent-outage detection (#27): the recorder was DOWN ~18h overnight+morning and a real meeting
+    // was missed with nothing shown. The forgiving clean-stop is written ONLY on a user Quit — a
+    // SIGTERM/bootout death (cleanStop == nil) must still be surfaced, else the feature swallows the
+    // exact incident it exists for (correctness review, P0). The pure decision must (a) flag a long gap
+    // on a live mac, incl. the bootout death, (b) NOT flag an overnight shutdown (mac rebooted), (c) NOT
+    // flag a deliberate Quit (clean-stop adjacent to the last beat), (d) NOT flag a quick restart /
+    // first run, (e) still flag when a STALE clean-stop (from a Quit long ago) sits in prefs.
+    let t0 = schedDate("2026-07-21 17:00")   // "now" on the incident's restart
+    let liveMacBoot = schedDate("2026-07-16 09:00")   // mac up for days
+    check("outage: an 18h bootout-death on a live mac IS surfaced (cleanStop nil — the actual incident)",
+          recorderOutage(lastHeartbeat: schedDate("2026-07-20 23:00"), cleanStop: nil,
+                         now: t0, bootTime: liveMacBoot).map { Int($0) } == 18 * 3600)
+    check("outage: an overnight SHUTDOWN (mac rebooted during the gap) is benign, incl. the boot==last tie",
+          recorderOutage(lastHeartbeat: schedDate("2026-07-20 22:00"), cleanStop: nil,
+                         now: schedDate("2026-07-21 08:00"), bootTime: schedDate("2026-07-21 07:59")) == nil
+              && recorderOutage(lastHeartbeat: schedDate("2026-07-20 22:00"), cleanStop: nil,
+                                now: t0, bootTime: schedDate("2026-07-20 22:00")) == nil)   // bootTime == last → benign (>=)
+    check("outage: a deliberate Quit (clean-stop adjacent to the last beat) is benign",
+          recorderOutage(lastHeartbeat: schedDate("2026-07-20 23:00"),
+                         cleanStop: schedDate("2026-07-20 23:00"), now: t0, bootTime: liveMacBoot) == nil)
+    check("outage: a STALE clean-stop from an old Quit does NOT blind a later crash (last advanced past it)",
+          recorderOutage(lastHeartbeat: schedDate("2026-07-20 23:00"),
+                         cleanStop: schedDate("2026-07-17 09:00"),   // a Quit 3+ days before this run's last beat
+                         now: t0, bootTime: liveMacBoot).map { Int($0) } == 18 * 3600)
+    check("outage: a quick restart (< min gap) and a first-ever run are both benign",
+          recorderOutage(lastHeartbeat: schedDate("2026-07-21 16:57"), cleanStop: nil,
+                         now: t0, bootTime: liveMacBoot) == nil   // 3 min < 5-min floor
+              && recorderOutage(lastHeartbeat: nil, cleanStop: nil, now: t0, bootTime: liveMacBoot) == nil)
+    check("outage: humanDuration reads as h/min and the from–to window spans days when needed",
+          humanDuration(18 * 3600) == "18 h" && humanDuration(45 * 60) == "45 min"
+              && humanDuration(2 * 3600 + 10 * 60) == "2 h 10 min" && humanDuration(30) == "30 s"
+              && outageWindowText(from: schedDate("2026-07-21 09:10"), to: schedDate("2026-07-21 09:55"), calendar: utc) == "09:10–09:55"
+              && outageWindowText(from: schedDate("2026-07-20 23:00"), to: schedDate("2026-07-21 08:00"), calendar: utc) == "Jul 20 23:00–Jul 21 08:00"
+              && outageMenuTitle(outageSeconds: 18 * 3600).contains("~18 h") && outageMenuTitle(outageSeconds: 0).isEmpty)
+    // The WIRING through the REAL beat()/noteUserQuit() — not raw d.set (test-honesty review, P0): a real
+    // Quit must write a cleanStop that suppresses the next start; a bootout (no Quit) must be surfaced,
+    // persisted, and shown by todayHealth + the menu line same-day only; a fresh Notifier must fire; a
+    // sub-threshold gap (5–30 min) is logged but NOT surfaced.
+    do {
+        let d = Pref.d   // ephemeral suite under selftest
+        func clear() { for k in [Pref.recorderHeartbeat, Pref.recorderCleanStop, Pref.recorderOutageAt, Pref.recorderOutageSeconds] { d.removeObject(forKey: k) } }
+        clear()
+        // A real Quit: beat, then noteUserQuit → cleanStop adjacent → a later start over an 18h gap is benign.
+        RecorderHeartbeat.beat(now: schedDate("2026-07-20 23:00"), d: d)
+        RecorderHeartbeat.noteUserQuit(now: schedDate("2026-07-20 23:00"), d: d)
+        let afterQuit = RecorderHeartbeat.checkOutageOnStart(now: t0, uptime: t0.timeIntervalSince(liveMacBoot), d: d)
+        // A bootout death: only a beat (no Quit) → the 18h gap IS surfaced + persisted.
+        clear()
+        RecorderHeartbeat.beat(now: schedDate("2026-07-20 23:00"), d: d)
+        let surfaced = RecorderHeartbeat.checkOutageOnStart(now: t0, uptime: t0.timeIntervalSince(liveMacBoot), d: d)
+        var hi = HealthInputs(); hi.recording = true
+        hi.outageSeconds = RecorderHeartbeat.outageForToday(now: t0, d: d)
+        var notified = false
+        Notifier.sinkForTest = { _, _ in notified = true }
+        Notifier.push(title: "macrec wasn't recording", body: "x", openWindow: "log")
+        Notifier.sinkForTest = nil
+        check("outage wiring: Quit suppresses, bootout surfaces+persists+notifies+shows, clears next day",
+              afterQuit == nil                                   // real Quit → cleanStop → suppressed
+                  && surfaced.map { Int($0) } == 18 * 3600       // bootout → surfaced
+                  && Int(hi.outageSeconds) == 18 * 3600
+                  && notified
+                  && RecorderHeartbeat.outageForToday(now: schedDate("2026-07-23 17:00"), d: d) == 0  // +48h → later local day, clears
+                  && todayHealth(hi).contains { $0.title == "Recorder was down earlier" && $0.action == .showLog }
+                  && outageMenuTitle(outageSeconds: hi.outageSeconds).contains("Recorder was down"))
+        // A 20-minute gap is logged (captured), never surfaced (no persistence, returns nil).
+        clear()
+        RecorderHeartbeat.beat(now: schedDate("2026-07-21 16:40"), d: d)   // 20 min before t0
+        var logged = ""
+        let sub = RecorderHeartbeat.checkOutageOnStart(now: t0, uptime: t0.timeIntervalSince(liveMacBoot), d: d,
+                                                       log: { logged = $0 })
+        check("outage: a 20-min gap is logged but NOT surfaced (under the alert bar)",
+              sub == nil && d.double(forKey: Pref.recorderOutageSeconds) == 0 && logged.contains("20 min"))
+        clear()
+        // The tray menu line is actually WIRED (dead-affordance lesson): with a same-day outage in prefs
+        // the real menu open leaves it titled, un-hidden and clickable; with nothing, it stays hidden.
+        // refreshPostProcessRows reads outageForToday() at the REAL now, so stamp "today" as real now.
+        d.set(Date().timeIntervalSince1970, forKey: Pref.recorderOutageAt)
+        d.set(Double(18 * 3600), forKey: Pref.recorderOutageSeconds)
+        let shown = AppController().outageMenuLineAfterMenuOpenForTest()
+        clear()
+        let gone = AppController().outageMenuLineAfterMenuOpenForTest()
+        check("outage: the tray menu line is wired — shown+clickable with a same-day outage, hidden without",
+              shown != nil && shown!.title.contains("Recorder was down") && shown!.hidden == false && shown!.enabled
+                  && gone != nil && gone!.hidden == true)
+    }
     // Orphan-segment adoption: stem parsing, pairing, the fresh-file veto, and the file-scan
     // stats matching the live writer (same rules by construction — streamed through SourceWriter).
     check("adopt: stem dates parse, stems pair, one fresh file vetoes the stem",

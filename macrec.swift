@@ -275,6 +275,10 @@ enum Pref {
     static let dailyDigestStructured = "dailyDigestStructured"  // also write a machine-readable JSON sidecar (default on)
     static let autoUpdateCheck = "autoUpdateCheck"        // daily background release check (default on)
     static let updateCheckLastRun = "updateCheckLastRun"  // "yyyy-MM-dd" marker — one check per day
+    static let recorderHeartbeat = "recorderHeartbeat"    // epoch of the last liveness beat (proof the app PROCESS was running — NOT the engine; a paused/parked recorder still beats)
+    static let recorderCleanStop = "recorderCleanStop"    // epoch of the last deliberate stop() — a Quit, not a death
+    static let recorderOutageAt = "recorderOutageAt"      // epoch a silent outage was detected on the following start
+    static let recorderOutageSeconds = "recorderOutageSeconds"  // how long that outage lasted (seconds)
     static let postProcessCmd = "postProcessCmd"        // freeform command ("" = off)
     static let hintsTerms = "hintsTerms"                // transcription hint terms (comma/newline separated)
     static let hintsFile = "hintsFile"                  // external hints file (one term per line, # comments)
@@ -1311,6 +1315,25 @@ public enum App {
         // Subcommand: mic-status — is the default input device currently in use?
         if args.first == "mic-status" {
             print(micStatus() ? "1" : "0")
+            exit(0)
+        }
+
+        // Subcommand: outage-check — the recorder-liveness probe (#27). No flag: report the last
+        // silent outage the app persisted (a scriptable health check). With `--heartbeat-ago N`:
+        // decide as the engine would for a heartbeat N seconds old, using the REAL system uptime —
+        // the one input the in-process selftest can only fake, so this proves the real path on the
+        // real machine. Pure decision, no persistence.
+        if args.first == "outage-check" {
+            let uptime = ProcessInfo.processInfo.systemUptime
+            let now = Date()
+            if let i = args.firstIndex(of: "--heartbeat-ago"), i + 1 < args.count, let ago = Double(args[i + 1]) {
+                let secs = recorderOutage(lastHeartbeat: now.addingTimeInterval(-ago), cleanStop: nil,
+                                          now: now, bootTime: now.addingTimeInterval(-uptime))
+                print("uptime=\(Int(uptime)) heartbeat-ago=\(Int(ago)) outage=\(secs.map { String(Int($0)) } ?? "none")")
+            } else {
+                let secs = RecorderHeartbeat.outageForToday(now: now)
+                print("uptime=\(Int(uptime)) last-outage-today=\(secs > 0 ? String(Int(secs)) : "none")")
+            }
             exit(0)
         }
 

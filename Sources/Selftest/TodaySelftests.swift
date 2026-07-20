@@ -102,6 +102,7 @@ func todaySelftests(_ check: (String, Bool) -> Void) {
     // input that exercises Test / Grant / Retry / no-button together.
     var mix = ok; mix.captureTest = .silent; mix.calendarGranted = false
     mix.summary = .failed("x.md", dateAt(hour: 14, minute: 0), reason: "Not logged in")
+    mix.outageSeconds = 18 * 3600   // #27: a past outage row must render an "Open log" button, not a dead end
     let tw = TodayWindow.shared
     tw.loadFixtureForTest(todayHealth(mix))
     let issues = tw.layoutIssues() + tw.layoutIssuesAtMinSize()
@@ -110,6 +111,7 @@ func todaySelftests(_ check: (String, Bool) -> Void) {
               && tw.actionButtonTitleForTest(rowTitle: "System audio is silent") == "Test…"
               && tw.actionButtonTitleForTest(rowTitle: "Calendar") == "Grant…"
               && tw.actionButtonTitleForTest(rowTitle: "Summary FAILED") == "Retry"
+              && tw.actionButtonTitleForTest(rowTitle: "Recorder was down earlier") == "Open log"   // not a dead affordance
               && tw.actionButtonTitleForTest(rowTitle: "Microphone") == nil)   // granted → no button
     for i in issues { elog("selftest: \(i)") }
 }
