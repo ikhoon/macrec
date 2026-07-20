@@ -803,10 +803,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         _ = requestPermissions()          // System Audio Recording prompt + Microphone popup
         CalendarLookup.requestAccess()    // Calendar popup
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            guard !audioCaptureAuthorized() else { return }
-            if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture") {
-                NSWorkspace.shared.open(u)   // "System Audio Recording Only" pane
-            }
+            // Whichever grant is still missing after the prompt — audio (fatal) first, else mic. The OS
+            // won't re-prompt a denial, so a denied user needs the System Settings pane, not a no-op.
+            guard let pane = permissionDeepLinkPane(audioOK: audioCaptureAuthorized(), micOK: micAuthorized()),
+                  let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") else { return }
+            NSWorkspace.shared.open(u)
         }
     }
 

@@ -152,6 +152,13 @@ func todaySelftests(_ check: (String, Bool) -> Void) {
     let (x1, xbad1, xal1) = healthAlerts(rows: [notRec], lastBad: [], alerted: [])   // tick: transient bad
     let (x2, _, _) = healthAlerts(rows: [], lastBad: xbad1, alerted: xal1)           // next tick: gone
     check("health alerts: a one-tick transient (engine restarting) never alerts", x1.isEmpty && x2.isEmpty)
+    // The Grant button must lead SOMEWHERE for every missing grant (the OS won't re-prompt a denial):
+    // audio (fatal) wins, else mic, and mic-only-denied must NOT dead-end at no pane.
+    check("permissions: deep-link pane picks the missing grant (audio first, then mic), nil when both ok",
+          permissionDeepLinkPane(audioOK: false, micOK: true) == "Privacy_AudioCapture"
+              && permissionDeepLinkPane(audioOK: true, micOK: false) == "Privacy_Microphone"   // was a dead end
+              && permissionDeepLinkPane(audioOK: false, micOK: false) == "Privacy_AudioCapture"
+              && permissionDeepLinkPane(audioOK: true, micOK: true) == nil)
 }
 
 private func dateAt(hour: Int, minute: Int) -> Date {
