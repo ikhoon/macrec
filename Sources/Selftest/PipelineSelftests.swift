@@ -255,12 +255,13 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
           == ["/s/2026-07-07-1000-standup.md", "/t/2026-07-07-1400.md"])
     // Digest style templates: named, unique, and every style keeps the invariants — checkbox
     // action items (so the vault can track them) and answer-in-input-language.
-    check("digest templates: unique names, checkbox action items everywhere, Standard is the default",
+    check("digest templates: unique names, MINE-ONLY checkbox rule everywhere, Standard is the default",
           Set(digestPromptTemplates.map(\.name)).count == digestPromptTemplates.count
-              && digestPromptTemplates.allSatisfy { $0.prompt.contains("- [ ]") }
+              // every template carries the mine-only rule (checkbox for me, plain bullet for others)
+              && digestPromptTemplates.allSatisfy { $0.prompt.contains("- [ ] item") && $0.prompt.contains("NO checkbox") }
               && digestPromptTemplates.allSatisfy { $0.prompt.contains("same language") }
               && digestPromptTemplates.first?.prompt == defaultDailyDigestPrompt
-              && defaultSummaryPrompt.contains("- [ ]")
+              && defaultSummaryPrompt.contains("- [ ] item") && defaultSummaryPrompt.contains("NO checkbox")
               && digestTemplateIndex(for: defaultDailyDigestPrompt + "\n") == 0
               && digestTemplateIndex(for: "my own prompt") == nil)
     // Structured daily-log sidecar (VISION Pillar 1): path, prompt, and the VALIDATION that refuses
@@ -452,7 +453,7 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
     let digCmd = dailyDigestInvocation(runner: .claude, prompt: "P", inputs: ["/s/a.md", "/s/b's.md"],
                                        outPath: "/d/2026-07/x.md") ?? ""
     check("digest: invocation cats inputs into the runner; H1 = file name; promote on success",
-          digCmd.hasPrefix("mkdir -p '/d/2026-07' && cat '/s/a.md' '/s/b'\\''s.md' | claude -p 'P' > '/d/2026-07/x.md.partial'")
+          digCmd.hasPrefix("mkdir -p '/d/2026-07' && cat '/s/a.md' '/s/b'\\''s.md' | claude --safe-mode -p 'P' > '/d/2026-07/x.md.partial'")
           && digCmd.contains("&& { printf '# %s\\n\\n' 'x'; cat '/d/2026-07/x.md.partial'; }")
           && digCmd.contains("&& mv '/d/2026-07/x.md.partial2' '/d/2026-07/x.md'")
           && dailyDigestInvocation(runner: .claude, prompt: "P", inputs: [], outPath: "/d/x.md") == nil)

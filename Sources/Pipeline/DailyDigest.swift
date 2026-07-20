@@ -6,32 +6,39 @@ import Foundation
 
 // MARK: L3 — daily digest (see PIPELINE.md; aggregates the day's summaries at a set time)
 
+// "Mine only" rule (maintainer, 2026-07-20): only action items clearly assigned to ME (the
+// "나"/"Me" speaker, the mic) become checkboxes; everyone else's stay plain bullets, so the vault's
+// task list is what I actually owe. Shared across the default and every template.
+let digestMineOnlyRule = "For the action items, format ONLY items clearly assigned to me (the "
+    + "speaker labeled \"나\" or \"Me\") as a markdown checkbox line \"- [ ] item\"; write every other "
+    + "person's action item as a plain bullet \"- item — owner\" with NO checkbox."
+
 let defaultDailyDigestPrompt = "These are summaries (or transcripts) of one day's meetings, in "
     + "chronological order. Write a daily digest: an overview of the day, highlights per meeting, "
-    + "and a combined list of decisions and action items with owners. Format every action item as "
-    + "a markdown checkbox line: \"- [ ] item — owner\". Answer in the same language as the input."
+    + "and a combined list of decisions and action items with owners. " + digestMineOnlyRule
+    + " Answer in the same language as the input."
 
 /// Named digest STYLES for the Settings template picker. Picking one prefills the editable prompt
 /// — the default is a suggestion, never a decision; edits flip the picker to Custom and win.
-/// Every style keeps the two invariants: checkbox action items and answer-in-input-language.
+/// Every style keeps the invariants: the mine-only checkbox rule and answer-in-input-language.
 let digestPromptTemplates: [(name: String, prompt: String)] = [
     ("Standard", defaultDailyDigestPrompt),
     ("Compact bullets",
      "These are summaries (or transcripts) of one day's meetings, in chronological order. Write a "
          + "terse daily digest as short bullets only — no prose paragraphs: 3–6 bullets for the "
-         + "day's key events, then decisions, then action items, each action item as a markdown "
-         + "checkbox line: \"- [ ] item — owner\". Answer in the same language as the input."),
+         + "day's key events, then decisions, then action items. " + digestMineOnlyRule
+         + " Answer in the same language as the input."),
     ("Executive brief",
      "These are summaries (or transcripts) of one day's meetings, in chronological order. Write an "
          + "executive brief: a 3–5 sentence narrative of the day emphasizing outcomes, risks and "
-         + "needed escalations, then the decisions, then action items as markdown checkbox lines: "
-         + "\"- [ ] item — owner (due date if mentioned)\". Answer in the same language as the input."),
+         + "needed escalations, then the decisions, then the action items. " + digestMineOnlyRule
+         + " Answer in the same language as the input."),
     ("Action tracker",
      "These are summaries (or transcripts) of one day's meetings, in chronological order. Produce "
          + "an action-first digest: a markdown table of every action item (columns: owner, item, "
-         + "due, source meeting), the same items as markdown checkbox lines \"- [ ] item — owner\", "
-         + "then a one-paragraph overview of the day and the decisions. Answer in the same language "
-         + "as the input."),
+         + "due, source meeting), then the action items as a list. " + digestMineOnlyRule
+         + " Then a one-paragraph overview of the day and the decisions. Answer in the same "
+         + "language as the input."),
 ]
 
 /// Which template a prompt text is — nil means Custom. Trimmed so a trailing newline doesn't
@@ -142,7 +149,7 @@ func dailyDigestInvocation(runner: SummaryRunner, prompt: String, inputs: [Strin
     let cat = "cat " + inputs.map(shq).joined(separator: " ")
     let runnerCmd: String
     switch runner {
-    case .claude: runnerCmd = "\(cat) | claude -p \(shq(prompt))"
+    case .claude: runnerCmd = "\(cat) | claude --safe-mode -p \(shq(prompt))"
     case .gemini: runnerCmd = "\(cat) | gemini -p \(shq(prompt))"
     case .codex:  runnerCmd = "{ printf '%s\\n\\n' \(shq(prompt)); \(cat); } | codex exec -"
     }

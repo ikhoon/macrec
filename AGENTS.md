@@ -94,6 +94,17 @@ concise and specific to macrec; don't pad the file with generic advice.
    speaker for an evening, and the wedged output route survived a coreaudiod restart. An unpinned
    fix is one refactor away from re-shipping its P0; "the comment explains it" is not a pin — the
    comment survived while the line it described was deleted.
+14. **A pure-core selftest + a FIXTURE snapshot is NOT "driving it" — open the real installed
+   window on the real machine and read the real state.** The Today dashboard shipped with the
+   health logic as a pure `todayHealth(HealthInputs)` (well tested) and a fixture snapshot that
+   HARDCODED `runnerResolved = true` — so the live sampler's launchd-PATH bug ("claude not found")
+   was structurally invisible to every check, and the maintainer found it in five minutes by
+   opening the window. The bugs live in the IMPURE seam the pure test bypasses (the sampler, the
+   real cell layout, the running-summary spinner, the app being down at all). After any UI/behavior
+   change: install, open the actual surface, and observe the actual state — a fixture that can only
+   render "healthy" can only ever prove "healthy renders." If the maintainer is the one who found
+   it, the QA step did not happen. *(claude-not-found, day-header misalignment, filter spinner,
+   18-hour recorder outage — all found by the maintainer, none by the suite.)*
 
 ## 3. CS fundamentals we hold ourselves to
 

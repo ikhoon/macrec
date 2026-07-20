@@ -31,7 +31,7 @@ func structuredDigestInvocation(runner: SummaryRunner, day: String, digestPath: 
     let cat = "cat \(shq(digestPath))"
     let runnerCmd: String
     switch runner {
-    case .claude: runnerCmd = "\(cat) | claude -p \(shq(prompt))"
+    case .claude: runnerCmd = "\(cat) | claude --safe-mode -p \(shq(prompt))"
     case .gemini: runnerCmd = "\(cat) | gemini -p \(shq(prompt))"
     case .codex: runnerCmd = "{ printf '%s\\n\\n' \(shq(prompt)); \(cat); } | codex exec -"
     }

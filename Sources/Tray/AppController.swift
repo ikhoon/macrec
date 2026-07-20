@@ -511,13 +511,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         }
     }
 
-    /// Does a summary-runner / whisper CLI resolve? An absolute path checks the file; a bare name
-    /// is looked up on the same PATH the runners use (login shell reads .zprofile, not .zshrc).
+    /// Does a summary-runner / whisper CLI resolve? An absolute path checks the file; a bare name is
+    /// looked up with the EXACT environment the runners use (postProcessEnvironment prepends
+    /// /opt/homebrew/bin, /usr/local/bin, ~/.local/bin, ~/bin). Under launchd a bare `zsh -lc` sees
+    /// none of those unless the user's PATH export happens to be in .zprofile — so resolving without
+    /// that prepend falsely reported "claude not found" while the actual summary run finds it fine.
     private func toolResolves(_ nameOrPath: String) -> Bool {
         if nameOrPath.contains("/") { return FileManager.default.isExecutableFile(atPath: nameOrPath) }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-lc", "command -v \(nameOrPath) >/dev/null 2>&1"]
+        p.arguments = ["-c", "command -v \(nameOrPath) >/dev/null 2>&1"]
+        p.environment = postProcessEnvironment(for: nameOrPath)
         p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
         do { try p.run() } catch { return false }
         p.waitUntilExit()
