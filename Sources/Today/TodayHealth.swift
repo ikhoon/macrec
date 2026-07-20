@@ -36,6 +36,10 @@ struct HealthInputs {
     // A silent outage detected on this run's start (the recorder was dead for a stretch while the mac
     // was awake) — seconds, or 0 when there's nothing to report. Surfaced so a past gap isn't invisible.
     var outageSeconds: Double = 0
+    // macOS notification authorization is DEFINITIVELY denied (not merely undetermined). When it is, the
+    // outage/health push alerts silently never arrive — the user must be told in-app, or they trust a
+    // safety net that isn't there. Default false (assume ok until the async query says otherwise).
+    var notificationsDenied = false
     var now = Date()
 }
 
@@ -55,7 +59,8 @@ enum HealthAction: Equatable {
     case openSettings(pane: String)
     case retrySummary
     case testCapture
-    case showLog   // open the app log (where the #27 "was DOWN" detail lives)
+    case showLog                    // open the app log (where the #27 "was DOWN" detail lives)
+    case openNotificationSettings   // System Settings > Notifications (alerts are off)
 }
 
 struct HealthRow: Equatable {
@@ -115,6 +120,13 @@ func todayHealth(_ i: HealthInputs) -> [HealthRow] {
                               // stays visible — a background push would double-signal (and can't tell a
                               // still-open prompt from a real denial). Let those surfaces own it.
                               suppressBackgroundAlert: true))
+    }
+    // Notifications OFF means the outage (#27) and health (#32) push alerts silently never arrive — say
+    // so in-app (this can't be a push, obviously). suppressBackgroundAlert for that same reason.
+    if i.notificationsDenied {
+        rows.append(HealthRow(group: "Permissions", title: "Notifications",
+                              detail: "Off — macrec's outage and health alerts won't reach you. Turn them on in System Settings.",
+                              level: .warn, action: .openNotificationSettings, suppressBackgroundAlert: true))
     }
 
     // ---- Pipeline ----

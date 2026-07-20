@@ -103,6 +103,7 @@ func todaySelftests(_ check: (String, Bool) -> Void) {
     var mix = ok; mix.captureTest = .silent; mix.calendarGranted = false
     mix.summary = .failed("x.md", dateAt(hour: 14, minute: 0), reason: "Not logged in")
     mix.outageSeconds = 18 * 3600   // #27: a past outage row must render an "Open log" button, not a dead end
+    mix.notificationsDenied = true  // #33: a "Notifications off" row must render a Settings… deep-link
     let tw = TodayWindow.shared
     tw.loadFixtureForTest(todayHealth(mix))
     let issues = tw.layoutIssues() + tw.layoutIssuesAtMinSize()
@@ -112,7 +113,14 @@ func todaySelftests(_ check: (String, Bool) -> Void) {
               && tw.actionButtonTitleForTest(rowTitle: "Calendar") == "Grant…"
               && tw.actionButtonTitleForTest(rowTitle: "Summary FAILED") == "Retry"
               && tw.actionButtonTitleForTest(rowTitle: "Recorder was down earlier") == "Open log"   // not a dead affordance
+              && tw.actionButtonTitleForTest(rowTitle: "Notifications") == "Settings…"              // #33 deep-link
               && tw.actionButtonTitleForTest(rowTitle: "Microphone") == nil)   // granted → no button
+    // #33: the row shows ONLY on definitive denial (not undetermined), is a warn, and never background-alerts.
+    check("today: notifications-off is a warn row, only when denied, and never a background alert",
+          todayHealth({ var i = ok; i.notificationsDenied = true; return i }()).contains {
+              $0.title == "Notifications" && $0.level == .warn && $0.suppressBackgroundAlert
+          }
+              && !todayHealth(ok).contains { $0.title == "Notifications" })   // default (not denied) → no row
     for i in issues { elog("selftest: \(i)") }
 
     // #32: a closed window still warns — BAD conditions become notifications, DEBOUNCED (bad on two

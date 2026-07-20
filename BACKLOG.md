@@ -6,10 +6,10 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
 ## Now — in progress
 
 - [ ] **Today dashboard follow-ups** (increment 1 shipped: capture/permissions/pipeline/output health
-      with fix buttons, tray → Today… ⌘D). Next: a verdict for the *dropped-metric* silent-failure
-      class (all-audio-scored-0s → everything discarded) — needs a live segment-level speech signal,
-      not just the last-run status; a red→system-notification path so a closed window still warns;
-      per-permission Settings deep-link.
+      with fix buttons, tray → Today… ⌘D). red→system-notification path so a closed window still warns
+      ✅ (#150, #32 — debounced BAD-condition push). Next: a verdict for the *dropped-metric*
+      silent-failure class (all-audio-scored-0s → everything discarded) — needs a live segment-level
+      speech signal, not just the last-run status; per-permission Settings deep-link.
 
 - [x] **Modularize `Sources/` into per-module directories** — pure byte-identical moves, one module/PR.
       Audio/ · Live/ (#99), Tray/ (#106), Pipeline/ (#107), Settings/ (#108), Selftest/ (#109). All done.
