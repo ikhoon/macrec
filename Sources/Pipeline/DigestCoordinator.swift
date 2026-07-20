@@ -91,6 +91,7 @@ final class DigestCoordinator {
                 self.failures = 0; self.nextAttempt = .distantPast
                 SummaryStatus.shared.finished("daily digest \(day)", at: self.now(), output: out)
                 Notifier.push(title: "Daily digest ready", body: "\(day) — \(inputs.count) meetings", filePath: out)
+                self.writeStructuredSidecar(day: day, digestPath: out, runner: runner)
             } else {
                 let why = reapFailedPostProcess(outPath: out)
                 self.failures += 1
@@ -107,4 +108,43 @@ final class DigestCoordinator {
             }
         }
     }
+
+    /// After a successful digest, distill it into a machine-readable JSON sidecar (VISION Pillar 1)
+    /// — best-effort: a failed/invalid extraction leaves the .md digest untouched and logs why. The
+    /// runner writes to `<out>.json.partial`; only a reply that VALIDATES is promoted, so a
+    /// hallucinated or truncated answer never becomes the structured record.
+    private func writeStructuredSidecar(day: String, digestPath: String, runner: SummaryRunner) {
+        guard Pref.bool(Pref.dailyDigestStructured, "MR_DAILY_DIGEST_STRUCTURED", true) else { return }
+        let out = structuredSidecarPath(digestPath: digestPath)
+        // The .md was just (re)written; a prior .json is now derived from stale content. Drop it up
+        // front — no sidecar beats one that disagrees with its digest (review finding). A successful
+        // run rewrites it below.
+        try? FileManager.default.removeItem(atPath: out)
+        let cmd = structuredDigestInvocation(runner: runner, day: day, digestPath: digestPath, outPath: out)
+        run(cmd) { status in
+            let partial = out + ".partial"
+            defer { try? FileManager.default.removeItem(atPath: partial) }
+            // Bounded read — a wedged runner can stream megabytes before dying (as reapFailedPostProcess
+            // guards); read the reply once, cap it, and reuse it for both the decision and the log.
+            let reply = boundedReadUTF8(partial, cap: 64 * 1024)
+            guard let json = structuredSidecarOutcome(exitStatus: status, partial: reply, day: day) else {
+                elog("digest: structured sidecar for \(day) skipped (exit \(status), reply "
+                    + "\((reply ?? "").prefix(80)))")
+                return
+            }
+            do {
+                try json.write(toFile: out, atomically: true, encoding: .utf8)
+                elog("digest: structured sidecar → \(URL(fileURLWithPath: out).lastPathComponent)")
+            } catch { elog("digest: structured sidecar write failed — \(error)") }
+        }
+    }
+}
+
+/// Read at most `cap` bytes of a file as UTF-8 (nil if unreadable) — a runner's `.partial` can be
+/// arbitrarily large before it fails, and this runs on the completion queue.
+func boundedReadUTF8(_ path: String, cap: Int) -> String? {
+    guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? fh.close() }
+    let data = (try? fh.read(upToCount: cap)) ?? Data()
+    return String(decoding: data, as: UTF8.self)
 }

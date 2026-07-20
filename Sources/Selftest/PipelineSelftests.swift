@@ -263,6 +263,39 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
               && defaultSummaryPrompt.contains("- [ ]")
               && digestTemplateIndex(for: defaultDailyDigestPrompt + "\n") == 0
               && digestTemplateIndex(for: "my own prompt") == nil)
+    // Structured daily-log sidecar (VISION Pillar 1): path, prompt, and the VALIDATION that refuses
+    // to write garbage — the one thing standing between a hallucinated reply and the queryable record.
+    check("structured digest: sidecar path is the digest stem + .json",
+          structuredSidecarPath(digestPath: "/v/Daily/2026-07/2026-07-20.md") == "/v/Daily/2026-07/2026-07-20.json"
+              && structuredDigestPrompt(day: "2026-07-20").contains("2026-07-20")
+              && structuredDigestInvocation(runner: .claude, day: "2026-07-20",
+                                            digestPath: "/d/x.md", outPath: "/d/x.json").contains("'/d/x.json'.partial"))
+    // Valid JSON is normalized (sorted keys, forced date) and accepted; a fenced reply is unwrapped;
+    // parse failure, wrong top-level type, and a mistyped collection field are all REJECTED (nil).
+    let good = validateStructuredDigest(
+        "{\"date\":\"1999-01-01\",\"decisions\":[{\"text\":\"ship it\"}],\"actionItems\":[],\"meetings\":[],\"entities\":[]}",
+        day: "2026-07-20")
+    check("structured digest: valid JSON normalized (date forced, keys sorted), garbage rejected",
+          good == "{\"actionItems\":[],\"date\":\"2026-07-20\",\"decisions\":[{\"text\":\"ship it\"}],\"entities\":[],\"meetings\":[]}"
+              && validateStructuredDigest("```json\n{\"date\":\"x\",\"meetings\":[]}\n```", day: "2026-07-20") != nil
+              && validateStructuredDigest("I couldn't find any decisions.", day: "2026-07-20") == nil
+              && validateStructuredDigest("[1,2,3]", day: "2026-07-20") == nil            // top-level array
+              && validateStructuredDigest("{\"date\":\"x\",\"meetings\":\"oops\"}", day: "2026-07-20") == nil // wrong type
+              && validateStructuredDigest("", day: "2026-07-20") == nil)
+    // Review round: missing collection keys are DEFAULTED to [] (every sidecar has all four); a
+    // boundary fence is stripped but a triple-backtick INSIDE a string value survives (global
+    // replace once corrupted it); the promote/discard outcome is pure over (exit, reply).
+    let defaulted = validateStructuredDigest("{\"date\":\"x\"}", day: "2026-07-20")
+    check("structured digest: missing collections default to [] and inner backticks survive",
+          defaulted == "{\"actionItems\":[],\"date\":\"2026-07-20\",\"decisions\":[],\"entities\":[],\"meetings\":[]}"
+              && (validateStructuredDigest("```json\n{\"date\":\"x\",\"decisions\":[{\"text\":\"run ```make```\"}]}\n```", day: "2026-07-20")?
+                  .contains("run ```make```") ?? false)
+              && stripBoundaryFence("```JSON\n{\"a\":1}\n```") == "{\"a\":1}")   // case/space-tolerant boundary
+    check("structured digest: promote/discard outcome is pure over (exit, reply)",
+          structuredSidecarOutcome(exitStatus: 0, partial: "{\"date\":\"x\",\"meetings\":[]}", day: "2026-07-20") != nil
+              && structuredSidecarOutcome(exitStatus: 1, partial: "{\"date\":\"x\"}", day: "2026-07-20") == nil   // non-zero exit
+              && structuredSidecarOutcome(exitStatus: 0, partial: nil, day: "2026-07-20") == nil                 // no reply
+              && structuredSidecarOutcome(exitStatus: 0, partial: "not json", day: "2026-07-20") == nil)
     // Legacy-default prompt migration: a stored prompt equal to a PAST default clears (the improved
     // default applies); a real customization is never touched.
     do {
