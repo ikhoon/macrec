@@ -24,6 +24,9 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
 ## Pillar 1 — ambient daily tracking → LLM-actionable knowledge
 
 - [ ] Make the daily log **structured + machine-readable** (entities, decisions, action items), not prose.
+      Increment 1 shipped: a validated JSON sidecar (`<date>.json`) written beside the digest after it
+      lands (opt-outable Settings toggle, default on). Next: surface it in the Library / expose it as a
+      queryable store or MCP surface (below).
 - [ ] Expose the daily log to an agent/LLM (queryable store / MCP surface) so it can act on the day.
 - [ ] Selectable calendar fields in the transcript header, fed to the summarizer (#31).
 - [ ] Finish the Summaries tab (#4).

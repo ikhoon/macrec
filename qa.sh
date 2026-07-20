@@ -198,8 +198,38 @@ PY
   fi
 }
 
+# ---- s6 — structured daily-log extraction (real claude, the JSON-sidecar runner seam) --------------
+s6() {
+  print -r -- "s6: structured JSON sidecar — real claude distills a digest into valid schema JSON"
+  local token; token=$(claude_token)
+  if [[ -z "$token" ]]; then skip "no claude token (credentials.json or CLI keychain)"; return; fi
+  # A tiny fixture digest (mock content only). The prompt shape mirrors structuredDigestInvocation.
+  print -r -- "# 2026-03-02\n\n## Decisions\n- Ship increment one first.\n\n## Action items\n- [ ] draft the plan — alex\n" > "$SCRATCH/digest.md"
+  local prompt='From this daily digest, extract a structured record. Output ONLY minified JSON (no markdown, no code fence, no prose) with EXACTLY these keys: {"date":"2026-03-02","meetings":[],"decisions":[{"text":"","meeting":""}],"actionItems":[{"text":"","owner":"","due":"","done":false}],"entities":[{"name":"","kind":""}]}. Omit optional string fields when unknown; keep arrays empty if there is nothing.'
+  cat "$SCRATCH/digest.md" | CLAUDE_CODE_OAUTH_TOKEN="$token" PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH" \
+    /bin/zsh -lc "claude -p '$prompt'" > "$SCRATCH/struct.json" 2>"$SCRATCH/struct.err"
+  # Validate the way the app does: strip an optional fence, parse, require date + array-typed collections.
+  if python3 - "$SCRATCH/struct.json" <<'PY'
+import json, sys, re
+raw = open(sys.argv[1]).read().strip()
+raw = re.sub(r'^```json|^```|```$', '', raw, flags=re.M).strip()
+try: d = json.loads(raw)
+except Exception as e: print("parse-fail", e); sys.exit(1)
+ok = isinstance(d, dict) and isinstance(d.get("date"), str) \
+     and all(not (k in d) or isinstance(d[k], list) for k in ("meetings","decisions","actionItems","entities"))
+sys.exit(0 if ok else 2)
+PY
+  then
+    pass "s6: claude produced schema-valid structured JSON ($(head -c 60 "$SCRATCH/struct.json" | tr -d '\n'))"
+  else
+    fail "s6: structured JSON invalid — reply follows"
+    head -3 "$SCRATCH/struct.json" | sed 's/^/      /'
+    head -2 "$SCRATCH/struct.err" | sed 's/^/      /'
+  fi
+}
+
 print -r -- "macrec QA (tier 2) — scratch: $SCRATCH"
-if [[ $# -eq 0 ]]; then s1; s2; s3; s4; s5; else for s in "$@"; do "$s"; done; fi
+if [[ $# -eq 0 ]]; then s1; s2; s3; s4; s5; s6; else for s in "$@"; do "$s"; done; fi
 print -r -- ""
 print -r -- "qa: $PASS passed, $FAIL failed, $SKIP skipped"
 [[ $FAIL -eq 0 ]] || exit 1

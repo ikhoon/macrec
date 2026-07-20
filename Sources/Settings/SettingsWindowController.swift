@@ -70,6 +70,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     private let promptScroll = PassthroughScrollView()   // its bordered, scrolling host (wheel passes to the pane when it fits)
     private let summaryOutField = NSTextField()   // summary output dir ("" = next to the transcript)
     private let dailyBtn = NSSwitch()
+    private let structuredBtn = NSSwitch()
     private let dailyTimePicker = NSDatePicker()  // HH:mm the digest becomes due
     private let dailyOutField = NSTextField()     // digest output dir ("" = alongside the summaries)
     private let dailyNameField = NSTextField()    // digest file-name template ("" = "{date}.md")
@@ -603,6 +604,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             ], group: "pp.summary"),
             Section(header: "Daily digest", note: nil, rows: [
                 sw(dailyBtn, "Write a daily digest", "Roll the day's meeting summaries into one file."),
+                sw(structuredBtn, "Also write a structured JSON log",
+                   "A machine-readable <date>.json beside the digest — decisions, action items, "
+                       + "people — for an agent to query. Runs the summariser once more after the digest."),
                 r("Write at", dailyTimePicker),
                 r("Style", digestTemplatePopup, "Picking a style fills the prompt below — edit it "
                   + "freely; edits show as Custom."),
@@ -1149,6 +1153,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         promptFileField.stringValue = Pref.explicit(Pref.summaryPromptFile, "MR_SUMMARY_PROMPT_FILE")
         summaryOutField.stringValue = Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT")
         dailyBtn.state = Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false) ? .on : .off
+        structuredBtn.state = Pref.bool(Pref.dailyDigestStructured, "MR_DAILY_DIGEST_STRUCTURED", true) ? .on : .off
         updateBtn.state = Pref.bool(Pref.autoUpdateCheck, "MR_AUTO_UPDATE_CHECK", true) ? .on : .off
         let savedDaily = Pref.explicit(Pref.dailyPrompt, "MR_DAILY_DIGEST_PROMPT")
         dailyPromptView.string = savedDaily.isEmpty ? defaultDailyDigestPrompt : savedDaily
@@ -1415,6 +1420,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         d.set(promptFileField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryPromptFile)
         d.set(summaryOutField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.summaryOut)
         d.set(dailyBtn.state == .on, forKey: Pref.dailyDigest)
+        d.set(structuredBtn.state == .on, forKey: Pref.dailyDigestStructured)
         d.set(updateBtn.state == .on, forKey: Pref.autoUpdateCheck)
         let dp = dailyPromptView.string.trimmingCharacters(in: .whitespacesAndNewlines)
         d.set(dp == defaultDailyDigestPrompt ? "" : dp, forKey: Pref.dailyPrompt)   // default stays editable, not stored

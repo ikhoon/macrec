@@ -272,6 +272,7 @@ enum Pref {
     static let dailyPrompt = "dailyDigestPrompt"        // digest prompt (absent = built-in default)
     static let dailyPromptFile = "dailyDigestPromptFile"  // external prompt file — overrides when readable
     static let dailyDigestLastRun = "dailyDigestLastRun"  // "yyyy-MM-dd" marker — one digest per day
+    static let dailyDigestStructured = "dailyDigestStructured"  // also write a machine-readable JSON sidecar (default on)
     static let autoUpdateCheck = "autoUpdateCheck"        // daily background release check (default on)
     static let updateCheckLastRun = "updateCheckLastRun"  // "yyyy-MM-dd" marker — one check per day
     static let postProcessCmd = "postProcessCmd"        // freeform command ("" = off)
