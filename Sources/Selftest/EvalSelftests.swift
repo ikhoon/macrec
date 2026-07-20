@@ -107,4 +107,83 @@ func evalSelftests(_ check: (String, Bool) -> Void) {
           evalTimingReport([(engine: "slow", seconds: 20, audioSeconds: 60),
                             (engine: "fast", seconds: 5, audioSeconds: 60)])
               .contains("fast     5.0s     12.0×"))
+
+    // eval-fetch (#31): a YouTube caption track → the spoken transcript, for a ko/ja eval reference.
+    // Two real shapes (fixtures modeled on actual tracks): a ROLLING auto-caption (each cue echoes the
+    // last finalized line as plain text, then adds newly-spoken words with inline <c>/<timestamp> tags)
+    // and a CLEAN track (one plain line per cue). Both must collapse to the same spoken text.
+    let rollingKo = """
+    WEBVTT
+    Kind: captions
+    Language: ko
+
+    00:00:02.010 --> 00:00:04.000 align:start position:0%
+    [음악]
+    안녕하세요<00:00:02.500><c> 여러분</c>
+
+    00:00:04.000 --> 00:00:04.010 align:start position:0%
+    안녕하세요 여러분
+
+    00:00:04.010 --> 00:00:06.000 align:start position:0%
+    안녕하세요 여러분
+    오늘은<00:00:04.500><c> 회의를</c><00:00:05.000><c> 시작합니다</c>
+    """
+    check("eval-fetch: a rolling auto-caption keeps only the freshly-spoken (tagged) lines, deduped",
+          vttToText(rollingKo) == "안녕하세요 여러분 오늘은 회의를 시작합니다")
+    let cleanJa = """
+    WEBVTT
+    Kind: captions
+    Language: ja
+
+    00:00:01.000 --> 00:00:03.000
+    会議を始めましょう
+
+    00:00:03.000 --> 00:00:05.000
+    今日の議題です
+
+    00:00:05.000 --> 00:00:07.000
+    今日の議題です
+    """
+    check("eval-fetch: a clean caption track keeps every line, collapsing consecutive repeats",
+          vttToText(cleanJa) == "会議を始めましょう 今日の議題です")
+    // NOTE/STYLE blocks (common in human tracks — the kind we PREFER) must not leak their bodies; an
+    // SRT-style numeric cue INDEX (before the timing line) is ignored, but a numeric caption TEXT
+    // ("10", a year) after it is KEPT — the two were indistinguishable in the first, per-line parser.
+    // The NOTE block deliberately embeds a "-->" (a timing note): without the block-skip, the cue
+    // parser's timing-line guard would treat that arrow as the cue timing and leak "번역: 자원봉사자".
+    let noisy = """
+    WEBVTT
+
+    NOTE
+    구간 00:01 --> 00:03 검수함
+    번역: 자원봉사자
+
+    STYLE
+    ::cue { color: white }
+
+    1
+    00:00:01.000 --> 00:00:03.000
+    2024년 회의
+
+    2
+    00:00:03.000 --> 00:00:05.000
+    10
+    """
+    check("eval-fetch: NOTE/STYLE bodies don't leak (even a NOTE with -->); numeric cue-index skipped but numeric TEXT kept",
+          vttToText(noisy) == "2024년 회의 10")
+    // Tag-strip is scoped to WebVTT tag shapes: a genuine "<"/">" in speech survives, real tags go.
+    check("eval-fetch: tag strip keeps a literal < > in speech, removes c/v/timestamp tags",
+          stripVttTags("5 < 10 > 3 이면 통과") == "5 < 10 > 3 이면 통과"
+              && stripVttTags("안녕<c.colorE5E5E5> 여러분</c>") == "안녕 여러분"
+              && stripVttTags("<v 화자>회의</v>あ<00:00:01.500>い") == "회의あい")
+    check("eval-fetch: an empty/header-only VTT parses to empty (no crash)",
+          vttToText("WEBVTT\n\n").isEmpty && vttToText("").isEmpty)
+    check("eval-fetch: language aliases resolve, others reject",
+          evalFetchLang("ko") == "ko" && evalFetchLang("Korean") == "ko"
+              && evalFetchLang("jp") == "ja" && evalFetchLang("japanese") == "ja"
+              && evalFetchLang("en") == nil && evalFetchLang("") == nil)
+    // A user --id can't escape the corpus dir (path traversal): no separators or parent refs survive.
+    check("eval-fetch: stem sanitization strips path separators and parent refs",
+          !evalFetchStem("../../etc/passwd").contains("/") && !evalFetchStem("../../etc/passwd").contains("..")
+              && evalFetchStem("2026-07-standup") == "2026-07-standup" && evalFetchStem("  ") == "clip")
 }

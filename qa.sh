@@ -276,8 +276,51 @@ s8() {
   fi
 }
 
+# ---- s9 — eval-fetch caption parsing on the REAL binary (#31), deterministic (no network) -----------
+s9() {
+  print -r -- "s9: eval-fetch --vtt-file parses a rolling auto-caption to clean deduped text (real binary)"
+  local bin=".build/debug/macrec"
+  [[ -x "$bin" ]] || bin="/Applications/macrec.app/Contents/MacOS/macrec"
+  if [[ ! -x "$bin" ]]; then skip "s9: no macrec binary"; return; fi
+  # A rolling YouTube auto-caption (each cue echoes the finalized line, then adds tagged new words).
+  cat > "$SCRATCH/cap.vtt" <<'VTT'
+WEBVTT
+Kind: captions
+Language: ja
+
+00:00:00.000 --> 00:00:02.000 align:start position:0%
+[音楽]
+
+00:00:02.000 --> 00:00:04.000 align:start position:0%
+[音楽]
+会議を<00:00:02.500><c> 始めましょう</c>
+
+00:00:04.000 --> 00:00:04.010 align:start position:0%
+会議を 始めましょう
+
+
+00:00:04.010 --> 00:00:06.000 align:start position:0%
+会議を 始めましょう
+今日の<00:00:04.500><c> 議題です</c>
+VTT
+  # A standalone [音楽] cue (no speech, no tags) is kept as text — harmless, CER's normalizer strips
+  # bracketed non-speech; the rolling echo + tagged-line dedup is what this pins.
+  local out; out=$("$bin" eval-fetch --vtt-file "$SCRATCH/cap.vtt" 2>&1)
+  if [[ "$out" == "[音楽] 会議を 始めましょう 今日の 議題です" ]]; then
+    pass "s9: rolling caption parsed to clean deduped text"
+  else
+    fail "s9: parse wrong — got '$out'"
+  fi
+  # The live network path needs yt-dlp; SKIP loudly (never a false pass) when it's absent.
+  if command -v yt-dlp >/dev/null 2>&1; then
+    print -r -- "  (yt-dlp present — a live 'eval-fetch <url> --lang ja' can build a real corpus)"
+  else
+    skip "s9-live: yt-dlp not installed — live YouTube fetch unavailable (brew install yt-dlp)"
+  fi
+}
+
 print -r -- "macrec QA (tier 2) — scratch: $SCRATCH"
-if [[ $# -eq 0 ]]; then s1; s2; s3; s4; s5; s6; s7; s8; else for s in "$@"; do "$s"; done; fi
+if [[ $# -eq 0 ]]; then s1; s2; s3; s4; s5; s6; s7; s8; s9; else for s in "$@"; do "$s"; done; fi
 print -r -- ""
 print -r -- "qa: $PASS passed, $FAIL failed, $SKIP skipped"
 [[ $FAIL -eq 0 ]] || exit 1
