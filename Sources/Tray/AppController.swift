@@ -201,6 +201,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         grantItem = grant
         menu.addItem(grant)
         menu.addItem(item("Settings…", #selector(openSettings), ",", symbol: "gearshape"))
+        menu.addItem(item("Today…", #selector(openToday), "d", symbol: "heart.text.square"))
         menu.addItem(item("Library…", #selector(openLibrary), "l", symbol: "books.vertical"))
         menu.addItem(item("Open transcripts folder", #selector(openTranscripts), "o", symbol: "folder"))
         menu.addItem(item("Show log", #selector(showLog), symbol: "text.alignleft"))
@@ -354,6 +355,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
                 if self?.paused == false { self?.statusLine.title = "● Recording · mic + system audio" }
                 self?.pushFlushOutcomeIfNeeded(msg)
                 LibraryWindow.shared.noteLibraryChanged()   // a new file just landed — refresh the open library
+                TodayWindow.shared.noteChanged()             // the Today counts changed
             }
         }
         engine = eng
@@ -397,6 +399,133 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     }
 
     @objc private func openLibrary() { LibraryWindow.shared.show() }
+
+    @objc private func openToday() {
+        let t = TodayWindow.shared
+        t.sampleInputs = { [weak self] in self?.sampleHealth() ?? HealthInputs() }
+        t.onGrant = { [weak self] in self?.grantPermissions() }
+        t.onOpenSettings = { [weak self] _ in self?.openSettings() }
+        t.onRetrySummary = { [weak self] in self?.flushNow() }
+        t.onTestCapture = { [weak self] in self?.runCaptureTest() }
+        t.onWillRefresh = { [weak self] in self?.refreshToolCacheAsync() }
+        refreshToolCacheAsync()   // warm the cache before the first render
+        t.show()
+    }
+
+    /// The definitive muted-tap check: play a tone and see whether the RUNNING recorder's system
+    /// level responds. Passive sampling can't tell a quiet room from a dead tap; this can. Runs off
+    /// the main thread; the verdict feeds todayCaptureTest and re-renders.
+    private func runCaptureTest() {
+        guard engine?.running == true else {   // nothing is recording → the test can't observe capture
+            todayCaptureTest = .untested
+            TodayWindow.shared.noteChanged()
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let player = Process()
+            player.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+            player.arguments = ["-v", "0.3", "-t", "1.5", "/System/Library/Sounds/Submarine.aiff"]
+            try? player.run()
+            var peak: Float = 0
+            let deadline = Date().addingTimeInterval(1.6)
+            while Date() < deadline {
+                peak = max(peak, self?.engine?.liveLevels().sys ?? 0)
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            player.waitUntilExit()
+            let verdict: CaptureTest = peak > 0.02 ? .captured : .silent
+            DispatchQueue.main.async {
+                self?.todayCaptureTest = verdict
+                TodayWindow.shared.noteChanged()
+            }
+        }
+    }
+
+    /// Sample the live app into the dashboard's pure inputs (see TodayHealth). Cheap — re-run each tick.
+    private func sampleHealth() -> HealthInputs {
+        var h = HealthInputs()
+        h.audioGranted = audioCaptureAuthorized(); h.micGranted = micAuthorized()
+        h.calendarGranted = CalendarLookup.authorized
+        h.recording = engine?.running == true && !paused && !schedulePaused
+        h.paused = paused || schedulePaused
+        let lv = engine?.liveLevels() ?? (mic: 0, sys: 0)
+        h.micLevel = lv.mic; h.sysLevel = lv.sys
+        h.captureTest = todayCaptureTest   // set only by the Test… button; passive = .untested
+        h.modelReady = ModelStore.shared.isReady; h.modelName = WhisperCatalog.selected.name
+        h.modelDownloading = ModelStore.shared.isDownloading
+        let runner = SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude
+        h.runnerName = runner.rawValue
+        // Tool resolution spawns a login shell — NEVER on the render path (main thread, 1 Hz).
+        // A background refresh (see openToday) keeps this cache warm; until it lands, assume
+        // resolved so a healthy setup doesn't flash red on first open.
+        let tools = toolCache?.value ?? (whisper: true, runner: true)
+        h.whisperResolved = tools.whisper; h.runnerResolved = tools.runner
+        h.summary = SummaryStatus.shared.snapshot.0
+        let day = todayString()
+        let txDir = Pref.str(Pref.txtDir, "MR_TRANSCRIPTS_DIR", NSHomeDirectory() + "/Documents/macrec/transcripts")
+        let sumPref = Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT")
+        let sideBySide = sumPref.isEmpty
+        let sumDir = sideBySide ? txDir : sumPref
+        // Only this month's folder can hold today's files — don't walk the whole multi-month tree
+        // every 1 Hz tick (review finding).
+        let month = String(day.prefix(7))
+        let counts = todayOutputCounts(transcriptStems: stemsInMonth(txDir, month: month),
+                                       summaryStems: stemsInMonth(sumDir, month: month),
+                                       day: day, summariesSideBySide: sideBySide)
+        h.transcriptsToday = counts.transcripts; h.summariesToday = counts.summaries
+        h.digestEnabled = Pref.bool(Pref.dailyDigest, "MR_DAILY_DIGEST", false)
+        h.digestTime = Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00")
+        h.digestRanToday = Pref.explicit(Pref.dailyDigestLastRun, "") == todayString()
+        h.now = Date()
+        return h
+    }
+
+    /// .md file stems (no extension) in a tree's YYYY-MM subfolder plus any root-level files —
+    /// only the month that can contain today's output, so the 1 Hz sampler never walks the whole
+    /// multi-month tree.
+    private func stemsInMonth(_ root: String, month: String) -> [String] {
+        let fm = FileManager.default
+        func stems(_ dir: String) -> [String] {
+            ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
+                .filter { $0.hasSuffix(".md") }.map { String($0.dropLast(3)) }
+        }
+        return stems(root) + stems(root + "/" + month)
+    }
+
+    // Tool resolution result, refreshed on a BACKGROUND queue (each check spawns a login shell) so
+    // the render path never blocks. nil until the first refresh completes.
+    private var toolCache: (value: (whisper: Bool, runner: Bool), at: Date)?
+    /// Resolve the whisper + runner CLIs off the main thread, cache the result, and re-render.
+    /// Called on window open and coalesced to at most once / 30 s.
+    private func refreshToolCacheAsync() {
+        if let c = toolCache, Date().timeIntervalSince(c.at) < 30 { return }
+        let whisper = Pref.str("whisperCli", "MR_WHISPER_CLI", BundledTools.whisperCli ?? "whisper-cli")
+        let runner = (SummaryRunner(rawValue: Pref.explicit(Pref.summaryRunner, "MR_SUMMARY_RUNNER")) ?? .claude).rawValue
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let w = self.toolResolves(whisper), r = self.toolResolves(runner)
+            DispatchQueue.main.async {
+                self.toolCache = ((w, r), Date())
+                TodayWindow.shared.noteChanged()
+            }
+        }
+    }
+
+    /// Does a summary-runner / whisper CLI resolve? An absolute path checks the file; a bare name
+    /// is looked up on the same PATH the runners use (login shell reads .zprofile, not .zshrc).
+    private func toolResolves(_ nameOrPath: String) -> Bool {
+        if nameOrPath.contains("/") { return FileManager.default.isExecutableFile(atPath: nameOrPath) }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-lc", "command -v \(nameOrPath) >/dev/null 2>&1"]
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
+    /// The capture-test verdict, set by the Test… button (nil until run). Passive sampling leaves it.
+    private var todayCaptureTest: CaptureTest = .untested
 
     @objc private func flushNow() {
         guard engine != nil, !paused, !flushBusy else { return }   // busy = one flush at a time

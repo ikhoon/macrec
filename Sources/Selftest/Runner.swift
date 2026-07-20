@@ -17,6 +17,7 @@ func runSelftest() -> Never {
     pipelineSelftests(check)
     evalSelftests(check)
     librarySelftests(check)
+    todaySelftests(check)
     scenarioSelftests(check)
     print(fails == 0 ? "selftest: ALL PASS" : "selftest: \(fails) FAILED")
     exit(fails == 0 ? 0 : 1)
