@@ -21,13 +21,15 @@ enum PostProcessMode: String { case off, summary, shell }
 enum SummaryRunner: String, CaseIterable { case claude, codex, gemini }
 
 /// The built-in summary prompt — the turn-key default (editable in Settings). Answering in the
-/// transcript's own language keeps it correct for mixed ko/en/ja meetings; checkbox action items
-/// stay trackable in the vault (Obsidian renders and toggles them).
+/// transcript's own language keeps it correct for mixed ko/en/ja meetings. Only MY action items
+/// (the "나"/"Me" speaker — the mic) become trackable checkboxes; someone else's stay plain bullets,
+/// so the vault's task list is only what I actually owe (maintainer rule).
 let defaultSummaryPrompt = "Summarize this meeting transcript: key points, decisions made, and action items "
     + "with owners. If the file includes a calendar meeting-notes section, use it as context (agenda, "
-    + "attendees, terminology) and note anything planned there that was not discussed. Format every action "
-    + "item as a markdown checkbox line: \"- [ ] item — owner\". Answer in the same language as the "
-    + "transcript."
+    + "attendees, terminology) and note anything planned there that was not discussed. In the action "
+    + "items, format ONLY items clearly assigned to me (the speaker labeled \"나\" or \"Me\", the "
+    + "microphone) as a markdown checkbox line \"- [ ] item\"; write every other person's action item "
+    + "as a plain bullet \"- item — owner\" with NO checkbox. Answer in the same language as the transcript."
 
 /// Stored prompts byte-identical to a PAST default were never customized — clear them once so an
 /// improved default applies. A real customization never matches and is never touched.
@@ -44,6 +46,17 @@ let legacyDefaultPrompts: [String] = [
     "These are summaries (or transcripts) of one day's meetings, in chronological order. Write a "
         + "daily digest: an overview of the day, highlights per meeting, and a combined list of "
         + "decisions and action items with owners. Answer in the same language as the input.",
+    // summary, the every-action-item-is-a-checkbox version (before the mine-only rule):
+    "Summarize this meeting transcript: key points, decisions made, and action items with owners. "
+        + "If the file includes a calendar meeting-notes section, use it as context (agenda, attendees, "
+        + "terminology) and note anything planned there that was not discussed. Format every action "
+        + "item as a markdown checkbox line: \"- [ ] item — owner\". Answer in the same language as the "
+        + "transcript.",
+    // digest, the every-action-item-is-a-checkbox version (before the mine-only rule):
+    "These are summaries (or transcripts) of one day's meetings, in chronological order. Write a "
+        + "daily digest: an overview of the day, highlights per meeting, and a combined list of "
+        + "decisions and action items with owners. Format every action item as a markdown checkbox "
+        + "line: \"- [ ] item — owner\". Answer in the same language as the input.",
 ]
 
 /// One-time at startup: drop stored prompt prefs that are just stale copies of an old default.
@@ -93,7 +106,7 @@ func postProcessInvocation(mode: PostProcessMode, runner: SummaryRunner, prompt:
         let dir = URL(fileURLWithPath: out).deletingLastPathComponent().path
         let runnerCmd: String
         switch runner {
-        case .claude: runnerCmd = "claude -p \(shq(effective)) < \(shq(transcriptPath))"
+        case .claude: runnerCmd = "claude --safe-mode -p \(shq(effective)) < \(shq(transcriptPath))"
         case .gemini: runnerCmd = "gemini -p \(shq(effective)) < \(shq(transcriptPath))"
         // codex exec takes the prompt from stdin with `-`; prepend it to the transcript.
         case .codex:  runnerCmd = "{ printf '%s\\n\\n' \(shq(effective)); cat \(shq(transcriptPath)); } | codex exec -"

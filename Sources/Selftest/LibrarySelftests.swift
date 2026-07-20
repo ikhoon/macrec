@@ -242,6 +242,14 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
     let issues = LibraryWindow.shared.layoutIssues()
     check("library: no window control is collapsed or overlapping", issues.isEmpty)
+    // Alignment (the day-header-shifted-right bug): the date header must sit at or LEFT of the
+    // entry text — the shared cell's phantom 16pt icon gap used to push the header right of it.
+    if let inset = LibraryWindow.shared.dayHeaderTextInsetForTest() {
+        // The date must sit at its cell's leading edge (~2pt), NOT after a phantom 22pt icon gap.
+        check("library: day-header date is flush-left in its cell (no phantom icon indent)", inset < 10)
+    } else {
+        check("library: a day-header row is laid out for the alignment check", false)
+    }
     for i in issues { elog("selftest: \(i)") }
     // Player lifecycle WITHOUT audible playback (review P1: the whole subsystem was untested):
     // lazy load on prime, real duration on the clock, reset on row switch, a deleted file named

@@ -4,6 +4,12 @@ import AppKit
 /// A menu-bar (accessory) app has no Edit menu, so without this a text field in an auxiliary window gets
 /// no ⌘V/⌘C at all — the field editor never sees the key equivalent.
 final class EditKeyWindow: NSWindow {
+    /// Esc closes the window — every macrec aux window (Log, Library, Today) is an EditKeyWindow, so
+    /// they all get it for free. cancelOperation is the standard Esc route; guard against a search
+    /// field that wants Esc to just clear itself first (NSSearchField handles Esc as clear when it
+    /// has text + focus, so this only fires when nothing consumed it).
+    override func cancelOperation(_ sender: Any?) { close() }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command {
             let sel: Selector?

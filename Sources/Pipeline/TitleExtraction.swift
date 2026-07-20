@@ -48,7 +48,7 @@ func titleExtractionInvocation(runner: SummaryRunner, summaryPath: String) -> St
         + "meaningful meeting content, reply with exactly: NONE"
     let cat = "cat \(shq(summaryPath))"
     switch runner {
-    case .claude: return "\(cat) | claude -p \(shq(prompt))"
+    case .claude: return "\(cat) | claude --safe-mode -p \(shq(prompt))"
     case .gemini: return "\(cat) | gemini -p \(shq(prompt))"
     case .codex: return "{ printf '%s\\n\\n' \(shq(prompt)); \(cat); } | codex exec -"
     }

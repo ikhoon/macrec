@@ -125,7 +125,7 @@ func translationSelftests(_ check: (String, Bool) -> Void) {
     // a failed run's .partial keeps the runner's own words (the reap contract), never a header line.
     let sumCmd = inv(.summary, .claude) ?? ""
     check("post-process: claude summary template (mkdir + runner → .partial, H1 composed on success)",
-          sumCmd.hasPrefix("mkdir -p '/t' && claude -p 'P' < '/t/a b'\\''s.md' > '/t/a b'\\''s-sum.md.partial'")
+          sumCmd.hasPrefix("mkdir -p '/t' && claude --safe-mode -p 'P' < '/t/a b'\\''s.md' > '/t/a b'\\''s-sum.md.partial'")
           && sumCmd.contains("&& { printf '# %s\\n\\n' 'a b'\\''s-sum'; cat '/t/a b'\\''s-sum.md.partial'; }")
           && sumCmd.contains("&& mv '/t/a b'\\''s-sum.md.partial2' '/t/a b'\\''s-sum.md'")
           && sumCmd.hasSuffix("&& rm -f '/t/a b'\\''s-sum.md.partial'"))

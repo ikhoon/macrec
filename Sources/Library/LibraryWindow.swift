@@ -110,6 +110,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         let urls = Set(allDays.flatMap(\.entries).map(\.url))
         rerunPhase = rerunPhase.filter { $0.value == .running || urls.contains($0.key) }
         applyFilter()
+        applyHeaderActions()   // a rescan may reflect saved prefs / a finished run — re-derive once
     }
 
     /// Engine hook: a transcript/summary just landed. Refresh only if the user is looking.
@@ -322,12 +323,13 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             ? "Nothing here yet — transcripts appear as meetings are recorded."
             : (onlyKind == .digest && !filterActive) ? "No daily digests yet — they're written once a day."
             : "No match for the current filter."
-        // Keep the preview in sync: the selected file may be gone after a rescan.
+        // Keep the preview in sync: the selected file may be gone after a rescan (showEntry(nil)
+        // re-derives the header itself). The header/spinner is a function of the SELECTED entry, not
+        // the filter text — so do NOT re-derive it here, or every filter keystroke re-animates the
+        // re-run spinner (maintainer found it spinning during filtering). refresh() handles the
+        // prefs-changed case below.
         if let sel = selected,
            !shownDays.contains(where: { $0.entries.contains(sel) }) { showEntry(nil) }
-        // Prefs may have changed since the header was drawn (Settings saved, then the window
-        // refocused → refresh) — re-derive the action strip on every rescan.
-        applyHeaderActions()
     }
 
     /// The one decision for the right pane: which entry, and which of its documents. Everything —
@@ -734,6 +736,32 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     func outlineView(_ v: NSOutlineView, shouldSelectItem item: Any) -> Bool { item is LibraryEntry }
 
     func outlineView(_ v: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        // Day-group headers get their OWN cell with the label flush-left — the shared entry cell
+        // reserves a 16 pt icon + 6 pt gap, which pushed the date right (maintainer found it).
+        if let day = item as? LibraryDay {
+            let gid = NSUserInterfaceItemIdentifier("group")
+            let cell = v.makeView(withIdentifier: gid, owner: nil) as? NSTableCellView ?? {
+                let c = NSTableCellView()
+                c.identifier = gid
+                let t = NSTextField(labelWithString: "")
+                t.translatesAutoresizingMaskIntoConstraints = false
+                t.lineBreakMode = .byTruncatingTail
+                c.addSubview(t)
+                c.textField = t
+                NSLayoutConstraint.activate([
+                    t.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 2),
+                    t.trailingAnchor.constraint(equalTo: c.trailingAnchor, constant: -2),
+                    t.centerYAnchor.constraint(equalTo: c.centerYAnchor),
+                ])
+                return c
+            }()
+            cell.textField?.stringValue = libraryDayLabel(
+                day: day.day, today: Self.dayString(Date()),
+                yesterday: Self.dayString(Date().addingTimeInterval(-86400)))
+            cell.textField?.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+            cell.textField?.textColor = .secondaryLabelColor
+            return cell
+        }
         let id = NSUserInterfaceItemIdentifier("cell")
         let cell = v.makeView(withIdentifier: id, owner: nil) as? NSTableCellView ?? {
             let c = NSTableCellView()
@@ -841,6 +869,23 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     var rerunButtonTitleForTest: String? { rerunBtn.isHidden ? nil : rerunBtn.title }
     var rerunSpinningForTest: Bool { !rerunSpinner.isHidden }
     var rerunStatusForTest: String? { rerunStatus.isHidden ? nil : rerunStatus.stringValue }
+
+    /// Alignment guard (the day-header-shifted-right bug): how far the DAY-header text is inset from
+    /// its OWN cell's leading edge. The bug shared the entry cell, whose text sits after a 16pt icon
+    /// + 6pt gap (~22pt inset); the fix's group cell puts the text at ~2pt. The outline's own
+    /// child-indentation is factored OUT by measuring within the cell, so this catches the real
+    /// defect (which comparing day-vs-entry x did not — the outline indents children regardless).
+    /// nil if no day row is laid out.
+    func dayHeaderTextInsetForTest() -> CGFloat? {
+        outline.reloadData(); outline.expandItem(nil, expandChildren: true)
+        outline.layoutSubtreeIfNeeded()
+        for r in 0 ..< outline.numberOfRows where outline.item(atRow: r) is LibraryDay {
+            guard let cell = outline.view(atColumn: 0, row: r, makeIfNecessary: true) as? NSTableCellView,
+                  let t = cell.textField else { continue }
+            return t.convert(t.bounds, to: cell).minX
+        }
+        return nil
+    }
     var playerTimeForTest: Double { player?.currentTime ?? -1 }
     var playerPlayingForTest: Bool { player?.isPlaying ?? false }
     var docAttributedForTest: NSAttributedString { textView.attributedString() }
