@@ -159,6 +159,25 @@ func todaySelftests(_ check: (String, Bool) -> Void) {
               && permissionDeepLinkPane(audioOK: true, micOK: false) == "Privacy_Microphone"   // was a dead end
               && permissionDeepLinkPane(audioOK: false, micOK: false) == "Privacy_AudioCapture"
               && permissionDeepLinkPane(audioOK: true, micOK: true) == nil)
+    // The tray menu's health line (the menu-bar user's surface for a BROKEN pipeline): the worst BAD
+    // condition by name, a count when several, "" (hidden) when nothing is broken.
+    let mRec = HealthRow(group: "Capture", title: "Not recording", detail: "x", level: .bad, action: .none)
+    let mTool = HealthRow(group: "Pipeline", title: "whisper-cli", detail: "x", level: .bad, action: .none)
+    let mWarn = HealthRow(group: "Capture", title: "Paused", detail: "x", level: .warn, action: .none)
+    let mOK = HealthRow(group: "Today", title: "Transcribed", detail: "x", level: .ok, action: .none)
+    check("menu health line: worst bad by name, count when several, empty when healthy",
+          menuHealthLine([mRec, mTool, mWarn]) == "⚠︎ Not recording (+1 more)"
+              && menuHealthLine([mTool, mWarn]) == "⚠︎ whisper-cli"
+              && menuHealthLine([mWarn, mOK]).isEmpty        // warns don't trip the menu line
+              && menuHealthLine([mOK]).isEmpty)
+    // WIRED (dead-affordance lesson): the real menu open sets the line from live health (no engine in
+    // the selftest → "Not recording") and it's clickable → Today; consistency: hidden iff empty.
+    if let m = AppController().healthMenuLineAfterMenuOpenForTest() {
+        check("menu health line: real menu shows it when broken, clickable → Today, hidden⇔empty",
+              !m.title.isEmpty && !m.hidden && m.opensToday && (m.hidden == m.title.isEmpty))
+    } else {
+        check("menu health line: the menu built for the wiring check", false)
+    }
 }
 
 private func dateAt(hour: Int, minute: Int) -> Date {

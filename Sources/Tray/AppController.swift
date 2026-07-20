@@ -45,6 +45,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private var levelTimer: Timer?
     private let heartbeatQueue = DispatchQueue(label: "com.ikhoon.macrec.heartbeat")   // #27: process-liveness beat
     private var outageLine: NSMenuItem!   // shown only after a same-day silent outage (durable surface)
+    private var healthLine: NSMenuItem!   // shown only when a BAD health condition exists (menu-bar surface)
     private var alertedHealth: Set<String> = []   // #32: BAD conditions already pushed (dedup, re-alert on recurrence)
     private var lastBadHealth: Set<String> = []   // #32: BAD keys from the previous tick (2-tick debounce)
     private let launchedAt = Date()               // #32: startup grace so transient boot states don't alert
@@ -179,8 +180,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         // a same-day outage to report.
         outageLine = NSMenuItem(title: "", action: #selector(showLog), keyEquivalent: "")
         outageLine.target = self; outageLine.isHidden = true
+        // The menu-bar user's surface for a BROKEN pipeline (tool/model missing, capture silent, not
+        // recording): the menu is what they see, and with notifications off they get no push. Clicking
+        // opens Today for the detail + fix. Hidden while everything is healthy, so the menu stays clean.
+        healthLine = NSMenuItem(title: "", action: #selector(openToday), keyEquivalent: "")
+        healthLine.target = self; healthLine.isHidden = true
         menu.addItem(statusLine); menu.addItem(levelItem); menu.addItem(lastSavedLine); menu.addItem(modelLine)
-        menu.addItem(summaryLine); menu.addItem(digestLine); menu.addItem(outageLine)
+        menu.addItem(summaryLine); menu.addItem(digestLine); menu.addItem(outageLine); menu.addItem(healthLine)
         menu.addItem(.separator())
         // Transcribe now — view-backed so the click does NOT dismiss the menu (user pick, round 2:
         // stay open and watch the row's spinner in place). MenuHoverView supplies the native-style
@@ -250,6 +256,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
                                            today: day.string(from: Date()))
         let outageTitle = outageMenuTitle(outageSeconds: RecorderHeartbeat.outageForToday())
         outageLine.title = outageTitle; outageLine.isHidden = outageTitle.isEmpty
+        let healthTitle = menuHealthLine(todayHealth(sampleHealth()))
+        healthLine.title = healthTitle; healthLine.isHidden = healthTitle.isEmpty
     }
 
     /// Drives the REAL buildMenu + menuWillOpen and reports the two post-process rows. A deleted call to
@@ -279,6 +287,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         menu.cancelTracking()
         guard let o = outageLine else { return nil }
         return (o.title, o.isHidden, o.isEnabled)
+    }
+
+    /// #33 follow-up: drive the real menu build + open and report the health line — proves it's WIRED
+    /// (refreshPostProcessRows sets it from live health) and clickable → Today. In the selftest env
+    /// there's no engine, so sampleHealth yields "Not recording" (.bad) and the line must appear.
+    func healthMenuLineAfterMenuOpenForTest() -> (title: String, hidden: Bool, opensToday: Bool)? {
+        buildMenu()
+        guard let menu = statusItem.menu else { return nil }
+        menuWillOpen(menu)
+        menu.update()
+        menu.cancelTracking()
+        guard let h = healthLine else { return nil }
+        return (h.title, h.isHidden, h.action == #selector(openToday) && h.target != nil)
     }
 
     /// Clicking the summary row: reveal what it wrote, or explain why it didn't. Never nothing.
