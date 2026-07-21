@@ -54,7 +54,7 @@ final class TodayWindow: NSObject, NSWindowDelegate {
         let w = EditKeyWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 560),
                               styleMask: [.titled, .closable, .resizable, .miniaturizable],
                               backing: .buffered, defer: false)
-        w.title = "macrec today"
+        w.title = "macrec status"
         w.center()
         w.isReleasedWhenClosed = false
         w.delegate = self
