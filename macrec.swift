@@ -1373,9 +1373,14 @@ public enum App {
         }
         if args.first == "watchdog-daemon" {
             elog("watchdog: daemon started (pid \(ProcessInfo.processInfo.processIdentifier)), interval \(Int(RecorderHeartbeat.interval))s")
+            // Sleep BEFORE the first check: at login both agents RunAtLoad concurrently (launchd gives no
+            // sibling ordering) and a just-launched recorder can lag in `runningApplications(bid)`, so an
+            // immediate check would log a false "recorder is down" and fire a redundant kickstart at every
+            // boot. The interval grace lets it register first; steady-state detection latency is unchanged
+            // (still one tick), and a genuine death in the first minute is caught on the next tick.
             while true {
-                watchdogCheckOnce()
                 Thread.sleep(forTimeInterval: RecorderHeartbeat.interval)
+                watchdogCheckOnce()
             }
         }
 

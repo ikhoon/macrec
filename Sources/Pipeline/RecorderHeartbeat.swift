@@ -59,7 +59,30 @@ func watchdogCheckOnce(d: UserDefaults = Pref.d, log: (String) -> Void = { elog(
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
     p.arguments = ["kickstart", "gui/\(getuid())/com.ikhoon.macrec"]
-    try? p.run(); p.waitUntilExit()
+    let err = Pipe()
+    p.standardError = err
+    // The watchdog IS the safety net — a silent failure here reproduces the very "no signal at all"
+    // outage #36 exists to kill. So surface every failure path: a launch that can't start, a non-zero
+    // exit, and (since this loop is the daemon's whole lifetime on ONE thread) a launchctl that hangs
+    // and would otherwise wedge every future tick.
+    do {
+        try p.run()
+    } catch {
+        log("watchdog: FAILED to run launchctl (\(error)) — recorder NOT relaunched, will retry next tick")
+        return
+    }
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async { p.waitUntilExit(); done.signal() }
+    if done.wait(timeout: .now() + 20) == .timedOut {
+        p.terminate()
+        log("watchdog: launchctl kickstart hung (>20s) — terminated it; will retry next tick")
+        return
+    }
+    if p.terminationStatus != 0 {
+        let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        log("watchdog: launchctl kickstart exited \(p.terminationStatus)\(msg.isEmpty ? "" : " — \(msg)") — recorder may still be down")
+    }
 }
 
 /// A gap in seconds → a short human string for the log/notification/panel ("18 h", "45 min", "2 h 10 min").

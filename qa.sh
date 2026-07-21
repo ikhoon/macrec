@@ -372,6 +372,33 @@ s10kill() {
   fi
 }
 
+# ---- s10quit — DESTRUCTIVE: the complementary guarantee — a deliberate Quit STAYS quit ---------------
+# Opt-in only (./qa.sh s10quit). s10kill proves the watchdog relaunches a crash; this proves it does NOT
+# relaunch a deliberate Quit. It sets watchdogQuitRequested (what the menu Quit sets), SIGTERMs the
+# recorder (clean exit — the main KeepAlive won't relaunch it either), and asserts it stays DOWN across
+# more than one watchdog tick. Without this, a regression that made the watchdog ignore the flag would
+# fight the user's Quit forever, and only manual testing would catch it.
+s10quit() {
+  print -r -- "s10quit: DESTRUCTIVE — a deliberate Quit (flag set) must NOT be relaunched by the watchdog"
+  if ! pgrep -f "macrec watchdog-daemon" >/dev/null; then skip "s10quit: watchdog not running (run ./install.sh)"; return; fi
+  local before; before=$(pgrep -f "/Applications/macrec.app/Contents/MacOS/macrec$" | head -1)
+  if [[ -z "$before" ]]; then skip "s10quit: recorder not running to begin with"; return; fi
+  defaults write com.ikhoon.macrec.prefs watchdogQuitRequested -bool true
+  kill -TERM "$before" 2>/dev/null
+  print -r -- "  set quit flag + SIGTERM'd recorder (was pid $before) — asserting it stays DOWN for 75s (>1 tick)…"
+  local waited=0 relaunched="" now=""
+  while [[ $waited -lt 75 ]]; do
+    sleep 5; waited=$((waited+5))
+    now=$(pgrep -f "/Applications/macrec.app/Contents/MacOS/macrec$" | head -1)
+    [[ -n "$now" && "$now" != "$before" ]] && { relaunched="$now"; break; }
+  done
+  if [[ -z "$relaunched" ]]; then pass "s10quit: recorder stayed DOWN ${waited}s — deliberate Quit respected"
+  else fail "s10quit: recorder RELAUNCHED (pid $relaunched) despite the quit flag — Quit not respected"; fi
+  # Restore: clear the flag and bring the recorder back, whatever the verdict.
+  defaults delete com.ikhoon.macrec.prefs watchdogQuitRequested 2>/dev/null || true
+  launchctl kickstart "gui/$(id -u)/com.ikhoon.macrec" 2>/dev/null || true
+}
+
 print -r -- "macrec QA (tier 2) — scratch: $SCRATCH"
 if [[ $# -eq 0 ]]; then s1; s2; s3; s4; s5; s6; s7; s8; s9; s10; else for s in "$@"; do "$s"; done; fi
 print -r -- ""
