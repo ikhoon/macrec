@@ -47,10 +47,10 @@ func libraryGridCalendar(from current: Calendar = .current) -> Calendar {
 
 // MARK: - the calendar sidebar (dumb renderer of monthGrid)
 
-/// A compact month calendar above the Library list (user ask: "왼쪽에는 달력") — days that HAVE
-/// recordings are full-strength and dotted, empty days are dimmed; clicking a day filters the list
-/// to it, clicking it again clears the filter. All decisions (grid, shift, filter) are pure and
-/// selftested; this view only materializes them into buttons.
+/// A compact month calendar above the Library list (the maintainer asked for a calendar-first way
+/// into a day's recordings). Recorded days read accent, empty days dim; clicking a day filters the
+/// list to it, re-clicking (or the ✕ chip) clears. All decisions (grid, shift, filter) are pure
+/// and selftested; this view only materializes them into buttons.
 final class LibraryCalendarView: NSView {
     /// The picked day ("yyyy-MM-dd"), or nil when the pick was cleared. The window owns the filter.
     var onPick: ((String?) -> Void)?
@@ -65,6 +65,7 @@ final class LibraryCalendarView: NSView {
     private let cal = libraryGridCalendar()
     private let monthLabel = NSTextField(labelWithString: "")
     private let grid = NSStackView()
+    private let clearBtn = NSButton(title: "", target: nil, action: nil)
     private let titleFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -75,7 +76,9 @@ final class LibraryCalendarView: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         let prev = NSButton(title: "‹", target: self, action: #selector(prevMonth))
+        prev.setAccessibilityLabel("Previous month")
         let next = NSButton(title: "›", target: self, action: #selector(nextMonth))
+        next.setAccessibilityLabel("Next month")
         for b in [prev, next] {
             b.isBordered = false
             b.font = .systemFont(ofSize: 14, weight: .semibold)
@@ -91,7 +94,15 @@ final class LibraryCalendarView: NSView {
         grid.orientation = .vertical
         grid.spacing = 1
         grid.alignment = .centerX
-        let v = NSStackView(views: [header, grid])
+        // The clear chip: the ONLY always-reachable way out of a day filter once the user pages to
+        // another month (the picked cell — the toggle — is then off-screen; CodeRabbit + review).
+        clearBtn.bezelStyle = .inline
+        clearBtn.controlSize = .small
+        clearBtn.font = .systemFont(ofSize: 10)
+        clearBtn.target = self
+        clearBtn.action = #selector(clearTapped)
+        clearBtn.setAccessibilityLabel("Clear the day filter")
+        let v = NSStackView(views: [header, grid, clearBtn])
         v.orientation = .vertical
         v.spacing = 4
         v.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 6, right: 8)
@@ -146,6 +157,13 @@ final class LibraryCalendarView: NSView {
         onPick?(selectedDay)
     }
 
+    @objc private func clearTapped() {
+        guard selectedDay != nil else { return }
+        selectedDay = nil
+        rebuild()
+        onPick?(nil)
+    }
+
     private func rebuild() {
         // "yyyy-MM" → "MMM yyyy" via the grid's own first real day (no second parsing convention).
         monthLabel.stringValue = month
@@ -178,6 +196,9 @@ final class LibraryCalendarView: NSView {
             row.spacing = 1
             grid.addArrangedSubview(row)
         }
+        clearBtn.isHidden = selectedDay == nil
+        clearBtn.title = "✕ \(selectedDay ?? "")"
+        clearBtn.toolTip = "Show every day again"
     }
 
     private func dayButton(_ day: String?) -> NSView {
@@ -211,14 +232,30 @@ final class LibraryCalendarView: NSView {
         b.widthAnchor.constraint(equalToConstant: 24).isActive = true
         b.heightAnchor.constraint(equalToConstant: 22).isActive = true
         b.toolTip = has ? "\(day) — show only this day's recordings" : "\(day) — no recordings"
+        // VoiceOver hears the DATE and whether it holds recordings, not a bare number (CodeRabbit).
+        b.setAccessibilityLabel("\(day), \(has ? "has recordings" : "no recordings")")
         return b
     }
 
-    // Selftest hooks: drive a pick like a click, read the rendered state.
-    func pickForTest(_ day: String) {
-        let b = NSButton()
-        b.identifier = NSUserInterfaceItemIdentifier(day)
-        dayTapped(b)
+    // Selftest hooks: drive the RENDERED controls (performClick on the real button — a fabricated
+    // action could pass with no visible control wired at all; CodeRabbit), read the state back.
+    @discardableResult
+    func pickForTest(_ day: String) -> Bool {
+        let hit = grid.arrangedSubviews.dropFirst()
+            .flatMap { ($0 as? NSStackView)?.arrangedSubviews ?? [] }
+            .compactMap { $0 as? NSButton }
+            .first { $0.identifier?.rawValue == day }
+        guard let hit else { return false }   // the date isn't on the shown month's grid
+        hit.performClick(nil)
+        return true
+    }
+
+    /// performClick the ✕ chip; false when it isn't visible (no active filter to clear).
+    @discardableResult
+    func clickClearForTest() -> Bool {
+        guard !clearBtn.isHidden else { return false }
+        clearBtn.performClick(nil)
+        return true
     }
 
     func flipForTest(by: Int) { flip(by: by) }

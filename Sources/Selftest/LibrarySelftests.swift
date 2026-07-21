@@ -198,16 +198,31 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     check("library calendar: constant 6-week height; a browsed month survives a rescan",
           sixRows == 6 && LibraryWindow.shared.calendarMonthForTest == "2026-02"
               && LibraryWindow.shared.calendarWeekRowCountForTest() == 6)
+    // The ✕ chip is the only always-reachable clear once the user pages AWAY from the picked day's
+    // month — the picked cell (the toggle) is then off-screen (CodeRabbit + review). Real controls:
+    // the pick lands on a RENDERED button (the honest seam refuses an off-grid date), the flip goes
+    // through ‹, and the chip's performClick restores every day.
+    LibraryWindow.shared.calendarFlipForTest(by: 1)   // back to 2026-03 (the 6-week check left Feb shown)
+    let pickLanded = LibraryWindow.shared.calendarPickForTest("2026-03-01")
+    LibraryWindow.shared.calendarFlipForTest(by: -1)  // browse to February — the picked cell is gone
+    let offGridPick = LibraryWindow.shared.calendarPickForTest("2026-03-01")   // not rendered → false
+    let chipCleared = LibraryWindow.shared.calendarClickClearForTest()
+    check("library calendar: the ✕ chip clears a filter whose day is off the browsed month's grid",
+          pickLanded && !offGridPick && chipCleared
+              && LibraryWindow.shared.selectedDayForTest == nil
+              && LibraryWindow.shared.shownDayCountForTest == 3
+              && !LibraryWindow.shared.calendarClickClearForTest())   // chip hides once cleared
     // The tray deep-link clears an active day filter AND the calendar highlight must follow — a
     // stale view copy makes the next click on that day a dead toggle (review P1).
     LibraryWindow.shared.loadFixtureForTest(twoMonths)
+    LibraryWindow.shared.calendarFlipForTest(by: 1)   // back to 2026-03 where the pick target renders
     LibraryWindow.shared.calendarPickForTest("2026-03-01")
     _ = LibraryWindow.shared.showSelectingForTest(URL(fileURLWithPath: "/tmp/library-fixture.md"))
     let syncedOff = LibraryWindow.shared.calendarSelectedDayForTest == nil
         && LibraryWindow.shared.selectedDayForTest == nil
-    LibraryWindow.shared.calendarPickForTest("2026-03-01")   // first click must FILTER, not dead-toggle
+    let repick = LibraryWindow.shared.calendarPickForTest("2026-03-01")   // first click must FILTER, not dead-toggle
     check("library calendar: a deep-link clears the highlight too — the next pick filters first-click",
-          syncedOff && LibraryWindow.shared.selectedDayForTest == "2026-03-01"
+          syncedOff && repick && LibraryWindow.shared.selectedDayForTest == "2026-03-01"
               && LibraryWindow.shared.shownDayCountForTest == 1)
     // The window is a SINGLETON — clear the pick and restore the default fixture, or the leftover
     // day filter leaks into every later check (it silently emptied the scope/re-run suites once).

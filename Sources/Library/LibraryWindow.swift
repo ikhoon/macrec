@@ -414,7 +414,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             ? "Nothing here yet — transcripts appear as meetings are recorded."
             : (selectedDay != nil && !filterActive)
             ? "No \(onlyKind == .digest ? "daily digests" : "recordings") on \(selectedDay ?? "")"
-            + " — click the date again to show every day."
+            + " — click the date again, or ✕ under the calendar, to show every day."
             : (onlyKind == .digest && !filterActive) ? "No daily digests yet — they're written once a day."
             : "No match for the current filter."
         // Keep the preview in sync: the selected file may be gone after a rescan (showEntry(nil)
@@ -1130,7 +1130,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     }
 
     // Calendar wiring hooks: drive a day pick through the REAL view + onPick chain, read the state.
-    func calendarPickForTest(_ day: String) { calendarView.pickForTest(day) }
+    @discardableResult
+    func calendarPickForTest(_ day: String) -> Bool { calendarView.pickForTest(day) }
+    func calendarClickClearForTest() -> Bool { calendarView.clickClearForTest() }
     var selectedDayForTest: String? { selectedDay }
     var calendarSelectedDayForTest: String? { calendarView.selectedDay }   // the VIEW's copy (desync guard)
     var calendarMonthForTest: String { calendarView.month }
