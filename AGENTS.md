@@ -132,6 +132,31 @@ concise and specific to macrec; don't pad the file with generic advice.
    "it's a launchd KeepAlive job" is not enough when the exit looks clean. Detection (a heartbeat) and
    prevention (termination opt-out) are two different jobs; ship both.
 
+17. **Defense-in-depth for a process that must not die: a KeepAlive watchdog daemon, not a
+   StartInterval tick.** #36 *prevents* the idle-reap (§2.16); #36b *recovers* from any death it can't
+   prevent (OOM kill, crash, failed install). A 60 s `StartInterval` LaunchAgent is the obvious tool and
+   the wrong one — it is silently throttled to never on this Mac (App Nap / timer coalescing: measured
+   `runs` stuck at 1 across a 75 s window). Use `KeepAlive` + an in-process 60 s loop instead: launchd
+   reliably keeps the daemon alive, and a plain-Foundation loop (no `NSApplication`) both ticks on
+   schedule AND never registers as an `NSRunningApplication` — so it can't trip the main app's
+   single-instance guard (which would otherwise make every relaunched recorder quit itself), and its own
+   liveness probe only ever sees the real GUI-registered recorder. Respect deliberate intent: relaunch
+   only when down AND no deliberate-Quit flag, `synchronize()`'d before the quitting process dies so the
+   daemon reads it fresh, cleared on the next launch. And the watchdog IS the safety net — it must never
+   fail silently: surface every failure of its own relaunch call (a launch that can't start, a non-zero
+   exit, a hang that would wedge the daemon's single thread).
+
+18. **A self-heal test must reproduce the actual death it recovers from AND isolate the component under
+   test.** `s10kill` first used `SIGKILL` to "prove" the watchdog relaunches the recorder — but SIGKILL
+   is an UNsuccessful exit that the main agent's own `KeepAlive{SuccessfulExit=false}` respawns on its
+   own, so the test false-PASSed whether or not the watchdog worked, and never exercised the clean-exit
+   idle-reap the watchdog exists for. Use `SIGTERM`: the recorder's stop handler exits cleanly (status
+   0), which the main KeepAlive ignores, so ONLY the watchdog can bring it back — that isolates the
+   watchdog AND faithfully reproduces the idle-reap. The general rule: when several layers can produce
+   the same recovery, pick the stimulus only the layer-under-test responds to, or the green test is
+   measuring a different layer. (The same review also added `s10quit` — the complement that asserts a
+   deliberate Quit STAYS quit, so a regression that ignored the flag can't slip through.)
+
 ## 3. CS fundamentals we hold ourselves to
 
 The bugs here have been fundamentals, not exotica: unhandled states, controls bound to nothing,
