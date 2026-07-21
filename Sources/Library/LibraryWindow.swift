@@ -604,7 +604,13 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// the Trash (recoverable, not a permanent rm). The sheet lists exactly what goes, by role, so
     /// nothing is removed unseen. A failure to trash any file is surfaced, not just logged.
     @objc private func deleteClicked() {
-        guard let e = selected, let win = window else { return }
+        if let e = selected { confirmDelete(e) }
+    }
+
+    /// The shared confirm→Trash flow, entry-parameterized so BOTH the detail-pane Delete and each list
+    /// row's trash button (user ask: the affordance must live on the list too) run the same path.
+    func confirmDelete(_ e: LibraryEntry) {
+        guard let win = window else { return }
         let files = deletionFiles(e)
         guard !files.isEmpty else { refresh(); return }   // files already gone → drop the stale row, not a dead click
         let alert = NSAlert()
@@ -862,6 +868,42 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     func outlineView(_ v: NSOutlineView, isGroupItem item: Any) -> Bool { item is LibraryDay }
     func outlineView(_ v: NSOutlineView, shouldSelectItem item: Any) -> Bool { item is LibraryEntry }
 
+    /// An entry row's cell: icon + one-line label + an always-visible trash button (user ask: the
+    /// delete affordance must be reachable from the LIST, not only the detail pane). The button is
+    /// subtle (borderless, secondary tint) so a hundred rows don't shout; `onDelete` is re-bound to
+    /// the row's CURRENT entry on every reuse so a recycled cell can never delete a stale one.
+    final class LibraryEntryCell: NSTableCellView {
+        let deleteBtn: NSButton = {
+            let b = NSButton()
+            b.translatesAutoresizingMaskIntoConstraints = false
+            b.bezelStyle = .inline
+            b.isBordered = false
+            b.image = NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete")?
+                .withSymbolConfiguration(.init(pointSize: 10, weight: .regular)
+                    .applying(.init(paletteColors: [.secondaryLabelColor])))
+            b.toolTip = "Move this recording's files to the Trash (asks first)"
+            return b
+        }()
+
+        // A readable binding (not a closure) so the selftest can PROVE a recycled cell points at its
+        // current row's entry — closure captures can't be inspected, and a stale capture is exactly
+        // the reuse bug the guard exists for.
+        var entry: LibraryEntry?
+        weak var owner: LibraryWindow?
+
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            deleteBtn.target = self
+            deleteBtn.action = #selector(deleteTapped)
+        }
+
+        @available(*, unavailable) required init?(coder _: NSCoder) { nil }
+
+        @objc private func deleteTapped() {
+            if let e = entry { owner?.confirmDelete(e) }
+        }
+    }
+
     func outlineView(_ v: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         // Day-group headers get their OWN cell with the label flush-left — the shared entry cell
         // reserves a 16 pt icon + 6 pt gap, which pushed the date right (maintainer found it).
@@ -890,8 +932,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             return cell
         }
         let id = NSUserInterfaceItemIdentifier("cell")
-        let cell = v.makeView(withIdentifier: id, owner: nil) as? NSTableCellView ?? {
-            let c = NSTableCellView()
+        let cell = v.makeView(withIdentifier: id, owner: nil) as? LibraryEntryCell ?? {
+            let c = LibraryEntryCell()
             c.identifier = id
             let icon = NSImageView()
             icon.translatesAutoresizingMaskIntoConstraints = false
@@ -903,6 +945,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             t.cell?.truncatesLastVisibleLine = true
             c.addSubview(icon)
             c.addSubview(t)
+            c.addSubview(c.deleteBtn)
             c.imageView = icon
             c.textField = t
             NSLayoutConstraint.activate([
@@ -910,8 +953,11 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
                 icon.centerYAnchor.constraint(equalTo: c.centerYAnchor),
                 icon.widthAnchor.constraint(equalToConstant: 16),
                 t.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
-                t.trailingAnchor.constraint(equalTo: c.trailingAnchor, constant: -2),
+                t.trailingAnchor.constraint(equalTo: c.deleteBtn.leadingAnchor, constant: -4),
                 t.centerYAnchor.constraint(equalTo: c.centerYAnchor),
+                c.deleteBtn.trailingAnchor.constraint(equalTo: c.trailingAnchor, constant: -2),
+                c.deleteBtn.centerYAnchor.constraint(equalTo: c.centerYAnchor),
+                c.deleteBtn.widthAnchor.constraint(equalToConstant: 18),
             ])
             return c
         }()
@@ -952,6 +998,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
                 text.append(NSAttributedString(attachment: att))
             }
             cell.textField?.attributedStringValue = text
+            // Re-bind on EVERY reuse: a recycled cell must delete ITS current entry, never the one it
+            // showed before scrolling. The confirm→Trash flow is the same one the detail Delete runs.
+            cell.entry = e
+            cell.owner = self
         }
         return cell
     }
@@ -996,6 +1046,23 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         }
         return currentDocURL()
     }
+    /// Row-delete wiring guard: every laid-out ENTRY row must carry a visible trash button that is
+    /// wired (target+action) and bound to that row's OWN entry — a recycled cell still bound to a
+    /// stale entry would trash the WRONG recording, the worst possible outcome for a delete control.
+    func rowDeleteBindingsForTest() -> (rows: Int, bound: Int) {
+        outline.layoutSubtreeIfNeeded()
+        var rows = 0, bound = 0
+        for r in 0..<outline.numberOfRows {
+            guard let e = outline.item(atRow: r) as? LibraryEntry else { continue }
+            rows += 1
+            guard let cell = outline.view(atColumn: 0, row: r, makeIfNecessary: true) as? LibraryEntryCell,
+                  cell.entry == e, cell.owner === self, !cell.deleteBtn.isHidden,
+                  cell.deleteBtn.action != nil, cell.deleteBtn.target === cell else { continue }
+            bound += 1
+        }
+        return (rows, bound)
+    }
+
     var playerBarHiddenForTest: Bool { playerBar.isHidden }
     var playerActiveForTest: Bool { player != nil }
     var openEnabledForTest: Bool { openBtn.isEnabled }

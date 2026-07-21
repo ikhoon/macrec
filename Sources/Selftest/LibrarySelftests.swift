@@ -125,6 +125,11 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     check("library: Delete is enabled for a real entry, disabled for the empty pane and standalone render",
           onReal && !onEmpty && !onStandalone)
     LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore
+    // The LIST-side delete (user ask): every entry row renders a wired trash button bound to its OWN
+    // entry — a recycled cell bound to a stale entry would trash the wrong recording on scroll.
+    let rowDel = LibraryWindow.shared.rowDeleteBindingsForTest()
+    check("library: every list row carries a wired trash button bound to its own entry",
+          rowDel.rows > 0 && rowDel.bound == rowDel.rows)
 
     // Stem parsing — every real shape in the vault, plus the garbage that must not crash the scan.
     let full = parseLibraryStem("2026-03-02-1030-project-kickoff")
