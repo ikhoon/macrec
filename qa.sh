@@ -319,8 +319,88 @@ VTT
   fi
 }
 
+# ---- s10 — the #36b watchdog is really deployed and alive (KeepAlive) ------------------------------
+# Tier-2's value here is what the selftest can't see: the pure decision (watchdogShouldRelaunch) is
+# unit-tested, but only a live check proves the KeepAlive LaunchAgent is installed with the right
+# arguments AND actually running as a process. Non-destructive: it never kills the recorder.
+s10() {
+  print -r -- "s10: #36b watchdog LaunchAgent deployed + running (KeepAlive)"
+  local wd_plist="$HOME/Library/LaunchAgents/com.ikhoon.macrec.watchdog.plist"
+  if [[ ! -f "$wd_plist" ]]; then skip "s10: watchdog not installed (run ./install.sh) — $wd_plist"; return; fi
+  grep -q "watchdog-daemon" "$wd_plist" || { fail "s10: plist missing 'watchdog-daemon' arg"; return; }
+  grep -q "KeepAlive" "$wd_plist"       || { fail "s10: plist missing KeepAlive (StartInterval is throttled to never on this Mac)"; return; }
+  local st; st=$(launchctl print "gui/$(id -u)/com.ikhoon.macrec.watchdog" 2>/dev/null | grep -E "state = " | head -1)
+  if ! pgrep -f "macrec watchdog-daemon" >/dev/null; then
+    fail "s10: watchdog agent not running (${st:-not loaded}) — KeepAlive should keep it up"
+    return
+  fi
+  pass "s10: watchdog daemon deployed + running (pid $(pgrep -f 'macrec watchdog-daemon' | head -1),${st:+ $st})"
+}
+
+# ---- s10kill — DESTRUCTIVE: SIGTERM the recorder, prove the WATCHDOG (not launchd) relaunches it -----
+# Opt-in only (./qa.sh s10kill): it terminates the running recorder, so it's not in the default run.
+# This is the real end-to-end proof of the self-heal path (§2.14), the thing a pure test can't show.
+# It MUST use SIGTERM, not SIGKILL: the recorder's SIGTERM handler exits cleanly (status 0), and the
+# main agent's KeepAlive is SuccessfulExit=false — so launchd will NOT relaunch a clean exit. That makes
+# the watchdog the ONLY thing that can bring it back, which both isolates the watchdog under test and
+# faithfully reproduces the idle-reap (a clean exit ~0) that #36b exists to recover from. A SIGKILL is an
+# UNsuccessful exit that the main KeepAlive respawns on its own — so it would false-PASS this check
+# whether or not the watchdog works, and never exercise the clean-exit death the watchdog is built for.
+s10kill() {
+  print -r -- "s10kill: DESTRUCTIVE — SIGTERM the recorder (clean exit); ONLY the watchdog can relaunch it"
+  if ! pgrep -f "macrec watchdog-daemon" >/dev/null; then skip "s10kill: watchdog not running (run ./install.sh)"; return; fi
+  local before; before=$(pgrep -f "/Applications/macrec.app/Contents/MacOS/macrec$" | head -1)
+  if [[ -z "$before" ]]; then skip "s10kill: recorder not running to begin with — nothing to relaunch"; return; fi
+  # A menu Quit sets watchdogQuitRequested; make sure it's clear so this reads a genuine crash, not a Quit.
+  # (The SIGTERM stop-handler does NOT set that flag — only the menu Quit does — so this stays a crash.)
+  defaults delete com.ikhoon.macrec.prefs watchdogQuitRequested 2>/dev/null || true
+  kill -TERM "$before" 2>/dev/null
+  print -r -- "  SIGTERM'd recorder (was pid $before) — waiting up to 75s for the watchdog's next tick…"
+  local waited=0 now=""
+  while [[ $waited -lt 75 ]]; do
+    sleep 5; waited=$((waited+5))
+    now=$(pgrep -f "/Applications/macrec.app/Contents/MacOS/macrec$" | head -1)
+    [[ -n "$now" && "$now" != "$before" ]] && break
+  done
+  if [[ -n "$now" && "$now" != "$before" ]]; then
+    sleep 6   # confirm it STAYS up (a single-instance-guard conflict would kill the relaunched copy)
+    local still; still=$(pgrep -f "/Applications/macrec.app/Contents/MacOS/macrec$" | head -1)
+    if [[ "$still" == "$now" ]]; then pass "s10kill: watchdog relaunched the recorder in ~${waited}s (pid $now) and it stayed up"
+    else fail "s10kill: relaunched (pid $now) but then vanished (now '$still') — single-instance conflict?"; fi
+  else
+    fail "s10kill: recorder NOT relaunched after ${waited}s — watchdog did not self-heal"
+  fi
+}
+
+# ---- s10quit — DESTRUCTIVE: the complementary guarantee — a deliberate Quit STAYS quit ---------------
+# Opt-in only (./qa.sh s10quit). s10kill proves the watchdog relaunches a crash; this proves it does NOT
+# relaunch a deliberate Quit. It sets watchdogQuitRequested (what the menu Quit sets), SIGTERMs the
+# recorder (clean exit — the main KeepAlive won't relaunch it either), and asserts it stays DOWN across
+# more than one watchdog tick. Without this, a regression that made the watchdog ignore the flag would
+# fight the user's Quit forever, and only manual testing would catch it.
+s10quit() {
+  print -r -- "s10quit: DESTRUCTIVE — a deliberate Quit (flag set) must NOT be relaunched by the watchdog"
+  if ! pgrep -f "macrec watchdog-daemon" >/dev/null; then skip "s10quit: watchdog not running (run ./install.sh)"; return; fi
+  local before; before=$(pgrep -f "/Applications/macrec.app/Contents/MacOS/macrec$" | head -1)
+  if [[ -z "$before" ]]; then skip "s10quit: recorder not running to begin with"; return; fi
+  defaults write com.ikhoon.macrec.prefs watchdogQuitRequested -bool true
+  kill -TERM "$before" 2>/dev/null
+  print -r -- "  set quit flag + SIGTERM'd recorder (was pid $before) — asserting it stays DOWN for 75s (>1 tick)…"
+  local waited=0 relaunched="" now=""
+  while [[ $waited -lt 75 ]]; do
+    sleep 5; waited=$((waited+5))
+    now=$(pgrep -f "/Applications/macrec.app/Contents/MacOS/macrec$" | head -1)
+    [[ -n "$now" && "$now" != "$before" ]] && { relaunched="$now"; break; }
+  done
+  if [[ -z "$relaunched" ]]; then pass "s10quit: recorder stayed DOWN ${waited}s — deliberate Quit respected"
+  else fail "s10quit: recorder RELAUNCHED (pid $relaunched) despite the quit flag — Quit not respected"; fi
+  # Restore: clear the flag and bring the recorder back, whatever the verdict.
+  defaults delete com.ikhoon.macrec.prefs watchdogQuitRequested 2>/dev/null || true
+  launchctl kickstart "gui/$(id -u)/com.ikhoon.macrec" 2>/dev/null || true
+}
+
 print -r -- "macrec QA (tier 2) — scratch: $SCRATCH"
-if [[ $# -eq 0 ]]; then s1; s2; s3; s4; s5; s6; s7; s8; s9; else for s in "$@"; do "$s"; done; fi
+if [[ $# -eq 0 ]]; then s1; s2; s3; s4; s5; s6; s7; s8; s9; s10; else for s in "$@"; do "$s"; done; fi
 print -r -- ""
 print -r -- "qa: $PASS passed, $FAIL failed, $SKIP skipped"
 [[ $FAIL -eq 0 ]] || exit 1

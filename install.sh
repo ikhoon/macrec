@@ -144,6 +144,47 @@ pkill -9 -f 'macrec.app/Contents/MacOS/macrec' 2>/dev/null || true
 launchctl enable "$DOMAIN/$LABEL" 2>/dev/null || true
 launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null \
   || { sleep 2; launchctl bootstrap "$DOMAIN" "$PLIST"; }
+# RunAtLoad does NOT fire when bootstrap runs from a non-login shell context (a script, an SSH
+# session): the job loads but never spawns (runs=0). kickstart it explicitly so the recorder is
+# actually running after install, whatever context install.sh ran in.
+launchctl kickstart "$DOMAIN/$LABEL" 2>/dev/null || true
+
+# #36b watchdog: a SECOND, tiny agent that relaunches the recorder if it goes down for any reason
+# (OS memory-pressure/idle kill exits ~0, which the main KeepAlive=SuccessfulExit=false won't relaunch).
+# It runs `macrec watchdog-daemon`: a KeepAlive-kept process that checks liveness every 60 s in-process
+# and respects a deliberate Quit (watchdogQuitRequested pref). We use KeepAlive + an internal loop, NOT
+# a 60 s StartInterval — a StartInterval agent is throttled to never on this Mac (App Nap / timer
+# coalescing: measured runs stuck at 1 across a 75 s window), whereas KeepAlive reliably keeps the
+# daemon alive and its plain-Foundation loop ticks on schedule.
+WD_LABEL="com.ikhoon.macrec.watchdog"
+WD_PLIST="$HOME/Library/LaunchAgents/$WD_LABEL.plist"
+echo "▸ writing watchdog agent → $WD_PLIST (relaunches the recorder if it dies)"
+cat > "$WD_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$WD_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$CAPTURE</string>
+    <string>watchdog-daemon</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$LOGFILE</string>
+  <key>StandardErrorPath</key><string>$LOGFILE</string>
+</dict>
+</plist>
+EOF
+launchctl bootout "$DOMAIN/$WD_LABEL" 2>/dev/null || true
+for i in {1..12}; do launchctl print "$DOMAIN/$WD_LABEL" >/dev/null 2>&1 || break; sleep 0.5; done
+launchctl enable "$DOMAIN/$WD_LABEL" 2>/dev/null || true
+launchctl bootstrap "$DOMAIN" "$WD_PLIST" 2>/dev/null \
+  || { sleep 2; launchctl bootstrap "$DOMAIN" "$WD_PLIST"; }
+# Same RunAtLoad caveat as the main agent — kick it so the watchdog is running immediately, not only
+# after the next login. (KeepAlive keeps it alive thereafter, whatever kills it.)
+launchctl kickstart "$DOMAIN/$WD_LABEL" 2>/dev/null || true
 
 echo
 echo "✅ installed → $INSTALL_APP  (shows as 'macrec' in Finder/Launchpad; click opens the tray menu)"

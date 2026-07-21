@@ -343,6 +343,13 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
               && outageWindowText(from: schedDate("2026-07-21 09:10"), to: schedDate("2026-07-21 09:55"), calendar: utc) == "09:10–09:55"
               && outageWindowText(from: schedDate("2026-07-20 23:00"), to: schedDate("2026-07-21 08:00"), calendar: utc) == "Jul 20 23:00–Jul 21 08:00"
               && outageMenuTitle(outageSeconds: 18 * 3600).contains("~18 h") && outageMenuTitle(outageSeconds: 0).isEmpty)
+    // #36b watchdog: relaunch the recorder ONLY when it's down AND the user didn't deliberately Quit —
+    // so a crash / OS memory-pressure kill / idle reap is recovered, but a menu Quit stays quit.
+    check("watchdog: relaunch iff down and not deliberately quit",
+          watchdogShouldRelaunch(mainRunning: false, quitRequested: false)          // died → relaunch
+              && !watchdogShouldRelaunch(mainRunning: false, quitRequested: true)   // user quit → stay dead
+              && !watchdogShouldRelaunch(mainRunning: true, quitRequested: false)   // up → do nothing
+              && !watchdogShouldRelaunch(mainRunning: true, quitRequested: true))
     // The WIRING through the REAL beat()/noteUserQuit() — not raw d.set (test-honesty review, P0): a real
     // Quit must write a cleanStop that suppresses the next start; a bootout (no Quit) must be surfaced,
     // persisted, and shown by todayHealth + the menu line same-day only; a fresh Notifier must fire; a

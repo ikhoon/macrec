@@ -290,6 +290,7 @@ enum Pref {
     static let recorderCleanStop = "recorderCleanStop"    // epoch of the last deliberate stop() — a Quit, not a death
     static let recorderOutageAt = "recorderOutageAt"      // epoch a silent outage was detected on the following start
     static let recorderOutageSeconds = "recorderOutageSeconds"  // how long that outage lasted (seconds)
+    static let watchdogQuitRequested = "watchdogQuitRequested"  // #36b: set on a deliberate Quit → the watchdog leaves it dead
     static let postProcessCmd = "postProcessCmd"        // freeform command ("" = off)
     static let hintsTerms = "hintsTerms"                // transcription hint terms (comma/newline separated)
     static let hintsFile = "hintsFile"                  // external hints file (one term per line, # comments)
@@ -1352,6 +1353,35 @@ public enum App {
                 print("uptime=\(Int(uptime)) last-outage-today=\(secs > 0 ? String(Int(secs)) : "none")")
             }
             exit(0)
+        }
+
+        // Subcommand: watchdog-tick / watchdog-daemon — the separate watchdog LaunchAgent (#36b).
+        // Relaunch the recorder when it's down and wasn't deliberately Quit, so an OS memory-pressure /
+        // idle kill (which exits ~0, so KeepAlive won't relaunch it) can't leave it dead. No GUI.
+        //
+        // `watchdog-daemon` is the SHIPPED form: a KeepAlive agent that loops every 60 s in-process.
+        // We loop internally rather than lean on launchd's StartInterval because a 60 s StartInterval
+        // agent is silently throttled to never on this Mac (App Nap / timer coalescing — measured:
+        // runs stuck at 1 across a 75 s window). launchd KeepAlive, by contrast, reliably keeps THIS
+        // process alive, and a plain Foundation loop (no NSApplication) ticks on schedule. Because the
+        // daemon never becomes an NSRunningApplication, the main app's single-instance guard never
+        // mistakes it for a second copy, and the daemon's own liveness probe only ever sees the real
+        // (GUI-registered) recorder. `watchdog-tick` is the one-shot form kept for manual checks/tests.
+        if args.first == "watchdog-tick" {
+            watchdogCheckOnce()
+            exit(0)
+        }
+        if args.first == "watchdog-daemon" {
+            elog("watchdog: daemon started (pid \(ProcessInfo.processInfo.processIdentifier)), interval \(Int(RecorderHeartbeat.interval))s")
+            // Sleep BEFORE the first check: at login both agents RunAtLoad concurrently (launchd gives no
+            // sibling ordering) and a just-launched recorder can lag in `runningApplications(bid)`, so an
+            // immediate check would log a false "recorder is down" and fire a redundant kickstart at every
+            // boot. The interval grace lets it register first; steady-state detection latency is unchanged
+            // (still one tick), and a genuine death in the first minute is caught on the next tick.
+            while true {
+                Thread.sleep(forTimeInterval: RecorderHeartbeat.interval)
+                watchdogCheckOnce()
+            }
         }
 
         // Subcommand: config — print the loaded settings (UserDefaults > env > default) and exit.

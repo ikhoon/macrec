@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 // MARK: - process-liveness heartbeat + silent-outage detection (#27)
@@ -33,6 +34,55 @@ func recorderOutage(lastHeartbeat: Date?, cleanStop: Date?, now: Date, bootTime:
     // an old cleanStop stale, so it can't blind a fresh crash-outage).
     if let stop = cleanStop, abs(stop.timeIntervalSince(last)) <= heartbeatSeconds * 2 { return nil }
     return gap
+}
+
+/// The watchdog's decision (#36b): relaunch the recorder ONLY when it's down AND the user didn't
+/// deliberately Quit it. A crash, an OS memory-pressure/idle kill, or a failed install leaves no quit
+/// flag, so the recorder is brought back within the watchdog's 60 s interval — whatever killed it. A
+/// menu Quit sets the flag (cleared on the next launch), so "a deliberate Quit stays quit". Pure.
+func watchdogShouldRelaunch(mainRunning: Bool, quitRequested: Bool) -> Bool {
+    !mainRunning && !quitRequested
+}
+
+/// One watchdog check: is the recorder down (no deliberate Quit)? Relaunch it if so. The thin I/O shell
+/// around `watchdogShouldRelaunch` — reads the live process list + the quit flag, kicks launchd on a
+/// verdict. Liveness is the GUI-registered recorder only: this daemon is a plain Foundation process, so
+/// it never appears in `runningApplications(bid)` and can't see itself as "the recorder is up".
+func watchdogCheckOnce(d: UserDefaults = Pref.d, log: (String) -> Void = { elog($0) }) {
+    let bid = Bundle.main.bundleIdentifier ?? "com.ikhoon.macrec"
+    let selfPid = ProcessInfo.processInfo.processIdentifier
+    let mainRunning = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+        .contains { $0.processIdentifier != selfPid }
+    guard watchdogShouldRelaunch(mainRunning: mainRunning,
+                                 quitRequested: d.bool(forKey: Pref.watchdogQuitRequested)) else { return }
+    log("watchdog: recorder is down (no deliberate Quit) — relaunching")
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    p.arguments = ["kickstart", "gui/\(getuid())/com.ikhoon.macrec"]
+    let err = Pipe()
+    p.standardError = err
+    // The watchdog IS the safety net — a silent failure here reproduces the very "no signal at all"
+    // outage #36 exists to kill. So surface every failure path: a launch that can't start, a non-zero
+    // exit, and (since this loop is the daemon's whole lifetime on ONE thread) a launchctl that hangs
+    // and would otherwise wedge every future tick.
+    do {
+        try p.run()
+    } catch {
+        log("watchdog: FAILED to run launchctl (\(error)) — recorder NOT relaunched, will retry next tick")
+        return
+    }
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async { p.waitUntilExit(); done.signal() }
+    if done.wait(timeout: .now() + 20) == .timedOut {
+        p.terminate()
+        log("watchdog: launchctl kickstart hung (>20s) — terminated it; will retry next tick")
+        return
+    }
+    if p.terminationStatus != 0 {
+        let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        log("watchdog: launchctl kickstart exited \(p.terminationStatus)\(msg.isEmpty ? "" : " — \(msg)") — recorder may still be down")
+    }
 }
 
 /// A gap in seconds → a short human string for the log/notification/panel ("18 h", "45 min", "2 h 10 min").

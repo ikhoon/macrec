@@ -74,6 +74,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         recordingActivity = ProcessInfo.processInfo.beginActivity(
             options: [.automaticTerminationDisabled, .suddenTerminationDisabled],
             reason: "macrec records meetings continuously")
+        Pref.d.removeObject(forKey: Pref.watchdogQuitRequested)   // #36b: we're running now — any prior Quit is void
         buildMenu()
         NSApp.mainMenu = Self.editShortcutMenu()   // wire ⌘X/C/V/A/Z app-wide (accessory apps have no Edit menu)
         // Credentials now live in a 0600 file (see Keychain), read lazily — no startup keychain access at
@@ -1004,7 +1005,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     // Only the explicit menu Quit is a "the user chose to stop" event — NOT applicationWillTerminate
     // (which also fires on logout / SIGTERM / bootout, the very deaths #27 must surface). So the
     // forgiving clean-stop marker is written here alone.
-    @objc private func quit() { RecorderHeartbeat.noteUserQuit(); stopEngineSync(); NSApp.terminate(nil) }
+    @objc private func quit() {
+        RecorderHeartbeat.noteUserQuit()
+        Pref.d.set(true, forKey: Pref.watchdogQuitRequested)   // #36b: deliberate Quit — the watchdog leaves it dead
+        Pref.d.synchronize()   // flush to cfprefsd BEFORE we die, so the watchdog daemon reads the flag, not a stale false
+        stopEngineSync()
+        NSApp.terminate(nil)
+    }
 
     /// #27: at launch, if the prior run's heartbeat shows the PROCESS was dead for a real stretch while
     /// the mac was awake (not a reboot, not a deliberate Quit), surface it — the silent 18-hour outage
