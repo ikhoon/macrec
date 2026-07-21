@@ -130,6 +130,54 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     let rowDel = LibraryWindow.shared.rowDeleteBindingsForTest()
     check("library: every list row carries a wired trash button bound to its own entry",
           rowDel.rows > 0 && rowDel.bound == rowDel.rows)
+    // CLICK-THROUGH (CodeRabbit on #162): wiring metadata alone can't prove a tap ARRIVES — fire a
+    // real performClick on a row's trash and assert the target/action chain resolved confirmDelete
+    // with that row's OWN entry (the hook stands in for the modal sheet, headless).
+    var clickedEntry: LibraryEntry?
+    LibraryWindow.shared.confirmDeleteHookForTest = { clickedEntry = $0 }
+    let kickoffRow = (0 ..< 20).first {
+        (LibraryWindow.shared.outlineItemForTest(row: $0) as? LibraryEntry)?.title == "project kickoff"
+    }
+    let clicked = kickoffRow.map { LibraryWindow.shared.clickRowDeleteForTest(row: $0) } ?? false
+    LibraryWindow.shared.confirmDeleteHookForTest = nil
+    check("library: a real click on a row's trash resolves confirmDelete with that row's entry",
+          clicked && clickedEntry?.title == "project kickoff" && clickedEntry?.kind == .transcript)
+
+    // The calendar sidebar (user ask): the pure month grid — cells land on the right weekdays, the
+    // month pads to whole weeks, leap February exists, and ‹ › arithmetic crosses year boundaries.
+    // A FIXED calendar (gregorian, Sunday-first, Seoul) — a test reading the machine's calendar
+    // passes here and fails on a Monday-first laptop (the environment decides the answer).
+    var cal = Calendar(identifier: .gregorian)
+    cal.firstWeekday = 1
+    cal.timeZone = TimeZone(identifier: "Asia/Seoul")!
+    let july = monthGrid("2026-07", calendar: cal)   // 2026-07-01 is a Wednesday
+    let feb = monthGrid("2024-02", calendar: cal)    // leap month, 29 days
+    check("library calendar: grid weekday placement, whole-week padding, leap month, ‹ › across years",
+          july.count == 5 && july[0][3] == "2026-07-01" && july[0][2] == nil
+              && july[4][5] == "2026-07-31" && july[4][6] == nil
+              && feb.joined().compactMap { $0 }.count == 29 && feb[0][4] == "2024-02-01"
+              && monthShift("2026-01", by: -1, calendar: cal) == "2025-12"
+              && monthShift("2026-12", by: 1, calendar: cal) == "2027-01"
+              && weekdayHeaders(calendar: cal).count == 7)
+    // The day filter is one more pure input: only that day's group survives, it composes with the
+    // kind scope, and nil means every day (the existing behavior, unchanged).
+    let fixDays = libraryFixtureDays()
+    check("library calendar: the day filter keeps one day, composes with kind, nil keeps all",
+          libraryFiltered(fixDays, filter: "", day: "2026-03-01").map(\.day) == ["2026-03-01"]
+              && libraryFiltered(fixDays, filter: "", onlyKind: .digest, day: "2026-03-01").isEmpty
+              && libraryFiltered(fixDays, filter: "", day: nil).count == fixDays.count
+              && libraryFiltered(fixDays, filter: "", day: "2020-01-01").isEmpty)
+    // WIRING: a pick through the REAL calendar view filters the outline to that day; picking the
+    // same day again clears it (toggle). The month opens where the data is (the newest fixture day).
+    LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
+    LibraryWindow.shared.calendarPickForTest("2026-03-01")
+    let picked = (LibraryWindow.shared.selectedDayForTest, LibraryWindow.shared.shownDayCountForTest)
+    LibraryWindow.shared.calendarPickForTest("2026-03-01")
+    let cleared = (LibraryWindow.shared.selectedDayForTest, LibraryWindow.shared.shownDayCountForTest)
+    check("library calendar: a pick filters the list to that day, a re-pick clears, month follows data",
+          picked == ("2026-03-01", 1) && cleared.0 == nil && cleared.1 == 2
+              && LibraryWindow.shared.calendarMonthForTest == "2026-03"
+              && LibraryWindow.shared.calendarDayButtonCountForTest() == 31)   // March renders 31 day buttons
 
     // Stem parsing — every real shape in the vault, plus the garbage that must not crash the scan.
     let full = parseLibraryStem("2026-03-02-1030-project-kickoff")

@@ -1,0 +1,186 @@
+import AppKit
+import Foundation
+
+// MARK: - pure month-grid decisions (selftested)
+
+/// The weeks of `month` ("yyyy-MM") as rows of seven "yyyy-MM-dd" cells, nil-padded before the 1st
+/// and after the last day, honoring the calendar's firstWeekday. Pure — the view just renders it.
+func monthGrid(_ month: String, calendar: Calendar = .current) -> [[String?]] {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.calendar = calendar; f.timeZone = calendar.timeZone; f.dateFormat = "yyyy-MM"
+    guard let first = f.date(from: month),
+          let days = calendar.range(of: .day, in: .month, for: first) else { return [] }
+    let lead = (calendar.component(.weekday, from: first) - calendar.firstWeekday + 7) % 7
+    var cells = [String?](repeating: nil, count: lead)
+    for d in days { cells.append(String(format: "%@-%02d", month, d)) }
+    while cells.count % 7 != 0 { cells.append(nil) }
+    return stride(from: 0, to: cells.count, by: 7).map { Array(cells[$0 ..< $0 + 7]) }
+}
+
+/// `month` ("yyyy-MM") shifted by `by` months — the ‹ › navigation. Pure.
+func monthShift(_ month: String, by: Int, calendar: Calendar = .current) -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.calendar = calendar; f.timeZone = calendar.timeZone; f.dateFormat = "yyyy-MM"
+    guard let d = f.date(from: month), let s = calendar.date(byAdding: .month, value: by, to: d) else { return month }
+    return f.string(from: s)
+}
+
+/// Weekday header letters starting at the calendar's firstWeekday (e.g. S M T W T F S). Pure.
+func weekdayHeaders(calendar: Calendar = .current) -> [String] {
+    let syms = calendar.veryShortWeekdaySymbols
+    let start = calendar.firstWeekday - 1
+    return (0 ..< 7).map { syms[(start + $0) % syms.count] }
+}
+
+// MARK: - the calendar sidebar (dumb renderer of monthGrid)
+
+/// A compact month calendar above the Library list (user ask: "왼쪽에는 달력") — days that HAVE
+/// recordings are full-strength and dotted, empty days are dimmed; clicking a day filters the list
+/// to it, clicking it again clears the filter. All decisions (grid, shift, filter) are pure and
+/// selftested; this view only materializes them into buttons.
+final class LibraryCalendarView: NSView {
+    /// The picked day ("yyyy-MM-dd"), or nil when the pick was cleared. The window owns the filter.
+    var onPick: ((String?) -> Void)?
+
+    private(set) var month: String = "" // "yyyy-MM" currently shown
+    private(set) var selectedDay: String?
+    private var contentDays: Set<String> = []
+    private var today: String = ""
+    private let monthLabel = NSTextField(labelWithString: "")
+    private let grid = NSStackView()
+    private let titleFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "MMM yyyy"
+        return f
+    }()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        let prev = NSButton(title: "‹", target: self, action: #selector(prevMonth))
+        let next = NSButton(title: "›", target: self, action: #selector(nextMonth))
+        for b in [prev, next] {
+            b.isBordered = false
+            b.font = .systemFont(ofSize: 14, weight: .semibold)
+            // ≥ the 12 pt layout-guard floor for text controls — and a decent click target.
+            b.widthAnchor.constraint(equalToConstant: 22).isActive = true
+            b.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        }
+        monthLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        monthLabel.alignment = .center
+        let header = NSStackView(views: [prev, monthLabel, next])
+        header.orientation = .horizontal
+        header.distribution = .equalCentering
+        grid.orientation = .vertical
+        grid.spacing = 1
+        grid.alignment = .centerX
+        let v = NSStackView(views: [header, grid])
+        v.orientation = .vertical
+        v.spacing = 4
+        v.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 6, right: 8)
+        v.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(v)
+        NSLayoutConstraint.activate([
+            v.topAnchor.constraint(equalTo: topAnchor),
+            v.leadingAnchor.constraint(equalTo: leadingAnchor),
+            v.trailingAnchor.constraint(equalTo: trailingAnchor),
+            v.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+
+    @available(*, unavailable) required init?(coder _: NSCoder) { nil }
+
+    /// Re-render for a month + the days that have content. `selectedDay` survives month flips so
+    /// browsing other months never silently drops an active filter.
+    func load(month: String, contentDays: Set<String>, selectedDay: String?, today: String) {
+        self.month = month
+        self.contentDays = contentDays
+        self.selectedDay = selectedDay
+        self.today = today
+        rebuild()
+    }
+
+    @objc private func prevMonth() { flip(by: -1) }
+    @objc private func nextMonth() { flip(by: 1) }
+    private func flip(by: Int) {
+        month = monthShift(month, by: by)
+        rebuild()
+    }
+
+    @objc private func dayTapped(_ sender: NSButton) {
+        guard let day = sender.identifier?.rawValue, !day.isEmpty else { return }
+        selectedDay = selectedDay == day ? nil : day // toggle: re-clicking the picked day clears it
+        rebuild()
+        onPick?(selectedDay)
+    }
+
+    private func rebuild() {
+        // "yyyy-MM" → "MMM yyyy" via the grid's own first real day (no second parsing convention).
+        monthLabel.stringValue = month
+        if let first = monthGrid(month).joined().compactMap({ $0 }).first {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.dateFormat = "yyyy-MM-dd"
+            if let d = f.date(from: first) { monthLabel.stringValue = titleFormatter.string(from: d) }
+        }
+        grid.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let headerRow = NSStackView(views: weekdayHeaders().map { s in
+            let l = NSTextField(labelWithString: s)
+            l.font = .systemFont(ofSize: 9, weight: .semibold)
+            l.textColor = .tertiaryLabelColor
+            l.alignment = .center
+            l.widthAnchor.constraint(equalToConstant: 24).isActive = true
+            l.heightAnchor.constraint(equalToConstant: 12).isActive = true   // the layout-guard floor
+            return l
+        })
+        headerRow.orientation = .horizontal
+        headerRow.spacing = 1
+        grid.addArrangedSubview(headerRow)
+        for week in monthGrid(month) {
+            let row = NSStackView(views: week.map { day in dayButton(day) })
+            row.orientation = .horizontal
+            row.spacing = 1
+            grid.addArrangedSubview(row)
+        }
+    }
+
+    private func dayButton(_ day: String?) -> NSView {
+        guard let day else {
+            let pad = NSView()
+            pad.widthAnchor.constraint(equalToConstant: 24).isActive = true
+            pad.heightAnchor.constraint(equalToConstant: 22).isActive = true
+            return pad
+        }
+        let has = contentDays.contains(day)
+        let b = NSButton(title: String(Int(day.suffix(2)) ?? 0), target: self, action: #selector(dayTapped(_:)))
+        b.identifier = NSUserInterfaceItemIdentifier(day)
+        b.isBordered = false
+        b.font = .systemFont(ofSize: 11, weight: day == today ? .bold : .regular)
+        b.contentTintColor = day == selectedDay ? .white : has ? .labelColor : .tertiaryLabelColor
+        b.wantsLayer = true
+        b.layer?.cornerRadius = 4
+        b.layer?.backgroundColor = day == selectedDay ? NSColor.controlAccentColor.cgColor : nil
+        // The content marker: a dot under the number would need a taller row — an accent-tinted
+        // number reads just as fast at this size, so recorded days are accent unless selected.
+        if has, day != selectedDay { b.contentTintColor = .controlAccentColor }
+        b.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        b.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        b.toolTip = has ? "\(day) — show only this day's recordings" : "\(day) — no recordings"
+        return b
+    }
+
+    // Selftest hooks: drive a pick like a click, read the rendered state.
+    func pickForTest(_ day: String) {
+        let b = NSButton()
+        b.identifier = NSUserInterfaceItemIdentifier(day)
+        dayTapped(b)
+    }
+
+    var monthForTest: String { month }
+    func dayButtonCountForTest() -> Int {
+        grid.arrangedSubviews.dropFirst().flatMap { ($0 as? NSStackView)?.arrangedSubviews ?? [] }
+            .compactMap { $0 as? NSButton }.count
+    }
+}

@@ -99,6 +99,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     private var fixtureDays: [LibraryDay]? // test/snapshot data — nil means scan the real folders
     private var selected: LibraryEntry?
     private var standaloneURL: URL? // a file rendered directly (tray fallback: on disk but not indexed)
+    // The calendar sidebar (user ask): clicking a day filters the list to it; nil = every day.
+    private let calendarView = LibraryCalendarView()
+    private var selectedDay: String?
 
     func show() {
         if window == nil { build() }
@@ -125,6 +128,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     private func selectIndexed(_ target: URL) -> Bool {
         guard let hit = libraryEntryToSelect(days: allDays, target: target) else { return false }
         searchField.stringValue = ""; scopePicker.selectedSegment = 0
+        selectedDay = nil   // an active calendar day-filter would hide the target's row too
         applyFilter()   // unfiltered outline so reselect finds the row
         reselect(url: hit.url, kind: hit.kind)
         return true
@@ -162,6 +166,13 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         // keep their entry so a completion can still land its failure reason.
         let urls = Set(allDays.flatMap(\.entries).map(\.url))
         rerunPhase = rerunPhase.filter { $0.value == .running || urls.contains($0.key) }
+        // The calendar mirrors the scan: recorded days light up; the shown month starts where the
+        // data is (the newest day), then the user's ‹ › browsing owns it.
+        let today = Self.dayString(Date())
+        let month = calendarView.month.isEmpty
+            ? String((allDays.first?.day ?? today).prefix(7)) : calendarView.month
+        calendarView.load(month: month, contentDays: Set(allDays.map(\.day)),
+                          selectedDay: selectedDay, today: today)
         applyFilter()
         applyHeaderActions()   // a rescan may reflect saved prefs / a finished run — re-derive once
     }
@@ -180,10 +191,13 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             summaryOut: Pref.explicit(Pref.summaryOut, "MR_SUMMARY_OUT"),
             dailyOut: Pref.explicit(Pref.dailyDigestOut, "MR_DAILY_DIGEST_OUT"),
             audioDir: Pref.str(Pref.audioDir, "MR_AUDIO_DIR", ""))
+        // limitDays 3650, not the scan's 90 default: the calendar can page YEARS back, and a month
+        // that has recordings must never render as empty just because it fell off a silent cap.
         return scanLibrary(transcriptsDir: URL(fileURLWithPath: roots.transcripts),
                            summaryDir: URL(fileURLWithPath: roots.summaries),
                            dailyDir: URL(fileURLWithPath: roots.daily),
-                           audioDir: roots.audio.isEmpty ? nil : URL(fileURLWithPath: roots.audio))
+                           audioDir: roots.audio.isEmpty ? nil : URL(fileURLWithPath: roots.audio),
+                           limitDays: 3650)
     }
 
     // MARK: build
@@ -242,6 +256,20 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         let leftScroll = NSScrollView()
         leftScroll.documentView = outline
         leftScroll.hasVerticalScroller = true
+        // The calendar rides ABOVE the list in the left pane; its pick becomes the day filter.
+        calendarView.onPick = { [weak self] day in
+            guard let self else { return }
+            selectedDay = day
+            applyFilter()
+        }
+        let left = NSStackView(views: [calendarView, leftScroll])
+        left.orientation = .vertical
+        left.spacing = 0
+        left.translatesAutoresizingMaskIntoConstraints = false
+        calendarView.leadingAnchor.constraint(equalTo: left.leadingAnchor).isActive = true
+        calendarView.trailingAnchor.constraint(equalTo: left.trailingAnchor).isActive = true
+        leftScroll.leadingAnchor.constraint(equalTo: left.leadingAnchor).isActive = true
+        leftScroll.trailingAnchor.constraint(equalTo: left.trailingAnchor).isActive = true
 
         // Right: header (what's selected + actions) over the document text.
         headerLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
@@ -324,7 +352,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         split.isVertical = true
         split.dividerStyle = .thin
         split.translatesAutoresizingMaskIntoConstraints = false
-        split.addArrangedSubview(leftScroll)
+        split.addArrangedSubview(left)
         split.addArrangedSubview(right)
         // Classic (autoresizing) pane sizing, NOT autolayout: with anchored arranged subviews the
         // split view logged an ambiguous-layout warning and refused full divider dragging (observed
@@ -368,7 +396,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     private func applyFilter() {
         let onlyKind: LibraryEntry.Kind? = scopePicker.selectedSegment == 1 ? .digest : nil
-        shownDays = libraryFiltered(allDays, filter: searchField.stringValue, onlyKind: onlyKind)
+        shownDays = libraryFiltered(allDays, filter: searchField.stringValue, onlyKind: onlyKind,
+                                    day: selectedDay)
         outline.reloadData()
         outline.expandItem(nil, expandChildren: true)
         emptyLabel.isHidden = !shownDays.isEmpty
@@ -378,6 +407,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         let filterActive = !searchField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty
         emptyLabel.stringValue = allDays.isEmpty
             ? "Nothing here yet — transcripts appear as meetings are recorded."
+            : (selectedDay != nil && !filterActive && onlyKind == nil)
+            ? "No recordings on \(selectedDay ?? "") — click the date again to show every day."
             : (onlyKind == .digest && !filterActive) ? "No daily digests yet — they're written once a day."
             : "No match for the current filter."
         // Keep the preview in sync: the selected file may be gone after a rescan (showEntry(nil)
@@ -610,6 +641,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// The shared confirm→Trash flow, entry-parameterized so BOTH the detail-pane Delete and each list
     /// row's trash button (user ask: the affordance must live on the list too) run the same path.
     func confirmDelete(_ e: LibraryEntry) {
+        // Click-through seam (CodeRabbit on #162): with the hook set, a performClick on a row's
+        // trash button records WHICH entry the real target/action chain resolved to — proving the
+        // click path end-to-end without a modal sheet in a headless test.
+        if let hook = confirmDeleteHookForTest { hook(e); return }
         guard let win = window else { return }
         let files = deletionFiles(e)
         guard !files.isEmpty else { refresh(); return }   // files already gone → drop the stale row, not a dead click
@@ -1007,6 +1042,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             // showed before scrolling. The confirm→Trash flow is the same one the detail Delete runs.
             cell.entry = e
             cell.owner = self
+            // VoiceOver must be able to tell WHICH recording each row's trash deletes (CodeRabbit).
+            cell.deleteBtn.setAccessibilityLabel("Delete \(spec.text)")
         }
         return cell
     }
@@ -1067,6 +1104,30 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         }
         return (rows, bound)
     }
+
+    /// Captures the entry a confirmDelete CLICK resolved to instead of showing the modal sheet —
+    /// nil in production (the sheet shows). Set by the selftest around a performClick.
+    var confirmDeleteHookForTest: ((LibraryEntry) -> Void)?
+
+    /// The outline's item at `row` — lets the selftest find a named fixture row to click.
+    func outlineItemForTest(row: Int) -> Any? {
+        row < outline.numberOfRows ? outline.item(atRow: row) : nil
+    }
+
+    /// Fire a real performClick on the trash button of outline row `row` (an entry row) — drives
+    /// the actual target/action chain, not a mirror of it. Returns false when the row has no cell.
+    func clickRowDeleteForTest(row: Int) -> Bool {
+        guard let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: true) as? LibraryEntryCell
+        else { return false }
+        cell.deleteBtn.performClick(nil)
+        return true
+    }
+
+    // Calendar wiring hooks: drive a day pick through the REAL view + onPick chain, read the state.
+    func calendarPickForTest(_ day: String) { calendarView.pickForTest(day) }
+    var selectedDayForTest: String? { selectedDay }
+    var calendarMonthForTest: String { calendarView.month }
+    func calendarDayButtonCountForTest() -> Int { calendarView.dayButtonCountForTest() }
 
     var playerBarHiddenForTest: Bool { playerBar.isHidden }
     var playerActiveForTest: Bool { player != nil }
