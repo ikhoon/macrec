@@ -71,7 +71,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     private let docPicker = NSSegmentedControl(labels: ["Summary", "Transcript"],
                                                trackingMode: .selectOne, target: nil, action: nil)
     private let openBtn = NSButton(title: "Open", target: nil, action: nil)
-    private let revealBtn = NSButton(title: "Reveal in Finder", target: nil, action: nil)
+    private let revealBtn = NSButton(title: "Reveal", target: nil, action: nil)   // in Finder (tooltip); short to leave the title room
+    private let deleteBtn = NSButton(title: "Delete…", target: nil, action: nil)   // confirm → Trash the entry + its files
     private let exportBtn = NSButton(title: "Export Transcript…", target: nil, action: nil)
     // Transcript-actions row (its own row — squeezed into the header strip they crushed the title):
     // Export + the re-run slot (button OR spinner+label), derived in applyHeaderActions (one decision).
@@ -142,6 +143,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         playerBar.isHidden = true
         openBtn.isEnabled = true
         revealBtn.isEnabled = true
+        deleteBtn.isEnabled = false   // a standalone-rendered file has no indexed entry / related files to delete
         applyHeaderActions()
         if let data = try? Data(contentsOf: url, options: .mappedIfSafe) {
             let text = String(decoding: data.prefix(2_000_000), as: UTF8.self)
@@ -250,12 +252,16 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         openBtn.action = #selector(openDoc)
         revealBtn.target = self
         revealBtn.action = #selector(revealDoc)
+        revealBtn.toolTip = "Reveal in Finder"
         exportBtn.target = self
         exportBtn.action = #selector(exportClicked)
         exportBtn.toolTip = "Save the transcript as Markdown, plain text, SRT or VTT"
         rerunBtn.target = self
         rerunBtn.action = #selector(rerunClicked)
-        for b in [openBtn, revealBtn, exportBtn, rerunBtn] { b.bezelStyle = .rounded }
+        deleteBtn.target = self
+        deleteBtn.action = #selector(deleteClicked)
+        deleteBtn.toolTip = "Move this recording (transcript, summary, and audio) to the Trash"
+        for b in [openBtn, revealBtn, exportBtn, rerunBtn, deleteBtn] { b.bezelStyle = .rounded }
         rerunSpinner.style = .spinning
         rerunSpinner.controlSize = .small
         rerunSpinner.isDisplayedWhenStopped = false
@@ -263,7 +269,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         rerunStatus.textColor = .secondaryLabelColor
         rerunStatus.lineBreakMode = .byTruncatingTail
         rerunStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let head = NSStackView(views: [headerLabel, NSView(), docPicker, openBtn, revealBtn])
+        let head = NSStackView(views: [headerLabel, NSView(), docPicker, openBtn, revealBtn, deleteBtn])
         head.orientation = .horizontal
         head.spacing = 8
         head.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 6, right: 10)
@@ -397,6 +403,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             playerBar.isHidden = true
             openBtn.isEnabled = false
             revealBtn.isEnabled = false
+            deleteBtn.isEnabled = false
             applyHeaderActions()
             setPlainDoc("")
             return
@@ -417,6 +424,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         playerBar.isHidden = e.audioURL == nil
         openBtn.isEnabled = true
         revealBtn.isEnabled = true
+        deleteBtn.isEnabled = true
         applyHeaderActions()
         loadDoc()
     }
@@ -568,6 +576,73 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     @objc private func openDoc() { if let u = currentDocURL() { NSWorkspace.shared.open(u) } }
     @objc private func revealDoc() {
         if let u = currentDocURL() { NSWorkspace.shared.activateFileViewerSelecting([u]) }
+    }
+
+    /// The (role, file) pairs a delete would remove: EXISTING on disk, and NOT referenced by any OTHER
+    /// indexed entry (so deleting one recording can never orphan a file a twin still points at — a
+    /// stem-collision across folders). Role labels disambiguate the confirm sheet (a dedicated summary
+    /// dir gives the summary the transcript's basename, so bare names would read identically).
+    private func deletionFiles(_ e: LibraryEntry) -> [(role: String, url: URL)] {
+        let othersUse = Set(allDays.flatMap(\.entries).filter { $0 != e }
+            .flatMap { [$0.url, $0.summaryURL, $0.audioURL].compactMap { $0?.standardizedFileURL.path } })
+        let fm = FileManager.default
+        return libraryDeletionSet(e).compactMap { u in
+            guard fm.fileExists(atPath: u.path), !othersUse.contains(u.standardizedFileURL.path) else { return nil }
+            let role: String
+            switch true {
+            case u == e.url: role = e.kind == .digest ? "digest" : "transcript"
+            case u == e.summaryURL: role = "summary"
+            case ["wav", "m4a"].contains(u.pathExtension.lowercased()): role = "audio"
+            case u.pathExtension.lowercased() == "json": role = "structured data"
+            default: role = "file"
+            }
+            return (role, u)
+        }
+    }
+
+    /// Delete the selected recording — confirm FIRST (destructive, user asked), then move its files to
+    /// the Trash (recoverable, not a permanent rm). The sheet lists exactly what goes, by role, so
+    /// nothing is removed unseen. A failure to trash any file is surfaced, not just logged.
+    @objc private func deleteClicked() {
+        guard let e = selected, let win = window else { return }
+        let files = deletionFiles(e)
+        guard !files.isEmpty else { refresh(); return }   // files already gone → drop the stale row, not a dead click
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete this recording?"
+        alert.informativeText = "These files move to the Trash (recover them there if needed):\n\n"
+            + files.map { "• \($0.role): \($0.url.lastPathComponent)" }.joined(separator: "\n")
+        alert.addButton(withTitle: "Move to Trash")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        alert.beginSheetModal(for: win) { [weak self] resp in
+            guard resp == .alertFirstButtonReturn, let self else { return }
+            let failed = self.performDelete(e)
+            guard !failed.isEmpty, let w = self.window else { return }
+            let a = NSAlert()
+            a.alertStyle = .warning
+            a.messageText = "Some files couldn't be moved to the Trash"
+            a.informativeText = "Still on disk (try again, or move them in Finder):\n\n"
+                + failed.map { "• \($0.lastPathComponent)" }.joined(separator: "\n")
+            a.addButton(withTitle: "OK")
+            a.beginSheetModal(for: w, completionHandler: nil)
+        }
+    }
+
+    /// Move the recording's files to the Trash, then clear the pane + rescan so the row is gone. `remove`
+    /// is injectable so the selftest drives the real loop without littering the Trash. Returns the files
+    /// that COULD NOT be removed (empty on full success) — the caller surfaces a shortfall, never silent.
+    @discardableResult
+    func performDelete(_ e: LibraryEntry,
+                       remove: (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }) -> [URL] {
+        var failed: [URL] = []
+        for (_, url) in deletionFiles(e) {
+            do { try remove(url) }
+            catch { elog("library: delete failed for \(url.lastPathComponent) — \(error.localizedDescription)"); failed.append(url) }
+        }
+        if selected == e { showEntry(nil) }   // the deleted row can no longer be shown
+        refresh()                             // rescan → the entry is gone from the sidebar
+        return failed
     }
 
     // MARK: seek links (a rendered "[HH:MM:SS]" stamp → the player)
@@ -924,6 +999,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     var playerBarHiddenForTest: Bool { playerBar.isHidden }
     var playerActiveForTest: Bool { player != nil }
     var openEnabledForTest: Bool { openBtn.isEnabled }
+    var deleteEnabledForTest: Bool { deleteBtn.isEnabled }   // #37: pinned — Delete's gating differs from Open/Reveal
     var docTextForTest: String { textView.string }
     var clockTextForTest: String { clockLabel.stringValue }
     var seekMaxForTest: Double { seekSlider.maxValue }

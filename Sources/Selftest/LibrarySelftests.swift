@@ -74,6 +74,58 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     try? FileManager.default.removeItem(at: orphan)
     LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore the rich default
 
+    // #37: deleting a recording removes the transcript + its summary + audio (BOTH the raw .wav and the
+    // archived .m4a); a digest deletes only itself. Pure decision, then the real performDelete loop.
+    let dTx = URL(fileURLWithPath: "/tmp/2026-03-02-1400-x.md")
+    let dSum = URL(fileURLWithPath: "/tmp/2026-03-02-1400-x-sum.md")
+    let dWav = URL(fileURLWithPath: "/tmp/2026-03-02-1400-x.wav")
+    let dM4a = URL(fileURLWithPath: "/tmp/2026-03-02-1400-x.m4a")
+    let delEntry = LibraryEntry(day: "2026-03-02", time: "14:00", title: "x", kind: .transcript,
+                                url: dTx, summaryURL: dSum, audioURL: dWav)
+    let dset = libraryDeletionSet(delEntry)
+    // digest deletes its .md AND the #146 structured .json sidecar next to it; an audio-only row where
+    // url == audioURL exercises the dedup (the .wav appears once, plus the .m4a sibling) → count 2.
+    let digMd = URL(fileURLWithPath: "/tmp/2026-03-02.md")
+    let digestEntry = LibraryEntry(day: "2026-03-02", time: nil, title: nil, kind: .digest, url: digMd, summaryURL: nil, audioURL: nil)
+    let audioOnly = LibraryEntry(day: "d", time: "17:00", title: nil, kind: .audio,
+                                 url: dM4a, summaryURL: nil, audioURL: dM4a)
+    check("library: deletion set covers transcript+summary+audio(both), digest+.json, and dedups audio-only",
+          dset.count == 4 && dset.contains(dTx) && dset.contains(dSum) && dset.contains(dWav) && dset.contains(dM4a)
+              && libraryDeletionSet(digestEntry) == [digMd, URL(fileURLWithPath: "/tmp/2026-03-02.json")]
+              && libraryDeletionSet(audioOnly) == [dM4a, URL(fileURLWithPath: "/tmp/2026-03-02-1400-x.wav")])   // dedup: .m4a once + .wav
+    // WIRING (dead-affordance + destructive-op discipline): performDelete removes the real files on disk
+    // (remove injected = removeItem, no Trash litter), reports failures (empty here), and clears the pane.
+    let ddir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("macrec-del-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: ddir, withIntermediateDirectories: true)
+    let fTx = ddir.appendingPathComponent("m.md"), fSum = ddir.appendingPathComponent("m-sum.md")
+    let fWav = ddir.appendingPathComponent("m.wav")
+    for u in [fTx, fSum, fWav] { try? "x".write(to: u, atomically: true, encoding: .utf8) }
+    let fEntry = LibraryEntry(day: "2026-03-02", time: "14:00", title: "m", kind: .transcript,
+                              url: fTx, summaryURL: fSum, audioURL: fWav)
+    LibraryWindow.shared.loadFixtureForTest([LibraryDay(day: "2026-03-02", entries: [fEntry])])
+    LibraryWindow.shared.selectForTest(fEntry)   // so the delete clears the pane (selected == e)
+    let failed = LibraryWindow.shared.performDelete(fEntry, remove: { try FileManager.default.removeItem(at: $0) })
+    let dfm = FileManager.default
+    check("library: delete removes the 3 files, reports no failure, and clears the pane",
+          failed.isEmpty && !dfm.fileExists(atPath: fTx.path) && !dfm.fileExists(atPath: fSum.path)
+              && !dfm.fileExists(atPath: fWav.path) && !LibraryWindow.shared.openEnabledForTest)   // pane cleared → Open off
+    try? dfm.removeItem(at: ddir)
+    // Delete's enablement diverges from Open/Reveal: ON for a real entry, OFF for the empty pane AND
+    // the #34 standalone render (no indexed entry / related files). Pinned so a refactor can't re-enable it.
+    LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
+    LibraryWindow.shared.selectForTest(libraryFixtureDays()[0].entries[1])   // a real transcript row
+    let onReal = LibraryWindow.shared.deleteEnabledForTest
+    LibraryWindow.shared.selectForTest(nil)
+    let onEmpty = LibraryWindow.shared.deleteEnabledForTest
+    let orphanFile = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("macrec-del-orphan-\(UUID().uuidString).md")
+    try? "# x".write(to: orphanFile, atomically: true, encoding: .utf8)
+    _ = LibraryWindow.shared.showSelectingForTest(orphanFile)   // standalone render (not indexed)
+    let onStandalone = LibraryWindow.shared.deleteEnabledForTest
+    try? dfm.removeItem(at: orphanFile)
+    check("library: Delete is enabled for a real entry, disabled for the empty pane and standalone render",
+          onReal && !onEmpty && !onStandalone)
+    LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore
+
     // Stem parsing — every real shape in the vault, plus the garbage that must not crash the scan.
     let full = parseLibraryStem("2026-03-02-1030-project-kickoff")
     let bare = parseLibraryStem("2026-03-02-1030")
