@@ -119,6 +119,19 @@ concise and specific to macrec; don't pad the file with generic advice.
    invariant: the heartbeat proves the *process* is alive (a paused recorder still beats), not the
    engine — so an intentional idle never reads as a gap without needing a forgiveness marker at all.
 
+16. **An LSUIElement recorder must opt out of macOS automatic/sudden termination, or the OS reaps it
+   when idle and KeepAlive never brings it back.** The recurring "macrec 꺼져있네" outage was NOT a
+   crash: a menu-bar (`LSUIElement`) accessory app is a candidate for automatic/sudden termination when
+   macOS decides it's idle; macrec exited 0 when reaped, and launchd `KeepAlive` with
+   `SuccessfulExit=false` only relaunches a CRASH — so a clean OS-initiated exit stays dead (measured:
+   DOWN 62 min, no crash report). #27's heartbeat only *detected* it. The fix that PREVENTS it:
+   `ProcessInfo.disableSuddenTermination()` + `disableAutomaticTermination(...)` + a process-lifetime
+   `beginActivity([.automaticTerminationDisabled, .suddenTerminationDisabled])` at launch — WITHOUT
+   `.idleSystemSleepDisabled` (system sleep must still work; the engine suspends on sleep, resumes on
+   wake). The rule: a background agent that must run continuously has to tell the OS so explicitly —
+   "it's a launchd KeepAlive job" is not enough when the exit looks clean. Detection (a heartbeat) and
+   prevention (termination opt-out) are two different jobs; ship both.
+
 ## 3. CS fundamentals we hold ourselves to
 
 The bugs here have been fundamentals, not exotica: unhandled states, controls bound to nothing,
