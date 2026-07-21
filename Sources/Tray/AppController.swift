@@ -308,7 +308,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         case .none:
             break
         case .reveal(let path):
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            // Show the summary IN-APP (Library renders the markdown) rather than bouncing to Finder —
+            // the user reaches for the note, not the file (user request).
+            LibraryWindow.shared.show(selecting: URL(fileURLWithPath: path))
         case .explain(let file, let reason):
             NSApp.activate(ignoringOtherApps: true)
             let a = NSAlert()

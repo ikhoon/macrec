@@ -31,6 +31,49 @@ func libraryFixtureDays() -> [LibraryDay] {
 }
 
 func librarySelftests(_ check: (String, Bool) -> Void) {
+    // #34: the tray "summary:" row opens IN-APP — libraryEntryToSelect finds the row for a given file.
+    // A transcript matches by its SUMMARY (so the Summary view opens on it); a digest by its own file;
+    // a redundant path component (./ or ../) still matches (standardized); an unknown file → nil.
+    let tx = URL(fileURLWithPath: "/tmp/s1.md"), sum = URL(fileURLWithPath: "/tmp/s1-sum.md")
+    let dig = URL(fileURLWithPath: "/tmp/2026-03-02.md")
+    let selDays = [LibraryDay(day: "2026-03-02", entries: [
+        LibraryEntry(day: "2026-03-02", time: nil, title: nil, kind: .digest, url: dig, summaryURL: nil, audioURL: nil),
+        LibraryEntry(day: "2026-03-02", time: "14:00", title: "a", kind: .transcript, url: tx, summaryURL: sum, audioURL: nil),
+    ])]
+    let selBySummary = libraryEntryToSelect(days: selDays, target: sum)
+    check("library: entry-to-select finds the row by summary or own file, standardizes, else nil",
+          selBySummary?.url == tx && selBySummary?.kind == .transcript                                       // via summaryURL
+              && libraryEntryToSelect(days: selDays, target: dig)?.kind == .digest                           // via own file
+              && libraryEntryToSelect(days: selDays, target: URL(fileURLWithPath: "/tmp/x/../s1-sum.md"))?.url == tx  // standardized
+              && libraryEntryToSelect(days: selDays, target: URL(fileURLWithPath: "/tmp/nope.md")) == nil)
+    // Review: roots expand "~" symmetrically with the WRITE side — a typed "~/dir" summary root must
+    // not be scanned literally (else the tray click dead-ends on a file written to the real path).
+    check("library: roots expand ~ symmetrically (typed ~/dir isn't scanned literally)",
+          !libraryRoots(transcripts: "~/t", summaryOut: "~/s", dailyOut: "", audioDir: "").summaries.hasPrefix("~")
+              && libraryRoots(transcripts: "/abs", summaryOut: "", dailyOut: "", audioDir: "").summaries == "/abs")
+    // WIRING (dead-affordance lesson): the tray summary row drives the REAL show(selecting:) logic to
+    // land its right pane ON the summary AND on the digest (a distinct picker-hidden branch) — not just
+    // the pure matcher. Both fixture rows have no file on disk, so they must resolve via the index.
+    let wTx = URL(fileURLWithPath: "/tmp/wire-tx.md"), wSum = URL(fileURLWithPath: "/tmp/wire-sum.md")
+    let wDig = URL(fileURLWithPath: "/tmp/wire-2026-03-02.md")
+    LibraryWindow.shared.loadFixtureForTest([LibraryDay(day: "2026-03-02", entries: [
+        LibraryEntry(day: "2026-03-02", time: nil, title: nil, kind: .digest, url: wDig, summaryURL: nil, audioURL: nil),
+        LibraryEntry(day: "2026-03-02", time: "14:00", title: "x", kind: .transcript, url: wTx, summaryURL: wSum, audioURL: nil),
+    ])])
+    check("library: tray row opens the Library ON the summary AND the digest (in-app, not Finder)",
+          LibraryWindow.shared.showSelectingForTest(wSum) == wSum      // transcript → its Summary
+              && LibraryWindow.shared.showSelectingForTest(wDig) == wDig)   // digest → its own file (picker hidden)
+    // A target on disk but NOT indexed (orphaned summary / custom-named digest) renders IN-APP directly
+    // — never a dead click, never Finder (review P1). An absent file → nil.
+    let orphan = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("macrec-orphan-\(UUID().uuidString).md")
+    try? "# orphan\n\nbody".write(to: orphan, atomically: true, encoding: .utf8)
+    check("library: an on-disk-but-unindexed summary renders in-app, not a dead click; absent → nil",
+          LibraryWindow.shared.showSelectingForTest(orphan) == orphan
+              && LibraryWindow.shared.showSelectingForTest(URL(fileURLWithPath: "/tmp/absent-\(UUID().uuidString).md")) == nil)
+    try? FileManager.default.removeItem(at: orphan)
+    LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore the rich default
+
     // Stem parsing — every real shape in the vault, plus the garbage that must not crash the scan.
     let full = parseLibraryStem("2026-03-02-1030-project-kickoff")
     let bare = parseLibraryStem("2026-03-02-1030")
