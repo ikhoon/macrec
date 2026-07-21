@@ -158,9 +158,6 @@ final class TodayWindow: NSObject, NSWindowDelegate {
         // The detail is a WRAPPING caption, capped to a readable measure. A single-line label's
         // compression resistance (750) beats the window's set size, so the longest sentence used to
         // FORCE the whole window ~950 pt wide (user: "가로로만 겁내 길어") — wrap instead of stretch.
-        // The detail is a WRAPPING caption, capped to a readable measure. A single-line label's
-        // compression resistance (750) beats the window's set size, so the longest sentence used to
-        // FORCE the whole window ~950 pt wide (user: "가로로만 겁내 길어") — wrap instead of stretch.
         let detail = wrappingCaption(row.detail)
         detail.widthAnchor.constraint(lessThanOrEqualToConstant: 430).isActive = true
         let text = NSStackView(views: [title, detail])
@@ -181,7 +178,11 @@ final class TodayWindow: NSObject, NSWindowDelegate {
         let h = NSStackView(views: views)
         h.orientation = .horizontal
         h.spacing = 8
-        h.alignment = .centerY
+        // firstBaseline, not centerY (review): a wrapped 2-3 line detail makes the row tall, and a
+        // center-aligned dot/button drifts into the middle of the PARAGRAPH — annotating the caption
+        // instead of the title. Baseline-align to the title's first line; the baseline-less dot sits
+        // its bottom edge on that baseline, which reads as a bullet on the title.
+        h.alignment = .firstBaseline
         h.edgeInsets = NSEdgeInsets(top: 4, left: 0, bottom: 4, right: 0)
         h.translatesAutoresizingMaskIntoConstraints = false
         text.setContentHuggingPriority(.defaultLow, for: .horizontal)
