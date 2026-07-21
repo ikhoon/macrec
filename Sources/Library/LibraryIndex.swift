@@ -25,6 +25,25 @@ struct LibraryDay: Equatable, Hashable {
     var entries: [LibraryEntry]
 }
 
+/// The files removed when a Library entry is deleted: the transcript/digest itself, its same-stem
+/// summary, and its audio — BOTH the raw .wav and the archived .m4a (whichever exist), since retention
+/// may have compressed one into the other. Pure + selftested; the caller filters to those that exist and
+/// moves them to the Trash (recoverable). Deduped by standardized path, stable order.
+func libraryDeletionSet(_ e: LibraryEntry) -> [URL] {
+    var urls = [e.url]
+    if e.kind == .digest {   // the #146 structured sidecar (<date>.json) sits next to the digest .md
+        urls.append(e.url.deletingPathExtension().appendingPathExtension("json"))
+    }
+    if let s = e.summaryURL { urls.append(s) }
+    if let a = e.audioURL {
+        urls.append(a)
+        let other = a.pathExtension.lowercased() == "wav" ? "m4a" : "wav"
+        urls.append(a.deletingPathExtension().appendingPathExtension(other))
+    }
+    var seen = Set<String>()
+    return urls.filter { seen.insert($0.standardizedFileURL.path).inserted }
+}
+
 /// The entry to select for a given file `target` — the tray "summary:" row's in-app destination.
 /// A transcript row matches when the target IS its summary (so the Summary view opens on it); any row
 /// matches when the target is its own file (a digest, or a summary opened by its own path). Returns the
