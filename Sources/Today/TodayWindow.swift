@@ -59,7 +59,10 @@ final class TodayWindow: NSObject, NSWindowDelegate {
         w.isReleasedWhenClosed = false
         w.delegate = self
         w.minSize = NSSize(width: 380, height: 320)
-        w.setFrameAutosaveName("todayWindow")
+        // "todayWindow2": the pre-wrap builds autosaved the ~950 pt width the stretch bug FORCED (the
+        // user never chose it), so restoring under the old key would reopen wide forever. A new key
+        // abandons the poisoned frame once; resizes from here on persist normally under the new name.
+        w.setFrameAutosaveName("todayWindow2")
         let content = NSView()
 
         // Header: a big status dot + the overall one-liner (worst row wins).
@@ -68,6 +71,8 @@ final class TodayWindow: NSObject, NSWindowDelegate {
         overallDot.layer?.cornerRadius = 7
         overallLabel.font = .systemFont(ofSize: 15, weight: .semibold)
         overallLabel.lineBreakMode = .byTruncatingTail
+        // Truncate rather than stretch: the header one-liner must never force the window wide either.
+        overallLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let header = NSStackView(views: [overallDot, overallLabel])
         header.orientation = .horizontal
         header.spacing = 10
@@ -150,10 +155,14 @@ final class TodayWindow: NSObject, NSWindowDelegate {
 
         let title = NSTextField(labelWithString: row.title)
         title.font = .systemFont(ofSize: 13, weight: .medium)
-        let detail = NSTextField(labelWithString: row.detail)
-        detail.font = .systemFont(ofSize: 11)
-        detail.textColor = .secondaryLabelColor
-        detail.lineBreakMode = .byTruncatingTail
+        // The detail is a WRAPPING caption, capped to a readable measure. A single-line label's
+        // compression resistance (750) beats the window's set size, so the longest sentence used to
+        // FORCE the whole window ~950 pt wide (user: "가로로만 겁내 길어") — wrap instead of stretch.
+        // The detail is a WRAPPING caption, capped to a readable measure. A single-line label's
+        // compression resistance (750) beats the window's set size, so the longest sentence used to
+        // FORCE the whole window ~950 pt wide (user: "가로로만 겁내 길어") — wrap instead of stretch.
+        let detail = wrappingCaption(row.detail)
+        detail.widthAnchor.constraint(lessThanOrEqualToConstant: 430).isActive = true
         let text = NSStackView(views: [title, detail])
         text.orientation = .vertical
         text.spacing = 1
@@ -262,6 +271,24 @@ final class TodayWindow: NSObject, NSWindowDelegate {
         }
         walk(content)
         return issues
+    }
+
+    /// REGRESSION SEAM (selftest): the laid-out height of the detail label containing `fragment`, at the
+    /// default content size. A SINGLE-LINE detail is the stretch bug — its >500 intrinsic priority made
+    /// the onscreen window grow to the longest sentence (~950 pt, user: "가로로만 겁내 길어"). That window
+    /// growth only happens in AppKit's onscreen layout pass, which a headless test cannot run — so the
+    /// guard pins the CAUSE instead: the long detail must WRAP (≥ 2 line heights) at the set width.
+    func detailHeightForTest(containing fragment: String,
+                             at size: NSSize = NSSize(width: 480, height: 560)) -> CGFloat {
+        guard let win = window, let content = win.contentView else { return -1 }
+        win.setContentSize(size)
+        content.layoutSubtreeIfNeeded()
+        func find(_ v: NSView) -> NSTextField? {
+            if let t = v as? NSTextField, t.stringValue.contains(fragment) { return t }
+            for sub in v.subviews { if let hit = find(sub) { return hit } }
+            return nil
+        }
+        return find(content)?.frame.height ?? -1
     }
 
     /// UI TEST KIT (see `macrec today-snapshot`): render the fixture-filled window to a PNG.
