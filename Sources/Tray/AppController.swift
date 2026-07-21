@@ -930,12 +930,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        // Windowed-app staples: ⌘W closes the front window; ⌘Q routes through the delegate's
-        // terminate reply (window-close while the Library is up, a real quit otherwise).
+        // ⌘Q routes through the delegate's terminate reply — window-close, not app-death.
         let fileItem = NSMenuItem(); main.addItem(fileItem)
         let file = NSMenu(title: "File"); fileItem.submenu = file
         file.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
-        file.addItem(withTitle: "Quit macrec", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        file.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         return main
     }
 
