@@ -103,6 +103,7 @@ func todaySelftests(_ check: (String, Bool) -> Void) {
     var mix = ok; mix.captureTest = .silent; mix.calendarGranted = false
     mix.summary = .failed("x.md", dateAt(hour: 14, minute: 0), reason: "Not logged in")
     mix.outageSeconds = 18 * 3600   // #27: a past outage row must render an "Open log" button, not a dead end
+    mix.capturedSilenceToday = true // dropped-metric: a "Recorded silence earlier" row must also open the log
     mix.notificationsDenied = true  // #33: a "Notifications off" row must render a Settings… deep-link
     let tw = TodayWindow.shared
     tw.loadFixtureForTest(todayHealth(mix))
@@ -113,6 +114,7 @@ func todaySelftests(_ check: (String, Bool) -> Void) {
               && tw.actionButtonTitleForTest(rowTitle: "Calendar") == "Grant…"
               && tw.actionButtonTitleForTest(rowTitle: "Summary FAILED") == "Retry"
               && tw.actionButtonTitleForTest(rowTitle: "Recorder was down earlier") == "Open log"   // not a dead affordance
+              && tw.actionButtonTitleForTest(rowTitle: "Recorded silence earlier") == "Open log"    // dropped-metric row
               && tw.actionButtonTitleForTest(rowTitle: "Notifications") == "Settings…"              // #33 deep-link
               && tw.actionButtonTitleForTest(rowTitle: "Microphone") == nil)   // granted → no button
     // The stretch regression (user: "가로로만 겁내 길어"): a single-line detail label's intrinsic width

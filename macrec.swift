@@ -291,6 +291,7 @@ enum Pref {
     static let recorderOutageAt = "recorderOutageAt"      // epoch a silent outage was detected on the following start
     static let recorderOutageSeconds = "recorderOutageSeconds"  // how long that outage lasted (seconds)
     static let watchdogQuitRequested = "watchdogQuitRequested"  // #36b: set on a deliberate Quit → the watchdog leaves it dead
+    static let capturedSilenceAt = "capturedSilenceAt"    // epoch a run's live mic scored pure silence across consecutive segments; day-keyed
     static let postProcessCmd = "postProcessCmd"        // freeform command ("" = off)
     static let hintsTerms = "hintsTerms"                // transcription hint terms (comma/newline separated)
     static let hintsFile = "hintsFile"                  // external hints file (one term per line, # comments)
@@ -586,6 +587,7 @@ struct CompletedSegment {
     let sysPeak: Float
     let micPeak: Float
     let durationSeconds: Double
+    var adopted = false   // a PRIOR run's orphan replayed on start — not evidence about THIS run's capture
     /// Either side speaking is worth transcribing (covers listen-only meetings where only sys speaks).
     var voicedSeconds: Double { max(micVoicedSeconds, sysVoicedSeconds) }
     var speechSeconds: Double { max(micSpeechSeconds, sysSpeechSeconds) }   // sustained envelope only (clicks ≈ 0)

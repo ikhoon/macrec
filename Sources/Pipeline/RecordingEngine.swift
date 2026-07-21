@@ -19,9 +19,12 @@ final class RecordingEngine {
     private var exclusionRefresh: DispatchWorkItem?   // debounces the app-launch / output-change tap re-scan
     private var outputListenerRegistered = false      // register the default-output listener exactly once
     private var warnedDeadMic = false            // one dead-mic push per engine run (not per hour)
+    private var silentSegmentStreak = 0          // consecutive live-mic pure-silence segments (dropped-metric)
+    private var warnedCapturedSilence = false    // one captured-silence push per engine run
     var onTranscriptSaved: ((String) -> Void)?   // (message) — for refreshing UI state
     var onTranscriptURL: ((URL) -> Void)?        // path of the saved transcript file — notification click → open file
     var onSegmentResult: ((String) -> Void)?      // (message) — notify even when dropped for no speech
+    var micGrantedProbe: () -> Bool = { micAuthorized() }   // injectable: the selftest bundle has no TCC grant
 
     init(cfg: EngineConfig) {
         self.cfg = cfg
@@ -168,7 +171,9 @@ final class RecordingEngine {
         let t = DispatchSource.makeTimerSource(queue: timerQueue)
         t.schedule(deadline: .now() + firstDelay, repeating: cfg.segmentSeconds)
         t.setEventHandler { [weak self] in
-            guard let self = self, let seg = self.session.rotate() else { return }
+            // No rotation while suspended: the writers are fresh-but-empty during a lock, and the
+            // resulting all-zero segments would both waste work and read as a dead capture.
+            guard let self = self, !self.suspended, let seg = self.session.rotate() else { return }
             self.processQueue.async { self.process(seg); self.cleanupRetention() }
         }
         t.resume()
@@ -271,6 +276,29 @@ final class RecordingEngine {
                               body: "The mic records energy but nothing speech-like. Check System Settings → Sound → Input.")
             }
         }
+        // Captured-silence detector (the dropped-metric class): a LIVE mic delivering pure digital
+        // zero across consecutive rotations is muted/dead — every segment gets discarded for "no
+        // speech" and nothing is transcribed, invisibly. Distinct from micLooksDead (energy without
+        // speech); here there is NO energy. Only eligible live rotations count (a locked, unpermitted,
+        // manual, or adopted segment is silent by DESIGN, not by failure).
+        if captureSilenceEligible(micGranted: micGrantedProbe(), suspended: suspended,
+                                  manual: manual, adopted: seg.adopted) {
+            if isCaptureSilent(micPeak: seg.micPeak) {
+                silentSegmentStreak += 1
+                if !warnedCapturedSilence, capturedSilenceRun(silentStreak: silentSegmentStreak) {
+                    warnedCapturedSilence = true
+                    CaptureSilence.record()
+                    elog("engine: CAPTURE SILENCE — \(silentSegmentStreak) consecutive live segments with a zero mic; input may be muted/dead")
+                    onSegmentResult?("Capturing silence — check the input device / mic mute")
+                    Notifier.push(title: "macrec is recording silence",
+                                  body: "Recent segments captured no mic audio at all — check the input device and mic mute (System Settings → Sound → Input).")
+                }
+            } else {
+                silentSegmentStreak = 0
+            }
+        } else {
+            silentSegmentStreak = 0   // an ineligible segment breaks CONSECUTIVE — else two silent
+        }                             // rotations straddling a manual flush would still alarm
         // debugKeepTrackAudio: keep the PER-TRACK mic/sys wavs (normally deleted after the mix) —
         // transcription-quality A/B work (echo-dedup validation against real meetings) needs the
         // separated tracks, and the mixed wav can't be un-mixed. Kept files move into processed/
@@ -423,7 +451,7 @@ final class RecordingEngine {
                                            micVoicedSeconds: mic?.voiced ?? 0, sysVoicedSeconds: sys?.voiced ?? 0,
                                            micSpeechSeconds: mic?.speech ?? 0, sysSpeechSeconds: sys?.speech ?? 0,
                                            sysPeak: sys?.peak ?? 0, micPeak: mic?.peak ?? 0,
-                                           durationSeconds: dur)
+                                           durationSeconds: dur, adopted: true)
                 elog("engine: adopting orphaned segment \(stem) (dur \(Int(dur))s)")
                 self.process(seg)
             }

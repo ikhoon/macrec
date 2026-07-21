@@ -36,6 +36,9 @@ struct HealthInputs {
     // A silent outage detected on this run's start (the recorder was dead for a stretch while the mac
     // was awake) — seconds, or 0 when there's nothing to report. Surfaced so a past gap isn't invisible.
     var outageSeconds: Double = 0
+    // A run's live mic scored pure silence across consecutive segments earlier today (muted/dead
+    // input) — everything was discarded and nothing transcribed. Day-keyed; clears the next day.
+    var capturedSilenceToday = false
     // macOS notification authorization is DEFINITIVELY denied (not merely undetermined). When it is, the
     // outage/health push alerts silently never arrive — the user must be told in-app, or they trust a
     // safety net that isn't there. Default false (assume ok until the async query says otherwise).
@@ -104,6 +107,12 @@ func todayHealth(_ i: HealthInputs) -> [HealthRow] {
         rows.append(HealthRow(group: "Capture", title: "Recorder was down earlier",
                               detail: "No recording for ~\(humanDuration(i.outageSeconds)) today — a meeting in that window may not have been captured. Open the log for details.",
                               level: .warn, action: .showLog))
+    }
+    // The engine already pushed once at detection, so the row opts out of the background alert.
+    if i.capturedSilenceToday {
+        rows.append(HealthRow(group: "Capture", title: "Recorded silence earlier",
+                              detail: "Some recording earlier today captured no mic audio at all — a muted or wrong input device drops every segment. Check Sound → Input; open the log for details.",
+                              level: .warn, action: .showLog, suppressBackgroundAlert: true))
     }
 
     // ---- Permissions ----

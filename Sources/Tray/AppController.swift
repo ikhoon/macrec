@@ -588,6 +588,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         h.digestTime = Pref.str(Pref.dailyDigestTime, "MR_DAILY_DIGEST_TIME", "20:00")
         h.digestRanToday = Pref.explicit(Pref.dailyDigestLastRun, "") == todayString()
         h.outageSeconds = RecorderHeartbeat.outageForToday()
+        h.capturedSilenceToday = CaptureSilence.detectedToday()
         h.notificationsDenied = notifDenied
         h.now = Date()
         return h
