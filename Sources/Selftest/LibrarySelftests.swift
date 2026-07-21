@@ -235,10 +235,10 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     check("windowed app: policy follows the Library; only a real quit terminates",
           windowedActivationPolicy(libraryVisible: true) == .regular
               && windowedActivationPolicy(libraryVisible: false) == .accessory
-              && terminateShouldJustCloseWindow(realQuit: false, libraryVisible: true)      // ⌘Q → close
-              && !terminateShouldJustCloseWindow(realQuit: true, libraryVisible: true)      // tray/system → quit
-              && !terminateShouldJustCloseWindow(realQuit: false, libraryVisible: false)    // headless ⌘Q → quit
-              && !terminateShouldJustCloseWindow(realQuit: true, libraryVisible: false))
+              && terminateShouldJustCloseWindow(realQuit: false, windowVisible: true)      // ⌘Q → close
+              && !terminateShouldJustCloseWindow(realQuit: true, windowVisible: true)      // tray/logout → quit
+              && !terminateShouldJustCloseWindow(realQuit: false, windowVisible: false)    // windowless → quit
+              && !terminateShouldJustCloseWindow(realQuit: true, windowVisible: false))
 
     // Stem parsing — every real shape in the vault, plus the garbage that must not crash the scan.
     let full = parseLibraryStem("2026-03-02-1030-project-kickoff")

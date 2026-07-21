@@ -880,12 +880,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         openLibrary(); return true
     }
 
-    /// ⌘Q while the windowed surface is up CLOSES it (back to the menu-bar agent) — a windowed-app
-    /// reflex must never kill 24/7 recording. The tray Quit and system stops (flagged) really quit.
+    /// ⌘Q while any app window is up CLOSES that window (back to the menu-bar agent) — a windowed
+    /// reflex must never kill 24/7 recording. The tray Quit, SIGTERM, and a logout/shutdown-reasoned
+    /// quit event really quit (cancelling logout would BLOCK it — worse than any lost window).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if terminateShouldJustCloseWindow(realQuit: realQuitRequested,
-                                          libraryVisible: LibraryWindow.shared.isVisible) {
-            LibraryWindow.shared.closeWindow()
+        if let ev = NSAppleEventManager.shared().currentAppleEvent,
+           ev.eventClass == AEEventClass(kCoreEventClass), ev.eventID == AEEventID(kAEQuitApplication),
+           ev.attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason)) != nil {
+            realQuitRequested = true   // logout / restart / shutdown carries a quit reason
+        }
+        // Titled windows only: the status-item window and the borderless caption overlay are always
+        // "visible" and would otherwise swallow every quit forever.
+        let windowUp = NSApp.windows.first { $0.isVisible && $0.styleMask.contains(.titled) }
+        if terminateShouldJustCloseWindow(realQuit: realQuitRequested, windowVisible: windowUp != nil) {
+            (NSApp.keyWindow?.styleMask.contains(.titled) == true ? NSApp.keyWindow : windowUp)?
+                .performClose(nil)
             return .terminateCancel
         }
         return .terminateNow

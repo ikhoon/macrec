@@ -9,10 +9,10 @@ func windowedActivationPolicy(libraryVisible: Bool) -> NSApplication.ActivationP
     libraryVisible ? .regular : .accessory
 }
 
-/// Should a terminate request merely CLOSE the windowed surface instead of quitting? A windowed-app
-/// user's reflexive ⌘Q must never kill 24/7 recording — only the tray's deliberate Quit (which sets
-/// the watchdog flag) and system-initiated stops (SIGTERM/logout/shutdown, which must never be
-/// cancelled) actually terminate. Pure.
-func terminateShouldJustCloseWindow(realQuit: Bool, libraryVisible: Bool) -> Bool {
-    !realQuit && libraryVisible
+/// Should a terminate request merely CLOSE the front window instead of quitting? A reflexive ⌘Q
+/// from ANY of the app's windows (Library, Status, Settings, Log) must never kill 24/7 recording —
+/// only the tray's deliberate Quit (which arms the watchdog's stay-dead flag) and system-initiated
+/// stops (SIGTERM / a logout-reasoned quit event, which must never be cancelled) terminate. Pure.
+func terminateShouldJustCloseWindow(realQuit: Bool, windowVisible: Bool) -> Bool {
+    !realQuit && windowVisible
 }
