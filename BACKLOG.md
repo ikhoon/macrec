@@ -7,9 +7,16 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
 
 - [ ] **Today dashboard follow-ups** (increment 1 shipped: capture/permissions/pipeline/output health
       with fix buttons, tray → Today… ⌘D). red→system-notification path so a closed window still warns
-      ✅ (#150, #32 — debounced BAD-condition push). Next: a verdict for the *dropped-metric*
-      silent-failure class (all-audio-scored-0s → everything discarded) — needs a live segment-level
-      speech signal, not just the last-run status; per-permission Settings deep-link.
+      ✅ (#150, #32 — debounced BAD-condition push). Dropped-metric verdict ✅ (#165 — a live mic
+      recording pure digital silence across consecutive rotations is surfaced; mic-only + gated after
+      a review round rejected the two-source signal for cry-wolf). Long-detail stretch fixed ✅ (#161).
+      Next: per-permission Settings deep-link.
+
+- [x] **Windowed desktop app, increment 1** (maintainer asks, all shipped tonight): a Delete button on
+      every Library list row ✅ (#162); a month calendar above the list — click a date, see that day,
+      ✕ chip clears from any month ✅ (#163); a real windowed app while the Library is open (Dock,
+      ⌘Tab, Dock-reopen opens the window) with ⌘Q downgraded to window-close so it can never kill
+      24/7 recording ✅ (#164).
 
 - [x] **Recorder reliability — the recurring "macrec 꺼져있네" outage.** Silent-outage *detection*: a
       process-lifetime heartbeat + after-the-fact loud surfacing (#27, #148). *Prevention*: opt out of
