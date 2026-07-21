@@ -721,6 +721,20 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
           && !micLooksDead(voiced: 3.0, speech: 0.0)    // quiet hour — no verdict
           && !micLooksDead(voiced: 8.0, speech: 0.0)    // backchannel-only hour (short utterances) — no cry-wolf
           && !micLooksDead(voiced: 6.0, speech: 0.6))   // borderline but speech present
+    // Captured-silence (dropped-metric): MIC peak only — the system tap is exactly 0 whenever no
+    // app plays, so it can never separate dead from idle. A live mic's noise floor clears epsilon.
+    check("capture silence: zero mic is silence; a noise floor or a voice is not; streak needs 2",
+          isCaptureSilent(micPeak: 0.0) && isCaptureSilent(micPeak: 0.0005)
+              && !isCaptureSilent(micPeak: 0.005) && !isCaptureSilent(micPeak: 0.3)
+              && !capturedSilenceRun(silentStreak: 1) && capturedSilenceRun(silentStreak: 2))
+    // Eligibility: ONLY a live, permitted rotation counts — locked/unpermitted/manual/adopted
+    // segments are silent by design and once cried wolf (review P0s on the first cut).
+    check("capture silence: eligibility excludes suspended, unpermitted, manual, and adopted",
+          captureSilenceEligible(micGranted: true, suspended: false, manual: false, adopted: false)
+              && !captureSilenceEligible(micGranted: false, suspended: false, manual: false, adopted: false)
+              && !captureSilenceEligible(micGranted: true, suspended: true, manual: false, adopted: false)
+              && !captureSilenceEligible(micGranted: true, suspended: false, manual: true, adopted: false)
+              && !captureSilenceEligible(micGranted: true, suspended: false, manual: false, adopted: true))
     // Hallucination scrubbing — the exact failure classes from our junk transcripts:
     // a broadcast hour where one sentence repeated for 15 minutes, YouTube-outro
     // boilerplate on quiet rooms, "oh oh oh…" degeneration. Real speech must survive.

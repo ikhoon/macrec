@@ -198,6 +198,32 @@ func scenarioSelftests(_ check: (String, Bool) -> Void) {
             check("scenario S-PIPELINE(e): an uncalendared call with real speech is kept by the auto path",
                   fix.micSpeech >= 18 && body.contains("안녕하세요"))
         }
+        // (f) dropped-metric: two LIVE zero-mic segments fire ONE push + the day-keyed verdict; a
+        // voiced run never does. Eligibility corners (suspended/manual/adopted) are unit-pinned.
+        do {
+            var pushes = 0
+            Notifier.sinkForTest = { t, _ in if t.contains("recording silence") { pushes += 1 } }
+            var voicedResults: [String] = []
+            if let fix = writeFixtureWAVs(voiced: true) {
+                let e = RecordingEngine(cfg: cfg(model: model.path, calendarTitles: false))
+                e.micGrantedProbe = { true }
+                e.onSegmentResult = { voicedResults.append($0) }
+                e.process(segment(fix, start: date("2026-03-01 17:00:00")))
+            }
+            let e2 = RecordingEngine(cfg: cfg(model: model.path, calendarTitles: false))
+            e2.micGrantedProbe = { true }
+            var silentResults: [String] = []
+            e2.onSegmentResult = { silentResults.append($0) }
+            for h in ["18", "19"] {
+                if let fix = writeFixtureWAVs(voiced: false) {
+                    e2.process(segment(fix, start: date("2026-03-01 \(h):00:00")))
+                }
+            }
+            check("scenario S-PIPELINE(f): a zero-mic run is surfaced once (dropped-metric); a voiced run is not",
+                  pushes == 1 && silentResults.contains { $0.contains("Capturing silence") }
+                      && CaptureSilence.detectedToday()
+                      && !voicedResults.contains { $0.contains("Capturing silence") })
+        }
         Notifier.sinkForTest = nil
         try? fm.removeItem(at: scratch)
     }

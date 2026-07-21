@@ -205,6 +205,7 @@ func runTodaySnapshotSubcommand(_ args: [String]) -> Never {
     i.transcriptsToday = 3; i.summariesToday = 2
     i.digestEnabled = true; i.digestTime = "20:00"
     i.notificationsDenied = true   // #33: exercise the "Notifications off" warn row + its Settings… button
+    i.capturedSilenceToday = true  // dropped-metric: exercise the "Recorded silence earlier" warn row
     TodayWindow.shared.loadFixtureForTest(todayHealth(i))
     let files = TodayWindow.shared.snapshot(to: dir)
     for f in files { print(f.path) }
