@@ -50,6 +50,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private var lastBadHealth: Set<String> = []   // #32: BAD keys from the previous tick (2-tick debounce)
     private let launchedAt = Date()               // #32: startup grace so transient boot states don't alert
     private var notifDenied = false               // #33: notification auth is definitively denied (alerts won't arrive)
+    private var realQuitRequested = false         // tray Quit / system stop — terminate really terminates
     private var recordingActivity: NSObjectProtocol?   // #36: held for the process lifetime so macOS won't reap the idle recorder
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -109,6 +110,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
             // `engine` is main-confined (voice poll, menu actions read it there) — the signal source
             // fires on its own queue, so hop to main before touching it (review finding: racy mutation).
             DispatchQueue.main.async {
+                self?.realQuitRequested = true   // a system stop must terminate — never be downgraded to window-close
                 self?.stopEngineSync()
                 NSApp.terminate(nil)
             }
@@ -872,9 +874,30 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         }
     }
 
-    /// Clicking the app icon in /Applications/Launchpad/Dock while it's running → open the tray menu.
+    /// Clicking the app icon in /Applications/Launchpad/Dock while it's running → the windowed app
+    /// (the Library), not just the tray menu — a real app comes forward when reopened.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
-        openMenu(); return true
+        openLibrary(); return true
+    }
+
+    /// ⌘Q while any app window is up CLOSES that window (back to the menu-bar agent) — a windowed
+    /// reflex must never kill 24/7 recording. The tray Quit, SIGTERM, and a logout/shutdown-reasoned
+    /// quit event really quit (cancelling logout would BLOCK it — worse than any lost window).
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if let ev = NSAppleEventManager.shared().currentAppleEvent,
+           ev.eventClass == AEEventClass(kCoreEventClass), ev.eventID == AEEventID(kAEQuitApplication),
+           ev.attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason)) != nil {
+            realQuitRequested = true   // logout / restart / shutdown carries a quit reason
+        }
+        // Titled windows only: the status-item window and the borderless caption overlay are always
+        // "visible" and would otherwise swallow every quit forever.
+        let windowUp = NSApp.windows.first { $0.isVisible && $0.styleMask.contains(.titled) }
+        if terminateShouldJustCloseWindow(realQuit: realQuitRequested, windowVisible: windowUp != nil) {
+            (NSApp.keyWindow?.styleMask.contains(.titled) == true ? NSApp.keyWindow : windowUp)?
+                .performClose(nil)
+            return .terminateCancel
+        }
+        return .terminateNow
     }
 
     /// Open the tray menu programmatically (when the app is clicked in /Applications).
@@ -907,6 +930,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        // ⌘Q routes through the delegate's terminate reply — window-close, not app-death.
+        let fileItem = NSMenuItem(); main.addItem(fileItem)
+        let file = NSMenu(title: "File"); fileItem.submenu = file
+        file.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        file.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         return main
     }
 
@@ -1006,6 +1034,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     // (which also fires on logout / SIGTERM / bootout, the very deaths #27 must surface). So the
     // forgiving clean-stop marker is written here alone.
     @objc private func quit() {
+        realQuitRequested = true
         RecorderHeartbeat.noteUserQuit()
         Pref.d.set(true, forKey: Pref.watchdogQuitRequested)   // #36b: deliberate Quit — the watchdog leaves it dead
         Pref.d.synchronize()   // flush to cfprefsd BEFORE we die, so the watchdog daemon reads the flag, not a stale false

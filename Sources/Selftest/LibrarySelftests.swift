@@ -229,6 +229,17 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     LibraryWindow.shared.calendarPickForTest("2026-03-01")   // toggle the pick back off
     LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
 
+    // Windowed-app lifecycle: a Dock identity only while the Library is up, and ⌘Q downgrades to a
+    // window close UNLESS the quit is deliberate (tray Quit) or system-initiated (SIGTERM/logout —
+    // cancelling those would block shutdown and starve the watchdog's clean-exit path).
+    check("windowed app: policy follows the Library; only a real quit terminates",
+          windowedActivationPolicy(libraryVisible: true) == .regular
+              && windowedActivationPolicy(libraryVisible: false) == .accessory
+              && terminateShouldJustCloseWindow(realQuit: false, windowVisible: true)      // ⌘Q → close
+              && !terminateShouldJustCloseWindow(realQuit: true, windowVisible: true)      // tray/logout → quit
+              && !terminateShouldJustCloseWindow(realQuit: false, windowVisible: false)    // windowless → quit
+              && !terminateShouldJustCloseWindow(realQuit: true, windowVisible: false))
+
     // Stem parsing — every real shape in the vault, plus the garbage that must not crash the scan.
     let full = parseLibraryStem("2026-03-02-1030-project-kickoff")
     let bare = parseLibraryStem("2026-03-02-1030")
