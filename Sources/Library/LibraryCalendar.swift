@@ -47,10 +47,9 @@ func libraryGridCalendar(from current: Calendar = .current) -> Calendar {
 
 // MARK: - the calendar sidebar (dumb renderer of monthGrid)
 
-/// A compact month calendar above the Library list (the maintainer asked for a calendar-first way
-/// into a day's recordings). Recorded days read accent, empty days dim; clicking a day filters the
-/// list to it, re-clicking (or the ✕ chip) clears. All decisions (grid, shift, filter) are pure
-/// and selftested; this view only materializes them into buttons.
+/// A compact month calendar above the Library list: recorded days read accent, empty days dim;
+/// clicking a day filters the list to it, re-clicking (or the ✕ chip) clears. All decisions
+/// (grid, shift, filter) are pure and selftested; this view only materializes them into buttons.
 final class LibraryCalendarView: NSView {
     /// The picked day ("yyyy-MM-dd"), or nil when the pick was cleared. The window owns the filter.
     var onPick: ((String?) -> Void)?
@@ -95,7 +94,7 @@ final class LibraryCalendarView: NSView {
         grid.spacing = 1
         grid.alignment = .centerX
         // The clear chip: the ONLY always-reachable way out of a day filter once the user pages to
-        // another month (the picked cell — the toggle — is then off-screen; CodeRabbit + review).
+        // another month (the picked cell — the toggle — is then off-screen).
         clearBtn.bezelStyle = .inline
         clearBtn.controlSize = .small
         clearBtn.font = .systemFont(ofSize: 10)
@@ -232,13 +231,13 @@ final class LibraryCalendarView: NSView {
         b.widthAnchor.constraint(equalToConstant: 24).isActive = true
         b.heightAnchor.constraint(equalToConstant: 22).isActive = true
         b.toolTip = has ? "\(day) — show only this day's recordings" : "\(day) — no recordings"
-        // VoiceOver hears the DATE and whether it holds recordings, not a bare number (CodeRabbit).
+        // VoiceOver hears the DATE and whether it holds recordings, not a bare number.
         b.setAccessibilityLabel("\(day), \(has ? "has recordings" : "no recordings")")
         return b
     }
 
     // Selftest hooks: drive the RENDERED controls (performClick on the real button — a fabricated
-    // action could pass with no visible control wired at all; CodeRabbit), read the state back.
+    // action could pass with no visible control wired at all), read the state back.
     @discardableResult
     func pickForTest(_ day: String) -> Bool {
         let hit = grid.arrangedSubviews.dropFirst()

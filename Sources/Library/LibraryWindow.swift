@@ -647,7 +647,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// The shared confirm→Trash flow, entry-parameterized so BOTH the detail-pane Delete and each list
     /// row's trash button (user ask: the affordance must live on the list too) run the same path.
     func confirmDelete(_ e: LibraryEntry) {
-        // Click-through seam (CodeRabbit on #162): with the hook set, a performClick on a row's
+        // Click-through seam: with the hook set, a performClick on a row's
         // trash button records WHICH entry the real target/action chain resolved to — proving the
         // click path end-to-end without a modal sheet in a headless test.
         if let hook = confirmDeleteHookForTest { hook(e); return }
@@ -1048,7 +1048,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             // showed before scrolling. The confirm→Trash flow is the same one the detail Delete runs.
             cell.entry = e
             cell.owner = self
-            // VoiceOver must be able to tell WHICH recording each row's trash deletes (CodeRabbit).
+            // VoiceOver must be able to tell WHICH recording each row's trash deletes.
             cell.deleteBtn.setAccessibilityLabel("Delete \(spec.text)")
         }
         return cell

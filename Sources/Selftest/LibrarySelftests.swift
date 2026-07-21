@@ -130,7 +130,7 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     let rowDel = LibraryWindow.shared.rowDeleteBindingsForTest()
     check("library: every list row carries a wired trash button bound to its own entry",
           rowDel.rows > 0 && rowDel.bound == rowDel.rows)
-    // CLICK-THROUGH (CodeRabbit on #162): wiring metadata alone can't prove a tap ARRIVES — fire a
+    // CLICK-THROUGH: wiring metadata alone can't prove a tap ARRIVES — fire a
     // real performClick on a row's trash and assert the target/action chain resolved confirmDelete
     // with that row's OWN entry (the hook stands in for the modal sheet, headless).
     var clickedEntry: LibraryEntry?
@@ -199,7 +199,7 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
           sixRows == 6 && LibraryWindow.shared.calendarMonthForTest == "2026-02"
               && LibraryWindow.shared.calendarWeekRowCountForTest() == 6)
     // The ✕ chip is the only always-reachable clear once the user pages AWAY from the picked day's
-    // month — the picked cell (the toggle) is then off-screen (CodeRabbit + review). Real controls:
+    // month — the picked cell (the toggle) is then off-screen. Real controls:
     // the pick lands on a RENDERED button (the honest seam refuses an off-grid date), the flip goes
     // through ‹, and the chip's performClick restores every day.
     LibraryWindow.shared.calendarFlipForTest(by: 1)   // back to 2026-03 (the 6-week check left Feb shown)
