@@ -870,17 +870,22 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     /// An entry row's cell: icon + one-line label + an always-visible trash button (user ask: the
     /// delete affordance must be reachable from the LIST, not only the detail pane). The button is
-    /// subtle (borderless, secondary tint) so a hundred rows don't shout; `onDelete` is re-bound to
-    /// the row's CURRENT entry on every reuse so a recycled cell can never delete a stale one.
+    /// subtle (borderless, template-tinted) so a hundred rows don't shout; `entry`/`owner` are
+    /// re-bound to the row's CURRENT entry on every reuse so a recycled cell can never delete a
+    /// stale one.
     final class LibraryEntryCell: NSTableCellView {
         let deleteBtn: NSButton = {
             let b = NSButton()
             b.translatesAutoresizingMaskIntoConstraints = false
             b.bezelStyle = .inline
             b.isBordered = false
-            b.image = NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete")?
-                .withSymbolConfiguration(.init(pointSize: 10, weight: .regular)
-                    .applying(.init(paletteColors: [.secondaryLabelColor])))
+            // A TEMPLATE image (not palette-baked): the glyph then inverts with the emphasized blue
+            // selection like the rest of the row, instead of staying dim gray on it.
+            let img = NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete")?
+                .withSymbolConfiguration(.init(pointSize: 10, weight: .regular))
+            img?.isTemplate = true
+            b.image = img
+            b.contentTintColor = .secondaryLabelColor
             b.toolTip = "Move this recording's files to the Trash (asks first)"
             return b
         }()
