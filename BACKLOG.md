@@ -11,6 +11,13 @@ Grouped by the `VISION.md` pillars. Checked = done/merged. Kept current as work 
       silent-failure class (all-audio-scored-0s → everything discarded) — needs a live segment-level
       speech signal, not just the last-run status; per-permission Settings deep-link.
 
+- [x] **Recorder reliability — the recurring "macrec 꺼져있네" outage.** Silent-outage *detection*: a
+      process-lifetime heartbeat + after-the-fact loud surfacing (#27, #148). *Prevention*: opt out of
+      macOS automatic/sudden termination so an idle `LSUIElement` recorder isn't reaped on a clean exit
+      KeepAlive won't relaunch (#36, #155; Today→Status rename #35). *Recovery*: a KeepAlive watchdog
+      daemon (`macrec watchdog-daemon`) self-heals the recorder within ~60 s of any non-deliberate death,
+      while a deliberate Quit stays quit (#36b, #158). Lessons in AGENTS.md §2.15–2.18 (#156, #159).
+
 - [x] **Modularize `Sources/` into per-module directories** — pure byte-identical moves, one module/PR.
       Audio/ · Live/ (#99), Tray/ (#106), Pipeline/ (#107), Settings/ (#108), Selftest/ (#109). All done.
 - [ ] **Eval harness — ko/ja quality measurement** (quality priority zero). CER metrics (ja/ko) ✅ (#110).
