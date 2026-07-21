@@ -201,6 +201,7 @@ func scenarioSelftests(_ check: (String, Bool) -> Void) {
         // (f) dropped-metric: two LIVE zero-mic segments fire ONE push + the day-keyed verdict; a
         // voiced run never does. Eligibility corners (suspended/manual/adopted) are unit-pinned.
         do {
+            Pref.d.removeObject(forKey: Pref.capturedSilenceAt)   // no stale same-day verdict
             var pushes = 0
             Notifier.sinkForTest = { t, _ in if t.contains("recording silence") { pushes += 1 } }
             var voicedResults: [String] = []
@@ -219,10 +220,15 @@ func scenarioSelftests(_ check: (String, Bool) -> Void) {
                     e2.process(segment(fix, start: date("2026-03-01 \(h):00:00")))
                 }
             }
+            // Day-keying with INJECTED dates: same-day reads back, the next local day clears.
+            let stamp = date("2026-03-01 19:00:00")
+            CaptureSilence.record(now: stamp)
             check("scenario S-PIPELINE(f): a zero-mic run is surfaced once (dropped-metric); a voiced run is not",
                   pushes == 1 && silentResults.contains { $0.contains("Capturing silence") }
-                      && CaptureSilence.detectedToday()
+                      && CaptureSilence.detectedToday(now: stamp)
+                      && !CaptureSilence.detectedToday(now: date("2026-03-02 09:00:00"))
                       && !voicedResults.contains { $0.contains("Capturing silence") })
+            Pref.d.removeObject(forKey: Pref.capturedSilenceAt)   // don't leak the warn into later suites
         }
         Notifier.sinkForTest = nil
         try? fm.removeItem(at: scratch)

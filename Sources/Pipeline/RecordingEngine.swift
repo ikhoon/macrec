@@ -296,7 +296,9 @@ final class RecordingEngine {
             } else {
                 silentSegmentStreak = 0
             }
-        }
+        } else {
+            silentSegmentStreak = 0   // an ineligible segment breaks CONSECUTIVE — else two silent
+        }                             // rotations straddling a manual flush would still alarm
         // debugKeepTrackAudio: keep the PER-TRACK mic/sys wavs (normally deleted after the mix) —
         // transcription-quality A/B work (echo-dedup validation against real meetings) needs the
         // separated tracks, and the mixed wav can't be un-mixed. Kept files move into processed/
