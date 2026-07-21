@@ -150,6 +150,7 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     var cal = Calendar(identifier: .gregorian)
     cal.firstWeekday = 1
     cal.timeZone = TimeZone(identifier: "Asia/Seoul")!
+    cal.locale = Locale(identifier: "en_US_POSIX")
     let july = monthGrid("2026-07", calendar: cal)   // 2026-07-01 is a Wednesday
     let feb = monthGrid("2024-02", calendar: cal)    // leap month, 29 days
     check("library calendar: grid weekday placement, whole-week padding, leap month, ‹ › across years",
@@ -158,7 +159,10 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
               && feb.joined().compactMap { $0 }.count == 29 && feb[0][4] == "2024-02-01"
               && monthShift("2026-01", by: -1, calendar: cal) == "2025-12"
               && monthShift("2026-12", by: 1, calendar: cal) == "2027-01"
-              && weekdayHeaders(calendar: cal).count == 7)
+              // CONTENT, not count (count==7 is true by construction — a vacuous pin): Sunday-first
+              // English letters, exactly. The view builds its own gregorian/POSIX calendar the same way.
+              && weekdayHeaders(calendar: cal) == ["S", "M", "T", "W", "T", "F", "S"]
+              && libraryGridCalendar(from: cal).identifier == .gregorian)
     // The day filter is one more pure input: only that day's group survives, it composes with the
     // kind scope, and nil means every day (the existing behavior, unchanged).
     let fixDays = libraryFixtureDays()
@@ -168,16 +172,47 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
               && libraryFiltered(fixDays, filter: "", day: nil).count == fixDays.count
               && libraryFiltered(fixDays, filter: "", day: "2020-01-01").isEmpty)
     // WIRING: a pick through the REAL calendar view filters the outline to that day; picking the
-    // same day again clears it (toggle). The month opens where the data is (the newest fixture day).
-    LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
+    // same day again clears it (toggle). The month opens where the data is: a TWO-month fixture —
+    // with every fixture day in one month, "follows the newest" and "any month with data" would be
+    // indistinguishable and the assertion vacuous (review finding).
+    var twoMonths = libraryFixtureDays()
+    twoMonths.append(LibraryDay(day: "2026-02-27", entries: [
+        LibraryEntry(day: "2026-02-27", time: "11:00", title: "sprint review", kind: .transcript,
+                     url: URL(fileURLWithPath: "/tmp/library-fixture.md"), summaryURL: nil, audioURL: nil),
+    ]))
+    LibraryWindow.shared.loadFixtureForTest(twoMonths)
     LibraryWindow.shared.calendarPickForTest("2026-03-01")
     let picked = (LibraryWindow.shared.selectedDayForTest, LibraryWindow.shared.shownDayCountForTest)
     LibraryWindow.shared.calendarPickForTest("2026-03-01")
     let cleared = (LibraryWindow.shared.selectedDayForTest, LibraryWindow.shared.shownDayCountForTest)
     check("library calendar: a pick filters the list to that day, a re-pick clears, month follows data",
-          picked == ("2026-03-01", 1) && cleared.0 == nil && cleared.1 == 2
-              && LibraryWindow.shared.calendarMonthForTest == "2026-03"
+          picked == ("2026-03-01", 1) && cleared.0 == nil && cleared.1 == 3
+              && LibraryWindow.shared.calendarMonthForTest == "2026-03"   // newest month, not February
               && LibraryWindow.shared.calendarDayButtonCountForTest() == 31)   // March renders 31 day buttons
+    // The grid height is CONSTANT (always 6 week rows): a 5-week month would bounce the list ~23px
+    // on every ‹ › page. And the auto-follow contract: the month tracks the newest data only until
+    // the user pages — then their browsing owns it and a rescan must not snap it back.
+    let sixRows = LibraryWindow.shared.calendarWeekRowCountForTest()
+    LibraryWindow.shared.calendarFlipForTest(by: -1)   // → 2026-02, user-navigated
+    LibraryWindow.shared.loadFixtureForTest(twoMonths) // rescan while browsed away
+    check("library calendar: constant 6-week height; a browsed month survives a rescan",
+          sixRows == 6 && LibraryWindow.shared.calendarMonthForTest == "2026-02"
+              && LibraryWindow.shared.calendarWeekRowCountForTest() == 6)
+    // The tray deep-link clears an active day filter AND the calendar highlight must follow — a
+    // stale view copy makes the next click on that day a dead toggle (review P1).
+    LibraryWindow.shared.loadFixtureForTest(twoMonths)
+    LibraryWindow.shared.calendarPickForTest("2026-03-01")
+    _ = LibraryWindow.shared.showSelectingForTest(URL(fileURLWithPath: "/tmp/library-fixture.md"))
+    let syncedOff = LibraryWindow.shared.calendarSelectedDayForTest == nil
+        && LibraryWindow.shared.selectedDayForTest == nil
+    LibraryWindow.shared.calendarPickForTest("2026-03-01")   // first click must FILTER, not dead-toggle
+    check("library calendar: a deep-link clears the highlight too — the next pick filters first-click",
+          syncedOff && LibraryWindow.shared.selectedDayForTest == "2026-03-01"
+              && LibraryWindow.shared.shownDayCountForTest == 1)
+    // The window is a SINGLETON — clear the pick and restore the default fixture, or the leftover
+    // day filter leaks into every later check (it silently emptied the scope/re-run suites once).
+    LibraryWindow.shared.calendarPickForTest("2026-03-01")   // toggle the pick back off
+    LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
 
     // Stem parsing — every real shape in the vault, plus the garbage that must not crash the scan.
     let full = parseLibraryStem("2026-03-02-1030-project-kickoff")

@@ -129,6 +129,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         guard let hit = libraryEntryToSelect(days: allDays, target: target) else { return false }
         searchField.stringValue = ""; scopePicker.selectedSegment = 0
         selectedDay = nil   // an active calendar day-filter would hide the target's row too
+        calendarView.syncSelection(nil)   // the view's highlight must follow, or it lies (review P1)
         applyFilter()   // unfiltered outline so reselect finds the row
         reselect(url: hit.url, kind: hit.kind)
         return true
@@ -166,11 +167,12 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         // keep their entry so a completion can still land its failure reason.
         let urls = Set(allDays.flatMap(\.entries).map(\.url))
         rerunPhase = rerunPhase.filter { $0.value == .running || urls.contains($0.key) }
-        // The calendar mirrors the scan: recorded days light up; the shown month starts where the
-        // data is (the newest day), then the user's ‹ › browsing owns it.
+        // The calendar mirrors the scan: recorded days light up. The month FOLLOWS the newest data
+        // until the user pages with ‹ › — then their browsing owns it (a new recording must move an
+        // auto-tracking grid, but must never snap a browsed month back; review finding).
         let today = Self.dayString(Date())
-        let month = calendarView.month.isEmpty
-            ? String((allDays.first?.day ?? today).prefix(7)) : calendarView.month
+        let month = calendarView.userNavigated
+            ? calendarView.month : String((allDays.first?.day ?? today).prefix(7))
         calendarView.load(month: month, contentDays: Set(allDays.map(\.day)),
                           selectedDay: selectedDay, today: today)
         applyFilter()
@@ -265,7 +267,6 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         let left = NSStackView(views: [calendarView, leftScroll])
         left.orientation = .vertical
         left.spacing = 0
-        left.translatesAutoresizingMaskIntoConstraints = false
         calendarView.leadingAnchor.constraint(equalTo: left.leadingAnchor).isActive = true
         calendarView.trailingAnchor.constraint(equalTo: left.trailingAnchor).isActive = true
         leftScroll.leadingAnchor.constraint(equalTo: left.leadingAnchor).isActive = true
@@ -354,9 +355,11 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         split.translatesAutoresizingMaskIntoConstraints = false
         split.addArrangedSubview(left)
         split.addArrangedSubview(right)
-        // Classic (autoresizing) pane sizing, NOT autolayout: with anchored arranged subviews the
-        // split view logged an ambiguous-layout warning and refused full divider dragging (observed
-        // live the first night). Pane minimums live in the delegate instead.
+        // Classic (autoresizing) pane sizing, NOT autolayout — for BOTH panes: with anchored
+        // arranged subviews the split view logged an ambiguous-layout warning and refused full
+        // divider dragging (observed live the first night). Pane minimums live in the delegate.
+        left.translatesAutoresizingMaskIntoConstraints = true
+        left.autoresizingMask = [.width, .height]
         right.translatesAutoresizingMaskIntoConstraints = true
         right.autoresizingMask = [.width, .height]
         split.delegate = self
@@ -405,10 +408,13 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         // a digest has no searchable title, so any real query hides them and "no digests yet" would
         // lie (review finding).
         let filterActive = !searchField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty
+        // The picked-day case reads FIRST and folds the scope in — with a day picked AND the Daily
+        // scope, "no daily digests yet" would blame the wrong filter (review finding).
         emptyLabel.stringValue = allDays.isEmpty
             ? "Nothing here yet — transcripts appear as meetings are recorded."
-            : (selectedDay != nil && !filterActive && onlyKind == nil)
-            ? "No recordings on \(selectedDay ?? "") — click the date again to show every day."
+            : (selectedDay != nil && !filterActive)
+            ? "No \(onlyKind == .digest ? "daily digests" : "recordings") on \(selectedDay ?? "")"
+            + " — click the date again to show every day."
             : (onlyKind == .digest && !filterActive) ? "No daily digests yet — they're written once a day."
             : "No match for the current filter."
         // Keep the preview in sync: the selected file may be gone after a rescan (showEntry(nil)
@@ -1126,8 +1132,11 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     // Calendar wiring hooks: drive a day pick through the REAL view + onPick chain, read the state.
     func calendarPickForTest(_ day: String) { calendarView.pickForTest(day) }
     var selectedDayForTest: String? { selectedDay }
+    var calendarSelectedDayForTest: String? { calendarView.selectedDay }   // the VIEW's copy (desync guard)
     var calendarMonthForTest: String { calendarView.month }
     func calendarDayButtonCountForTest() -> Int { calendarView.dayButtonCountForTest() }
+    func calendarWeekRowCountForTest() -> Int { calendarView.weekRowCountForTest }
+    func calendarFlipForTest(by: Int) { calendarView.flipForTest(by: by) }
 
     var playerBarHiddenForTest: Bool { playerBar.isHidden }
     var playerActiveForTest: Bool { player != nil }

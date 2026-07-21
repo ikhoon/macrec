@@ -34,6 +34,17 @@ func weekdayHeaders(calendar: Calendar = .current) -> [String] {
     return (0 ..< 7).map { syms[(start + $0) % syms.count] }
 }
 
+/// The grid's working calendar: always GREGORIAN — the library's "yyyy-MM-dd" stems are Gregorian
+/// by construction, and a Buddhist/Japanese system calendar would mis-place every cell — with
+/// English symbols to match the app's UI language, keeping the user's week start and timezone.
+func libraryGridCalendar(from current: Calendar = .current) -> Calendar {
+    var c = Calendar(identifier: .gregorian)
+    c.locale = Locale(identifier: "en_US_POSIX")
+    c.firstWeekday = current.firstWeekday
+    c.timeZone = current.timeZone
+    return c
+}
+
 // MARK: - the calendar sidebar (dumb renderer of monthGrid)
 
 /// A compact month calendar above the Library list (user ask: "왼쪽에는 달력") — days that HAVE
@@ -46,8 +57,12 @@ final class LibraryCalendarView: NSView {
 
     private(set) var month: String = "" // "yyyy-MM" currently shown
     private(set) var selectedDay: String?
+    /// True once the user pages with ‹ › — until then the window keeps the month on the newest data
+    /// (a recording landing in a new month must move the grid; a browsed month must not snap back).
+    private(set) var userNavigated = false
     private var contentDays: Set<String> = []
     private var today: String = ""
+    private let cal = libraryGridCalendar()
     private let monthLabel = NSTextField(labelWithString: "")
     private let grid = NSStackView()
     private let titleFormatter: DateFormatter = {
@@ -102,10 +117,25 @@ final class LibraryCalendarView: NSView {
         rebuild()
     }
 
+    /// Window-driven selection sync (the tray deep-link clears the filter): the view's own copy must
+    /// follow, or the highlight lies AND the next click toggles the stale value into a dead first click.
+    func syncSelection(_ day: String?) {
+        guard selectedDay != day else { return }
+        selectedDay = day
+        rebuild()
+    }
+
+    /// Appearance/accent changes re-resolve the layer colors (a CGColor is captured statically).
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        if !month.isEmpty { rebuild() }
+    }
+
     @objc private func prevMonth() { flip(by: -1) }
     @objc private func nextMonth() { flip(by: 1) }
     private func flip(by: Int) {
-        month = monthShift(month, by: by)
+        userNavigated = true
+        month = monthShift(month, by: by, calendar: cal)
         rebuild()
     }
 
@@ -119,14 +149,14 @@ final class LibraryCalendarView: NSView {
     private func rebuild() {
         // "yyyy-MM" → "MMM yyyy" via the grid's own first real day (no second parsing convention).
         monthLabel.stringValue = month
-        if let first = monthGrid(month).joined().compactMap({ $0 }).first {
+        if let first = monthGrid(month, calendar: cal).joined().compactMap({ $0 }).first {
             let f = DateFormatter()
             f.locale = Locale(identifier: "en_US_POSIX")
             f.dateFormat = "yyyy-MM-dd"
             if let d = f.date(from: first) { monthLabel.stringValue = titleFormatter.string(from: d) }
         }
         grid.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        let headerRow = NSStackView(views: weekdayHeaders().map { s in
+        let headerRow = NSStackView(views: weekdayHeaders(calendar: cal).map { s in
             let l = NSTextField(labelWithString: s)
             l.font = .systemFont(ofSize: 9, weight: .semibold)
             l.textColor = .tertiaryLabelColor
@@ -138,7 +168,11 @@ final class LibraryCalendarView: NSView {
         headerRow.orientation = .horizontal
         headerRow.spacing = 1
         grid.addArrangedSubview(headerRow)
-        for week in monthGrid(month) {
+        // Always SIX week rows (pad short months with empty rows): a 5-week month would otherwise
+        // change the calendar's height and make the list below jump ~23 px on every ‹ › page.
+        var weeks = monthGrid(month, calendar: cal)
+        while weeks.count < 6 { weeks.append([String?](repeating: nil, count: 7)) }
+        for week in weeks {
             let row = NSStackView(views: week.map { day in dayButton(day) })
             row.orientation = .horizontal
             row.spacing = 1
@@ -158,10 +192,19 @@ final class LibraryCalendarView: NSView {
         b.identifier = NSUserInterfaceItemIdentifier(day)
         b.isBordered = false
         b.font = .systemFont(ofSize: 11, weight: day == today ? .bold : .regular)
-        b.contentTintColor = day == selectedDay ? .white : has ? .labelColor : .tertiaryLabelColor
+        // System "text on emphasized selection" color, not a hardcoded white — the accent color is
+        // user-configurable and the light accents (yellow/green) would wash a white number out.
+        b.contentTintColor = day == selectedDay ? .alternateSelectedControlTextColor
+            : has ? .labelColor : .tertiaryLabelColor
         b.wantsLayer = true
         b.layer?.cornerRadius = 4
         b.layer?.backgroundColor = day == selectedDay ? NSColor.controlAccentColor.cgColor : nil
+        // Today keeps a weight-INDEPENDENT marker (a thin accent ring): bold alone disappears on an
+        // unrecorded (tertiary-dimmed) today.
+        if day == today, day != selectedDay {
+            b.layer?.borderWidth = 1
+            b.layer?.borderColor = NSColor.controlAccentColor.cgColor
+        }
         // The content marker: a dot under the number would need a taller row — an accent-tinted
         // number reads just as fast at this size, so recorded days are accent unless selected.
         if has, day != selectedDay { b.contentTintColor = .controlAccentColor }
@@ -178,9 +221,14 @@ final class LibraryCalendarView: NSView {
         dayTapped(b)
     }
 
+    func flipForTest(by: Int) { flip(by: by) }
     var monthForTest: String { month }
     func dayButtonCountForTest() -> Int {
         grid.arrangedSubviews.dropFirst().flatMap { ($0 as? NSStackView)?.arrangedSubviews ?? [] }
             .compactMap { $0 as? NSButton }.count
     }
+
+    /// Week rows currently rendered (excluding the weekday header) — pinned at a constant 6 so the
+    /// list below never jumps when paging between 5- and 6-week months.
+    var weekRowCountForTest: Int { grid.arrangedSubviews.count - 1 }
 }
