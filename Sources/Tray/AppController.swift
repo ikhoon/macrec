@@ -50,6 +50,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private var lastBadHealth: Set<String> = []   // #32: BAD keys from the previous tick (2-tick debounce)
     private let launchedAt = Date()               // #32: startup grace so transient boot states don't alert
     private var notifDenied = false               // #33: notification auth is definitively denied (alerts won't arrive)
+    private var realQuitRequested = false         // tray Quit / system stop — terminate really terminates
     private var recordingActivity: NSObjectProtocol?   // #36: held for the process lifetime so macOS won't reap the idle recorder
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -109,6 +110,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
             // `engine` is main-confined (voice poll, menu actions read it there) — the signal source
             // fires on its own queue, so hop to main before touching it (review finding: racy mutation).
             DispatchQueue.main.async {
+                self?.realQuitRequested = true   // a system stop must terminate — never be downgraded to window-close
                 self?.stopEngineSync()
                 NSApp.terminate(nil)
             }
@@ -872,9 +874,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         }
     }
 
-    /// Clicking the app icon in /Applications/Launchpad/Dock while it's running → open the tray menu.
+    /// Clicking the app icon in /Applications/Launchpad/Dock while it's running → the windowed app
+    /// (the Library), not just the tray menu — a real app comes forward when reopened.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
-        openMenu(); return true
+        openLibrary(); return true
+    }
+
+    /// ⌘Q while the windowed surface is up CLOSES it (back to the menu-bar agent) — a windowed-app
+    /// reflex must never kill 24/7 recording. The tray Quit and system stops (flagged) really quit.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if terminateShouldJustCloseWindow(realQuit: realQuitRequested,
+                                          libraryVisible: LibraryWindow.shared.isVisible) {
+            LibraryWindow.shared.closeWindow()
+            return .terminateCancel
+        }
+        return .terminateNow
     }
 
     /// Open the tray menu programmatically (when the app is clicked in /Applications).
@@ -907,6 +921,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        // Windowed-app staples: ⌘W closes the front window; ⌘Q routes through the delegate's
+        // terminate reply (window-close while the Library is up, a real quit otherwise).
+        let fileItem = NSMenuItem(); main.addItem(fileItem)
+        let file = NSMenu(title: "File"); fileItem.submenu = file
+        file.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        file.addItem(withTitle: "Quit macrec", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         return main
     }
 
@@ -1006,6 +1026,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     // (which also fires on logout / SIGTERM / bootout, the very deaths #27 must surface). So the
     // forgiving clean-stop marker is written here alone.
     @objc private func quit() {
+        realQuitRequested = true
         RecorderHeartbeat.noteUserQuit()
         Pref.d.set(true, forKey: Pref.watchdogQuitRequested)   // #36b: deliberate Quit — the watchdog leaves it dead
         Pref.d.synchronize()   // flush to cfprefsd BEFORE we die, so the watchdog daemon reads the flag, not a stale false
