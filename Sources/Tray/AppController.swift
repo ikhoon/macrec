@@ -50,6 +50,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
     private var lastBadHealth: Set<String> = []   // #32: BAD keys from the previous tick (2-tick debounce)
     private let launchedAt = Date()               // #32: startup grace so transient boot states don't alert
     private var notifDenied = false               // #33: notification auth is definitively denied (alerts won't arrive)
+    private var recordingActivity: NSObjectProtocol?   // #36: held for the process lifetime so macOS won't reap the idle recorder
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Single instance: if a copy is already running (the LaunchAgent one), just tell it to open
@@ -62,6 +63,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
                 .init("com.ikhoon.macrec.openMenu"), object: nil, deliverImmediately: true)
             NSApp.terminate(nil); return
         }
+        // #36 (root cause of the recurring "macrec 꺼져있네" outage): an LSUIElement accessory app is a
+        // candidate for macOS automatic/sudden termination when it looks idle. macrec exits 0 when reaped,
+        // and launchd KeepAlive (SuccessfulExit=false) does NOT relaunch a clean exit — so it stays dead
+        // (observed: DOWN 62 min, no crash report). Opt out for the whole session so the recorder isn't
+        // reaped; the #27 heartbeat only DETECTED this — this prevents it. (System sleep is untouched: the
+        // engine still suspends on sleep and resumes on wake.)
+        ProcessInfo.processInfo.disableSuddenTermination()
+        ProcessInfo.processInfo.disableAutomaticTermination("continuous meeting recording")
+        recordingActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.automaticTerminationDisabled, .suddenTerminationDisabled],
+            reason: "macrec records meetings continuously")
         buildMenu()
         NSApp.mainMenu = Self.editShortcutMenu()   // wire ⌘X/C/V/A/Z app-wide (accessory apps have no Edit menu)
         // Credentials now live in a 0600 file (see Keychain), read lazily — no startup keychain access at
@@ -226,7 +238,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
         grantItem = grant
         menu.addItem(grant)
         menu.addItem(item("Settings…", #selector(openSettings), ",", symbol: "gearshape"))
-        menu.addItem(item("Today…", #selector(openToday), "d", symbol: "heart.text.square"))
+        menu.addItem(item("Status…", #selector(openToday), "d", symbol: "heart.text.square"))
         menu.addItem(item("Library…", #selector(openLibrary), "l", symbol: "books.vertical"))
         menu.addItem(item("Open transcripts folder", #selector(openTranscripts), "o", symbol: "folder"))
         menu.addItem(item("Show log", #selector(showLog), symbol: "text.alignleft"))
