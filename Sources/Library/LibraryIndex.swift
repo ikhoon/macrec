@@ -25,6 +25,19 @@ struct LibraryDay: Equatable, Hashable {
     var entries: [LibraryEntry]
 }
 
+/// The entry to select for a given file `target` — the tray "summary:" row's in-app destination.
+/// A transcript row matches when the target IS its summary (so the Summary view opens on it); any row
+/// matches when the target is its own file (a digest, or a summary opened by its own path). Returns the
+/// row's transcript URL + kind (what `reselect` keys on). Pure + selftested; path-standardized so a
+/// `/private` or symlinked path still matches.
+func libraryEntryToSelect(days: [LibraryDay], target: URL) -> (url: URL, kind: LibraryEntry.Kind)? {
+    let t = target.standardizedFileURL.path
+    for e in days.flatMap(\.entries) where e.summaryURL?.standardizedFileURL.path == t || e.url.standardizedFileURL.path == t {
+        return (e.url, e.kind)
+    }
+    return nil
+}
+
 /// Parse a library file STEM — "YYYY-MM-DD-HHMM[-title]" or the digest's bare "YYYY-MM-DD".
 /// Hyphens in the title read as spaces for display. Returns nil for stems without a leading date
 /// (stray files must never crash the scan — they are simply not library entries).

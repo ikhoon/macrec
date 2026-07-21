@@ -45,9 +45,13 @@ func libraryClock(_ seconds: Double) -> String {
 /// (dailyDigestOutputPath's rule). Pure so the fallback chain is testable.
 func libraryRoots(transcripts: String, summaryOut: String, dailyOut: String, audioDir: String)
     -> (transcripts: String, summaries: String, daily: String, audio: String) {
+    // Expand "~" symmetrically with the WRITE side (summaryOutputPath / dailyDigestOutputPath both
+    // expandingTildeInPath): a typed "~/sums" dir would otherwise scan a literal "~" folder, find no
+    // summaries, and the tray "summary:" click would dead-end on a file it wrote to the real path.
+    func expand(_ p: String) -> String { p.isEmpty ? p : (p as NSString).expandingTildeInPath }
     let s = summaryOut.isEmpty ? transcripts : summaryOut
     let d = dailyOut.isEmpty ? s : dailyOut
-    return (transcripts, s, d, audioDir)
+    return (expand(transcripts), expand(s), expand(d), expand(audioDir))
 }
 
 // MARK: - the Library window (the desktop app's first surface)
@@ -93,12 +97,59 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     private var shownDays: [LibraryDay] = []
     private var fixtureDays: [LibraryDay]? // test/snapshot data — nil means scan the real folders
     private var selected: LibraryEntry?
+    private var standaloneURL: URL? // a file rendered directly (tray fallback: on disk but not indexed)
 
     func show() {
         if window == nil { build() }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         refresh()
+    }
+
+    /// Open the window on `target` (a summary or digest file) and show it — the tray "summary:" row's
+    /// in-app destination, replacing the old reveal-in-Finder. An INDEXED target selects its row and the
+    /// Summary view; a target that's on disk but not indexed (orphaned summary, custom-named digest) is
+    /// rendered directly — still in-app, never bouncing to Finder (user request). Never a dead click.
+    func show(selecting target: URL) {
+        show()   // makeKeyAndOrderFront + refresh() → allDays populated
+        if !selectIndexed(target), FileManager.default.fileExists(atPath: target.path) {
+            renderStandalone(target)
+        }
+    }
+
+    /// Select the indexed row for `target` (clearing any filter FIRST so reselect's row exists) and show
+    /// its Summary. Returns false — WITHOUT touching the filter — when the target isn't indexed, so a
+    /// miss leaves the user's browsing place. Shared by `show(selecting:)` and its test hook, so the
+    /// selftest drives this real logic rather than a mirror (test-honesty).
+    private func selectIndexed(_ target: URL) -> Bool {
+        guard let hit = libraryEntryToSelect(days: allDays, target: target) else { return false }
+        searchField.stringValue = ""; scopePicker.selectedSegment = 0
+        applyFilter()   // unfiltered outline so reselect finds the row
+        reselect(url: hit.url, kind: hit.kind)
+        return true
+    }
+
+    /// Render a file NOT in the index directly in the right pane — the tray fallback when a summary's
+    /// transcript was deleted/renamed or a custom-named digest isn't a library row. In-app markdown, so
+    /// the user still sees the note (Open/Reveal act on this file via currentDocURL's standalone branch).
+    private func renderStandalone(_ url: URL) {
+        stopPlayback()
+        selected = nil
+        standaloneURL = url
+        headerLabel.stringValue = url.deletingPathExtension().lastPathComponent
+        headerLabel.toolTip = url.path
+        docPicker.isHidden = true
+        playerBar.isHidden = true
+        openBtn.isEnabled = true
+        revealBtn.isEnabled = true
+        applyHeaderActions()
+        if let data = try? Data(contentsOf: url, options: .mappedIfSafe) {
+            let text = String(decoding: data.prefix(2_000_000), as: UTF8.self)
+            textView.textStorage?.setAttributedString(MarkdownRender.render(text, baseURL: url, transcriptStart: nil))
+            textView.scrollToBeginningOfDocument(nil)
+        } else {
+            setPlainDoc("(could not read \(url.path))")
+        }
     }
 
     /// Re-scan sources. Called on open, on focus, and when the engine saves a transcript — the
@@ -337,6 +388,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// from here, so a clickable control can never point at a document that isn't there.
     private func showEntry(_ entry: LibraryEntry?) {
         stopPlayback()   // switching rows silences the previous file and resets the bar
+        standaloneURL = nil   // a real selection supersedes any tray-fallback standalone render
         selected = entry
         guard let e = entry else {
             headerLabel.stringValue = ""
@@ -371,7 +423,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     /// The URL the right pane is currently showing (summary first — segment 0 — or the transcript).
     private func currentDocURL() -> URL? {
-        guard let e = selected else { return nil }
+        guard let e = selected else { return standaloneURL }   // standalone fallback (tray: not indexed)
         if !docPicker.isHidden, docPicker.selectedSegment == 0, let s = e.summaryURL { return s }
         return e.url
     }
@@ -858,6 +910,17 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     // Selection-driven state, readable by selftests: drive rows like a user, assert the derivation
     // (player bar visibility, lazy load, resets) without audible playback.
     func selectForTest(_ e: LibraryEntry?) { showEntry(e) }
+    /// Drives the REAL show(selecting:) logic (selectIndexed + the standalone fallback) minus only the
+    /// window-front hop, and returns the URL the right pane lands on — so the selftest exercises the
+    /// actual method, not a mirror (test-honesty). nil when the target is neither indexed nor on disk.
+    func showSelectingForTest(_ target: URL) -> URL? {
+        refresh()
+        if !selectIndexed(target) {
+            guard FileManager.default.fileExists(atPath: target.path) else { return nil }
+            renderStandalone(target)
+        }
+        return currentDocURL()
+    }
     var playerBarHiddenForTest: Bool { playerBar.isHidden }
     var playerActiveForTest: Bool { player != nil }
     var openEnabledForTest: Bool { openBtn.isEnabled }
