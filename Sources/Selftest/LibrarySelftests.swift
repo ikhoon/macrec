@@ -130,6 +130,104 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     let rowDel = LibraryWindow.shared.rowDeleteBindingsForTest()
     check("library: every list row carries a wired trash button bound to its own entry",
           rowDel.rows > 0 && rowDel.bound == rowDel.rows)
+    // CLICK-THROUGH: wiring metadata alone can't prove a tap ARRIVES — fire a
+    // real performClick on a row's trash and assert the target/action chain resolved confirmDelete
+    // with that row's OWN entry (the hook stands in for the modal sheet, headless).
+    var clickedEntry: LibraryEntry?
+    LibraryWindow.shared.confirmDeleteHookForTest = { clickedEntry = $0 }
+    let kickoffRow = (0 ..< 20).first {
+        (LibraryWindow.shared.outlineItemForTest(row: $0) as? LibraryEntry)?.title == "project kickoff"
+    }
+    let clicked = kickoffRow.map { LibraryWindow.shared.clickRowDeleteForTest(row: $0) } ?? false
+    LibraryWindow.shared.confirmDeleteHookForTest = nil
+    check("library: a real click on a row's trash resolves confirmDelete with that row's entry",
+          clicked && clickedEntry?.title == "project kickoff" && clickedEntry?.kind == .transcript)
+
+    // The calendar sidebar (user ask): the pure month grid — cells land on the right weekdays, the
+    // month pads to whole weeks, leap February exists, and ‹ › arithmetic crosses year boundaries.
+    // A FIXED calendar (gregorian, Sunday-first, Seoul) — a test reading the machine's calendar
+    // passes here and fails on a Monday-first laptop (the environment decides the answer).
+    var cal = Calendar(identifier: .gregorian)
+    cal.firstWeekday = 1
+    cal.timeZone = TimeZone(identifier: "Asia/Seoul")!
+    cal.locale = Locale(identifier: "en_US_POSIX")
+    let july = monthGrid("2026-07", calendar: cal)   // 2026-07-01 is a Wednesday
+    let feb = monthGrid("2024-02", calendar: cal)    // leap month, 29 days
+    check("library calendar: grid weekday placement, whole-week padding, leap month, ‹ › across years",
+          july.count == 5 && july[0][3] == "2026-07-01" && july[0][2] == nil
+              && july[4][5] == "2026-07-31" && july[4][6] == nil
+              && feb.joined().compactMap { $0 }.count == 29 && feb[0][4] == "2024-02-01"
+              && monthShift("2026-01", by: -1, calendar: cal) == "2025-12"
+              && monthShift("2026-12", by: 1, calendar: cal) == "2027-01"
+              // CONTENT, not count (count==7 is true by construction — a vacuous pin): Sunday-first
+              // English letters, exactly. The view builds its own gregorian/POSIX calendar the same way.
+              && weekdayHeaders(calendar: cal) == ["S", "M", "T", "W", "T", "F", "S"]
+              && libraryGridCalendar(from: cal).identifier == .gregorian)
+    // The day filter is one more pure input: only that day's group survives, it composes with the
+    // kind scope, and nil means every day (the existing behavior, unchanged).
+    let fixDays = libraryFixtureDays()
+    check("library calendar: the day filter keeps one day, composes with kind, nil keeps all",
+          libraryFiltered(fixDays, filter: "", day: "2026-03-01").map(\.day) == ["2026-03-01"]
+              && libraryFiltered(fixDays, filter: "", onlyKind: .digest, day: "2026-03-01").isEmpty
+              && libraryFiltered(fixDays, filter: "", day: nil).count == fixDays.count
+              && libraryFiltered(fixDays, filter: "", day: "2020-01-01").isEmpty)
+    // WIRING: a pick through the REAL calendar view filters the outline to that day; picking the
+    // same day again clears it (toggle). The month opens where the data is: a TWO-month fixture —
+    // with every fixture day in one month, "follows the newest" and "any month with data" would be
+    // indistinguishable and the assertion vacuous (review finding).
+    var twoMonths = libraryFixtureDays()
+    twoMonths.append(LibraryDay(day: "2026-02-27", entries: [
+        LibraryEntry(day: "2026-02-27", time: "11:00", title: "sprint review", kind: .transcript,
+                     url: URL(fileURLWithPath: "/tmp/library-fixture.md"), summaryURL: nil, audioURL: nil),
+    ]))
+    LibraryWindow.shared.loadFixtureForTest(twoMonths)
+    LibraryWindow.shared.calendarPickForTest("2026-03-01")
+    let picked = (LibraryWindow.shared.selectedDayForTest, LibraryWindow.shared.shownDayCountForTest)
+    LibraryWindow.shared.calendarPickForTest("2026-03-01")
+    let cleared = (LibraryWindow.shared.selectedDayForTest, LibraryWindow.shared.shownDayCountForTest)
+    check("library calendar: a pick filters the list to that day, a re-pick clears, month follows data",
+          picked == ("2026-03-01", 1) && cleared.0 == nil && cleared.1 == 3
+              && LibraryWindow.shared.calendarMonthForTest == "2026-03"   // newest month, not February
+              && LibraryWindow.shared.calendarDayButtonCountForTest() == 31)   // March renders 31 day buttons
+    // The grid height is CONSTANT (always 6 week rows): a 5-week month would bounce the list ~23px
+    // on every ‹ › page. And the auto-follow contract: the month tracks the newest data only until
+    // the user pages — then their browsing owns it and a rescan must not snap it back.
+    let sixRows = LibraryWindow.shared.calendarWeekRowCountForTest()
+    LibraryWindow.shared.calendarFlipForTest(by: -1)   // → 2026-02, user-navigated
+    LibraryWindow.shared.loadFixtureForTest(twoMonths) // rescan while browsed away
+    check("library calendar: constant 6-week height; a browsed month survives a rescan",
+          sixRows == 6 && LibraryWindow.shared.calendarMonthForTest == "2026-02"
+              && LibraryWindow.shared.calendarWeekRowCountForTest() == 6)
+    // The ✕ chip is the only always-reachable clear once the user pages AWAY from the picked day's
+    // month — the picked cell (the toggle) is then off-screen. Real controls:
+    // the pick lands on a RENDERED button (the honest seam refuses an off-grid date), the flip goes
+    // through ‹, and the chip's performClick restores every day.
+    LibraryWindow.shared.calendarFlipForTest(by: 1)   // back to 2026-03 (the 6-week check left Feb shown)
+    let pickLanded = LibraryWindow.shared.calendarPickForTest("2026-03-01")
+    LibraryWindow.shared.calendarFlipForTest(by: -1)  // browse to February — the picked cell is gone
+    let offGridPick = LibraryWindow.shared.calendarPickForTest("2026-03-01")   // not rendered → false
+    let chipCleared = LibraryWindow.shared.calendarClickClearForTest()
+    check("library calendar: the ✕ chip clears a filter whose day is off the browsed month's grid",
+          pickLanded && !offGridPick && chipCleared
+              && LibraryWindow.shared.selectedDayForTest == nil
+              && LibraryWindow.shared.shownDayCountForTest == 3
+              && !LibraryWindow.shared.calendarClickClearForTest())   // chip hides once cleared
+    // The tray deep-link clears an active day filter AND the calendar highlight must follow — a
+    // stale view copy makes the next click on that day a dead toggle (review P1).
+    LibraryWindow.shared.loadFixtureForTest(twoMonths)
+    LibraryWindow.shared.calendarFlipForTest(by: 1)   // back to 2026-03 where the pick target renders
+    LibraryWindow.shared.calendarPickForTest("2026-03-01")
+    _ = LibraryWindow.shared.showSelectingForTest(URL(fileURLWithPath: "/tmp/library-fixture.md"))
+    let syncedOff = LibraryWindow.shared.calendarSelectedDayForTest == nil
+        && LibraryWindow.shared.selectedDayForTest == nil
+    let repick = LibraryWindow.shared.calendarPickForTest("2026-03-01")   // first click must FILTER, not dead-toggle
+    check("library calendar: a deep-link clears the highlight too — the next pick filters first-click",
+          syncedOff && repick && LibraryWindow.shared.selectedDayForTest == "2026-03-01"
+              && LibraryWindow.shared.shownDayCountForTest == 1)
+    // The window is a SINGLETON — clear the pick and restore the default fixture, or the leftover
+    // day filter leaks into every later check (it silently emptied the scope/re-run suites once).
+    LibraryWindow.shared.calendarPickForTest("2026-03-01")   // toggle the pick back off
+    LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
 
     // Stem parsing — every real shape in the vault, plus the garbage that must not crash the scan.
     let full = parseLibraryStem("2026-03-02-1030-project-kickoff")

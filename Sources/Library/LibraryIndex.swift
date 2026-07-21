@@ -153,13 +153,16 @@ func scanLibrary(transcriptsDir: URL, summaryDir: URL?, dailyDir: URL?, audioDir
     }
 }
 
-/// The rows a filter keeps: an optional KIND scope (nil = every kind) AND a case-insensitive text
-/// match on title/day/time (blank = every row). Both apply; days with no surviving entry
-/// disappear. Pure + selftested (the window's list is just this).
-func libraryFiltered(_ days: [LibraryDay], filter: String, onlyKind: LibraryEntry.Kind? = nil) -> [LibraryDay] {
+/// The rows a filter keeps: an optional KIND scope (nil = every kind), an optional calendar DAY
+/// ("yyyy-MM-dd", nil = every day — the sidebar calendar's pick), AND a case-insensitive text match
+/// on title/day/time (blank = every row). All apply; days with no surviving entry disappear.
+/// Pure + selftested (the window's list is just this).
+func libraryFiltered(_ days: [LibraryDay], filter: String, onlyKind: LibraryEntry.Kind? = nil,
+                     day onlyDay: String? = nil) -> [LibraryDay] {
     let f = filter.trimmingCharacters(in: .whitespaces).lowercased()
-    guard !f.isEmpty || onlyKind != nil else { return days }
+    guard !f.isEmpty || onlyKind != nil || onlyDay != nil else { return days }
     return days.compactMap { day in
+        if let onlyDay, day.day != onlyDay { return nil }
         let kept = day.entries.filter { e in
             guard onlyKind == nil || e.kind == onlyKind else { return false }
             guard !f.isEmpty else { return true }
