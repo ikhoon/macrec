@@ -115,6 +115,12 @@ func todaySelftests(_ check: (String, Bool) -> Void) {
               && tw.actionButtonTitleForTest(rowTitle: "Recorder was down earlier") == "Open log"   // not a dead affordance
               && tw.actionButtonTitleForTest(rowTitle: "Notifications") == "Settings…"              // #33 deep-link
               && tw.actionButtonTitleForTest(rowTitle: "Microphone") == nil)   // granted → no button
+    // The stretch regression (user: "가로로만 겁내 길어"): a single-line detail label's intrinsic width
+    // (priority > 500) made the onscreen window GROW to the longest sentence (~950 pt). The headless
+    // guard pins the cause: the mix fixture's outage detail — the longest line — must actually WRAP
+    // (≥ 2 line heights ≈ 26 pt) at the 480 pt content width, instead of laying out as one line (~14 pt).
+    check("today: the longest detail wraps at the set width instead of stretching the window",
+          tw.detailHeightForTest(containing: "No recording for") >= 26)
     // #33: the row shows ONLY on definitive denial (not undetermined), is a warn, and never background-alerts.
     check("today: notifications-off is a warn row, only when denied, and never a background alert",
           todayHealth({ var i = ok; i.notificationsDenied = true; return i }()).contains {
