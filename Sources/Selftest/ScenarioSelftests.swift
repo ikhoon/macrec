@@ -230,21 +230,23 @@ func scenarioSelftests(_ check: (String, Bool) -> Void) {
                       && !voicedResults.contains { $0.contains("Capturing silence") })
             Pref.d.removeObject(forKey: Pref.capturedSilenceAt)   // don't leak the warn into later suites
         }
-        // (g) The slice-boundary collision: an event starting exactly where slice 1 ends stamps
-        // BOTH slices 22:00 — the second write must land beside the first, never over it.
-        if let f1 = writeFixtureWAVs(voiced: true), let f2 = writeFixtureWAVs(voiced: true) {
+        // (g) A name already on disk must SUFFIX, never overwrite (the boundary-event stamp can
+        // hand two slices one minute). Pre-seed the exact target, then write through the pipeline.
+        if let f2 = writeFixtureWAVs(voiced: true) {
+            let seeded = tDir.appendingPathComponent("2026-03/2026-03-03-2200-boundary-sync.md")
+            try? fm.createDirectory(at: seeded.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? "# seeded earlier slice\n".write(to: seeded, atomically: true, encoding: .utf8)
             CalendarLookup.eventsOverrideForTest = [
                 EventCandidate(title: "boundary sync", start: date("2026-03-03 22:00:00"),
                                end: date("2026-03-03 23:00:00"), hasLink: true),
             ]
             let engine = RecordingEngine(cfg: cfg(model: model.path, calendarTitles: true))
-            engine.process(segment(f1, start: date("2026-03-03 21:00:00")))
             engine.process(segment(f2, start: date("2026-03-03 22:00:00")))
             CalendarLookup.eventsOverrideForTest = nil
-            let a = tDir.appendingPathComponent("2026-03/2026-03-03-2200-boundary-sync.md")
             let b = tDir.appendingPathComponent("2026-03/2026-03-03-2200-boundary-sync-2.md")
-            check("scenario S-PIPELINE(g): a boundary event yields two distinct files, no overwrite",
-                  fm.fileExists(atPath: a.path) && fm.fileExists(atPath: b.path))
+            let seededIntact = (try? String(contentsOf: seeded, encoding: .utf8))?.contains("seeded earlier") == true
+            check("scenario S-PIPELINE(g): a taken name suffixes to -2 and the first file survives",
+                  seededIntact && fm.fileExists(atPath: b.path))
         }
         Notifier.sinkForTest = nil
         try? fm.removeItem(at: scratch)
