@@ -179,7 +179,12 @@ func runLibrarySnapshotSubcommand(_ args: [String]) -> Never {
     // Show the TRANSCRIPT view (not the default summary): the stamped lines render their
     // macrec-seek links there, and the PNG must show them.
     LibraryWindow.shared.pickDocForTest(1)
-    var files = LibraryWindow.shared.snapshot(to: dir)
+    // BOTH appearances (user rule: dark and light must each be looked at) — <dir>/dark, <dir>/light.
+    var files: [URL] = []
+    for (mode, name) in [("dark", NSAppearance.Name.darkAqua), ("light", .aqua)] {
+        NSApp.appearance = NSAppearance(named: name)
+        files += LibraryWindow.shared.snapshot(to: dir.appendingPathComponent(mode))
+    }
     // Daily-only scope: the list must collapse to digest rows — a second shot proves the filter.
     LibraryWindow.shared.setScopeForTest(1)
     files += LibraryWindow.shared.snapshot(to: dir.appendingPathComponent("daily"))
@@ -207,7 +212,12 @@ func runTodaySnapshotSubcommand(_ args: [String]) -> Never {
     i.notificationsDenied = true   // #33: exercise the "Notifications off" warn row + its Settings… button
     i.capturedSilenceToday = true  // dropped-metric: exercise the "Recorded silence earlier" warn row
     TodayWindow.shared.loadFixtureForTest(todayHealth(i))
-    let files = TodayWindow.shared.snapshot(to: dir)
+    // BOTH appearances (user rule: dark and light must each be looked at) — <dir>/dark, <dir>/light.
+    var files: [URL] = []
+    for (mode, name) in [("dark", NSAppearance.Name.darkAqua), ("light", .aqua)] {
+        NSApp.appearance = NSAppearance(named: name)
+        files += TodayWindow.shared.snapshot(to: dir.appendingPathComponent(mode))
+    }
     for f in files { print(f.path) }
     print(files.isEmpty ? "today-snapshot: FAILED (nothing rendered)" : "today-snapshot: \(files.count) shot → \(dir.path)")
     exit(files.isEmpty ? 1 : 0)

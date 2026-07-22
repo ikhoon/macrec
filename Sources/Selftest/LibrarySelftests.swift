@@ -232,6 +232,9 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     // Windowed-app lifecycle: a Dock identity only while the Library is up, and ⌘Q downgrades to a
     // window close UNLESS the quit is deliberate (tray Quit) or system-initiated (SIGTERM/logout —
     // cancelling those would block shutdown and starve the watchdog's clean-exit path).
+    check("appearance: mode maps to aqua/darkAqua and system means no override",
+          appearanceName(for: "light") == .aqua && appearanceName(for: "dark") == .darkAqua
+              && appearanceName(for: "system") == nil && appearanceName(for: "garbage") == nil)
     check("windowed app: only a real quit terminates",
           terminateShouldJustCloseWindow(realQuit: false, windowVisible: true)      // ⌘Q → close
               && !terminateShouldJustCloseWindow(realQuit: true, windowVisible: true)      // tray/logout → quit
