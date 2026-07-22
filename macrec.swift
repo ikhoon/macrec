@@ -1004,11 +1004,8 @@ func transcriptBaseName(start: Date, timeZone: TimeZone = .current) -> String {
     return f.string(from: start)
 }
 
-/// The stamp a transcript is named with. A mapped event stamps ITS OWN start (calendar-first naming:
-/// a recorder that joined at :42 still files under the meeting's :30) — but only for the meeting's
-/// FIRST slice: once a file already carries that stamp (`eventTaken`), later slices clamp to their
-/// own window so consecutive hours of one meeting can't collide onto one name. No event → the
-/// segment's start. Pure + selftested.
+/// Calendar-first stamp: the event's start names the meeting's first slice; a taken name clamps
+/// later slices to their own window so consecutive hours can't collide. No event → segment start.
 func transcriptStart(segStart: Date, segEnd: Date, eventStart: Date?, eventTaken: Bool = false) -> Date {
     guard let e = eventStart else { return segStart }
     guard !eventTaken else { return min(max(e, segStart), segEnd) }

@@ -605,12 +605,9 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
           transcriptStart(segStart: segA, segEnd: segAEnd, eventStart: nil) == segA
           && transcriptStart(segStart: segA, segEnd: segAEnd,
                              eventStart: schedDate("2026-07-05 21:10")) == schedDate("2026-07-05 21:10")
-          // Calendar-first (the 10:42-restart incident): recording joined late, but the FIRST slice
-          // of the meeting still files under the meeting's own start.
+          // Calendar-first: a late-joining recording still files under the meeting's own start.
           && transcriptStart(segStart: segA, segEnd: segAEnd,
                              eventStart: schedDate("2026-07-05 20:30")) == schedDate("2026-07-05 20:30")
-          // A later slice of the SAME meeting (its event-start name is taken) clamps to its own
-          // window — two hours of one meeting must never collapse onto one file name.
           && transcriptStart(segStart: segA, segEnd: segAEnd,
                              eventStart: schedDate("2026-07-05 20:30"), eventTaken: true) == segA
           && transcriptStart(segStart: segA, segEnd: segAEnd,

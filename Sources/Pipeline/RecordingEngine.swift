@@ -556,7 +556,14 @@ final class RecordingEngine {
             bodyMine: bodyMine, bodyTheirs: bodyTheirs,
             body: body,
             eventNotes: calendarNotesForTranscript(event?.notes))
-        let mdURL = monthDir.appendingPathComponent("\(slug).md")
+        // Suffix rather than overwrite when the name is still taken (an event ending exactly on a
+        // slice boundary can stamp two slices with one minute — silent data loss without this).
+        var mdURL = monthDir.appendingPathComponent("\(slug).md")
+        var nameTry = 2
+        while fm.fileExists(atPath: mdURL.path), nameTry <= 9 {
+            mdURL = monthDir.appendingPathComponent("\(slug)-\(nameTry).md")
+            nameTry += 1
+        }
         try doc.markdown(l10n).write(to: mdURL, atomically: true, encoding: .utf8)
         elog("engine:   → transcript saved: \(mdURL.path)")
         return mdURL
