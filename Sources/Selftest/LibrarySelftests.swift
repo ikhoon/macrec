@@ -282,6 +282,14 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     LibraryWindow.shared.healthSample = nil
     check("main window: nav swaps Live/Library/Status panes with real content",
           statusRows > todayHealth(healthFix).count / 2 && statusShown && liveShown && backToLib && replayed)
+    // The nav round-trip regression: with an audio row selected, leave Library and come back — the
+    // player bar must re-derive from the selection, not latch the force-hidden state forever.
+    LibraryWindow.shared.selectForTest(libraryFixtureDays()[0].entries[1])   // has audioURL
+    LibraryWindow.shared.switchSectionForTest(.status)
+    LibraryWindow.shared.switchSectionForTest(.library)
+    check("main window: the player bar survives a section round-trip for an audio row",
+          !LibraryWindow.shared.playerBarHiddenForTest)
+    LibraryWindow.shared.liveMirrorClear()
     check("windowed app: launches as a regular (Dock) app; only a real quit terminates",
           launchActivationPolicy() == .regular)
     check("windowed app: only a real quit terminates",
