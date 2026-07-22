@@ -8,6 +8,8 @@ func libraryFixtureDays() -> [LibraryDay] {
     let u = URL(fileURLWithPath: "/tmp/library-fixture.md")
     let a = URL(fileURLWithPath: "/tmp/library-fixture.wav")
     return [
+        // Hand-built test data (index-addressed by many tests below) — NOT a claim about scan order;
+        // the real digest-first, earliest→latest ordering is covered by the librarySortedEntries test.
         LibraryDay(day: "2026-03-02", entries: [
             LibraryEntry(day: "2026-03-02", time: nil, title: nil, kind: .digest, url: u,
                          summaryURL: nil, audioURL: nil),
@@ -525,10 +527,25 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
               && libraryDayLabel(day: "2026-03-01", today: "2026-03-02", yesterday: "2026-03-01") == "Yesterday — 2026-03-01"
               && libraryDayLabel(day: "2026-02-14", today: "2026-03-02", yesterday: "2026-03-01") == "2026-02-14"
               && libraryRowSpec(fix[0].entries[0]) == LibraryRowSpec(icon: "newspaper", tint: .orange, text: "Daily digest", trailing: [])
-              && libraryRowSpec(fix[0].entries[1]) == LibraryRowSpec(icon: "text.bubble", tint: .blue, text: "14:00  project kickoff", trailing: ["sparkles", "waveform"])
-              && libraryRowSpec(fix[0].entries[2]) == LibraryRowSpec(icon: "text.bubble", tint: .blue, text: "10:30  daily standup", trailing: [])
+              && libraryRowSpec(fix[0].entries[1]) == LibraryRowSpec(icon: "text.bubble", tint: .neutral, text: "14:00  project kickoff", trailing: ["sparkles", "waveform"])
+              && libraryRowSpec(fix[0].entries[2]) == LibraryRowSpec(icon: "text.bubble", tint: .neutral, text: "10:30  daily standup", trailing: [])
               && libraryRowSpec(fix[1].entries[0]) == LibraryRowSpec(icon: "waveform", tint: .purple, text: "17:52  (untitled)", trailing: [])
-              && libraryRowSpec(fix[1].entries[1]) == LibraryRowSpec(icon: "text.bubble", tint: .blue, text: "16:00  (untitled)", trailing: ["waveform"]))
+              && libraryRowSpec(fix[1].entries[1]) == LibraryRowSpec(icon: "text.bubble", tint: .neutral, text: "16:00  (untitled)", trailing: ["waveform"]))
+    // Ordering: the incident was a picked day coming back NEWEST-first. Digest heads the day, then
+    // earliest→latest. Tests the pure sort directly (the disk scan just calls it).
+    let ordU = URL(fileURLWithPath: "/tmp/ord.md")
+    let unordered = [
+        LibraryEntry(day: "d", time: "14:00", title: "pm", kind: .transcript, url: ordU, summaryURL: nil, audioURL: nil),
+        LibraryEntry(day: "d", time: nil, title: nil, kind: .digest, url: ordU, summaryURL: nil, audioURL: nil),
+        LibraryEntry(day: "d", time: "09:00", title: "am", kind: .transcript, url: ordU, summaryURL: nil, audioURL: nil),
+    ]
+    check("library: a day lists the digest first, then earliest→latest (not reverse)",
+          librarySortedEntries(unordered).map { $0.time ?? "digest" } == ["digest", "09:00", "14:00"])
+    // Row-icon color: non-blue by rule, and the common transcript is NOT a pale secondary gray.
+    check("library: row-icon tint is non-blue and the transcript icon is a strong label",
+          libraryTintColor(.neutral) == .labelColor && libraryTintColor(.orange) == .systemOrange
+              && libraryTintColor(.purple) == .systemPurple
+              && libraryTintColor(.neutral) != .secondaryLabelColor)
     check("library: filter keeps matching rows and drops empty days",
           libraryFiltered(fix, filter: "kickoff").count == 1
               && libraryFiltered(fix, filter: "kickoff").first?.entries.count == 1
@@ -597,10 +614,66 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         lw.primePlayerForTest()
         let missing = lw.clockTextForTest.contains("missing")
         lw.selectForTest(nil)
-        let cleared = lw.playerBarHiddenForTest && !lw.openEnabledForTest && lw.docTextForTest.isEmpty
+        // Nothing selected, but recordings exist → the pane shows the "select one" invite (not the
+        // previous doc, and not a blank half-built pane). Controls stay disabled.
+        let cleared = lw.playerBarHiddenForTest && !lw.openEnabledForTest
+            && lw.docTextForTest.contains("Select a recording")
         check("library: player lazy-loads with real duration, resets on row switch, names a missing file",
               audioRow && audioLayout && loaded && reset && missing && cleared)
         try? fm.removeItem(at: wav)
+        // First-open transition (drives the REAL refresh path, not a pre-paint): start blank+empty like
+        // build()'s pre-scan showEntry(nil), then let a rescan discover recordings with NOTHING selected.
+        // The invite must appear only because refresh→applyFilter repaints it — delete that and this fails.
+        lw.loadFixtureForTest([])
+        lw.selectForTest(nil)
+        let blankBeforeScan = lw.docTextForTest.isEmpty
+        lw.setFixtureForTest(libraryFixtureDays())   // next scan sees recordings; no reselect
+        lw.refreshForTest()
+        let inviteAfterScan = lw.docTextForTest.contains("Select a recording")
+        // A day-pick / filter that empties the VISIBLE list must NOT keep inviting a pick from an empty
+        // left pane (it would contradict the "No recordings/No match" notice) — the review's P1. Drive the
+        // REAL calendar button + search field so this also guards their target-action wiring.
+        let pickedEmptyDay = lw.calendarPickForTest("2026-03-05")   // a real click on an empty day on the grid
+        let noInviteEmptyDay = !lw.docTextForTest.contains("Select a recording")
+        _ = lw.calendarClickClearForTest()   // real ✕ chip → clears the day filter
+        lw.setSearchForTest("zzz-no-such-match")   // real search field + its wired filterChanged action
+        let noInviteNoMatch = !lw.docTextForTest.contains("Select a recording")
+        lw.setSearchForTest("")   // clears back to the full list → the invite returns
+        let inviteBack = lw.docTextForTest.contains("Select a recording")
+        check("library: empty-pane invite tracks the VISIBLE list (first open yes; empty day/no-match no)",
+              blankBeforeScan && inviteAfterScan && pickedEmptyDay && noInviteEmptyDay && noInviteNoMatch && inviteBack)
+        // The nav-highlight fix (the "dead"/무반응 nav complaint). Build a FRESH window and assert Library
+        // is already filled + bold BEFORE any click — this guards build()'s own initial switchSection(.library)
+        // (the first-open paint), which a click-first test would mask. Then CLICK the real nav buttons and
+        // assert the selection moves. Break the startup paint, the wiring, or the style → fail.
+        lw.resetWindowForTest()
+        lw.loadFixtureForTest(libraryFixtureDays())
+        let initialNav = lw.navHighlightForTest   // no click yet → reflects build()'s startup paint
+        lw.clickNavForTest(.status)
+        let statusNav = lw.navHighlightForTest
+        lw.clickNavForTest(.library)
+        let libNav = lw.navHighlightForTest
+        check("library: Library is painted selected on open, and clicking a nav row moves the selection",
+              initialNav.activeFilled && initialNav.activeBold && initialNav.othersClear
+                  && statusNav.activeFilled && statusNav.activeBold && statusNav.othersClear
+                  && libNav.activeFilled && libNav.activeBold && libNav.othersClear)
+        // Stable-identity selection across a rescan (review Major): a summary landing on the SELECTED
+        // transcript changes its value (gains summaryURL) but not its (url, kind) — the preview must
+        // rebind to the fresh entry (picker now shown), not clear to the invite on a value-equality miss.
+        let tURL = URL(fileURLWithPath: "/tmp/id-\(UUID().uuidString).md")
+        let noSummary = LibraryDay(day: "2026-03-02", entries: [
+            LibraryEntry(day: "2026-03-02", time: "11:00", title: "topic", kind: .transcript,
+                         url: tURL, summaryURL: nil, audioURL: nil)])
+        lw.loadFixtureForTest([noSummary])
+        lw.selectForTest(noSummary.entries[0])
+        let pickerHiddenNoSummary = lw.docPickerHiddenForTest   // no summary yet → picker hidden
+        let withSummary = LibraryDay(day: "2026-03-02", entries: [
+            LibraryEntry(day: "2026-03-02", time: "11:00", title: "topic", kind: .transcript,
+                         url: tURL, summaryURL: tURL, audioURL: nil)])   // same (url, kind); summary landed
+        lw.setFixtureForTest([withSummary])
+        lw.refreshForTest()
+        check("library: a summary landing on the selected row rebinds it (not clears) across a rescan",
+              pickerHiddenNoSummary && lw.selectedURLForTest == tURL && !lw.docPickerHiddenForTest)
         LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore the rich default
     }
     // Transcript stamps: parsing, the clock→offset decision, and the seek-link scheme.

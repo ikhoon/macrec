@@ -143,13 +143,18 @@ func scanLibrary(transcriptsDir: URL, summaryDir: URL?, dailyDir: URL?, audioDir
             summaryURL: nil, audioURL: u))
     }
     let days = byDay.keys.sorted(by: >).prefix(limitDays)
-    return days.map { day in
-        let entries = byDay[day]!.sorted { a, b in
-            if (a.kind == .digest) != (b.kind == .digest) { return a.kind == .digest } // digest first
-            if (a.time ?? "") != (b.time ?? "") { return (a.time ?? "") > (b.time ?? "") } // newest first
-            return a.kind.rawValue > b.kind.rawValue // same minute: transcript before its audio sibling
-        }
-        return LibraryDay(day: day, entries: entries)
+    return days.map { LibraryDay(day: $0, entries: librarySortedEntries(byDay[$0]!)) }
+}
+
+/// One day's entries in list order: the daily digest first (the whole-day summary reads as the day's
+/// header), then EARLIEST-to-LATEST by time (the user reads a day forward, not in reverse — a picked
+/// day once came back newest-first), a transcript ahead of its same-minute audio sibling. Pure so the
+/// ordering is selftested directly, not through a disk scan.
+func librarySortedEntries(_ entries: [LibraryEntry]) -> [LibraryEntry] {
+    entries.sorted { a, b in
+        if (a.kind == .digest) != (b.kind == .digest) { return a.kind == .digest }
+        if (a.time ?? "") != (b.time ?? "") { return (a.time ?? "") < (b.time ?? "") }
+        return a.kind.rawValue > b.kind.rawValue
     }
 }
 

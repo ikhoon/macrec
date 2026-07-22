@@ -124,6 +124,11 @@ func runSettingsSnapshotSubcommand(_ args: [String]) -> Never {
 @MainActor
 func runLibrarySnapshotSubcommand(_ args: [String]) -> Never {
     let dir = URL(fileURLWithPath: args.count > 1 ? args[1] : "/tmp/macrec-library-shots")
+    // Each day's entries in the SHIPPED list order (digest first, earliest→latest). The raw fixture
+    // stays newest-first so the many index-addressed unit tests keep their positions, but the eyeball
+    // snapshot must render exactly the order the real scan produces — else the PNG shows the opposite
+    // order from what ships, for the very dimension a change may be altering (review finding).
+    let sortedFixture = libraryFixtureDays().map { LibraryDay(day: $0.day, entries: librarySortedEntries($0.entries)) }
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     // The fixture entries all point at these files — give the preview pane something to
@@ -174,7 +179,7 @@ func runLibrarySnapshotSubcommand(_ args: [String]) -> Never {
     // Built-in summary mode (in the throwaway test store): the Re-run summary button must
     // be laid out in the shot — hidden-by-prefs would leave the new control unseen forever.
     Pref.d.set("summary", forKey: Pref.postProcessMode)
-    LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
+    LibraryWindow.shared.loadFixtureForTest(sortedFixture)
     LibraryWindow.shared.primePlayerForTest()
     // Show the TRANSCRIPT view (not the default summary): the stamped lines render their
     // macrec-seek links there, and the PNG must show them.
@@ -191,7 +196,7 @@ func runLibrarySnapshotSubcommand(_ args: [String]) -> Never {
         LibraryWindow.shared.setScopeForTest(0)
         // The Daily scope filtered the selected transcript out and CLEARED the selection — restore
         // it, or every later shot (the other appearance) renders an empty detail pane.
-        LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
+        LibraryWindow.shared.loadFixtureForTest(sortedFixture)
         LibraryWindow.shared.pickDocForTest(1)
         // The restore must leave a RENDERED detail — URL-exists alone would pass an empty pane.
         if !LibraryWindow.shared.docTextForTest.contains("Auto-transcribed fixture") { missing = true }
