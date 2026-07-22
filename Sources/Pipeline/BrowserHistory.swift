@@ -151,8 +151,11 @@ enum BrowserHistory {
         defer { try? fm.removeItem(at: tmp) }
         let copy = tmp.appendingPathComponent("db")
         do { try fm.copyItem(atPath: dbPath, toPath: copy.path) } catch { return [] }
+        // A present sidecar that fails to copy → bail: reading main-without-its-wal is inconsistent,
+        // worse than skipping this source. (A checkpoint racing between copies is benign — SQLite
+        // validates the -wal against the db header and ignores a mismatched one, reading the main db.)
         for ext in ["-wal", "-shm"] where fm.fileExists(atPath: dbPath + ext) {
-            try? fm.copyItem(atPath: dbPath + ext, toPath: copy.path + ext)
+            do { try fm.copyItem(atPath: dbPath + ext, toPath: copy.path + ext) } catch { return [] }
         }
         let cmd = "/usr/bin/sqlite3 -readonly -separator '\u{1f}' " + shq(copy.path) + " " + shq(sql)
         guard let out = run(cmd) else { return [] }

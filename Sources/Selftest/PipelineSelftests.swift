@@ -761,6 +761,21 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
                        BrowsingVisit(url: "https://a/", title: "A", visits: 3)])
               == [BrowsingVisit(url: "https://a/", title: "A", visits: 5),
                   BrowsingVisit(url: "https://b/", title: "B", visits: 1)])
+    // Success path: query() copies the db to a PRIVATE temp path, builds the sqlite3 command against
+    // the COPY (never the live file), and parses the runner's US-delimited rows. A real temp file
+    // stands in for the db (existence-gated); the runner is injected so there's no sqlite3 dependency.
+    let fakeDB = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("macrec-fakedb-\(UUID().uuidString).sqlite")
+    try? Data("x".utf8).write(to: fakeDB)
+    var seenCmd = ""
+    let parsed = BrowserHistory.query(dbPath: fakeDB.path, sql: "SELECT 1", run: { c in
+        seenCmd = c
+        return "https://a/\u{1f}Title A\u{1f}3\nhttps://b/\u{1f}\u{1f}1"
+    })
+    try? FileManager.default.removeItem(at: fakeDB)
+    check("browser history: query copies to a private path, targets the copy, parses rows",
+          parsed == [BrowsingVisit(url: "https://a/", title: "Title A", visits: 3),
+                     BrowsingVisit(url: "https://b/", title: "", visits: 1)]
+              && seenCmd.contains("macrec-hist-") && !seenCmd.contains("macrec-fakedb-"))
     // Query resilience: a runner error (locked db / missing sqlite3) yields [], never a throw.
     check("browser history: a query failure degrades to no rows, never breaking the digest",
           BrowserHistory.query(dbPath: "/nonexistent.db", sql: "x", run: { _ in nil }).isEmpty
