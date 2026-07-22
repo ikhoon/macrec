@@ -189,6 +189,10 @@ func runLibrarySnapshotSubcommand(_ args: [String]) -> Never {
         LibraryWindow.shared.setScopeForTest(1)
         let daily = LibraryWindow.shared.snapshot(to: dir.appendingPathComponent(mode).appendingPathComponent("daily"))
         LibraryWindow.shared.setScopeForTest(0)
+        // The Daily scope filtered the selected transcript out and CLEARED the selection — restore
+        // it, or every later shot (the other appearance) renders an empty detail pane.
+        LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
+        LibraryWindow.shared.pickDocForTest(1)
         if main.isEmpty || daily.isEmpty { missing = true }
         files += main + daily
     }

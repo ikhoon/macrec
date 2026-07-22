@@ -212,22 +212,19 @@ final class LibraryCalendarView: NSView {
         b.identifier = NSUserInterfaceItemIdentifier(day)
         b.isBordered = false
         b.font = .systemFont(ofSize: 11, weight: day == today ? .bold : .regular)
-        // System "text on emphasized selection" color, not a hardcoded white — the accent color is
-        // user-configurable and the light accents (yellow/green) would wash a white number out.
-        b.contentTintColor = day == selectedDay ? .alternateSelectedControlTextColor
+        // MONOCHROME (no accent): recorded days read at full label strength + medium weight, empty
+        // days recede to tertiary; the picked day is an inverted gray pill; today wears a gray ring.
+        b.contentTintColor = day == selectedDay ? .windowBackgroundColor
             : has ? .labelColor : .tertiaryLabelColor
+        if has, day != selectedDay { b.font = .systemFont(ofSize: 11, weight: day == today ? .bold : .medium) }
         b.wantsLayer = true
         b.layer?.cornerRadius = 4
-        b.layer?.backgroundColor = day == selectedDay ? NSColor.controlAccentColor.cgColor : nil
-        // Today keeps a weight-INDEPENDENT marker (a thin accent ring): bold alone disappears on an
-        // unrecorded (tertiary-dimmed) today.
+        b.layer?.backgroundColor = day == selectedDay
+            ? NSColor.labelColor.withAlphaComponent(0.85).cgColor : nil
         if day == today, day != selectedDay {
             b.layer?.borderWidth = 1
-            b.layer?.borderColor = NSColor.controlAccentColor.cgColor
+            b.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.35).cgColor
         }
-        // The content marker: a dot under the number would need a taller row — an accent-tinted
-        // number reads just as fast at this size, so recorded days are accent unless selected.
-        if has, day != selectedDay { b.contentTintColor = .controlAccentColor }
         b.widthAnchor.constraint(equalToConstant: 24).isActive = true
         b.heightAnchor.constraint(equalToConstant: 22).isActive = true
         b.toolTip = has ? "\(day) — show only this day's recordings" : "\(day) — no recordings"

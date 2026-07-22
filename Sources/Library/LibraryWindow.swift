@@ -60,11 +60,12 @@ func libraryRoots(transcripts: String, summaryOut: String, dailyOut: String, aud
 /// answering "what did macrec catch today?" used to mean digging through Finder. Left: days and
 /// entries; right: the selected transcript/summary, with Open / Reveal for the real file.
 final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate,
-    NSSplitViewDelegate, AVAudioPlayerDelegate, NSTextViewDelegate {
+    NSSplitViewDelegate, AVAudioPlayerDelegate, NSTextViewDelegate, NSSearchFieldDelegate {
     static let shared = LibraryWindow()
     private var window: NSWindow?
     private let outline = NSOutlineView()
     private let searchField = NSSearchField()
+    private let searchToggle = NSButton()   // magnifier; expands the field on click, collapses when empty
     private let scopePicker = NSSegmentedControl()   // All | Daily (digests only)
     private let textView = NSTextView()
     private let headerLabel = NSTextField(labelWithString: "")
@@ -209,9 +210,13 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     private func build() {
         let w = EditKeyWindow(contentRect: NSRect(x: 0, y: 0, width: 1160, height: 720),
-                              styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                              styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
                               backing: .buffered, defer: false)
         w.title = "macrec library"
+        // No visible title bar (modern desktop-app look): the content runs to the top edge and the
+        // traffic lights float over it; the toolbar row leaves a draggable strip clear of them.
+        w.titlebarAppearsTransparent = true
+        w.titleVisibility = .hidden
         w.center()
         w.isReleasedWhenClosed = false
         w.delegate = self
@@ -220,9 +225,19 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         w.setFrameAutosaveName("libraryWindow")
         let content = NSView()
 
+        // Search collapses to a magnifier button (the always-wide field wasted the whole top row);
+        // clicking expands the field + focuses it, and it collapses again when left empty.
+        searchToggle.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "Search")
+        searchToggle.isBordered = false
+        searchToggle.bezelStyle = .inline
+        searchToggle.setAccessibilityLabel("Search")
+        searchToggle.target = self
+        searchToggle.action = #selector(toggleSearch)
         searchField.translatesAutoresizingMaskIntoConstraints = false
         searchField.placeholderString = "Filter by title or date"
         searchField.sendsSearchStringImmediately = true
+        searchField.isHidden = true
+        searchField.delegate = self
         searchField.target = self
         searchField.action = #selector(filterChanged)
 
@@ -239,12 +254,15 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
         let refreshBtn = NSButton(title: "Refresh", target: self, action: #selector(refreshClicked))
         refreshBtn.bezelStyle = .rounded
-        let bar = NSStackView(views: [searchField, scopePicker, refreshBtn])
+        let bar = NSStackView(views: [searchToggle, searchField, NSView(), scopePicker, refreshBtn])
         bar.orientation = .horizontal
         bar.spacing = 8
-        bar.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 6, right: 10)
+        // Left inset clears the traffic lights (fullSizeContentView); top inset leaves a drag strip.
+        bar.edgeInsets = NSEdgeInsets(top: 8, left: 78, bottom: 6, right: 12)
         bar.translatesAutoresizingMaskIntoConstraints = false
+        searchToggle.setContentHuggingPriority(.required, for: .horizontal)
         searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
 
         // Left: the day/entry outline.
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("entry"))
@@ -313,6 +331,13 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         summaryBar.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 6, right: 10)
 
         textView.isEditable = false
+        // Mono links: NSTextView paints .link runs with its own attributes (default accent blue),
+        // overriding the attributed string — pin them to underlined label gray here.
+        textView.linkTextAttributes = [
+            .foregroundColor: NSColor.labelColor,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .cursor: NSCursor.pointingHand,
+        ]
         textView.isSelectable = true
         textView.delegate = self   // intercepts macrec-seek: stamp clicks (clickedOnLink below)
         textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -399,6 +424,30 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     @objc private func filterChanged() { applyFilter() }
     @objc private func refreshClicked() { refresh() }
+
+    /// Expand the search field and focus it; a second click (or leaving it empty) collapses it back
+    /// to the magnifier so the top row isn't a permanently-wide field over mostly-empty space.
+    @objc private func toggleSearch() {
+        if searchField.isHidden {
+            searchField.isHidden = false
+            window?.makeFirstResponder(searchField)
+        } else {
+            collapseSearchIfEmpty(force: true)
+        }
+    }
+
+    private func collapseSearchIfEmpty(force: Bool) {
+        guard force || searchField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        searchField.stringValue = ""
+        searchField.isHidden = true
+        applyFilter()
+        if window?.firstResponder === searchField.currentEditor() { window?.makeFirstResponder(nil) }
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard (obj.object as? NSSearchField) === searchField else { return }
+        collapseSearchIfEmpty(force: false)   // left empty → tidy back to the icon
+    }
 
     private func applyFilter() {
         let onlyKind: LibraryEntry.Kind? = scopePicker.selectedSegment == 1 ? .digest : nil
@@ -953,6 +1002,18 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         }
     }
 
+    // A quiet gray selection instead of the emphasized accent-blue row (mono rule): AppKit renders
+    // the unemphasized style when the row view opts out of emphasis.
+    func outlineView(_ v: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
+        let r = MonoRowView()
+        r.isEmphasized = false
+        return r
+    }
+
+    final class MonoRowView: NSTableRowView {
+        override var isEmphasized: Bool { get { false } set {} }   // AppKit re-sets it on focus; pin it
+    }
+
     func outlineView(_ v: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         // Day-group headers get their OWN cell with the label flush-left — the shared entry cell
         // reserves a 16 pt icon + 6 pt gap, which pushed the date right (maintainer found it).
@@ -1020,11 +1081,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         } else if let e = item as? LibraryEntry {
             let spec = libraryRowSpec(e)
             cell.imageView?.image = NSImage(systemSymbolName: spec.icon, accessibilityDescription: e.kind.rawValue)
-            switch spec.tint {
-            case .orange: cell.imageView?.contentTintColor = .systemOrange
-            case .blue: cell.imageView?.contentTintColor = .systemBlue
-            case .purple: cell.imageView?.contentTintColor = .systemPurple
-            }
+            // MONOCHROME (user rule: no blue, icons included) — the kind reads from the symbol
+            // shape; spec.tint stays in the pure spec for tests but the cell renders neutral.
+            cell.imageView?.contentTintColor = .secondaryLabelColor
             let font = NSFont.systemFont(ofSize: 12)
             // Attributed text carries its OWN paragraph style — without an explicit truncating
             // one it WRAPS, and a long real title overlapped the next row (fixture titles were
