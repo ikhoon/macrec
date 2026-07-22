@@ -108,9 +108,6 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     func show() {
         if window == nil { build() }
-        // The windowed app moment: a Dock icon + ⌘Tab entry while the Library is up (reverted on
-        // close) — the recorder still boots and lives as a headless menu-bar agent.
-        NSApp.setActivationPolicy(windowedActivationPolicy(libraryVisible: true))
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         refresh()
@@ -596,10 +593,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         }
     }
 
-    func windowWillClose(_ notification: Notification) {
-        stopPlayback()
-        NSApp.setActivationPolicy(windowedActivationPolicy(libraryVisible: false))
-    }
+    func windowWillClose(_ notification: Notification) { stopPlayback() }
 
     // MARK: split view (classic sizing — see build())
 

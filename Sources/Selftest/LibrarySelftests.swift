@@ -232,10 +232,8 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     // Windowed-app lifecycle: a Dock identity only while the Library is up, and ⌘Q downgrades to a
     // window close UNLESS the quit is deliberate (tray Quit) or system-initiated (SIGTERM/logout —
     // cancelling those would block shutdown and starve the watchdog's clean-exit path).
-    check("windowed app: policy follows the Library; only a real quit terminates",
-          windowedActivationPolicy(libraryVisible: true) == .regular
-              && windowedActivationPolicy(libraryVisible: false) == .accessory
-              && terminateShouldJustCloseWindow(realQuit: false, windowVisible: true)      // ⌘Q → close
+    check("windowed app: only a real quit terminates",
+          terminateShouldJustCloseWindow(realQuit: false, windowVisible: true)      // ⌘Q → close
               && !terminateShouldJustCloseWindow(realQuit: true, windowVisible: true)      // tray/logout → quit
               && !terminateShouldJustCloseWindow(realQuit: false, windowVisible: false)    // windowless → quit
               && !terminateShouldJustCloseWindow(realQuit: true, windowVisible: false))
