@@ -282,6 +282,38 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     LibraryWindow.shared.healthSample = nil
     check("main window: nav swaps Live/Library/Status panes with real content",
           statusRows > todayHealth(healthFix).count / 2 && statusShown && liveShown && backToLib && replayed)
+    // The nav round-trip regression: with an audio row selected, leave Library and come back — the
+    // player bar must re-derive from the selection, not latch the force-hidden state forever.
+    LibraryWindow.shared.selectForTest(libraryFixtureDays()[0].entries[1])   // has audioURL
+    LibraryWindow.shared.switchSectionForTest(.status)
+    LibraryWindow.shared.switchSectionForTest(.library)
+    check("main window: the player bar survives a section round-trip for an audio row",
+          !LibraryWindow.shared.playerBarHiddenForTest)
+    // The other three sprint fixes, asserted through real wiring:
+    // (a) the summary bar never bleeds over Status/Live and returns with Library;
+    LibraryWindow.shared.switchSectionForTest(.status)
+    let barGated = LibraryWindow.shared.summaryBarHiddenForTest
+    LibraryWindow.shared.switchSectionForTest(.library)
+    let barBack = !LibraryWindow.shared.summaryBarHiddenForTest   // transcript row selected → export eligible
+    // (b) the 1 Hz Status tick repaints a CHANGED sample (run the loop past one tick);
+    var tickFix = healthFix
+    LibraryWindow.shared.healthSample = { tickFix }
+    LibraryWindow.shared.switchSectionForTest(.status)
+    let rowsBefore = LibraryWindow.shared.statusRowCountForTest
+    tickFix.notificationsDenied = true
+    RunLoop.main.run(until: Date().addingTimeInterval(1.3))
+    let rowsAfter = LibraryWindow.shared.statusRowCountForTest
+    LibraryWindow.shared.switchSectionForTest(.library)
+    let timerGone = !LibraryWindow.shared.statusTimerLiveForTest
+    LibraryWindow.shared.healthSample = nil
+    // (c) a stop clears the pending mirror — a dead session must not replay.
+    LibraryWindow.shared.liveMirror(NSAttributedString(string: "captured before stop"))
+    LibraryWindow.shared.liveMirrorClear()
+    LibraryWindow.shared.switchSectionForTest(.live)
+    let notReplayed = !LibraryWindow.shared.liveMirrorTextForTest.contains("captured before stop")
+    LibraryWindow.shared.switchSectionForTest(.library)
+    check("main window: bar gating, live status tick, and stop-clear all hold",
+          barGated && barBack && rowsAfter == rowsBefore + 1 && timerGone && notReplayed)
     check("windowed app: launches as a regular (Dock) app; only a real quit terminates",
           launchActivationPolicy() == .regular)
     check("windowed app: only a real quit terminates",

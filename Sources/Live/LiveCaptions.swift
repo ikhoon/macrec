@@ -211,6 +211,7 @@ final class LiveCaptions {
     func stop() {
         guard active else { return }
         active = false; renderScheduled = false   // drop any pending coalesced render (so a restart isn't suppressed)
+        LibraryWindow.shared.liveMirrorClear()    // a later Live visit must not replay this dead session
         srcLock.lock(); let m = mic, s = sys; mic = nil; sys = nil; srcLock.unlock()
         m?.stop(); s?.stop()
         translator = nil

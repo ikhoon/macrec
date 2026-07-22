@@ -73,6 +73,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     private let liveHint = NSTextField(labelWithString: "Live Captions mirror — start/stop from the tray; the floating overlay stays available as a second screen.")
     private let statusPane = NSStackView()
     private var statusActions: [HealthAction] = []
+    private var statusTimer: Timer?
     /// Wired by the app: the same live health sample + action routing the Status window uses.
     var healthSample: (() -> HealthInputs)?
     var onHealthAction: ((HealthAction) -> Void)?
@@ -126,6 +127,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         refresh()
+        if section == .status, statusTimer == nil { switchSection(.status) }   // reopen restarts the tick
     }
 
     /// Open the window on `target` (a summary or digest file) and show it — the tray "summary:" row's
@@ -520,10 +522,20 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         // Library chrome hides wholesale outside its section; inside it, showEntry state rules.
         headBar.isHidden = !lib || selected == nil && standaloneURL == nil
         summaryBar.isHidden = headBar.isHidden
-        playerBar.isHidden = !lib || playerBar.isHidden
+        playerBar.isHidden = !lib || selected?.audioURL == nil
         if let scroll = textView.enclosingScrollView { scroll.isHidden = !lib }
         if lib { applyHeaderActions() }
         if new == .status { rebuildStatusPane() }
+        statusTimer?.invalidate(); statusTimer = nil
+        if new == .status {   // live mic %/verdicts, like the Status window's own 1 Hz tick
+            let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+                guard let self, section == .status,
+                      window?.isVisible == true || fixtureDays != nil else { return }
+                rebuildStatusPane()
+            }
+            RunLoop.main.add(t, forMode: .common)
+            statusTimer = t
+        }
         if new == .live, let pending = pendingLiveMirror {
             pendingLiveMirror = nil
             liveMirror(pending)   // replay the caption that arrived while another section was up
@@ -560,6 +572,11 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     /// The overlay's rendered stream, mirrored into the main window's Live pane (same text).
     private var pendingLiveMirror: NSAttributedString?
+    /// The live session ended — a later visit must not replay the dead session's captions.
+    func liveMirrorClear() {
+        pendingLiveMirror = nil
+        liveText.textStorage?.setAttributedString(NSAttributedString(string: ""))
+    }
     func liveMirror(_ text: NSAttributedString) {
         // The overlay renders many times a second — cache off-screen, paint only when the pane
         // shows (a caption arriving while browsing Library must still be there on entering Live).
@@ -575,6 +592,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     func switchSectionForTest(_ s: MainSection) { switchSection(s) }
     var livePaneHiddenForTest: Bool { livePane.isHidden }
     var statusPaneHiddenForTest: Bool { statusPane.isHidden }
+    var summaryBarHiddenForTest: Bool { summaryBar.isHidden }
+    var statusTimerLiveForTest: Bool { statusTimer != nil }
     var statusRowCountForTest: Int { statusPane.arrangedSubviews.count }
     var liveMirrorTextForTest: String { liveText.string }
 
@@ -804,7 +823,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         }
     }
 
-    func windowWillClose(_ notification: Notification) { stopPlayback() }
+    func windowWillClose(_ notification: Notification) {
+        stopPlayback()
+        statusTimer?.invalidate(); statusTimer = nil   // a closed window must not keep a 1 Hz timer
+    }
 
     // MARK: split view (classic sizing — see build())
 
@@ -935,7 +957,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         exportBtn.isEnabled = exportOn
         exportBtn.isHidden = !exportOn   // non-transcript rows have nothing to convert — no dead chrome
         let slot = currentSummarySlot()
-        summaryBar.isHidden = !exportOn && slot.buttonTitle == nil && !slot.spinning && slot.status == nil
+        // Section gate: refresh()/windowDidBecomeKey call this regardless of section — outside
+        // Library the bar must stay down or it bleeds over the Status/Live pane.
+        summaryBar.isHidden = section != .library
+            || (!exportOn && slot.buttonTitle == nil && !slot.spinning && slot.status == nil)
         rerunBtn.isHidden = slot.buttonTitle == nil
         if let t = slot.buttonTitle { rerunBtn.title = t }
         rerunSpinner.isHidden = !slot.spinning
