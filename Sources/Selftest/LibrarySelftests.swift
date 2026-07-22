@@ -124,6 +124,19 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     try? dfm.removeItem(at: orphanFile)
     check("library: Delete is enabled for a real entry, disabled for the empty pane and standalone render",
           onReal && !onEmpty && !onStandalone)
+    // Empty selection hides the WHOLE action strip (user report: an empty day pick left orphaned
+    // Open/Reveal buttons over a void); a selection or a standalone render brings it back.
+    LibraryWindow.shared.selectForTest(nil)
+    let stripHiddenEmpty = LibraryWindow.shared.headBarHiddenForTest
+    LibraryWindow.shared.selectForTest(libraryFixtureDays()[0].entries[1])
+    let stripShownSelected = !LibraryWindow.shared.headBarHiddenForTest
+    let orphan2 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("macrec-strip-\(UUID().uuidString).md")
+    try? "# t".write(to: orphan2, atomically: true, encoding: .utf8)
+    _ = LibraryWindow.shared.showSelectingForTest(orphan2)
+    let stripShownStandalone = !LibraryWindow.shared.headBarHiddenForTest
+    try? FileManager.default.removeItem(at: orphan2)
+    check("library: the action strip hides on empty selection, returns on select and standalone",
+          stripHiddenEmpty && stripShownSelected && stripShownStandalone)
     LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore
     // The LIST-side delete (user ask): every entry row renders a wired trash button bound to its OWN
     // entry — a recycled cell bound to a stale entry would trash the wrong recording on scroll.
