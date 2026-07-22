@@ -291,8 +291,8 @@ enum Pref {
     static let recorderOutageAt = "recorderOutageAt"      // epoch a silent outage was detected on the following start
     static let recorderOutageSeconds = "recorderOutageSeconds"  // how long that outage lasted (seconds)
     static let watchdogQuitRequested = "watchdogQuitRequested"  // #36b: set on a deliberate Quit → the watchdog leaves it dead
-    static let capturedSilenceAt = "capturedSilenceAt"
-    static let appearanceMode = "appearanceMode"          // "system" | "light" | "dark" — NSApp.appearance override    // epoch a run's live mic scored pure silence across consecutive segments; day-keyed
+    static let capturedSilenceAt = "capturedSilenceAt"    // epoch a run's live mic scored pure silence across consecutive segments; day-keyed
+    static let appearanceMode = "appearanceMode"          // "system" | "light" | "dark" — NSApp.appearance override
     static let postProcessCmd = "postProcessCmd"        // freeform command ("" = off)
     static let hintsTerms = "hintsTerms"                // transcription hint terms (comma/newline separated)
     static let hintsFile = "hintsFile"                  // external hints file (one term per line, # comments)

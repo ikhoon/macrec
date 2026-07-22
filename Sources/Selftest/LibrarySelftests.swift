@@ -235,6 +235,17 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     check("appearance: mode maps to aqua/darkAqua and system means no override",
           appearanceName(for: "light") == .aqua && appearanceName(for: "dark") == .darkAqua
               && appearanceName(for: "system") == nil && appearanceName(for: "garbage") == nil)
+    // The OBSERVABLE effect, not just the mapper: the saved pref drives NSApp.appearance (ephemeral
+    // suite; the prior appearance is restored so the selftest leaves the process as it found it).
+    let priorAppearance = NSApp.appearance
+    Pref.d.set("dark", forKey: Pref.appearanceMode); applySavedAppearance()
+    let appliedDark = NSApp.appearance?.name == .darkAqua
+    Pref.d.set("system", forKey: Pref.appearanceMode); applySavedAppearance()
+    let appliedSystem = NSApp.appearance == nil
+    NSApp.appearance = priorAppearance
+    Pref.d.removeObject(forKey: Pref.appearanceMode)
+    check("appearance: the saved mode is APPLIED to NSApp and system clears the override",
+          appliedDark && appliedSystem)
     check("windowed app: launches as a regular (Dock) app; only a real quit terminates",
           launchActivationPolicy() == .regular)
     check("windowed app: only a real quit terminates",
