@@ -399,8 +399,30 @@ s10quit() {
   launchctl kickstart "gui/$(id -u)/com.ikhoon.macrec" 2>/dev/null || true
 }
 
+# ---- s11 — the INSTALLED binary renders the Library window in both appearances (real GUI) -----------
+# Tier-2 for UI/library changes: the pure decisions ride `macrec selftest`, but only running the real
+# deployed .app in a real GUI session proves the window it renders is not blank/broken. The subcommand
+# uses fixture data (no real meeting names) and a throwaway store, so it never touches the user's state.
+s11() {
+  print -r -- "s11: library-snapshot renders every section in dark+light (installed binary, real GUI)"
+  local bin="/Applications/macrec.app/Contents/MacOS/macrec"
+  [[ -x "$bin" ]] || bin=".build/debug/macrec"
+  if [[ ! -x "$bin" ]]; then skip "s11: no macrec binary (package.sh --install, or swift build)"; return; fi
+  local dir="$SCRATCH/shots" out n
+  out=$("$bin" library-snapshot "$dir" 2>&1)
+  # 8 shots = {dark,light} × {main, daily, live, status}; the subcommand FAILS a blank or missing mode
+  # (snapshotIsBlank refuses to write a reassuring empty PNG), so exit-0 + 8 files ≡ a real render.
+  n=$(find "$dir" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+  if print -r -- "$out" | grep -q "library-snapshot: 8 shots" && [[ "$n" -eq 8 ]] \
+     && [[ -s "$dir/dark/library.png" && -s "$dir/light/library.png" ]]; then
+    pass "s11: 8 non-blank Library shots rendered in both appearances"
+  else
+    fail "s11: library-snapshot — $(print -r -- "$out" | tail -2 | tr '\n' ' ') (png count=$n)"
+  fi
+}
+
 print -r -- "macrec QA (tier 2) — scratch: $SCRATCH"
-if [[ $# -eq 0 ]]; then s1; s2; s3; s4; s5; s6; s7; s8; s9; s10; else for s in "$@"; do "$s"; done; fi
+if [[ $# -eq 0 ]]; then s1; s2; s3; s4; s5; s6; s7; s8; s9; s10; s11; else for s in "$@"; do "$s"; done; fi
 print -r -- ""
 print -r -- "qa: $PASS passed, $FAIL failed, $SKIP skipped"
 [[ $FAIL -eq 0 ]] || exit 1
