@@ -290,12 +290,14 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
               && !terminateShouldJustCloseWindow(realQuit: false, windowVisible: false)    // windowless → quit
               && !terminateShouldJustCloseWindow(realQuit: true, windowVisible: false))
 
-    // Clickable checkboxes: the pure flip round-trips, refuses non-task lines, and the WIRING
-    // drives the real click handler — the file changes on disk and the re-render shows the flip.
+    // Clickable checkboxes: one parser for render+toggle; the wiring flips the file on disk.
     check("checkbox: pure toggle flips [ ]↔[x] on the exact line, refuses drifted lines",
           toggledCheckboxText("- [ ] a\n- [x] b", line: 0) == "- [x] a\n- [x] b"
               && toggledCheckboxText("- [ ] a\n- [x] b", line: 1) == "- [ ] a\n- [ ] b"
               && toggledCheckboxText("plain\n- [ ] a", line: 0) == nil
+              && toggledCheckboxText("- prose [ ] literal", line: 0) == nil   // drifted: not a task marker
+              && toggledCheckboxText("- [ ]", line: 0) == "- [x]"             // empty task still toggles
+              && toggledCheckboxText("2. [x] done", line: 0) == "2. [ ] done"
               && toggledCheckboxText("- [ ] a", line: 5) == nil
               && macrecCheckLine(URL(string: "macrec-check://7")!) == 7
               && macrecCheckLine(URL(string: "https://x.test/")!) == nil)

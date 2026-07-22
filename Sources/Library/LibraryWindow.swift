@@ -1307,8 +1307,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// refresh() "rescans" (e.g. a summary appearing mid-run), like the real disk would.
     func setFixtureForTest(_ days: [LibraryDay]) { fixtureDays = days }
 
-    /// Flip "- [ ]"/"- [x]" on `line` of the shown document and reload. Refuses (logged) when the
-    /// file drifted since the render — never corrupts a non-checkbox line.
+    /// Flip the task box on `line` of the shown document and reload; drifted lines are refused.
     func toggleCheckbox(atSourceLine line: Int) {
         guard let url = currentDocURL(),
               let text = try? String(contentsOf: url, encoding: .utf8) else { return }
@@ -1318,8 +1317,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         }
         do {
             try flipped.write(to: url, atomically: true, encoding: .utf8)
-            // Re-render from the file through the SAME path that produced the view — a standalone
-            // render has no selected entry, so loadDoc() would blank it.
+            // Re-render via the path that produced the view (loadDoc blanks a standalone render).
             if standaloneURL != nil { renderStandalone(url) } else { loadDoc() }
         } catch {
             elog("library: checkbox toggle failed for \(url.lastPathComponent) — \(error.localizedDescription)")

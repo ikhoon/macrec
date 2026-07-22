@@ -151,18 +151,16 @@ enum MarkdownRender {
                 var bodyText = item.text
                 var bodyColor = NSColor.labelColor
                 var checkboxLine: Int?
-                if bodyText.hasPrefix("[ ] ") {
-                    markerGlyph = "☐"; bodyText = String(bodyText.dropFirst(4))
-                    checkboxLine = i - 1   // i already advanced past this source line
-                } else if bodyText.lowercased().hasPrefix("[x] ") {
-                    markerGlyph = "☑"; bodyText = String(bodyText.dropFirst(4))
-                    bodyColor = .secondaryLabelColor   // done items read as done
+                if let box = taskCheckbox(in: line) {   // the SAME parser the toggler uses
+                    markerGlyph = box.checked ? "☑" : "☐"
+                    bodyText = String(bodyText.dropFirst(3)).trimmingCharacters(in: .whitespaces).isEmpty
+                        ? "" : String(bodyText.dropFirst(4))
+                    if box.checked { bodyColor = .secondaryLabelColor }
                     checkboxLine = i - 1
                 }
                 var markerAttrs: [NSAttributedString.Key: Any] = [
                     .font: body, .foregroundColor: NSColor.secondaryLabelColor,
                 ]
-                // The box is a BUTTON: clicking flips the underlying "- [ ]" line in the file.
                 if let n = checkboxLine, let u = URL(string: "macrec-check://\(n)") { markerAttrs[.link] = u }
                 let marker = NSMutableAttributedString(string: markerGlyph + "  ", attributes: markerAttrs)
                 marker.append(inline(bodyText, font: body, color: bodyColor, baseURL: baseURL))
