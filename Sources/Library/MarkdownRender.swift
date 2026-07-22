@@ -84,7 +84,8 @@ enum MarkdownRender {
                 let lineOut = NSMutableAttributedString()
                 if let link = macrecSeekLink(offsetSeconds: offset) {
                     lineOut.append(NSAttributedString(string: stampText, attributes: [
-                        .font: mono, .foregroundColor: NSColor.linkColor, .link: link,
+                        .font: mono, .foregroundColor: NSColor.labelColor, .link: link,
+                        .underlineStyle: NSUnderlineStyle.single.rawValue,
                         .toolTip: "Play from here",
                     ]))
                 } else {
@@ -317,7 +318,8 @@ enum MarkdownRender {
                     let u = (token as NSString).substring(with: lm.range(at: 2))
                     if let url = resolveLink(u, baseURL: baseURL) {
                         out.append(NSAttributedString(string: t, attributes: [
-                            .font: font, .foregroundColor: NSColor.linkColor, .link: url,
+                            .font: font, .foregroundColor: NSColor.labelColor, .link: url,
+                            .underlineStyle: NSUnderlineStyle.single.rawValue,
                         ]))
                     } else {
                         out.append(NSAttributedString(string: t, attributes: plain))
@@ -341,7 +343,8 @@ enum MarkdownRender {
                 let trailing = String(token.dropFirst(urlText.count))
                 if let url = URL(string: urlText) {
                     out.append(NSAttributedString(string: urlText, attributes: [
-                        .font: font, .foregroundColor: NSColor.linkColor, .link: url,
+                        .font: font, .foregroundColor: NSColor.labelColor, .link: url,
+                            .underlineStyle: NSUnderlineStyle.single.rawValue,
                     ]))
                 } else {
                     out.append(NSAttributedString(string: urlText, attributes: plain))
