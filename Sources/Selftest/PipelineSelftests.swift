@@ -731,6 +731,59 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
           && !micLooksDead(voiced: 3.0, speech: 0.0)    // quiet hour — no verdict
           && !micLooksDead(voiced: 8.0, speech: 0.0)    // backchannel-only hour (short utterances) — no cry-wolf
           && !micLooksDead(voiced: 6.0, speech: 0.6))   // borderline but speech present
+    // Browser-history day-capture source: exact epoch conversions (Chrome µs-since-1601, Safari
+    // s-since-2001), host grouping, and the markdown shape — synthetic rows only (never real history).
+    let noonUTC = Date(timeIntervalSince1970: 1_767_182_400)   // 2025-12-31 12:00:00 UTC
+    check("browser history: epoch conversions land on the documented anchors",
+          chromeMicros(for: Date(timeIntervalSince1970: 0)) == 11_644_473_600_000_000
+              && safariSeconds(for: Date(timeIntervalSince1970: 978_307_200)) == 0
+              && chromeMicros(for: noonUTC) == (1_767_182_400 + 11_644_473_600) * 1_000_000
+              && browsingHost("https://mail.google.com/u/0") == "mail.google.com"
+              && browsingHost("https://www.example.com/x") == "example.com")
+    let bh = browsingMarkdown([
+        BrowsingVisit(url: "https://news.site/a", title: "Headline A", visits: 3),
+        BrowsingVisit(url: "https://news.site/b", title: "Headline B", visits: 1),
+        BrowsingVisit(url: "https://docs.dev/guide", title: "The Guide", visits: 5),
+        BrowsingVisit(url: "ftp://skip.me", title: "nope", visits: 9),
+    ], day: "2026-03-02") ?? ""
+    check("browser history: markdown groups by host, busiest first, caps noise, drops non-http",
+          bh.contains("## Browsing — 2026-03-02")
+              && bh.contains("- **docs.dev**") && bh.contains("The Guide")           // 5 visits → first
+              && bh.range(of: "docs.dev")!.lowerBound < bh.range(of: "news.site")!.lowerBound
+              && bh.contains("Headline A (3×)") && !bh.contains("(1×)")               // singletons unmarked
+              && !bh.contains("skip.me")                                             // non-http filtered
+              && browsingMarkdown([], day: "d") == nil
+              && dayBounds("2026-03-02")?.start != nil && dayBounds("bad") == nil)
+    // Cross-source merge: the same URL from Chrome AND Arc AND Safari sums, keeping a non-empty title.
+    check("browser history: same-URL visits merge across sources, busiest first",
+          mergeVisits([BrowsingVisit(url: "https://a/", title: "", visits: 2),
+                       BrowsingVisit(url: "https://b/", title: "B", visits: 1),
+                       BrowsingVisit(url: "https://a/", title: "A", visits: 3)])
+              == [BrowsingVisit(url: "https://a/", title: "A", visits: 5),
+                  BrowsingVisit(url: "https://b/", title: "B", visits: 1)])
+    // Success path: query() copies the db to a PRIVATE temp path, builds the sqlite3 command against
+    // the COPY (never the live file), and parses the runner's US-delimited rows. A real temp file
+    // stands in for the db (existence-gated); the runner is injected so there's no sqlite3 dependency.
+    let liveDB = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("fake-history-\(UUID().uuidString).sqlite")
+    try? Data("x".utf8).write(to: liveDB)
+    var seenCmd = ""
+    let parsed = BrowserHistory.query(dbPath: liveDB.path, sql: "SELECT 1", run: { c in
+        seenCmd = c
+        return "https://a/\u{1f}Title A\u{1f}3\nhttps://b/\u{1f}\u{1f}1"
+    })
+    try? FileManager.default.removeItem(at: liveDB)
+    // Assert the BEHAVIOR, not a private path prefix: the command reads a COPY under the temp
+    // directory (never the live file the browser is writing) and opens it read-only.
+    check("browser history: query reads a read-only temp COPY, never the live db, and parses rows",
+          parsed == [BrowsingVisit(url: "https://a/", title: "Title A", visits: 3),
+                     BrowsingVisit(url: "https://b/", title: "", visits: 1)]
+              && seenCmd.contains(FileManager.default.temporaryDirectory.path)
+              && !seenCmd.contains(liveDB.path) && seenCmd.contains("-readonly"))
+    // Query resilience: a runner error (locked db / missing sqlite3) yields [], never a throw.
+    check("browser history: a query failure degrades to no rows, never breaking the digest",
+          BrowserHistory.query(dbPath: "/nonexistent.db", sql: "x", run: { _ in nil }).isEmpty
+              && BrowserHistory.query(dbPath: "/etc/hosts", sql: "x", run: { _ in nil }).isEmpty)
+
     // Captured-silence (dropped-metric): MIC peak only — the system tap is exactly 0 whenever no
     // app plays, so it can never separate dead from idle. A live mic's noise floor clears epsilon.
     check("capture silence: zero mic is silence; a noise floor or a voice is not; streak needs 2",
