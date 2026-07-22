@@ -446,6 +446,11 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
     check("title: runner replies clean into usable titles, garbage stays nil",
           cleanExtractedTitle("\"프로젝트 킥오프.\"") == "프로젝트 킥오프"
               && cleanExtractedTitle("\n\n  Weekly sync notes  \nBecause you asked…") == "Weekly sync notes"
+              // Length tuning: a rambling reply truncates at a word boundary under the 48-char cap,
+              // never rejects to "(untitled)"; the prompt titles ANY note (topic), not only meetings.
+              && cleanExtractedTitle("Quarterly planning review and cross team roadmap alignment session for the platform group") == "Quarterly planning review and cross team roadmap"
+              && cleanExtractedTitle(String(repeating: "가", count: 60)) == nil   // an unbroken 48+ token is noise
+              && titleExtractionInvocation(runner: .claude, summaryPath: "/tmp/x.md").contains("topic or activity")
               && cleanExtractedTitle("# Title!") == "Title"
               && cleanExtractedTitle("") == nil
               && cleanExtractedTitle("!!! …") == nil
