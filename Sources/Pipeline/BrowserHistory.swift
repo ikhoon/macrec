@@ -140,11 +140,21 @@ enum BrowserHistory {
     /// pipe-delimited rows.
     static func query(dbPath: String, sql: String,
                       run: (String) -> String? = shellQuery) -> [BrowsingVisit] {
-        guard FileManager.default.fileExists(atPath: dbPath) else { return [] }
-        // -readonly + immutable=1: read even while the browser holds the file, and never create -wal/-shm.
-        let cmd = "/usr/bin/sqlite3 -readonly -separator '\u{1f}' "
-            + "'file:\(dbPath.replacingOccurrences(of: "'", with: "'\\''"))?immutable=1' "
-            + shq(sql)
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: dbPath) else { return [] }
+        // Snapshot the DB (+ its -wal/-shm) to a temp copy and read the copy: a live open with
+        // immutable=1 skips the WAL and misses today's visits, and a non-immutable open contends
+        // with the browser's writes. Copying leaves the live files untouched and lets SQLite replay
+        // the WAL on our own copy.
+        let tmp = fm.temporaryDirectory.appendingPathComponent("macrec-hist-\(UUID().uuidString)")
+        try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tmp) }
+        let copy = tmp.appendingPathComponent("db")
+        do { try fm.copyItem(atPath: dbPath, toPath: copy.path) } catch { return [] }
+        for ext in ["-wal", "-shm"] where fm.fileExists(atPath: dbPath + ext) {
+            try? fm.copyItem(atPath: dbPath + ext, toPath: copy.path + ext)
+        }
+        let cmd = "/usr/bin/sqlite3 -readonly -separator '\u{1f}' " + shq(copy.path) + " " + shq(sql)
         guard let out = run(cmd) else { return [] }
         return out.split(separator: "\n").compactMap { line in
             let f = line.components(separatedBy: "\u{1f}")
