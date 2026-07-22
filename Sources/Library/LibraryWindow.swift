@@ -529,7 +529,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         statusTimer?.invalidate(); statusTimer = nil
         if new == .status {   // live mic %/verdicts, like the Status window's own 1 Hz tick
             let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-                guard let self, section == .status, window?.isVisible == true else { return }
+                guard let self, section == .status,
+                      window?.isVisible == true || fixtureDays != nil else { return }
                 rebuildStatusPane()
             }
             RunLoop.main.add(t, forMode: .common)
