@@ -307,10 +307,10 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     LibraryWindow.shared.toggleCheckbox(atSourceLine: 2)
     let cbFlipped = (try? String(contentsOf: cbFile, encoding: .utf8))?.contains("- [x] draft") == true
     let cbRendered = LibraryWindow.shared.docTextForTest.contains("☑")
+    LibraryWindow.shared.toggleCheckbox(atSourceLine: 0)   // "# t" is no task → the refusal must surface
+    let cbRefusalSurfaced = LibraryWindow.shared.checkboxFailureForTest?.contains("changed since") == true
     try? FileManager.default.removeItem(at: cbFile)
     LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
-    LibraryWindow.shared.toggleCheckbox(atSourceLine: 0)   // "# t" — not a task line → refusal surfaces
-    let cbRefusalSurfaced = LibraryWindow.shared.checkboxFailureForTest?.contains("changed since") == true
     check("checkbox: a click flips the file line, re-renders, and a drifted click surfaces its refusal",
           cbFlipped && cbRendered && cbRefusalSurfaced)
 
