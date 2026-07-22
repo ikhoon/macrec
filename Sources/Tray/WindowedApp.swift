@@ -8,6 +8,10 @@ func terminateShouldJustCloseWindow(realQuit: Bool, windowVisible: Bool) -> Bool
     !realQuit && windowVisible
 }
 
+/// The launch activation policy — permanently a REGULAR app (Dock, ⌘Tab): the Library must stay
+/// reachable from the Dock even while every window is closed. Pure (pinned by a selftest).
+func launchActivationPolicy() -> NSApplication.ActivationPolicy { .regular }
+
 /// The NSAppearance name for a saved mode — nil means follow the system. Pure.
 func appearanceName(for mode: String) -> NSAppearance.Name? {
     switch mode {

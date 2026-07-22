@@ -235,6 +235,8 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     check("appearance: mode maps to aqua/darkAqua and system means no override",
           appearanceName(for: "light") == .aqua && appearanceName(for: "dark") == .darkAqua
               && appearanceName(for: "system") == nil && appearanceName(for: "garbage") == nil)
+    check("windowed app: launches as a regular (Dock) app; only a real quit terminates",
+          launchActivationPolicy() == .regular)
     check("windowed app: only a real quit terminates",
           terminateShouldJustCloseWindow(realQuit: false, windowVisible: true)      // ⌘Q → close
               && !terminateShouldJustCloseWindow(realQuit: true, windowVisible: true)      // tray/logout → quit

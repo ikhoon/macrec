@@ -1097,8 +1097,10 @@ var appController: AppController?   // retained for process lifetime
 
 func runMenuBarApp() -> Never {
     let app = NSApplication.shared
-    app.setActivationPolicy(.regular)   // ALWAYS in the Dock (user ask) — the tray stays as the quick surface
-    applySavedAppearance()              // the saved Light/Dark override must survive a relaunch
+    if !app.setActivationPolicy(launchActivationPolicy()) {
+        elog("app: setActivationPolicy(.regular) FAILED — no Dock presence this run")
+    }
+    applySavedAppearance()   // the saved Light/Dark override must survive a relaunch
     let c = AppController()
     appController = c
     app.delegate = c
