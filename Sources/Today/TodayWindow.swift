@@ -145,48 +145,8 @@ final class TodayWindow: NSObject, NSWindowDelegate {
     }
 
     private func rowView(_ row: HealthRow) -> NSView {
-        let dot = NSView()
-        dot.wantsLayer = true
-        dot.translatesAutoresizingMaskIntoConstraints = false
-        dot.layer?.cornerRadius = 4
-        dot.layer?.backgroundColor = Self.color(row.level).cgColor
-        dot.widthAnchor.constraint(equalToConstant: 8).isActive = true
-        dot.heightAnchor.constraint(equalToConstant: 8).isActive = true
-
-        let title = NSTextField(labelWithString: row.title)
-        title.font = .systemFont(ofSize: 13, weight: .medium)
-        // The detail is a WRAPPING caption, capped to a readable measure. A single-line label's
-        // compression resistance (750) beats the window's set size, so the longest sentence used to
-        // FORCE the whole window ~950 pt wide (user: "가로로만 겁내 길어") — wrap instead of stretch.
-        let detail = wrappingCaption(row.detail)
-        detail.widthAnchor.constraint(lessThanOrEqualToConstant: 430).isActive = true
-        let text = NSStackView(views: [title, detail])
-        text.orientation = .vertical
-        text.spacing = 1
-        text.alignment = .leading
-
-        let views: [NSView]
-        if let (label, sel) = actionButton(row.action) {
-            let b = NSButton(title: label, target: self, action: sel)
-            b.bezelStyle = .rounded
-            b.controlSize = .small
-            b.setContentHuggingPriority(.required, for: .horizontal)
-            views = [dot, text, NSView(), b]
-        } else {
-            views = [dot, text]
-        }
-        let h = NSStackView(views: views)
-        h.orientation = .horizontal
-        h.spacing = 8
-        // firstBaseline, not centerY (review): a wrapped 2-3 line detail makes the row tall, and a
-        // center-aligned dot/button drifts into the middle of the PARAGRAPH — annotating the caption
-        // instead of the title. Baseline-align to the title's first line; the baseline-less dot sits
-        // its bottom edge on that baseline, which reads as a bullet on the title.
-        h.alignment = .firstBaseline
-        h.edgeInsets = NSEdgeInsets(top: 4, left: 0, bottom: 4, right: 0)
-        h.translatesAutoresizingMaskIntoConstraints = false
-        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        return h
+        let a = actionButton(row.action)
+        return makeHealthRowView(row, actionTitle: a?.0, target: a == nil ? nil : self, action: a?.1)
     }
 
     private func actionButton(_ action: HealthAction) -> (String, Selector)? {
@@ -217,13 +177,7 @@ final class TodayWindow: NSObject, NSWindowDelegate {
     @objc private func doShowLog() { onShowLog?() }
     @objc private func doNotifSettings() { onOpenNotificationSettings?() }
 
-    private static func color(_ level: HealthLevel) -> NSColor {
-        switch level {
-        case .ok: return .systemGreen
-        case .warn: return .systemOrange
-        case .bad: return .systemRed
-        }
-    }
+    private static func color(_ level: HealthLevel) -> NSColor { healthLevelColor(level) }
 
     // MARK: test kit (mirrors LibraryWindow)
 
