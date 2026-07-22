@@ -1097,7 +1097,7 @@ var appController: AppController?   // retained for process lifetime
 
 func runMenuBarApp() -> Never {
     let app = NSApplication.shared
-    app.setActivationPolicy(.accessory)   // menu-bar only, no Dock icon (LSUIElement)
+    app.setActivationPolicy(.regular)   // ALWAYS in the Dock (user ask) — the tray stays as the quick surface
     let c = AppController()
     appController = c
     app.delegate = c
