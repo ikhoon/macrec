@@ -275,9 +275,13 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         && LibraryWindow.shared.liveMirrorTextForTest.contains("mirror check line")
     LibraryWindow.shared.switchSectionForTest(.library)
     let backToLib = LibraryWindow.shared.livePaneHiddenForTest
+    LibraryWindow.shared.liveMirror(NSAttributedString(string: "captured before open"))   // arrives off-screen
+    LibraryWindow.shared.switchSectionForTest(.live)
+    let replayed = LibraryWindow.shared.liveMirrorTextForTest.contains("captured before open")
+    LibraryWindow.shared.switchSectionForTest(.library)
     LibraryWindow.shared.healthSample = nil
     check("main window: nav swaps Live/Library/Status panes with real content",
-          statusRows > todayHealth(healthFix).count / 2 && statusShown && liveShown && backToLib)
+          statusRows > todayHealth(healthFix).count / 2 && statusShown && liveShown && backToLib && replayed)
     check("windowed app: launches as a regular (Dock) app; only a real quit terminates",
           launchActivationPolicy() == .regular)
     check("windowed app: only a real quit terminates",

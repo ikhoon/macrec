@@ -524,6 +524,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         if let scroll = textView.enclosingScrollView { scroll.isHidden = !lib }
         if lib { applyHeaderActions() }
         if new == .status { rebuildStatusPane() }
+        if new == .live, let pending = pendingLiveMirror {
+            pendingLiveMirror = nil
+            liveMirror(pending)   // replay the caption that arrived while another section was up
+        }
     }
 
     private func rebuildStatusPane() {
@@ -555,10 +559,14 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     }
 
     /// The overlay's rendered stream, mirrored into the main window's Live pane (same text).
+    private var pendingLiveMirror: NSAttributedString?
     func liveMirror(_ text: NSAttributedString) {
-        // The overlay renders many times a second — skip the text-storage churn unless the pane
-        // is actually on screen (section + window visibility both required).
-        guard section == .live, window?.isVisible == true || fixtureDays != nil else { return }
+        // The overlay renders many times a second — cache off-screen, paint only when the pane
+        // shows (a caption arriving while browsing Library must still be there on entering Live).
+        guard section == .live, window?.isVisible == true || fixtureDays != nil else {
+            pendingLiveMirror = text
+            return
+        }
         liveText.textStorage?.setAttributedString(text)
         liveText.scrollToEndOfDocument(nil)
     }
