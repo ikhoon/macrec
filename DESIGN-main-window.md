@@ -17,6 +17,7 @@ Build it as an **`NSSplitViewController`** with three `NSSplitViewItem`s (Claude
   source list under the floating traffic lights, and `minimumThickness`/`maximumThickness`. This replaces the raw `NSSplitView` +
   `NSSplitViewDelegate` that `LibraryWindow` drives today (:380). **Width min 240 / max 360pt** (Linear/Things source-list guidance, ref
   #4).
+
 - **Item 1 — detail** (`behavior = .default`): the view swapped per selection.
 - **Item 2 — inspector** (`behavior = .default`, `isCollapsed = true` by default): reserved, not built in v1. Both rails collapse for a
   focused center column (MacWhisper collapsible-rails model, ref #3).
@@ -26,6 +27,7 @@ Build it as an **`NSSplitViewController`** with three `NSSplitViewItem`s (Claude
 1. **Three pinned nav rows at the very top** — `Live Captions`, `Library`, `Status` — each a monochrome SF Symbol + label. This is the mode
    switcher (ref #2 takeaway 7, ref #1 takeaway 1). Selecting one swaps Item 1's view controller. Order Live first (it's the "now" surface),
    Library, then Status.
+
    - `Live Captions` → `waveform` (or `dot.radio`)
    - `Library` → `rectangle.stack` / `text.bubble`
    - `Status` → `heart.text.square` (Watchtower analogy)
@@ -59,12 +61,15 @@ w.titlebarSeparatorStyle = .none         // ADD — kills the hairline under the
 - **No NSToolbar in v1.** Keep macrec's hand-rolled top `NSStackView` bar (the collapsing search lives there and NSToolbar constrains it —
   ref #5 search note, and the documented Sequoia `NSSearchToolbarItem` focus bug). This also sidesteps the `titleVisibility=.hidden` +
   NSToolbar `displayMode` restore gotcha (Apple forum 779805, ref #1).
+
 - **Traffic lights: do NOT reposition them** in the main window. `LiveCaptionWindow` hand-grabs
   `standardWindowButton(.closeButton)?.superview` (:181) — that hack is fragile; don't carry it over (ref #5 takeaway 3). Instead **inset
   content**: the top bar already uses `edgeInsets left:78` (clears all three lights). **Raise `top` from 8 to ~28pt** so the native titlebar
   drag region survives.
+
 - **Drag region:** leave the top ~28pt free of interactive controls rather than setting `isMovableByWindowBackground = true` (that steals
   drags from content — ref #5).
+
 - **Draggable action anchors:** because the titlebar is invisible, keep the primary verbs in **fixed, predictable corners** (MacWhisper
   discipline, ref #3 takeaway 7) — a Record/Stop control anchored bottom-right of the Live pane.
 
@@ -92,7 +97,7 @@ recording kinds by GLYPH SHAPE, not hue** (ref #5 takeaway 5, 1Password monochro
 **Palette (neutral, system-dynamic so light/dark invert for free):**
 
 | Role | NSColor |
-|---|---|
+| --- | --- |
 | Primary text / active glyph | `labelColor` |
 | Secondary text / muted subtitle / status glyph | `secondaryLabelColor` |
 | Empty-state glyph, disabled | `tertiaryLabelColor` |
@@ -106,8 +111,10 @@ warm-cream identity specifically, layer it as dynamic `NSColor` asset catalog en
 monochrome.)
 
 **The ONE sanctioned accent = semantic status only, never chrome** (Linear "flashlight" rule ref #4; ref #5 takeaway 7):
+
 - **Live/recording indicator:** a **monochrome** pulsing `labelColor` dot or `recording.circle` SF Symbol — **NOT `systemRed`** (ref #5
   liveContent).
+
 - **Status health (the one real color):** `checkmark.circle.fill` `systemGreen` / `exclamationmark.triangle.fill` `systemYellow` /
   `xmark.octagon.fill` `systemRed` — this is *information*, and even Things/Fantastical keep status color. Filled symbols over bare dots.
 
@@ -129,12 +136,16 @@ back to the icon on empty end-editing via `NSSearchFieldDelegate`. This is the r
 all favor collapsed/summoned search over always-on, ref #4).
 
 Three polish items:
+
 - **Animate the reveal** — it currently toggles `isHidden` instantly. Animate the field's **width constraint** via `NSAnimationContext`
   (`animator().constant` 0→full over ~0.15-0.2s) (ref #2, ref #5).
+
 - **Anchor it to the list column**, not the sidebar (1Password rule, ref #1 takeaway 6). In the unified window that means the top bar above
   the Library detail/list, after the `left:78` traffic-light inset.
+
 - **Wire ⌘F (and optionally ⌘K)** to the same expansion so keyboard users never hit the collapsed icon as a dead end (Linear ⌘K palette /
   Things Quick Find, ref #4 takeaway 6).
+
 - **Keep live-filter-on-keystroke** (`controlTextDidChange`, :441). **Do NOT copy 1Password 8's deferred-results search** — reviewers panned
   it as un-Mac-like (ref #1 AVOID).
 
@@ -146,12 +157,15 @@ Three polish items:
 (ref #1 liveContent, ref #3 takeaway 3 — "a mode, not a popover").
 
 Reuse `LiveCaptionWindow`'s proven streaming model (ref #5 liveContent), re-hosted as a **docked auto-scrolling `NSTextView`**:
+
 - **Incremental append + `scrollToEndOfDocument` on each new line** — never reflow the whole buffer (perf + no flicker).
 - **Interim vs final by gray-level, not color** (Claude token-streaming, ref #2 liveContent): newest/interim text at `labelColor`; as lines
   finalize and age, ramp older lines to `secondaryLabelColor` → `tertiaryLabelColor` (the same alpha ramp as `captionLineAlpha`, in
   grayscale).
+
 - **Translation** carried as the primary line with the original demoted to a muted secondary line above/beside it (`subtitleLine` model),
   hierarchy by gray-level not a bordered panel (ref #2, ref #4 liveContent).
+
 - **Live indicator monochrome** — pulsing dot / `recording.circle`, never `systemRed`.
 - **Record/Stop anchored bottom-right** of the pane (MacWhisper fixed-corner discipline, ref #3).
 - **Click-to-seek parity** (MacWhisper, ref #3 takeaway 2): make live and library transcript rows share one row component so clicking any
@@ -165,14 +179,18 @@ one action button (ref #5 listDetail upgrade).
 ## 6. Library day-view / calendar
 
 Keep what exists, make it monochrome:
+
 - **Day groups** stay as `NSOutlineView` group rows via `isGroupItem` (LibraryWindow.swift:954) with `libraryDayLabel` headers — small-caps
   `secondaryLabelColor` (ref #1, ref #2 date-band captions).
+
 - **Rows two-line, breathable** (1Password/Claude density, ref #1/#2 listDetail): leading 16pt mono kind glyph + primary "HH:MM Title" +
   muted subtitle, trailing status glyphs (`sparkles` summarized, `waveform` audio) in `secondaryLabelColor`. Hairline separators only; lean
   on whitespace (Linear "removed unnecessary separators", ref #4).
+
 - **The existing mini-month calendar** (`LibraryCalendarView`, lights recorded days, filters on day-click — Fantastical-like) **stays,
   recolored monochrome** (ref #5 listDetail): recorded-day dots `secondaryLabelColor`, selected-day ring
   `unemphasizedSelectedContentBackgroundColor`, **mark TODAY with bold/filled `labelColor`** — not the `systemRed` Calendar uses.
+
 - **Detail = card stack** (1Password "sections of fields with air between", ref #1): summary/transcript markdown as one card, audio player
   as its own card, generous vertical whitespace; **constrain the markdown to a ~680-720pt readable measure**, not full-bleed (Claude, ref
   #2); **hide markdown syntax markers** in the rendered view (Bear hybrid editor, ref #4).
