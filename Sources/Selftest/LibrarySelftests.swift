@@ -631,26 +631,44 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         lw.refreshForTest()
         let inviteAfterScan = lw.docTextForTest.contains("Select a recording")
         // A day-pick / filter that empties the VISIBLE list must NOT keep inviting a pick from an empty
-        // left pane (it would contradict the "No recordings/No match" notice) — the review's P1.
-        lw.pickDayForTest("2099-01-01")   // a day with no recordings
+        // left pane (it would contradict the "No recordings/No match" notice) — the review's P1. Drive the
+        // REAL calendar button + search field so this also guards their target-action wiring.
+        let pickedEmptyDay = lw.calendarPickForTest("2026-03-05")   // a real click on an empty day on the grid
         let noInviteEmptyDay = !lw.docTextForTest.contains("Select a recording")
-        lw.pickDayForTest(nil)
-        lw.setSearchForTest("zzz-no-such-match")
+        _ = lw.calendarClickClearForTest()   // real ✕ chip → clears the day filter
+        lw.setSearchForTest("zzz-no-such-match")   // real search field + its wired filterChanged action
         let noInviteNoMatch = !lw.docTextForTest.contains("Select a recording")
         lw.setSearchForTest("")   // clears back to the full list → the invite returns
         let inviteBack = lw.docTextForTest.contains("Select a recording")
         check("library: empty-pane invite tracks the VISIBLE list (first open yes; empty day/no-match no)",
-              blankBeforeScan && inviteAfterScan && noInviteEmptyDay && noInviteNoMatch && inviteBack)
-        // The nav-highlight fix (the "dead"/무반응 nav complaint): the active row is filled + bold,
-        // inactive rows are clear. Break either and this fails — the fix was eyeball-only before.
-        lw.switchSectionForTest(.library)
+              blankBeforeScan && inviteAfterScan && pickedEmptyDay && noInviteEmptyDay && noInviteNoMatch && inviteBack)
+        // The nav-highlight fix (the "dead"/무반응 nav complaint): CLICK the real nav buttons, then assert
+        // the active row is filled + bold and inactive rows are clear. Break the wiring or the style → fail.
+        lw.clickNavForTest(.library)
         let libNav = lw.navHighlightForTest
-        lw.switchSectionForTest(.status)
+        lw.clickNavForTest(.status)
         let statusNav = lw.navHighlightForTest
-        lw.switchSectionForTest(.library)
-        check("library: the active nav row reads as selected (filled + bold), inactive rows are clear",
+        lw.clickNavForTest(.library)
+        check("library: clicking a nav row makes it read as selected (filled + bold), others clear",
               libNav.activeFilled && libNav.activeBold && libNav.othersClear
                   && statusNav.activeFilled && statusNav.activeBold && statusNav.othersClear)
+        // Stable-identity selection across a rescan (review Major): a summary landing on the SELECTED
+        // transcript changes its value (gains summaryURL) but not its (url, kind) — the preview must
+        // rebind to the fresh entry (picker now shown), not clear to the invite on a value-equality miss.
+        let tURL = URL(fileURLWithPath: "/tmp/id-\(UUID().uuidString).md")
+        let noSummary = LibraryDay(day: "2026-03-02", entries: [
+            LibraryEntry(day: "2026-03-02", time: "11:00", title: "topic", kind: .transcript,
+                         url: tURL, summaryURL: nil, audioURL: nil)])
+        lw.loadFixtureForTest([noSummary])
+        lw.selectForTest(noSummary.entries[0])
+        let pickerHiddenNoSummary = lw.docPickerHiddenForTest   // no summary yet → picker hidden
+        let withSummary = LibraryDay(day: "2026-03-02", entries: [
+            LibraryEntry(day: "2026-03-02", time: "11:00", title: "topic", kind: .transcript,
+                         url: tURL, summaryURL: tURL, audioURL: nil)])   // same (url, kind); summary landed
+        lw.setFixtureForTest([withSummary])
+        lw.refreshForTest()
+        check("library: a summary landing on the selected row rebinds it (not clears) across a rescan",
+              pickerHiddenNoSummary && lw.selectedURLForTest == tURL && !lw.docPickerHiddenForTest)
         LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore the rich default
     }
     // Transcript stamps: parsing, the clock→offset decision, and the seek-link scheme.

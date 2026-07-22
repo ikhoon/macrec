@@ -672,7 +672,15 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         // re-run spinner (maintainer found it spinning during filtering). refresh() handles the
         // prefs-changed case below.
         if let sel = selected {
-            if !shownDays.contains(where: { $0.entries.contains(sel) }) { showEntry(nil) } // filtered out
+            // Match by STABLE IDENTITY (url + kind), not the whole value: a rescan that lands a summary
+            // (or renames/attaches audio) changes the entry's metadata while the same row stays visible,
+            // and a value-equality miss would wrongly clear the user's preview. Rebind to the fresh entry
+            // so the picker/player pick up the new summary; clear only when the row is truly gone.
+            if let fresh = shownDays.lazy.flatMap(\.entries).first(where: { $0.url == sel.url && $0.kind == sel.kind }) {
+                if fresh != sel { showEntry(fresh) }
+            } else {
+                showEntry(nil) // the selected row was filtered out / deleted
+            }
         } else if standaloneURL == nil {
             // Nothing selected: repaint the empty pane so its invite/blank tracks the VISIBLE list —
             // a day-pick or filter that empties the list must drop the "select on the left" invite (it
@@ -1409,11 +1417,18 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     // (player bar visibility, lazy load, resets) without audible playback.
     func selectForTest(_ e: LibraryEntry?) { showEntry(e) }
     func refreshForTest() { refresh() }   // exercises the real refresh path (empty-pane hint repaint)
-    func setSearchForTest(_ s: String) { searchField.stringValue = s; applyFilter() }
-    func pickDayForTest(_ day: String?) { selectedDay = day; applyFilter() }   // drives the calendar onPick path
+    /// Type into the REAL search field and fire its wired target-action (filterChanged) — so the test
+    /// breaks if the field's action wiring breaks, not just if applyFilter changes.
+    func setSearchForTest(_ s: String) {
+        searchField.stringValue = s
+        _ = searchField.target?.perform(searchField.action, with: searchField)
+    }
+    /// Click the REAL nav button (target-action → navTapped → switchSection), not switchSection direct.
+    func clickNavForTest(_ s: MainSection) { navButtons.first { $0.tag == s.rawValue }?.performClick(nil) }
     /// The active nav row must LOOK selected (fill + bold) and inactive rows must not — the fix for the
-    /// "dead"/무반응 nav. Read after the framework's layout so the values are the shipped ones.
+    /// "dead"/무반응 nav. Force the framework's layout first so the values read are the shipped ones.
     var navHighlightForTest: (activeFilled: Bool, activeBold: Bool, othersClear: Bool) {
+        window?.contentView?.layoutSubtreeIfNeeded()
         let active = navButtons.first { $0.tag == section.rawValue }
         let activeW = active?.font.map { NSFontManager.shared.weight(of: $0) } ?? 0
         let inactiveW = navButtons.first { $0.tag != section.rawValue }?.font
@@ -1473,6 +1488,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     func calendarPickForTest(_ day: String) -> Bool { calendarView.pickForTest(day) }
     func calendarClickClearForTest() -> Bool { calendarView.clickClearForTest() }
     var selectedDayForTest: String? { selectedDay }
+    var selectedURLForTest: URL? { selected?.url }   // the row the right pane is bound to
+    var docPickerHiddenForTest: Bool { docPicker.isHidden }   // hidden ⇔ the selected row has no summary
     var calendarSelectedDayForTest: String? { calendarView.selectedDay }   // the VIEW's copy (desync guard)
     var calendarMonthForTest: String { calendarView.month }
     func calendarDayButtonCountForTest() -> Int { calendarView.dayButtonCountForTest() }
