@@ -303,11 +303,12 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         }
         // Sidebar nav: three peer destinations (1Password's Watchtower/All-Items shape). Selecting
         // one swaps the right-hand detail; the day tree below stays the Library's navigation.
-        let navSpecs: [(String, String, MainSection)] = [
-            ("waveform", "Live Captions", .live),
+        var navSpecs: [(String, String, MainSection)] = [
             ("rectangle.stack", "Library", .library),
             ("heart.text.square", "Status", .status),
         ]
+        // Live Captions only exists on macOS 26 — offering the row earlier would be a dead pane.
+        if #available(macOS 26, *) { navSpecs.insert(("waveform", "Live Captions", .live), at: 0) }
         let nav = NSStackView()
         nav.orientation = .vertical
         nav.spacing = 2
@@ -421,6 +422,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         liveText.isEditable = false
         liveText.drawsBackground = false
         liveText.textContainerInset = NSSize(width: 16, height: 12)
+        liveText.isVerticallyResizable = true
+        liveText.isHorizontallyResizable = false
+        liveText.autoresizingMask = [.width]
+        liveText.textContainer?.widthTracksTextView = true
         let liveScroll = NSScrollView()
         liveScroll.documentView = liveText
         liveScroll.hasVerticalScroller = true
@@ -551,6 +556,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     /// The overlay's rendered stream, mirrored into the main window's Live pane (same text).
     func liveMirror(_ text: NSAttributedString) {
+        // The overlay renders many times a second — skip the text-storage churn unless the pane
+        // is actually on screen (section + window visibility both required).
+        guard section == .live, window?.isVisible == true || fixtureDays != nil else { return }
         liveText.textStorage?.setAttributedString(text)
         liveText.scrollToEndOfDocument(nil)
     }
@@ -558,6 +566,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     // Section test hooks: drive the real switch, read the observable pane state.
     func switchSectionForTest(_ s: MainSection) { switchSection(s) }
     var livePaneHiddenForTest: Bool { livePane.isHidden }
+    var statusPaneHiddenForTest: Bool { statusPane.isHidden }
     var statusRowCountForTest: Int { statusPane.arrangedSubviews.count }
     var liveMirrorTextForTest: String { liveText.string }
 

@@ -150,15 +150,20 @@ final class TodayWindow: NSObject, NSWindowDelegate {
     }
 
     private func actionButton(_ action: HealthAction) -> (String, Selector)? {
+        // Titles come from the SHARED mapping (healthActionTitle) so this window and the main
+        // window's Status pane can never label the same action differently; only selectors differ.
+        let sel: Selector?
         switch action {
-        case .none: return nil
-        case .grantPermissions: return ("Grant…", #selector(doGrant))
-        case .openSettings: return ("Settings…", #selector(doSettings))
-        case .retrySummary: return ("Retry", #selector(doRetry))
-        case .testCapture: return ("Test…", #selector(doTest))
-        case .showLog: return ("Open log", #selector(doShowLog))
-        case .openNotificationSettings: return ("Settings…", #selector(doNotifSettings))
+        case .none: sel = nil
+        case .grantPermissions: sel = #selector(doGrant)
+        case .openSettings: sel = #selector(doSettings)
+        case .retrySummary: sel = #selector(doRetry)
+        case .testCapture: sel = #selector(doTest)
+        case .showLog: sel = #selector(doShowLog)
+        case .openNotificationSettings: sel = #selector(doNotifSettings)
         }
+        guard let sel, let title = healthActionTitle(action) else { return nil }
+        return (title, sel)
     }
 
     // The action row is stashed so the @objc handlers know which pane/target to hit.

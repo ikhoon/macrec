@@ -268,7 +268,7 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     LibraryWindow.shared.healthSample = { healthFix }
     LibraryWindow.shared.switchSectionForTest(.status)
     let statusRows = LibraryWindow.shared.statusRowCountForTest
-    let statusShown = !LibraryWindow.shared.headBarHiddenForTest ? false : true
+    let statusShown = !LibraryWindow.shared.statusPaneHiddenForTest && LibraryWindow.shared.headBarHiddenForTest
     LibraryWindow.shared.switchSectionForTest(.live)
     LibraryWindow.shared.liveMirror(NSAttributedString(string: "mirror check line"))
     let liveShown = !LibraryWindow.shared.livePaneHiddenForTest
