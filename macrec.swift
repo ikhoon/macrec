@@ -1388,6 +1388,14 @@ public enum App {
             }
         }
 
+        // Subcommand: browser-history <yyyy-mm-dd> — print the day's browsing markdown (QA / preview
+        // of the day-capture source). Read-only; prints nothing but a heading when there's no history.
+        if args.first == "browser-history" {
+            let day = args.count > 1 ? args[1] : todayString()
+            print(BrowserHistory.dayMarkdown(day) ?? "## Browsing — \(day)\n\n(no history)")
+            exit(0)
+        }
+
         // Subcommand: config — print the loaded settings (UserDefaults > env > default) and exit.
         if args.first == "config" {
             let c = EngineConfig.load()
