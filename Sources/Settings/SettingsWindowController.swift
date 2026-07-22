@@ -58,6 +58,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     private let deeplKeyField = NSSecureTextField()        // DeepL translation key (cloud translator, opt-in)
     private let claudeTokenField = NSSecureTextField()     // `claude setup-token` — headless auth for summaries
     private let translateProviderPopup = NSPopUpButton()   // live-translation backend: Apple (on-device) | DeepL
+    private let appearancePopup = NSPopUpButton()           // System | Light | Dark (NSApp.appearance override)
+    private let appearanceValues = ["system", "light", "dark"]
     private let translateProviderValues = TranslationProvider.allCases.map(\.rawValue)
     private let translateProviderTitles = TranslationProvider.allCases.map(\.title)
     private let postProcessField = NSTextField()  // freeform post-process command (shell mode)
@@ -138,6 +140,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         segPopup.addItems(withTitles: segTitles); langPopup.addItems(withTitles: langTitles)
         transcriptLangPopup.addItems(withTitles: tLangTitles)
         translateProviderPopup.addItems(withTitles: translateProviderTitles)
+        appearancePopup.addItems(withTitles: ["System", "Light", "Dark"])
         modelPopup.addItems(withTitles: WhisperCatalog.all.map { $0.label })
         txtRetPopup.addItems(withTitles: retTitles)
         audioRawCombo.addItems(withObjectValues: ["3 days", "7 days", "14 days", "30 days", "Don't compress"])
@@ -669,6 +672,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         ])
         pane("General", "gearshape", .systemGray, [
             Section(header: "General", note: nil, rows: [
+                r("Appearance", appearancePopup, "System follows macOS; Light/Dark pin the app's windows."),
                 sw(loginBtn, "Start at login", "Launch macrec on login for around-the-clock recording."),
                 sw(updateBtn, "Check for updates daily", "Silently checks GitHub once a day and notifies only "
                   + "when a new release is out. Check now from the tray menu → Check for Updates…"),
@@ -1140,6 +1144,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             field.stringValue = Keychain.exists(account) ? Self.keyMask : ""
         }
         translateProviderPopup.selectItem(at: idx(Pref.d.string(forKey: Pref.translateProvider) ?? "apple", translateProviderValues))
+        appearancePopup.selectItem(at: idx(Pref.d.string(forKey: Pref.appearanceMode) ?? "system", appearanceValues))
         openaiBaseField.stringValue = OpenAILiveTranscriber.configuredBase   // explicit save (even "") beats env
         postProcessField.stringValue = Pref.postProcessCommand               // same explicit-save semantics
         // Show the EFFECTIVE mode (incl. the v1 migration: unset mode + v1 command = Custom command) —
@@ -1413,6 +1418,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         d.set(customModelField.stringValue.trimmingCharacters(in: .whitespaces), forKey: Pref.customModel)
         d.set(openaiBaseField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.openaiBase)
         d.set(translateProviderValues[max(0, translateProviderPopup.indexOfSelectedItem)], forKey: Pref.translateProvider)
+        d.set(appearanceValues[max(0, appearancePopup.indexOfSelectedItem)], forKey: Pref.appearanceMode)
+        applySavedAppearance()   // take effect immediately — a saved theme the user can't see isn't saved
         d.set(postProcessField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Pref.postProcessCmd)
         d.set(ppModeValues[max(0, ppModeSeg.selectedSegment)], forKey: Pref.postProcessMode)
         d.set(runnerValues[max(0, runnerPopup.indexOfSelectedItem)], forKey: Pref.summaryRunner)

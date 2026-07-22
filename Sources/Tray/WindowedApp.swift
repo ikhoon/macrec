@@ -7,3 +7,21 @@ import AppKit
 func terminateShouldJustCloseWindow(realQuit: Bool, windowVisible: Bool) -> Bool {
     !realQuit && windowVisible
 }
+
+/// Permanently a regular app: the Library must stay reachable from the Dock with no window open.
+func launchActivationPolicy() -> NSApplication.ActivationPolicy { .regular }
+
+/// nil = follow the system.
+func appearanceName(for mode: String) -> NSAppearance.Name? {
+    switch mode {
+    case "light": return .aqua
+    case "dark": return .darkAqua
+    default: return nil
+    }
+}
+
+/// Apply the saved appearance override app-wide (launch + Save).
+func applySavedAppearance(d: UserDefaults = Pref.d) {
+    NSApp.appearance = appearanceName(for: d.string(forKey: Pref.appearanceMode) ?? "system")
+        .map { NSAppearance(named: $0) } ?? nil
+}
