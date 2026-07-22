@@ -612,6 +612,8 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
                              eventStart: schedDate("2026-07-05 20:30"), eventTaken: true) == segA
           && transcriptStart(segStart: segA, segEnd: segAEnd,
                              eventStart: schedDate("2026-07-05 22:30")) == segAEnd       // matched on the +60s window
+          && transcriptStart(segStart: segA, segEnd: segAEnd,
+                             eventStart: schedDate("2026-07-05 22:30"), eventTaken: true) == segAEnd
           && transcriptBaseName(start: transcriptStart(segStart: segA, segEnd: segAEnd,
                                                        eventStart: schedDate("2026-07-05 21:10")),
                                 timeZone: utc.timeZone) == "2026-07-05-2110")

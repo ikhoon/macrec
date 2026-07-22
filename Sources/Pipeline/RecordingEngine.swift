@@ -525,16 +525,26 @@ final class RecordingEngine {
         // Organize transcripts into monthly subfolders: transcripts/YYYY-MM/…  (audio under YYYY-MM/audio/).
         let monthDir = cfg.transcriptsDir.appendingPathComponent(monthF.string(from: stamp), isDirectory: true)
         try fm.createDirectory(at: monthDir, withIntermediateDirectories: true)
+        // ONE free stem for .md AND .wav (a suffixed transcript must never replace the first
+        // slice's audio); exhaustion falls through to a unique epoch suffix — never an occupied path.
+        var finalSlug = slug
+        if fm.fileExists(atPath: monthDir.appendingPathComponent("\(slug).md").path) {
+            var picked: String?
+            for n in 2 ... 9 where !fm.fileExists(atPath: monthDir.appendingPathComponent("\(slug)-\(n).md").path) {
+                picked = "\(slug)-\(n)"; break
+            }
+            finalSlug = picked ?? "\(slug)-\(Int(Date().timeIntervalSince1970))"
+        }
 
         // keep the mixed WAV per the keepAudio setting (mixed is nil when keepAudio is off)
         var audioLine = "- \(l10n.audio): \(l10n.audioNotKept)"
         if cfg.keepAudio, let mixed = mixed {
             let audioMonthDir = cfg.audioDir.appendingPathComponent(monthF.string(from: stamp), isDirectory: true)
             try fm.createDirectory(at: audioMonthDir, withIntermediateDirectories: true)
-            let keptAudio = audioMonthDir.appendingPathComponent("\(slug).wav")
+            let keptAudio = audioMonthDir.appendingPathComponent("\(finalSlug).wav")
             try? fm.removeItem(at: keptAudio)
             try fm.moveItem(at: mixed, to: keptAudio)
-            audioLine = "- \(l10n.audio): [\(slug).wav](\(relativePath(fromDir: monthDir, toFile: keptAudio)))"
+            audioLine = "- \(l10n.audio): [\(finalSlug).wav](\(relativePath(fromDir: monthDir, toFile: keptAudio)))"
         }
 
         var meta = ""
@@ -556,14 +566,7 @@ final class RecordingEngine {
             bodyMine: bodyMine, bodyTheirs: bodyTheirs,
             body: body,
             eventNotes: calendarNotesForTranscript(event?.notes))
-        // Suffix rather than overwrite when the name is still taken (an event ending exactly on a
-        // slice boundary can stamp two slices with one minute — silent data loss without this).
-        var mdURL = monthDir.appendingPathComponent("\(slug).md")
-        var nameTry = 2
-        while fm.fileExists(atPath: mdURL.path), nameTry <= 9 {
-            mdURL = monthDir.appendingPathComponent("\(slug)-\(nameTry).md")
-            nameTry += 1
-        }
+        let mdURL = monthDir.appendingPathComponent("\(finalSlug).md")
         try doc.markdown(l10n).write(to: mdURL, atomically: true, encoding: .utf8)
         elog("engine:   → transcript saved: \(mdURL.path)")
         return mdURL

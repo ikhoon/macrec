@@ -230,8 +230,7 @@ func scenarioSelftests(_ check: (String, Bool) -> Void) {
                       && !voicedResults.contains { $0.contains("Capturing silence") })
             Pref.d.removeObject(forKey: Pref.capturedSilenceAt)   // don't leak the warn into later suites
         }
-        // (g) A name already on disk must SUFFIX, never overwrite (the boundary-event stamp can
-        // hand two slices one minute). Pre-seed the exact target, then write through the pipeline.
+        // (g) A taken name must suffix, never overwrite (a boundary event can stamp two slices alike).
         if let f2 = writeFixtureWAVs(voiced: true) {
             let seeded = tDir.appendingPathComponent("2026-03/2026-03-03-2200-boundary-sync.md")
             try? fm.createDirectory(at: seeded.deletingLastPathComponent(), withIntermediateDirectories: true)
