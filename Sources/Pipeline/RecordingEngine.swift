@@ -525,15 +525,21 @@ final class RecordingEngine {
         // Organize transcripts into monthly subfolders: transcripts/YYYY-MM/…  (audio under YYYY-MM/audio/).
         let monthDir = cfg.transcriptsDir.appendingPathComponent(monthF.string(from: stamp), isDirectory: true)
         try fm.createDirectory(at: monthDir, withIntermediateDirectories: true)
-        // ONE free stem for .md AND .wav (a suffixed transcript must never replace the first
-        // slice's audio); exhaustion falls through to a unique epoch suffix — never an occupied path.
+        // ONE stem, free for EVERY output it will write (.md and, when kept, .wav) — a suffixed
+        // transcript must never delete another slice's audio, and no fallback may land occupied.
+        let audioMonth = cfg.audioDir.appendingPathComponent(monthF.string(from: stamp), isDirectory: true)
+        func stemFree(_ c: String) -> Bool {
+            !fm.fileExists(atPath: monthDir.appendingPathComponent("\(c).md").path)
+                && (!cfg.keepAudio || mixed == nil
+                    || !fm.fileExists(atPath: audioMonth.appendingPathComponent("\(c).wav").path))
+        }
         var finalSlug = slug
-        if fm.fileExists(atPath: monthDir.appendingPathComponent("\(slug).md").path) {
+        if !stemFree(slug) {
             var picked: String?
-            for n in 2 ... 9 where !fm.fileExists(atPath: monthDir.appendingPathComponent("\(slug)-\(n).md").path) {
-                picked = "\(slug)-\(n)"; break
-            }
-            finalSlug = picked ?? "\(slug)-\(Int(Date().timeIntervalSince1970))"
+            for n in 2 ... 9 where stemFree("\(slug)-\(n)") { picked = "\(slug)-\(n)"; break }
+            var fallback = "\(slug)-\(Int(Date().timeIntervalSince1970))"
+            while picked == nil, !stemFree(fallback) { fallback += "x" }
+            finalSlug = picked ?? fallback
         }
 
         // keep the mixed WAV per the keepAudio setting (mixed is nil when keepAudio is off)
