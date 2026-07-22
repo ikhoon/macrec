@@ -290,6 +290,26 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
               && !terminateShouldJustCloseWindow(realQuit: false, windowVisible: false)    // windowless → quit
               && !terminateShouldJustCloseWindow(realQuit: true, windowVisible: false))
 
+    // Clickable checkboxes: the pure flip round-trips, refuses non-task lines, and the WIRING
+    // drives the real click handler — the file changes on disk and the re-render shows the flip.
+    check("checkbox: pure toggle flips [ ]↔[x] on the exact line, refuses drifted lines",
+          toggledCheckboxText("- [ ] a\n- [x] b", line: 0) == "- [x] a\n- [x] b"
+              && toggledCheckboxText("- [ ] a\n- [x] b", line: 1) == "- [ ] a\n- [ ] b"
+              && toggledCheckboxText("plain\n- [ ] a", line: 0) == nil
+              && toggledCheckboxText("- [ ] a", line: 5) == nil
+              && macrecCheckLine(URL(string: "macrec-check://7")!) == 7
+              && macrecCheckLine(URL(string: "https://x.test/")!) == nil)
+    let cbFile = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("library-cb-\(UUID().uuidString).md")
+    try? "# t\n\n- [ ] draft the rollout plan\n".write(to: cbFile, atomically: true, encoding: .utf8)
+    _ = LibraryWindow.shared.showSelectingForTest(cbFile)   // standalone render of the fixture
+    LibraryWindow.shared.toggleCheckbox(atSourceLine: 2)
+    let cbFlipped = (try? String(contentsOf: cbFile, encoding: .utf8))?.contains("- [x] draft") == true
+    let cbRendered = LibraryWindow.shared.docTextForTest.contains("☑")
+    try? FileManager.default.removeItem(at: cbFile)
+    LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
+    check("checkbox: a click flips the file line and the re-render shows it done",
+          cbFlipped && cbRendered)
+
     // Stem parsing — every real shape in the vault, plus the garbage that must not crash the scan.
     let full = parseLibraryStem("2026-03-02-1030-project-kickoff")
     let bare = parseLibraryStem("2026-03-02-1030")

@@ -912,6 +912,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// A transcript stamp was clicked: seek the lazily loaded player there and play. Foreign links
     /// return false → NSTextView's default handling (NSWorkspace) — macrec-seek: never reaches it.
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        // A checkbox click flips the SOURCE line and re-renders — the file is the truth.
+        if let n = macrecCheckLine(link) { toggleCheckbox(atSourceLine: n); return true }
         guard let secs = macrecSeekSeconds(link) else { return false }
         guard let p = loadPlayerIfNeeded() else { return true }   // failure is on the clock label
         p.currentTime = min(secs, max(p.duration - 0.05, 0))      // a stamp past EOF lands at the end
@@ -1304,6 +1306,25 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// Swap the fixture WITHOUT rebuilding or reselecting — lets a test change what the next
     /// refresh() "rescans" (e.g. a summary appearing mid-run), like the real disk would.
     func setFixtureForTest(_ days: [LibraryDay]) { fixtureDays = days }
+
+    /// Flip "- [ ]"/"- [x]" on `line` of the shown document and reload. Refuses (logged) when the
+    /// file drifted since the render — never corrupts a non-checkbox line.
+    func toggleCheckbox(atSourceLine line: Int) {
+        guard let url = currentDocURL(),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        guard let flipped = toggledCheckboxText(text, line: line) else {
+            elog("library: checkbox toggle refused — line \(line) is no longer a task item in \(url.lastPathComponent)")
+            return
+        }
+        do {
+            try flipped.write(to: url, atomically: true, encoding: .utf8)
+            // Re-render from the file through the SAME path that produced the view — a standalone
+            // render has no selected entry, so loadDoc() would blank it.
+            if standaloneURL != nil { renderStandalone(url) } else { loadDoc() }
+        } catch {
+            elog("library: checkbox toggle failed for \(url.lastPathComponent) — \(error.localizedDescription)")
+        }
+    }
 
     // Selection-driven state, readable by selftests: drive rows like a user, assert the derivation
     // (player bar visibility, lazy load, resets) without audible playback.
