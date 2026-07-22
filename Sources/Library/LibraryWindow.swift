@@ -77,6 +77,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     // Transcript-actions row (its own row — squeezed into the header strip they crushed the title):
     // Export + the re-run slot (button OR spinner+label), derived in applyHeaderActions (one decision).
     private var summaryBar: NSStackView!
+    private var headBar: NSStackView!   // header row (title + doc picker + Open/Reveal/Delete)
     private let rerunBtn = NSButton(title: "Re-run summary", target: nil, action: nil)
     private let rerunSpinner = NSProgressIndicator()
     private let rerunStatus = NSTextField(labelWithString: "")
@@ -147,6 +148,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         standaloneURL = url
         headerLabel.stringValue = url.deletingPathExtension().lastPathComponent
         headerLabel.toolTip = url.path
+        headBar.isHidden = false      // a standalone render IS content — the strip returns
+        summaryBar.isHidden = false
         docPicker.isHidden = true
         playerBar.isHidden = true
         openBtn.isEnabled = true
@@ -302,6 +305,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         rerunStatus.lineBreakMode = .byTruncatingTail
         rerunStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let head = NSStackView(views: [headerLabel, NSView(), docPicker, openBtn, revealBtn, deleteBtn])
+        headBar = head
         head.orientation = .horizontal
         head.spacing = 8
         head.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 6, right: 10)
@@ -441,6 +445,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             headerLabel.toolTip = nil
             docPicker.isHidden = true
             playerBar.isHidden = true
+            // NOTHING is selected: hide the whole action strip — disabled-but-visible buttons over
+            // an empty pane read as broken (user report: an empty day pick "breaks" the UI).
+            headBar.isHidden = true
+            summaryBar.isHidden = true
             openBtn.isEnabled = false
             revealBtn.isEnabled = false
             deleteBtn.isEnabled = false
@@ -448,6 +456,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             setPlainDoc("")
             return
         }
+        headBar.isHidden = false
+        summaryBar.isHidden = false
         let day = libraryDayLabel(day: e.day, today: Self.dayString(Date()),
                                   yesterday: Self.dayString(Date().addingTimeInterval(-86400)))
         // The sidebar already shows the day — the header spends its width on the title (the
@@ -1143,6 +1153,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     func calendarWeekRowCountForTest() -> Int { calendarView.weekRowCountForTest }
     func calendarFlipForTest(by: Int) { calendarView.flipForTest(by: by) }
 
+    var headBarHiddenForTest: Bool { headBar.isHidden }
     var playerBarHiddenForTest: Bool { playerBar.isHidden }
     var playerActiveForTest: Bool { player != nil }
     var openEnabledForTest: Bool { openBtn.isEnabled }
