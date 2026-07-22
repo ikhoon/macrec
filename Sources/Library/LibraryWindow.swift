@@ -912,6 +912,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// A transcript stamp was clicked: seek the lazily loaded player there and play. Foreign links
     /// return false → NSTextView's default handling (NSWorkspace) — macrec-seek: never reaches it.
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        // A checkbox click flips the SOURCE line and re-renders — the file is the truth.
+        if let n = macrecCheckLine(link) { toggleCheckbox(atSourceLine: n); return true }
         guard let secs = macrecSeekSeconds(link) else { return false }
         guard let p = loadPlayerIfNeeded() else { return true }   // failure is on the clock label
         p.currentTime = min(secs, max(p.duration - 0.05, 0))      // a stamp past EOF lands at the end
@@ -1304,6 +1306,41 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// Swap the fixture WITHOUT rebuilding or reselecting — lets a test change what the next
     /// refresh() "rescans" (e.g. a summary appearing mid-run), like the real disk would.
     func setFixtureForTest(_ days: [LibraryDay]) { fixtureDays = days }
+
+    private(set) var checkboxFailureForTest: String?
+    /// Flip the task box on `line` of the shown document and reload; drifted lines are refused.
+    func toggleCheckbox(atSourceLine line: Int) {
+        checkboxFailureForTest = nil
+        guard let url = currentDocURL(),
+              let text = try? String(contentsOf: url, encoding: .utf8) else {
+            surfaceCheckboxFailure("The file could not be read — it may have moved.")
+            return
+        }
+        guard let flipped = toggledCheckboxText(text, line: line) else {
+            surfaceCheckboxFailure("The file changed since it was shown — refresh and try again.")
+            elog("library: checkbox toggle refused — line \(line) drifted in \(url.lastPathComponent)")
+            return
+        }
+        do {
+            try flipped.write(to: url, atomically: true, encoding: .utf8)
+            // Re-render via the path that produced the view (loadDoc blanks a standalone render).
+            if standaloneURL != nil { renderStandalone(url) } else { loadDoc() }
+        } catch {
+            surfaceCheckboxFailure("Saving failed: \(error.localizedDescription)")
+            elog("library: checkbox toggle failed for \(url.lastPathComponent) — \(error.localizedDescription)")
+        }
+    }
+
+    /// A failed click must be VISIBLE (silent-failure rule), not only logged.
+    private func surfaceCheckboxFailure(_ msg: String) {
+        checkboxFailureForTest = msg
+        guard let win = window, win.isVisible else { return }
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "Couldn't toggle the checkbox"
+        a.informativeText = msg
+        a.beginSheetModal(for: win, completionHandler: nil)
+    }
 
     // Selection-driven state, readable by selftests: drive rows like a user, assert the derivation
     // (player bar visibility, lazy load, resets) without audible playback.

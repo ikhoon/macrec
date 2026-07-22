@@ -150,15 +150,19 @@ enum MarkdownRender {
                 var markerGlyph = item.marker
                 var bodyText = item.text
                 var bodyColor = NSColor.labelColor
-                if bodyText.hasPrefix("[ ] ") {
-                    markerGlyph = "☐"; bodyText = String(bodyText.dropFirst(4))
-                } else if bodyText.lowercased().hasPrefix("[x] ") {
-                    markerGlyph = "☑"; bodyText = String(bodyText.dropFirst(4))
-                    bodyColor = .secondaryLabelColor   // done items read as done
+                var checkboxLine: Int?
+                if let box = taskCheckbox(in: line) {   // the SAME parser the toggler uses
+                    markerGlyph = box.checked ? "☑" : "☐"
+                    bodyText = String(bodyText.dropFirst(3)).trimmingCharacters(in: .whitespaces).isEmpty
+                        ? "" : String(bodyText.dropFirst(4))
+                    if box.checked { bodyColor = .secondaryLabelColor }
+                    checkboxLine = i - 1
                 }
-                let marker = NSMutableAttributedString(string: markerGlyph + "  ", attributes: [
+                var markerAttrs: [NSAttributedString.Key: Any] = [
                     .font: body, .foregroundColor: NSColor.secondaryLabelColor,
-                ])
+                ]
+                if let n = checkboxLine, let u = URL(string: "macrec-check://\(n)") { markerAttrs[.link] = u }
+                let marker = NSMutableAttributedString(string: markerGlyph + "  ", attributes: markerAttrs)
                 marker.append(inline(bodyText, font: body, color: bodyColor, baseURL: baseURL))
                 out.append(applying(para, to: marker))
                 out.append(NSAttributedString(string: "\n"))
