@@ -33,7 +33,22 @@ func cleanExtractedTitle(_ raw: String) -> String? {
     while let f = t.first, "\"'“”‘’#*`「」[](){}".contains(f) { t.removeFirst() }
     while let l = t.last, "\"'“”‘’.。!?*`「」[](){}".contains(l) { t.removeLast() }
     t = t.split(separator: " ").joined(separator: " ")
-    guard !t.isEmpty, t.count <= 80, t.contains(where: { $0.isLetter || $0.isNumber }) else { return nil }
+    // Tuning (user): titles must stay SHORT — a runner that rambles past the cap is truncated at a
+    // word boundary instead of rejected (a good-but-long title beats "(untitled)").
+    if t.count > 48 {
+        var cut = ""
+        for w in t.split(separator: " ") {
+            let next = cut.isEmpty ? String(w) : cut + " " + w
+            if next.count > 48 { break }
+            cut = next
+        }
+        // A sentence truncates at a word boundary; an unbroken 48+-char token is noise — reject.
+        guard !cut.isEmpty else { return nil }
+        t = cut
+        // Truncation can promote an internal period to terminal — strip trailing punctuation again.
+        while let l = t.last, "\"'“”‘’.。!?*`「」[](){},;:".contains(l) { t.removeLast() }
+    }
+    guard !t.isEmpty, t.contains(where: { $0.isLetter || $0.isNumber }) else { return nil }
     // The prompt's no-content protocol — an empty recording once got literally named
     // "Empty-recording-no-meeting-content" in production; NONE means leave it untitled.
     guard t.uppercased() != "NONE" else { return nil }
@@ -43,9 +58,11 @@ func cleanExtractedTitle(_ raw: String) -> String? {
 /// The title-extraction command: the summary on stdin, ONLY the title on stdout. Same runner CLIs
 /// (and the same PATH/auth environment) as the summary itself.
 func titleExtractionInvocation(runner: SummaryRunner, summaryPath: String) -> String {
-    let prompt = "Reply with ONLY a concise title (2-6 words) for this meeting note, in the note's "
-        + "own language. No quotes, no trailing punctuation, no explanations. If the note has no "
-        + "meaningful meeting content, reply with exactly: NONE"
+    // "Meeting note" phrasing made the model answer NONE for any non-meeting audio — topic titles.
+    let prompt = "Reply with ONLY a concise descriptive title (2-6 words) for this note, in the "
+        + "note's own language — name the main topic or activity; it need not be a formal meeting. "
+        + "No quotes, no trailing punctuation, no explanations. Reply with exactly NONE only if the "
+        + "note is essentially empty or has no meaningful content."
     let cat = "cat \(shq(summaryPath))"
     switch runner {
     case .claude: return "\(cat) | claude --safe-mode -p \(shq(prompt))"
