@@ -127,6 +127,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         refresh()
+        if section == .status, statusTimer == nil { switchSection(.status) }   // reopen restarts the tick
     }
 
     /// Open the window on `target` (a summary or digest file) and show it — the tray "summary:" row's
@@ -590,6 +591,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     func switchSectionForTest(_ s: MainSection) { switchSection(s) }
     var livePaneHiddenForTest: Bool { livePane.isHidden }
     var statusPaneHiddenForTest: Bool { statusPane.isHidden }
+    var summaryBarHiddenForTest: Bool { summaryBar.isHidden }
+    var statusTimerLiveForTest: Bool { statusTimer != nil }
     var statusRowCountForTest: Int { statusPane.arrangedSubviews.count }
     var liveMirrorTextForTest: String { liveText.string }
 
@@ -819,7 +822,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         }
     }
 
-    func windowWillClose(_ notification: Notification) { stopPlayback() }
+    func windowWillClose(_ notification: Notification) {
+        stopPlayback()
+        statusTimer?.invalidate(); statusTimer = nil   // a closed window must not keep a 1 Hz timer
+    }
 
     // MARK: split view (classic sizing — see build())
 
