@@ -529,9 +529,12 @@ final class RecordingEngine {
         // transcript must never delete another slice's audio, and no fallback may land occupied.
         let audioMonth = cfg.audioDir.appendingPathComponent(monthF.string(from: stamp), isDirectory: true)
         func stemFree(_ c: String) -> Bool {
+            // .m4a too: retention archives .wav → .m4a, and an orphaned archive at this stem would
+            // be targeted by the NEXT archive pass if the stem were reused.
             !fm.fileExists(atPath: monthDir.appendingPathComponent("\(c).md").path)
                 && (!cfg.keepAudio || mixed == nil
-                    || !fm.fileExists(atPath: audioMonth.appendingPathComponent("\(c).wav").path))
+                    || (!fm.fileExists(atPath: audioMonth.appendingPathComponent("\(c).wav").path)
+                        && !fm.fileExists(atPath: audioMonth.appendingPathComponent("\(c).m4a").path)))
         }
         var finalSlug = slug
         if !stemFree(slug) {
