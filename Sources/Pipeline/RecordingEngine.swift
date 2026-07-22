@@ -508,7 +508,16 @@ final class RecordingEngine {
         let title = event?.title ?? l10n.autoTitle
         // Stamp the file with the MEETING's start when one maps, else the segment's. Name, month
         // folder and the header's range all derive from this one value so they can never disagree.
-        let stamp = transcriptStart(segStart: seg.start, segEnd: end, eventStart: event?.start)
+        // eventTaken: does a transcript already sit at the EVENT-start name (an earlier slice of the
+        // same meeting)? Then this slice keeps its own clamped window instead of colliding.
+        let eventTaken: Bool = event.map { ev in
+            let evStamp = min(ev.start, end)
+            let evDir = cfg.transcriptsDir.appendingPathComponent(monthF.string(from: evStamp), isDirectory: true)
+            let evName = "\(transcriptBaseName(start: evStamp))-\(slugify(ev.title)).md"
+            return fm.fileExists(atPath: evDir.appendingPathComponent(evName).path)
+        } ?? false
+        let stamp = transcriptStart(segStart: seg.start, segEnd: end, eventStart: event?.start,
+                                    eventTaken: eventTaken)
         let mins = max(1, Int((end.timeIntervalSince(stamp) + 30) / 60))
         let base = transcriptBaseName(start: stamp)
         let slug = event.map { "\(base)-\(slugify($0.title))" } ?? base
