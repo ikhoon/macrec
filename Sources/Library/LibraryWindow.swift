@@ -1307,12 +1307,18 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// refresh() "rescans" (e.g. a summary appearing mid-run), like the real disk would.
     func setFixtureForTest(_ days: [LibraryDay]) { fixtureDays = days }
 
+    private(set) var checkboxFailureForTest: String?
     /// Flip the task box on `line` of the shown document and reload; drifted lines are refused.
     func toggleCheckbox(atSourceLine line: Int) {
+        checkboxFailureForTest = nil
         guard let url = currentDocURL(),
-              let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+              let text = try? String(contentsOf: url, encoding: .utf8) else {
+            surfaceCheckboxFailure("The file could not be read — it may have moved.")
+            return
+        }
         guard let flipped = toggledCheckboxText(text, line: line) else {
-            elog("library: checkbox toggle refused — line \(line) is no longer a task item in \(url.lastPathComponent)")
+            surfaceCheckboxFailure("The file changed since it was shown — refresh and try again.")
+            elog("library: checkbox toggle refused — line \(line) drifted in \(url.lastPathComponent)")
             return
         }
         do {
@@ -1320,8 +1326,20 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             // Re-render via the path that produced the view (loadDoc blanks a standalone render).
             if standaloneURL != nil { renderStandalone(url) } else { loadDoc() }
         } catch {
+            surfaceCheckboxFailure("Saving failed: \(error.localizedDescription)")
             elog("library: checkbox toggle failed for \(url.lastPathComponent) — \(error.localizedDescription)")
         }
+    }
+
+    /// A failed click must be VISIBLE (silent-failure rule), not only logged.
+    private func surfaceCheckboxFailure(_ msg: String) {
+        checkboxFailureForTest = msg
+        guard let win = window, win.isVisible else { return }
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "Couldn't toggle the checkbox"
+        a.informativeText = msg
+        a.beginSheetModal(for: win, completionHandler: nil)
     }
 
     // Selection-driven state, readable by selftests: drive rows like a user, assert the derivation

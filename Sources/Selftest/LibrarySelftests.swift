@@ -309,8 +309,10 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
     let cbRendered = LibraryWindow.shared.docTextForTest.contains("☑")
     try? FileManager.default.removeItem(at: cbFile)
     LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())
-    check("checkbox: a click flips the file line and the re-render shows it done",
-          cbFlipped && cbRendered)
+    LibraryWindow.shared.toggleCheckbox(atSourceLine: 0)   // "# t" — not a task line → refusal surfaces
+    let cbRefusalSurfaced = LibraryWindow.shared.checkboxFailureForTest?.contains("changed since") == true
+    check("checkbox: a click flips the file line, re-renders, and a drifted click surfaces its refusal",
+          cbFlipped && cbRendered && cbRefusalSurfaced)
 
     // Stem parsing — every real shape in the vault, plus the garbage that must not crash the scan.
     let full = parseLibraryStem("2026-03-02-1030-project-kickoff")
