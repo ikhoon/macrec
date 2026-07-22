@@ -13,7 +13,7 @@ func libraryDayLabel(day: String, today: String, yesterday: String) -> String {
 /// glance), the text, and trailing status icons ("summarized" sparkles, "audio kept" waveform).
 /// Pure so the icon/text decisions are selftested; the cell just materializes SF Symbols.
 struct LibraryRowSpec: Equatable {
-    enum Tint: String { case orange, blue, purple } // semantic — the cell maps to NSColors
+    enum Tint: String { case orange, purple, neutral } // semantic — the cell maps to NSColors
     var icon: String // SF Symbol name — the entry's kind
     var tint: Tint
     var text: String
@@ -29,7 +29,18 @@ func libraryRowSpec(_ e: LibraryEntry) -> LibraryRowSpec {
     var trailing: [String] = []
     if e.summaryURL != nil { trailing.append("sparkles") }
     if e.audioURL != nil { trailing.append("waveform") }
-    return LibraryRowSpec(icon: "text.bubble", tint: .blue, text: text, trailing: trailing)
+    return LibraryRowSpec(icon: "text.bubble", tint: .neutral, text: text, trailing: trailing)
+}
+
+/// Tint → row-icon color. Non-blue by rule (the user reads blue as too loud), and NOT washed out:
+/// a full-strength label for the common transcript so its icon never goes pale, warm accents for the
+/// two special kinds. Pure so the palette is selftested against a reintroduced blue.
+func libraryTintColor(_ t: LibraryRowSpec.Tint) -> NSColor {
+    switch t {
+    case .orange: return .systemOrange
+    case .purple: return .systemPurple
+    case .neutral: return .labelColor
+    }
 }
 
 /// mm:ss (or h:mm:ss) for the player clock. Pure + selftested.
@@ -500,6 +511,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         split.setPosition(300, ofDividerAt: 0)   // list ≈ a third, document gets the rest
         window = w
         showEntry(nil)   // the right pane starts EMPTY — no ghost picker/player before a selection
+        switchSection(.library)   // paint the default nav selection now — an unhighlighted Library read as dead
     }
 
     // MARK: data → view
@@ -514,7 +526,12 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         section = new
         for b in navButtons {
             let on = b.tag == new.rawValue
-            b.layer?.backgroundColor = on ? NSColor.labelColor.withAlphaComponent(0.12).cgColor : nil
+            // A FIXED mid-gray, not a dynamic catalog color: a layer's cgColor is resolved once and
+            // never re-adapts, so a dynamic color froze to build-time appearance and showed a dark pill
+            // in light mode. A 0.12 label alpha was also invisible in light, so the active section read
+            // as unselected ("무반응"). This gray reads on both backgrounds; bold marks the active row.
+            b.layer?.backgroundColor = on ? NSColor.gray.withAlphaComponent(0.28).cgColor : nil
+            b.font = .systemFont(ofSize: 13, weight: on ? .semibold : .medium)
         }
         let lib = new == .library
         livePane.isHidden = new != .live
@@ -542,10 +559,15 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         }
     }
 
+    private var renderedStatusRows: [HealthRow]? // last rendered — skip the 1 Hz rebuild when nothing changed
     private func rebuildStatusPane() {
+        let rows = todayHealth(healthSample?() ?? HealthInputs())
+        // The tick fires every second, but the rows rarely change — rebuilding an unchanged pane made
+        // it visibly twitch (user report: "화면이 움직인다"). Only rebuild on a real change.
+        guard rows != renderedStatusRows else { return }
+        renderedStatusRows = rows
         statusPane.arrangedSubviews.forEach { $0.removeFromSuperview() }
         statusActions = []
-        let rows = todayHealth(healthSample?() ?? HealthInputs())
         var lastGroup = ""
         for row in rows {
             if row.group != lastGroup {
@@ -649,8 +671,14 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         // the filter text — so do NOT re-derive it here, or every filter keystroke re-animates the
         // re-run spinner (maintainer found it spinning during filtering). refresh() handles the
         // prefs-changed case below.
-        if let sel = selected,
-           !shownDays.contains(where: { $0.entries.contains(sel) }) { showEntry(nil) }
+        if let sel = selected {
+            if !shownDays.contains(where: { $0.entries.contains(sel) }) { showEntry(nil) } // filtered out
+        } else if standaloneURL == nil {
+            // Nothing selected: repaint the empty pane so its invite/blank tracks the VISIBLE list —
+            // a day-pick or filter that empties the list must drop the "select on the left" invite (it
+            // would contradict the "No recordings" notice), and the first open must gain it post-scan.
+            showEntry(nil)
+        }
     }
 
     /// The one decision for the right pane: which entry, and which of its documents. Everything —
@@ -673,7 +701,11 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             revealBtn.isEnabled = false
             deleteBtn.isEnabled = false
             applyHeaderActions()
-            setPlainDoc("")
+            // A blank right pane read as half-built (user report). Invite a pick only when the VISIBLE
+            // list has rows to pick — a filter/day-pick that empties the list already shows its own
+            // centered "No …" notice, and "select on the left" over an empty left pane would contradict it.
+            setPlainDoc(shownDays.isEmpty ? "" : "\n\nSelect a recording on the left to read its transcript and summary.",
+                        centered: true)
             return
         }
         headBar.isHidden = false
@@ -734,10 +766,16 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// Plain messages go through the SAME attributed channel as rendered documents — assigning
     /// textView.string after setAttributedString inherits whatever font/paragraph style the last
     /// document ended with (a heading-first doc left the error message in 19 pt bold).
-    private func setPlainDoc(_ msg: String) {
-        textView.textStorage?.setAttributedString(NSAttributedString(string: msg, attributes: [
+    private func setPlainDoc(_ msg: String, centered: Bool = false) {
+        var attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.secondaryLabelColor,
-        ]))
+        ]
+        if centered {
+            let p = NSMutableParagraphStyle()
+            p.alignment = .center
+            attrs[.paragraphStyle] = p
+        }
+        textView.textStorage?.setAttributedString(NSAttributedString(string: msg, attributes: attrs))
     }
 
     // MARK: audio playback
@@ -1271,9 +1309,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         } else if let e = item as? LibraryEntry {
             let spec = libraryRowSpec(e)
             cell.imageView?.image = NSImage(systemSymbolName: spec.icon, accessibilityDescription: e.kind.rawValue)
-            // MONOCHROME (user rule: no blue, icons included) — the kind reads from the symbol
-            // shape; spec.tint stays in the pure spec for tests but the cell renders neutral.
-            cell.imageView?.contentTintColor = .secondaryLabelColor
+            // Tinted, non-blue: a strong label for transcripts, orange/purple for digest/audio, so the
+            // kind reads at a glance without washing out (a flat secondary gray looked pale — user report).
+            cell.imageView?.contentTintColor = libraryTintColor(spec.tint)
             let font = NSFont.systemFont(ofSize: 12)
             // Attributed text carries its OWN paragraph style — without an explicit truncating
             // one it WRAPS, and a long real title overlapped the next row (fixture titles were
@@ -1370,6 +1408,20 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     // Selection-driven state, readable by selftests: drive rows like a user, assert the derivation
     // (player bar visibility, lazy load, resets) without audible playback.
     func selectForTest(_ e: LibraryEntry?) { showEntry(e) }
+    func refreshForTest() { refresh() }   // exercises the real refresh path (empty-pane hint repaint)
+    func setSearchForTest(_ s: String) { searchField.stringValue = s; applyFilter() }
+    func pickDayForTest(_ day: String?) { selectedDay = day; applyFilter() }   // drives the calendar onPick path
+    /// The active nav row must LOOK selected (fill + bold) and inactive rows must not — the fix for the
+    /// "dead"/무반응 nav. Read after the framework's layout so the values are the shipped ones.
+    var navHighlightForTest: (activeFilled: Bool, activeBold: Bool, othersClear: Bool) {
+        let active = navButtons.first { $0.tag == section.rawValue }
+        let activeW = active?.font.map { NSFontManager.shared.weight(of: $0) } ?? 0
+        let inactiveW = navButtons.first { $0.tag != section.rawValue }?.font
+            .map { NSFontManager.shared.weight(of: $0) } ?? 99
+        let others = navButtons.filter { $0.tag != section.rawValue }
+            .allSatisfy { $0.layer?.backgroundColor == nil }
+        return (active?.layer?.backgroundColor != nil, activeW > inactiveW, others)
+    }
     /// Drives the REAL show(selecting:) logic (selectIndexed + the standalone fallback) minus only the
     /// window-front hop, and returns the URL the right pane lands on — so the selftest exercises the
     /// actual method, not a mirror (test-honesty). nil when the target is neither indexed nor on disk.
