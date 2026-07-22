@@ -42,10 +42,11 @@ func cleanExtractedTitle(_ raw: String) -> String? {
             if next.count > 48 { break }
             cut = next
         }
-        // A rambling SENTENCE truncates at a word boundary; a single unbroken 48+-char token is
-        // noise, not a title — reject it (the old cap's behavior) rather than slice it.
+        // A sentence truncates at a word boundary; an unbroken 48+-char token is noise — reject.
         guard !cut.isEmpty else { return nil }
         t = cut
+        // Truncation can promote an internal period to terminal — strip trailing punctuation again.
+        while let l = t.last, "\"'“”‘’.。!?*`「」[](){},;:".contains(l) { t.removeLast() }
     }
     guard !t.isEmpty, t.contains(where: { $0.isLetter || $0.isNumber }) else { return nil }
     // The prompt's no-content protocol — an empty recording once got literally named
@@ -57,10 +58,7 @@ func cleanExtractedTitle(_ raw: String) -> String? {
 /// The title-extraction command: the summary on stdin, ONLY the title on stdout. Same runner CLIs
 /// (and the same PATH/auth environment) as the summary itself.
 func titleExtractionInvocation(runner: SummaryRunner, summaryPath: String) -> String {
-    // "Meeting note" used to gate the reply: summaries of ordinary desk audio (a call, a video, a
-    // work session) were judged "not a meeting" and the model answered NONE every single time in
-    // production — so summarized recordings sat "(untitled)" forever. Any note with substance gets
-    // a TOPIC title; NONE is reserved for genuinely content-free notes.
+    // "Meeting note" phrasing made the model answer NONE for any non-meeting audio — topic titles.
     let prompt = "Reply with ONLY a concise descriptive title (2-6 words) for this note, in the "
         + "note's own language — name the main topic or activity; it need not be a formal meeting. "
         + "No quotes, no trailing punctuation, no explanations. Reply with exactly NONE only if the "
