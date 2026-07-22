@@ -1004,11 +1004,12 @@ func transcriptBaseName(start: Date, timeZone: TimeZone = .current) -> String {
     return f.string(from: start)
 }
 
-/// The mapped event's start, clamped to `[segStart, segEnd]` — unclamped, consecutive slices of one
-/// meeting collapse onto the same file name. No event → the segment's own start. Pure + selftested.
-func transcriptStart(segStart: Date, segEnd: Date, eventStart: Date?) -> Date {
+/// Calendar-first stamp: the event's start names the meeting's first slice; a taken name clamps
+/// later slices to their own window so consecutive hours can't collide. No event → segment start.
+func transcriptStart(segStart: Date, segEnd: Date, eventStart: Date?, eventTaken: Bool = false) -> Date {
     guard let e = eventStart else { return segStart }
-    return min(max(e, segStart), segEnd)
+    guard !eventTaken else { return min(max(e, segStart), segEnd) }
+    return min(e, segEnd)
 }
 /// Checks GitHub for a newer release and reports back on the main queue.
 enum UpdateChecker {

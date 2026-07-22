@@ -80,11 +80,11 @@ func scenarioSelftests(_ check: (String, Bool) -> Void) {
         let model = scratch.appendingPathComponent("model.bin")
         fm.createFile(atPath: model.path, contents: Data([0]))
 
-        func cfg(model: String, calendarTitles: Bool) -> EngineConfig {
+        func cfg(model: String, calendarTitles: Bool, keepAudio: Bool = false) -> EngineConfig {
             EngineConfig(segmentSeconds: 3600, voiceMinSeconds: 5,
                          transcriptsDir: tDir, audioDir: aDir, workDir: wDir,
                          whisperCli: stub.path, whisperModel: model, vadModel: "", vadEnabled: false,
-                         useCalendarTitles: calendarTitles, whisperLang: "ko", keepAudio: false,
+                         useCalendarTitles: calendarTitles, whisperLang: "ko", keepAudio: keepAudio,
                          audioRawDays: 0, audioRetentionDays: 0, transcriptRetentionDays: 0,
                          excludeBundleIds: [])
         }
@@ -229,6 +229,41 @@ func scenarioSelftests(_ check: (String, Bool) -> Void) {
                       && !CaptureSilence.detectedToday(now: date("2026-03-02 09:00:00"))
                       && !voicedResults.contains { $0.contains("Capturing silence") })
             Pref.d.removeObject(forKey: Pref.capturedSilenceAt)   // don't leak the warn into later suites
+        }
+        // (g) A taken name must suffix, never overwrite (a boundary event can stamp two slices alike).
+        if let f2 = writeFixtureWAVs(voiced: true) {
+            let seeded = tDir.appendingPathComponent("2026-03/2026-03-03-2200-boundary-sync.md")
+            try? fm.createDirectory(at: seeded.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? "# seeded earlier slice\n".write(to: seeded, atomically: true, encoding: .utf8)
+            CalendarLookup.eventsOverrideForTest = [
+                EventCandidate(title: "boundary sync", start: date("2026-03-03 22:00:00"),
+                               end: date("2026-03-03 23:00:00"), hasLink: true),
+            ]
+            let engine = RecordingEngine(cfg: cfg(model: model.path, calendarTitles: true))
+            engine.process(segment(f2, start: date("2026-03-03 22:00:00")))
+            CalendarLookup.eventsOverrideForTest = nil
+            let b = tDir.appendingPathComponent("2026-03/2026-03-03-2200-boundary-sync-2.md")
+            let seededIntact = (try? String(contentsOf: seeded, encoding: .utf8))?.contains("seeded earlier") == true
+            check("scenario S-PIPELINE(g): a taken name suffixes to -2 and the first file survives",
+                  seededIntact && fm.fileExists(atPath: b.path))
+        }
+        // (h) An orphaned ARCHIVE (.m4a, its .md long expired) also blocks the stem — else the next
+        // retention pass would convert the new .wav onto the old archive's path.
+        if let f = writeFixtureWAVs(voiced: true) {
+            let am = aDir.appendingPathComponent("2026-03", isDirectory: true)
+            try? fm.createDirectory(at: am, withIntermediateDirectories: true)
+            let orphanArchive = am.appendingPathComponent("2026-03-04-2200-boundary-sync.m4a")
+            try? Data("old".utf8).write(to: orphanArchive)
+            CalendarLookup.eventsOverrideForTest = [
+                EventCandidate(title: "boundary sync", start: date("2026-03-04 22:00:00"),
+                               end: date("2026-03-04 23:00:00"), hasLink: true),
+            ]
+            let engine = RecordingEngine(cfg: cfg(model: model.path, calendarTitles: true, keepAudio: true))
+            engine.process(segment(f, start: date("2026-03-04 22:00:00")))
+            CalendarLookup.eventsOverrideForTest = nil
+            check("scenario S-PIPELINE(h): an orphaned .m4a archive pushes the new stem to -2",
+                  fm.fileExists(atPath: tDir.appendingPathComponent("2026-03/2026-03-04-2200-boundary-sync-2.md").path)
+                      && (try? Data(contentsOf: orphanArchive)) == Data("old".utf8))
         }
         Notifier.sinkForTest = nil
         try? fm.removeItem(at: scratch)

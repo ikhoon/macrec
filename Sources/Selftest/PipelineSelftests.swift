@@ -601,14 +601,19 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
     // hour of a 20:30 meeting still files as 21:00 — otherwise both slices of one long meeting
     // would claim 20:30, collapse onto the same name, and the later one would overwrite the first.
     let segA = schedDate("2026-07-05 21:00"), segAEnd = schedDate("2026-07-05 22:00")
-    check("naming: a mapped calendar event stamps its own start, clamped to the recorded window",
+    check("naming: calendar-first stamps — the event's start for its first slice, clamped after",
           transcriptStart(segStart: segA, segEnd: segAEnd, eventStart: nil) == segA
           && transcriptStart(segStart: segA, segEnd: segAEnd,
                              eventStart: schedDate("2026-07-05 21:10")) == schedDate("2026-07-05 21:10")
+          // Calendar-first: a late-joining recording still files under the meeting's own start.
           && transcriptStart(segStart: segA, segEnd: segAEnd,
-                             eventStart: schedDate("2026-07-05 20:30")) == segA          // continuation slice
+                             eventStart: schedDate("2026-07-05 20:30")) == schedDate("2026-07-05 20:30")
+          && transcriptStart(segStart: segA, segEnd: segAEnd,
+                             eventStart: schedDate("2026-07-05 20:30"), eventTaken: true) == segA
           && transcriptStart(segStart: segA, segEnd: segAEnd,
                              eventStart: schedDate("2026-07-05 22:30")) == segAEnd       // matched on the +60s window
+          && transcriptStart(segStart: segA, segEnd: segAEnd,
+                             eventStart: schedDate("2026-07-05 22:30"), eventTaken: true) == segAEnd
           && transcriptBaseName(start: transcriptStart(segStart: segA, segEnd: segAEnd,
                                                        eventStart: schedDate("2026-07-05 21:10")),
                                 timeZone: utc.timeZone) == "2026-07-05-2110")

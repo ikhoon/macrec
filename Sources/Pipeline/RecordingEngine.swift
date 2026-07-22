@@ -508,7 +508,16 @@ final class RecordingEngine {
         let title = event?.title ?? l10n.autoTitle
         // Stamp the file with the MEETING's start when one maps, else the segment's. Name, month
         // folder and the header's range all derive from this one value so they can never disagree.
-        let stamp = transcriptStart(segStart: seg.start, segEnd: end, eventStart: event?.start)
+        // eventTaken: does a transcript already sit at the EVENT-start name (an earlier slice of the
+        // same meeting)? Then this slice keeps its own clamped window instead of colliding.
+        let eventTaken: Bool = event.map { ev in
+            let evStamp = min(ev.start, end)
+            let evDir = cfg.transcriptsDir.appendingPathComponent(monthF.string(from: evStamp), isDirectory: true)
+            let evName = "\(transcriptBaseName(start: evStamp))-\(slugify(ev.title)).md"
+            return fm.fileExists(atPath: evDir.appendingPathComponent(evName).path)
+        } ?? false
+        let stamp = transcriptStart(segStart: seg.start, segEnd: end, eventStart: event?.start,
+                                    eventTaken: eventTaken)
         let mins = max(1, Int((end.timeIntervalSince(stamp) + 30) / 60))
         let base = transcriptBaseName(start: stamp)
         let slug = event.map { "\(base)-\(slugify($0.title))" } ?? base
@@ -516,16 +525,35 @@ final class RecordingEngine {
         // Organize transcripts into monthly subfolders: transcripts/YYYY-MM/…  (audio under YYYY-MM/audio/).
         let monthDir = cfg.transcriptsDir.appendingPathComponent(monthF.string(from: stamp), isDirectory: true)
         try fm.createDirectory(at: monthDir, withIntermediateDirectories: true)
+        // ONE stem, free for EVERY output it will write (.md and, when kept, .wav) — a suffixed
+        // transcript must never delete another slice's audio, and no fallback may land occupied.
+        let audioMonth = cfg.audioDir.appendingPathComponent(monthF.string(from: stamp), isDirectory: true)
+        func stemFree(_ c: String) -> Bool {
+            // .m4a too: retention archives .wav → .m4a, and an orphaned archive at this stem would
+            // be targeted by the NEXT archive pass if the stem were reused.
+            !fm.fileExists(atPath: monthDir.appendingPathComponent("\(c).md").path)
+                && (!cfg.keepAudio || mixed == nil
+                    || (!fm.fileExists(atPath: audioMonth.appendingPathComponent("\(c).wav").path)
+                        && !fm.fileExists(atPath: audioMonth.appendingPathComponent("\(c).m4a").path)))
+        }
+        var finalSlug = slug
+        if !stemFree(slug) {
+            var picked: String?
+            for n in 2 ... 9 where stemFree("\(slug)-\(n)") { picked = "\(slug)-\(n)"; break }
+            var fallback = "\(slug)-\(Int(Date().timeIntervalSince1970))"
+            while picked == nil, !stemFree(fallback) { fallback += "x" }
+            finalSlug = picked ?? fallback
+        }
 
         // keep the mixed WAV per the keepAudio setting (mixed is nil when keepAudio is off)
         var audioLine = "- \(l10n.audio): \(l10n.audioNotKept)"
         if cfg.keepAudio, let mixed = mixed {
             let audioMonthDir = cfg.audioDir.appendingPathComponent(monthF.string(from: stamp), isDirectory: true)
             try fm.createDirectory(at: audioMonthDir, withIntermediateDirectories: true)
-            let keptAudio = audioMonthDir.appendingPathComponent("\(slug).wav")
+            let keptAudio = audioMonthDir.appendingPathComponent("\(finalSlug).wav")
             try? fm.removeItem(at: keptAudio)
             try fm.moveItem(at: mixed, to: keptAudio)
-            audioLine = "- \(l10n.audio): [\(slug).wav](\(relativePath(fromDir: monthDir, toFile: keptAudio)))"
+            audioLine = "- \(l10n.audio): [\(finalSlug).wav](\(relativePath(fromDir: monthDir, toFile: keptAudio)))"
         }
 
         var meta = ""
@@ -547,7 +575,7 @@ final class RecordingEngine {
             bodyMine: bodyMine, bodyTheirs: bodyTheirs,
             body: body,
             eventNotes: calendarNotesForTranscript(event?.notes))
-        let mdURL = monthDir.appendingPathComponent("\(slug).md")
+        let mdURL = monthDir.appendingPathComponent("\(finalSlug).md")
         try doc.markdown(l10n).write(to: mdURL, atomically: true, encoding: .utf8)
         elog("engine:   → transcript saved: \(mdURL.path)")
         return mdURL
