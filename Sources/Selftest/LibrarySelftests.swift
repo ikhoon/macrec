@@ -642,16 +642,21 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         let inviteBack = lw.docTextForTest.contains("Select a recording")
         check("library: empty-pane invite tracks the VISIBLE list (first open yes; empty day/no-match no)",
               blankBeforeScan && inviteAfterScan && pickedEmptyDay && noInviteEmptyDay && noInviteNoMatch && inviteBack)
-        // The nav-highlight fix (the "dead"/무반응 nav complaint): CLICK the real nav buttons, then assert
-        // the active row is filled + bold and inactive rows are clear. Break the wiring or the style → fail.
-        lw.clickNavForTest(.library)
-        let libNav = lw.navHighlightForTest
+        // The nav-highlight fix (the "dead"/무반응 nav complaint). Build a FRESH window and assert Library
+        // is already filled + bold BEFORE any click — this guards build()'s own initial switchSection(.library)
+        // (the first-open paint), which a click-first test would mask. Then CLICK the real nav buttons and
+        // assert the selection moves. Break the startup paint, the wiring, or the style → fail.
+        lw.resetWindowForTest()
+        lw.loadFixtureForTest(libraryFixtureDays())
+        let initialNav = lw.navHighlightForTest   // no click yet → reflects build()'s startup paint
         lw.clickNavForTest(.status)
         let statusNav = lw.navHighlightForTest
         lw.clickNavForTest(.library)
-        check("library: clicking a nav row makes it read as selected (filled + bold), others clear",
-              libNav.activeFilled && libNav.activeBold && libNav.othersClear
-                  && statusNav.activeFilled && statusNav.activeBold && statusNav.othersClear)
+        let libNav = lw.navHighlightForTest
+        check("library: Library is painted selected on open, and clicking a nav row moves the selection",
+              initialNav.activeFilled && initialNav.activeBold && initialNav.othersClear
+                  && statusNav.activeFilled && statusNav.activeBold && statusNav.othersClear
+                  && libNav.activeFilled && libNav.activeBold && libNav.othersClear)
         // Stable-identity selection across a rescan (review Major): a summary landing on the SELECTED
         // transcript changes its value (gains summaryURL) but not its (url, kind) — the preview must
         // rebind to the fresh entry (picker now shown), not clear to the invite on a value-equality miss.

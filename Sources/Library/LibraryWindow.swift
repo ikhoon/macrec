@@ -1354,6 +1354,17 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     // MARK: test kit (mirrors the Settings pane harness)
 
+    /// Drop the shared window so the next loadFixtureForTest builds a FRESH one — lets a test observe
+    /// build()'s own initial paint (e.g. the default nav selection) rather than a state left by an
+    /// earlier test on the singleton.
+    func resetWindowForTest() {
+        statusTimer?.invalidate(); statusTimer = nil
+        window?.close()
+        window = nil
+        navButtons = []   // makeWindow APPENDS; without this the rebuilt window keeps stale (painted) buttons
+        renderedStatusRows = nil
+    }
+
     /// Inject fixture data and build the window without touching the user's folders.
     func loadFixtureForTest(_ days: [LibraryDay]) {
         fixtureDays = days
