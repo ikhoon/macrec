@@ -754,6 +754,13 @@ func pipelineSelftests(_ check: (String, Bool) -> Void) {
               && !bh.contains("skip.me")                                             // non-http filtered
               && browsingMarkdown([], day: "d") == nil
               && dayBounds("2026-03-02")?.start != nil && dayBounds("bad") == nil)
+    // Cross-source merge: the same URL from Chrome AND Arc AND Safari sums, keeping a non-empty title.
+    check("browser history: same-URL visits merge across sources, busiest first",
+          mergeVisits([BrowsingVisit(url: "https://a/", title: "", visits: 2),
+                       BrowsingVisit(url: "https://b/", title: "B", visits: 1),
+                       BrowsingVisit(url: "https://a/", title: "A", visits: 3)])
+              == [BrowsingVisit(url: "https://a/", title: "A", visits: 5),
+                  BrowsingVisit(url: "https://b/", title: "B", visits: 1)])
     // Query resilience: a runner error (locked db / missing sqlite3) yields [], never a throw.
     check("browser history: a query failure degrades to no rows, never breaking the digest",
           BrowserHistory.query(dbPath: "/nonexistent.db", sql: "x", run: { _ in nil }).isEmpty

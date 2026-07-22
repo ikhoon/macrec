@@ -61,6 +61,23 @@ func browsingHost(_ url: String) -> String {
     return h.hasPrefix("www.") ? String(h.dropFirst(4)) : h
 }
 
+/// Sum visit counts for the same URL across sources (Chrome/Arc/Safari can each return it), keeping
+/// the first non-empty title and the busiest-first order. Pure.
+func mergeVisits(_ visits: [BrowsingVisit]) -> [BrowsingVisit] {
+    var order: [String] = []
+    var byURL: [String: BrowsingVisit] = [:]
+    for v in visits {
+        if var cur = byURL[v.url] {
+            cur.visits += v.visits
+            if cur.title.trimmingCharacters(in: .whitespaces).isEmpty { cur.title = v.title }
+            byURL[v.url] = cur
+        } else {
+            order.append(v.url); byURL[v.url] = v
+        }
+    }
+    return order.map { byURL[$0]! }.sorted { $0.visits > $1.visits }
+}
+
 /// The day's visits → a compact markdown block grouped by host (busiest host first, then by visit
 /// count), or nil when there's nothing. Titles are trimmed; a missing title falls back to the host.
 /// `maxPerHost` caps the noise from a single site. Pure + selftested.
@@ -96,9 +113,26 @@ func browsingMarkdown(_ visits: [BrowsingVisit], day: String, maxPerHost: Int = 
 // MARK: - I/O shell (read-only sqlite over an immutable copy)
 
 enum BrowserHistory {
-    /// The default local history DB paths (existence-checked by the caller).
-    static var chromePath: String { NSHomeDirectory() + "/Library/Application Support/Google/Chrome/Default/History" }
     static var safariPath: String { NSHomeDirectory() + "/Library/Safari/History.db" }
+
+    /// Every Chromium history DB present: Chrome AND Arc, across profile dirs (Default, Profile N) —
+    /// they share the schema and the WebKit-µs epoch, so one query shape covers all. Existence
+    /// filtered here; a missing browser simply contributes nothing.
+    static func chromiumHistoryPaths(fm: FileManager = .default) -> [String] {
+        let base = NSHomeDirectory() + "/Library/Application Support/"
+        let roots = ["Google/Chrome", "Arc/User Data", "BraveSoftware/Brave-Browser",
+                     "Microsoft Edge", "Chromium"]
+        var paths: [String] = []
+        for root in roots {
+            let dir = base + root
+            let profiles = (try? fm.contentsOfDirectory(atPath: dir)) ?? []
+            for p in profiles where p == "Default" || p.hasPrefix("Profile ") {
+                let db = "\(dir)/\(p)/History"
+                if fm.fileExists(atPath: db) { paths.append(db) }
+            }
+        }
+        return paths
+    }
 
     /// Query one day's visits from a history DB via `sqlite3` in IMMUTABLE read-only mode (never
     /// locks or writes the live browser's file). Returns [] on any error (missing db, locked, no
@@ -122,13 +156,13 @@ enum BrowserHistory {
     /// The whole day's browsing across installed browsers → a markdown block, or nil when empty.
     static func dayMarkdown(_ day: String, calendar: Calendar = .current) -> String? {
         guard let (start, end) = dayBounds(day, calendar: calendar) else { return nil }
-        var visits = query(dbPath: chromePath,
-                           sql: chromeHistoryQuery(startMicros: chromeMicros(for: start),
-                                                   endMicros: chromeMicros(for: end)))
+        let chromeSQL = chromeHistoryQuery(startMicros: chromeMicros(for: start),
+                                           endMicros: chromeMicros(for: end))
+        var visits = chromiumHistoryPaths().flatMap { query(dbPath: $0, sql: chromeSQL) }
         visits += query(dbPath: safariPath,
                         sql: safariHistoryQuery(startSeconds: safariSeconds(for: start),
                                                 endSeconds: safariSeconds(for: end)))
-        return browsingMarkdown(visits, day: day)
+        return browsingMarkdown(mergeVisits(visits), day: day)
     }
 
     private static func shellQuery(_ command: String) -> String? {
