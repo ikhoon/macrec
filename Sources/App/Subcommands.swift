@@ -195,8 +195,22 @@ func runLibrarySnapshotSubcommand(_ args: [String]) -> Never {
         LibraryWindow.shared.pickDocForTest(1)
         // The restore must leave a RENDERED detail — URL-exists alone would pass an empty pane.
         if !LibraryWindow.shared.docTextForTest.contains("Auto-transcribed fixture") { missing = true }
-        if main.isEmpty || daily.isEmpty { missing = true }
-        files += main + daily
+        // The Live + Status sections, same both-modes contract (fixture data only).
+        LibraryWindow.shared.switchSectionForTest(.live)
+        LibraryWindow.shared.liveMirror(NSAttributedString(string: "10:00:01  Me    좋은 아침입니다.\n10:00:04  Them  회의 시작할까요?\n"))
+        let live = LibraryWindow.shared.snapshot(to: dir.appendingPathComponent(mode).appendingPathComponent("live"))
+        var fix = HealthInputs()
+        fix.audioGranted = true; fix.micGranted = true; fix.calendarGranted = true
+        fix.recording = true; fix.micLevel = 0.4; fix.sysLevel = 0.3
+        fix.modelReady = true; fix.modelName = "large-v3"; fix.whisperResolved = true
+        fix.runnerResolved = true; fix.runnerName = "claude"
+        LibraryWindow.shared.healthSample = { fix }
+        LibraryWindow.shared.switchSectionForTest(.status)
+        let status = LibraryWindow.shared.snapshot(to: dir.appendingPathComponent(mode).appendingPathComponent("status"))
+        LibraryWindow.shared.healthSample = nil
+        LibraryWindow.shared.switchSectionForTest(.library)
+        if main.isEmpty || daily.isEmpty || live.isEmpty || status.isEmpty { missing = true }
+        files += main + daily + live + status
     }
     if missing { print("library-snapshot: FAILED (a mode's shot is missing)"); exit(1) }
     for f in files { print(f.path) }

@@ -556,6 +556,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
                 .backgroundColor: plate, .shadow: halo, .paragraphStyle: para]))
         }
         textView.textStorage?.setAttributedString(out)
+        LibraryWindow.shared.liveMirror(out)   // the main window's Live pane shows the same stream
         textView.scrollToEndOfDocument(nil)
     }
 
@@ -626,6 +627,7 @@ final class LiveCaptionWindow: NSObject, NSWindowDelegate {
                              range: NSRange(location: 0, length: out.length))
         }
         textView.textStorage?.setAttributedString(out)
+        LibraryWindow.shared.liveMirror(out)   // the main window's Live pane shows the same stream
         textView.scrollToEndOfDocument(nil)
     }
 

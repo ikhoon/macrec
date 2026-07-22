@@ -77,6 +77,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
             reason: "macrec records meetings continuously")
         Pref.d.removeObject(forKey: Pref.watchdogQuitRequested)   // #36b: we're running now — any prior Quit is void
         buildMenu()
+        wireMainWindowHealth()   // the main window's Status pane samples the same live health
         NSApp.mainMenu = Self.editShortcutMenu()   // wire ⌘X/C/V/A/Z app-wide (accessory apps have no Edit menu)
         // Credentials now live in a 0600 file (see Keychain), read lazily — no startup keychain access at
         // all, so nothing can prompt. Existing keys are re-entered once in Settings; the old login-keychain
@@ -899,6 +900,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMe
             return .terminateCancel
         }
         return .terminateNow
+    }
+
+    /// Wire the main window's Status pane to the same sample + actions the Status window uses.
+    private func wireMainWindowHealth() {
+        LibraryWindow.shared.healthSample = { [weak self] in self?.sampleHealth() ?? HealthInputs() }
+        LibraryWindow.shared.onHealthAction = { [weak self] action in
+            guard let self else { return }
+            switch action {
+            case .grantPermissions: grantPermissions()
+            case .openSettings: openSettings()
+            case .retrySummary: flushNow()
+            case .testCapture: runCaptureTest()
+            case .showLog: showLog()
+            case .openNotificationSettings:
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!)
+            case .none: break
+            }
+        }
     }
 
     /// Open the tray menu programmatically (when the app is clicked in /Applications).

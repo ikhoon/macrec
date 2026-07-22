@@ -64,6 +64,19 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     static let shared = LibraryWindow()
     private var window: NSWindow?
     private let outline = NSOutlineView()
+    // ── main-window sections (DESIGN-main-window.md): the sidebar routes Live / Library / Status ──
+    enum MainSection: Int { case live = 0, library = 1, status = 2 }
+    private(set) var section: MainSection = .library
+    private var navButtons: [NSButton] = []
+    private let livePane = NSStackView()
+    private let liveText = NSTextView()
+    private let liveHint = NSTextField(labelWithString: "Live Captions mirror — start/stop from the tray; the floating overlay stays available as a second screen.")
+    private let statusPane = NSStackView()
+    private var statusActions: [HealthAction] = []
+    /// Wired by the app: the same live health sample + action routing the Status window uses.
+    var healthSample: (() -> HealthInputs)?
+    var onHealthAction: ((HealthAction) -> Void)?
+
     private let searchField = NSSearchField()
     private let searchToggle = NSButton()   // magnifier; expands the field on click, collapses when empty
     private let scopePicker = NSSegmentedControl()   // All | Daily (digests only)
@@ -288,9 +301,41 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             selectedDay = day
             applyFilter()
         }
-        let left = NSStackView(views: [calendarView, leftScroll])
+        // Sidebar nav: three peer destinations (1Password's Watchtower/All-Items shape). Selecting
+        // one swaps the right-hand detail; the day tree below stays the Library's navigation.
+        var navSpecs: [(String, String, MainSection)] = [
+            ("rectangle.stack", "Library", .library),
+            ("heart.text.square", "Status", .status),
+        ]
+        // Live Captions only exists on macOS 26 — offering the row earlier would be a dead pane.
+        if #available(macOS 26, *) { navSpecs.insert(("waveform", "Live Captions", .live), at: 0) }
+        let nav = NSStackView()
+        nav.orientation = .vertical
+        nav.spacing = 2
+        nav.edgeInsets = NSEdgeInsets(top: 34, left: 10, bottom: 6, right: 10)
+        for (sym, label, sec) in navSpecs {
+            let b = NSButton(title: "  " + label, target: self, action: #selector(navTapped(_:)))
+            b.image = NSImage(systemSymbolName: sym, accessibilityDescription: label)
+            b.imagePosition = .imageLeading
+            b.isBordered = false
+            b.contentTintColor = .labelColor
+            b.font = .systemFont(ofSize: 13, weight: .medium)
+            b.alignment = .left
+            b.tag = sec.rawValue
+            b.wantsLayer = true
+            b.layer?.cornerRadius = 5
+            b.heightAnchor.constraint(equalToConstant: 26).isActive = true
+            navButtons.append(b)
+            nav.addArrangedSubview(b)
+            b.leadingAnchor.constraint(equalTo: nav.leadingAnchor, constant: 10).isActive = true
+            b.trailingAnchor.constraint(equalTo: nav.trailingAnchor, constant: -10).isActive = true
+        }
+
+        let left = NSStackView(views: [nav, calendarView, leftScroll])
         left.orientation = .vertical
         left.spacing = 0
+        nav.leadingAnchor.constraint(equalTo: left.leadingAnchor).isActive = true
+        nav.trailingAnchor.constraint(equalTo: left.trailingAnchor).isActive = true
         calendarView.leadingAnchor.constraint(equalTo: left.leadingAnchor).isActive = true
         calendarView.trailingAnchor.constraint(equalTo: left.trailingAnchor).isActive = true
         leftScroll.leadingAnchor.constraint(equalTo: left.leadingAnchor).isActive = true
@@ -373,10 +418,41 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         playerBar.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 6, right: 10)
         seekSlider.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let right = NSStackView(views: [head, summaryBar, playerBar, rightScroll])
+        // Live pane: a read-only mirror of the overlay's stream, same typography, plus the hint.
+        liveText.isEditable = false
+        liveText.drawsBackground = false
+        liveText.textContainerInset = NSSize(width: 16, height: 12)
+        liveText.isVerticallyResizable = true
+        liveText.isHorizontallyResizable = false
+        liveText.autoresizingMask = [.width]
+        liveText.textContainer?.widthTracksTextView = true
+        let liveScroll = NSScrollView()
+        liveScroll.documentView = liveText
+        liveScroll.hasVerticalScroller = true
+        liveScroll.drawsBackground = false
+        liveHint.font = .systemFont(ofSize: 11)
+        liveHint.textColor = .secondaryLabelColor
+        liveHint.lineBreakMode = .byWordWrapping
+        liveHint.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let liveHintBar = NSStackView(views: [liveHint])
+        liveHintBar.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 4, right: 16)
+        livePane.orientation = .vertical
+        livePane.spacing = 0
+        livePane.addArrangedSubview(liveHintBar)
+        livePane.addArrangedSubview(liveScroll)
+        liveHintBar.setContentHuggingPriority(.required, for: .vertical)
+        // Status pane: the SAME health rows the Status window renders (shared factory), embedded.
+        statusPane.orientation = .vertical
+        statusPane.alignment = .leading
+        statusPane.spacing = 2
+        statusPane.edgeInsets = NSEdgeInsets(top: 34, left: 16, bottom: 12, right: 16)
+
+        let right = NSStackView(views: [head, summaryBar, playerBar, rightScroll, livePane, statusPane])
         right.orientation = .vertical
         right.spacing = 0
         right.distribution = .fill
+        livePane.isHidden = true
+        statusPane.isHidden = true
         head.setContentHuggingPriority(.required, for: .vertical)
         summaryBar.setContentHuggingPriority(.required, for: .vertical)
         playerBar.setContentHuggingPriority(.required, for: .vertical)
@@ -425,6 +501,82 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     }
 
     // MARK: data → view
+
+    @objc private func navTapped(_ sender: NSButton) {
+        switchSection(MainSection(rawValue: sender.tag) ?? .library)
+    }
+
+    /// Swap the detail to the picked section. The Library's own subviews keep their internal
+    /// hidden/shown state; the section toggle only overlays on top of it.
+    func switchSection(_ new: MainSection) {
+        section = new
+        for b in navButtons {
+            let on = b.tag == new.rawValue
+            b.layer?.backgroundColor = on ? NSColor.labelColor.withAlphaComponent(0.12).cgColor : nil
+        }
+        let lib = new == .library
+        livePane.isHidden = new != .live
+        statusPane.isHidden = new != .status
+        // Library chrome hides wholesale outside its section; inside it, showEntry state rules.
+        headBar.isHidden = !lib || selected == nil && standaloneURL == nil
+        summaryBar.isHidden = headBar.isHidden
+        playerBar.isHidden = !lib || playerBar.isHidden
+        if let scroll = textView.enclosingScrollView { scroll.isHidden = !lib }
+        if lib { applyHeaderActions() }
+        if new == .status { rebuildStatusPane() }
+        if new == .live, let pending = pendingLiveMirror {
+            pendingLiveMirror = nil
+            liveMirror(pending)   // replay the caption that arrived while another section was up
+        }
+    }
+
+    private func rebuildStatusPane() {
+        statusPane.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        statusActions = []
+        let rows = todayHealth(healthSample?() ?? HealthInputs())
+        var lastGroup = ""
+        for row in rows {
+            if row.group != lastGroup {
+                lastGroup = row.group
+                let g = NSTextField(labelWithString: row.group.uppercased())
+                g.font = .systemFont(ofSize: 10, weight: .bold)
+                g.textColor = .tertiaryLabelColor
+                statusPane.addArrangedSubview(g)
+            }
+            let title = healthActionTitle(row.action)
+            let v = makeHealthRowView(row, actionTitle: title,
+                                      target: title == nil ? nil : self,
+                                      action: title == nil ? nil : #selector(statusActionTapped(_:)),
+                                      tag: statusActions.count)
+            statusActions.append(row.action)
+            statusPane.addArrangedSubview(v)
+        }
+    }
+
+    @objc private func statusActionTapped(_ sender: NSButton) {
+        guard sender.tag >= 0, sender.tag < statusActions.count else { return }
+        onHealthAction?(statusActions[sender.tag])
+    }
+
+    /// The overlay's rendered stream, mirrored into the main window's Live pane (same text).
+    private var pendingLiveMirror: NSAttributedString?
+    func liveMirror(_ text: NSAttributedString) {
+        // The overlay renders many times a second — cache off-screen, paint only when the pane
+        // shows (a caption arriving while browsing Library must still be there on entering Live).
+        guard section == .live, window?.isVisible == true || fixtureDays != nil else {
+            pendingLiveMirror = text
+            return
+        }
+        liveText.textStorage?.setAttributedString(text)
+        liveText.scrollToEndOfDocument(nil)
+    }
+
+    // Section test hooks: drive the real switch, read the observable pane state.
+    func switchSectionForTest(_ s: MainSection) { switchSection(s) }
+    var livePaneHiddenForTest: Bool { livePane.isHidden }
+    var statusPaneHiddenForTest: Bool { statusPane.isHidden }
+    var statusRowCountForTest: Int { statusPane.arrangedSubviews.count }
+    var liveMirrorTextForTest: String { liveText.string }
 
     @objc private func filterChanged() { applyFilter() }
     @objc private func refreshClicked() { refresh() }
@@ -668,6 +820,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     @objc private func rowSelected() {
         let item = outline.item(atRow: outline.selectedRow)
+        if item is LibraryEntry, section != .library { switchSection(.library) }   // a recording click IS Library
         showEntry(item as? LibraryEntry)
     }
 
