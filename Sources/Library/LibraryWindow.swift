@@ -616,9 +616,16 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         if showMonth { emptyLabel.isHidden = true; loadMonth() }   // the grid is its own empty state
     }
 
+    /// The one place mode is set: flips the flag, the segmented control, and the persisted pref together
+    /// so viewModeChanged and dropToList can't drift.
+    private func setMonthMode(_ on: Bool) {
+        monthMode = on
+        viewModePicker.selectedSegment = on ? 1 : 0
+        Pref.d.set(on ? "month" : "list", forKey: Pref.libraryViewMode)
+    }
+
     @objc private func viewModeChanged() {
-        monthMode = viewModePicker.selectedSegment == 1
-        Pref.d.set(monthMode ? "month" : "list", forKey: Pref.libraryViewMode)
+        setMonthMode(viewModePicker.selectedSegment == 1)
         entryPopover.close()
         updateModeVisibility()
     }
@@ -633,13 +640,22 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     /// A chip clicked: show the recording's document in a popover anchored to the chip — read it in place
     /// without leaving the month (the user's "그 안에 transcript를 바로 보여주는"). Summary if it has one.
+    /// The popover's read-only document: render the summary (or transcript), then strip the interactive
+    /// checkbox/seek links (macrec-check:// / macrec-seek://) — the popover has no delegate, so a click
+    /// would be a silent dead-end, and toggling here would hit the wrong file. Glyphs/text stay.
+    private func popoverDoc(for e: LibraryEntry) -> NSAttributedString {
+        let src = e.summaryURL ?? e.url
+        let md = (try? String(contentsOf: src, encoding: .utf8)) ?? "(could not read \(src.lastPathComponent))"
+        let rendered = NSMutableAttributedString(attributedString: MarkdownRender.render(md, baseURL: src.deletingLastPathComponent()))
+        rendered.removeAttribute(.link, range: NSRange(location: 0, length: rendered.length))
+        return rendered
+    }
+
     private func showEntryPopover(_ e: LibraryEntry, from: NSView) {
         let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: 460, height: 420))
         tv.isEditable = false
         tv.textContainerInset = NSSize(width: 14, height: 14)
-        let src = e.summaryURL ?? e.url
-        let md = (try? String(contentsOf: src, encoding: .utf8)) ?? "(could not read \(src.lastPathComponent))"
-        tv.textStorage?.setAttributedString(MarkdownRender.render(md, baseURL: src.deletingLastPathComponent()))
+        tv.textStorage?.setAttributedString(popoverDoc(for: e))
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 460, height: 420))
         scroll.documentView = tv
         scroll.hasVerticalScroller = true
@@ -661,9 +677,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     private func dropToList(day: String, select: LibraryEntry?) {
         entryPopover.close()
-        monthMode = false
-        viewModePicker.selectedSegment = 0
-        Pref.d.set("list", forKey: Pref.libraryViewMode)
+        setMonthMode(false)
         selectedDay = day
         calendarView.syncSelection(day)
         updateModeVisibility()
@@ -1641,6 +1655,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         viewModePicker.selectedSegment = on ? 1 : 0
         _ = viewModePicker.target?.perform(viewModePicker.action, with: viewModePicker)
     }
+    func popoverDocForTest(_ e: LibraryEntry) -> NSAttributedString { popoverDoc(for: e) }
     var monthModeVisibleForTest: Bool { !monthView.isHidden }
     var splitVisibleForTest: Bool { !libSplit.isHidden }
     var monthChipCountForTest: Int { monthView.chipCountForTest() }

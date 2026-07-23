@@ -760,6 +760,16 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         let monthOff = !lw.monthModeVisibleForTest && lw.splitVisibleForTest
         check("library: Month mode shows the grid, restores the split on another section, and resolves a chip",
               monthOn && splitBackOnStatus && monthBackOnLibrary && chipResolves && audioRouted && monthOff)
+        // The Month popover is a READ-ONLY preview: its checkbox/seek links are stripped so a click is
+        // never a silent dead-end (the popover has no delegate). The glyph stays; the link does not.
+        let popURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mr-pop-\(UUID().uuidString).md")
+        try? "# note\n\n- [ ] call the vendor\n\n[10:00:05] Me: hi".write(to: popURL, atomically: true, encoding: .utf8)
+        let popDoc = lw.popoverDocForTest(LibraryEntry(day: "2026-03-02", time: "10:00", title: "note", kind: .transcript, url: popURL, summaryURL: nil, audioURL: nil))
+        var anyLink = false
+        popDoc.enumerateAttribute(.link, in: NSRange(location: 0, length: popDoc.length)) { v, _, _ in if v != nil { anyLink = true } }
+        try? FileManager.default.removeItem(at: popURL)
+        check("library: the Month popover preview keeps the checkbox glyph but strips its dead link",
+              popDoc.string.contains("☐") && !anyLink)
         _ = lw.calendarClickClearForTest()   // the audio chip left a day filter — clear it for later tests
         LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore the rich default
     }
