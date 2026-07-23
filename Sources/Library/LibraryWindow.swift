@@ -638,19 +638,21 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         monthView.load(month: month, entriesByDay: entriesByDayMap(allDays), today: today)
     }
 
-    /// A chip clicked: show the recording's document in a popover anchored to the chip — read it in place
-    /// without leaving the month (the user's "그 안에 transcript를 바로 보여주는"). Summary if it has one.
     /// The popover's read-only document: render the summary (or transcript), then strip the interactive
     /// checkbox/seek links (macrec-check:// / macrec-seek://) — the popover has no delegate, so a click
-    /// would be a silent dead-end, and toggling here would hit the wrong file. Glyphs/text stay.
+    /// would be a silent dead-end, and toggling here would hit the wrong file. Glyphs/text stay. Read is
+    /// byte-capped and lenient (like the search index), not strict-UTF-8-or-bust.
     private func popoverDoc(for e: LibraryEntry) -> NSAttributedString {
         let src = e.summaryURL ?? e.url
-        let md = (try? String(contentsOf: src, encoding: .utf8)) ?? "(could not read \(src.lastPathComponent))"
+        let md: String = (try? Data(contentsOf: src, options: .mappedIfSafe))
+            .map { String(decoding: $0.prefix(512 * 1024), as: UTF8.self) } ?? "(could not read \(src.lastPathComponent))"
         let rendered = NSMutableAttributedString(attributedString: MarkdownRender.render(md, baseURL: src.deletingLastPathComponent()))
         rendered.removeAttribute(.link, range: NSRange(location: 0, length: rendered.length))
         return rendered
     }
 
+    /// A chip clicked: show the recording's document in a popover anchored to the chip — read it in place
+    /// without leaving the month (the user's "그 안에 transcript를 바로 보여주는"). Summary if it has one.
     private func showEntryPopover(_ e: LibraryEntry, from: NSView) {
         let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: 460, height: 420))
         tv.isEditable = false
