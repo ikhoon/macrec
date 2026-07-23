@@ -171,11 +171,9 @@ func libraryFiltered(_ days: [LibraryDay], filter: String, onlyKind: LibraryEntr
         let kept = day.entries.filter { e in
             guard onlyKind == nil || e.kind == onlyKind else { return false }
             guard !f.isEmpty else { return true }
-            // Metadata match (fast) OR a full-text match in the transcript/summary body (the `content`
-            // map, lowercased, is built and injected by the window so this stays pure/testable).
-            return (e.title ?? "").lowercased().contains(f) || e.day.contains(f)
-                || (e.time ?? "").contains(f) || e.kind.rawValue.contains(f)
-                || (content[e.url]?.contains(f) ?? false)
+            // Metadata match (fast, ONE predicate shared with libraryMetadataMatches) OR a full-text match
+            // in the transcript/summary body (the `content` map, lowercased, injected by the window).
+            return libraryMetadataMatches(e, filter: filter) || (content[e.url]?.contains(f) ?? false)
         }
         return kept.isEmpty ? nil : LibraryDay(day: day.day, entries: kept)
     }

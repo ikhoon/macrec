@@ -129,6 +129,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     private var contentIndex: [URL: IndexedBody] = [:]
     private var contentLower: [URL: String] = [:] // derived lower-only map handed to the pure filter
     private var contentIndexRefreshing = false
+    private var rowSnippetCache: [URL: String] = [:] // per-reload snippets — heightOfRowByItem + viewFor share one scan
     private var shownDays: [LibraryDay] = []
     private var fixtureDays: [LibraryDay]? // test/snapshot data — nil means scan the real folders
     private var selected: LibraryEntry?
@@ -660,17 +661,13 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         collapseSearchIfEmpty(force: false)   // left empty → tidy back to the icon
     }
 
-    /// Refresh the full-text index OFF the main thread: read only files whose mtime advanced (or are
-    /// new), reuse the rest from cache, drop vanished ones — so a focus-gain or unchanged rescan reads
-    /// nothing. On completion, publish on the main thread and re-run the FILTER (not a fresh kick — that
-    /// would loop) so body matches fill in behind the instant metadata matches. A per-file cap bounds a
-    /// runaway transcript. Under a unit fixture (nonexistent /tmp URLs) it simply finds nothing.
     /// Reconcile the index against `entries` by mtime: reuse an unchanged cached body, read a changed or
     /// new one (capped), drop the rest. Does disk I/O — the async path runs it off the main thread. Static
-    /// so the background closure can't touch mutable window state.
+    /// so the background closure can't touch mutable window state. A unit fixture's nonexistent /tmp URLs
+    /// simply contribute nothing.
     private static func buildIndex(_ entries: [LibraryEntry], from cached: [URL: IndexedBody]) -> [URL: IndexedBody] {
         let fm = FileManager.default
-        let cap = 512 * 1024
+        let cap = 512 * 1024   // BYTES, not characters — Korean transcripts are ~3 B/char, so a Character
         func mtime(_ url: URL) -> Date? { (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date }
         var index: [URL: IndexedBody] = [:]
         for e in entries {
@@ -681,7 +678,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             for url in sources where fm.fileExists(atPath: url.path) {
                 if let s = try? String(contentsOf: url, encoding: .utf8) { orig += (orig.isEmpty ? "" : "\n") + s }
             }
-            let clipped = String(orig.prefix(cap))
+            // cap bounds resident memory (orig + its lowercased copy); decode tolerates a mid-char cut.
+            let clipped = orig.utf8.count <= cap ? orig : String(decoding: Array(orig.utf8.prefix(cap)), as: UTF8.self)
             if !clipped.isEmpty { index[e.url] = IndexedBody(sig: sig, lower: clipped.lowercased(), orig: clipped) }
         }
         return index
@@ -692,6 +690,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         contentLower = index.mapValues(\.lower)
     }
 
+    /// Refresh the index OFF the main thread (a big library would beach-ball the first keystroke), then
+    /// publish on the main thread and re-run the FILTER — not a fresh kick, which would loop — so body
+    /// matches fill in behind the instant metadata matches.
     private func refreshContentIndexAsync() {
         guard !contentIndexRefreshing else { return }
         contentIndexRefreshing = true
@@ -708,12 +709,18 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         }
     }
 
-    /// The snippet for a row during an active search — from the IN-MEMORY index (no disk), only for a
-    /// body-only hit (a title hit is self-evident). Drives both the row's second line and its height.
-    private func rowSnippet(_ e: LibraryEntry) -> String? {
+    /// The snippet for a row during an active search — a body-only hit's matching line (a title hit is
+    /// self-evident). Served from a per-reload cache so heightOfRowByItem and viewFor share one body scan.
+    private func rowSnippet(_ e: LibraryEntry) -> String? { rowSnippetCache[e.url] }
+
+    /// Rebuild the row-snippet cache for the currently visible rows (once per applyFilterCore reload).
+    private func rebuildRowSnippetCache() {
+        rowSnippetCache = [:]
         let q = searchField.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty, !libraryMetadataMatches(e, filter: q), let body = contentIndex[e.url]?.orig else { return nil }
-        return searchSnippet(body, term: q)
+        guard !q.isEmpty else { return }
+        for e in shownDays.flatMap(\.entries) where !libraryMetadataMatches(e, filter: q) {
+            if let body = contentIndex[e.url]?.orig, let snip = searchSnippet(body, term: q) { rowSnippetCache[e.url] = snip }
+        }
     }
 
     private func applyFilter() {
@@ -727,6 +734,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         let onlyKind: LibraryEntry.Kind? = scopePicker.selectedSegment == 1 ? .digest : nil
         shownDays = libraryFiltered(allDays, filter: searchField.stringValue, onlyKind: onlyKind,
                                     day: selectedDay, content: contentLower)
+        rebuildRowSnippetCache()   // one scan feeds both heightOfRowByItem and viewFor for this reload
         outline.reloadData()
         outline.expandItem(nil, expandChildren: true)
         emptyLabel.isHidden = !shownDays.isEmpty
