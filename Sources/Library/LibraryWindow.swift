@@ -92,6 +92,11 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     private let searchField = NSSearchField()
     private let searchToggle = NSButton()   // magnifier; expands the field on click, collapses when empty
     private let scopePicker = NSSegmentedControl()   // All | Daily (digests only)
+    private let viewModePicker = NSSegmentedControl()   // List | Month — the two library presentations
+    private let monthView = MonthCalendarView()   // the big Calendar.app-style grid (Month mode)
+    private var monthMode = false   // false = the list+compact-calendar; true = the full month grid
+    private let entryPopover = NSPopover()   // a chip's transcript shown in place (Month mode)
+    private var libSplit: NSSplitView!   // the list/doc split — hidden while the month grid is up
     private let textView = NSTextView()
     private let headerLabel = NSTextField(labelWithString: "")
     private let docPicker = NSSegmentedControl(labels: ["Summary", "Transcript"],
@@ -220,6 +225,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
                           selectedDay: selectedDay, today: today)
         applyFilter()
         applyHeaderActions()   // a rescan may reflect saved prefs / a finished run — re-derive once
+        if monthMode, section == .library { loadMonth() }   // keep the grid in sync with new recordings
     }
 
     /// Engine hook: a transcript/summary just landed. Refresh only if the user is looking.
@@ -293,9 +299,18 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
         let refreshBtn = NSButton(title: "Refresh", target: self, action: #selector(refreshClicked))
         refreshBtn.bezelStyle = .rounded
+        // View mode: the compact list vs the big month grid — the two presentations the user asked for.
+        viewModePicker.segmentCount = 2
+        viewModePicker.setLabel("List", forSegment: 0)
+        viewModePicker.setLabel("Month", forSegment: 1)
+        viewModePicker.segmentStyle = .texturedRounded
+        viewModePicker.selectedSegment = 0
+        viewModePicker.target = self
+        viewModePicker.action = #selector(viewModeChanged)
+        viewModePicker.setContentHuggingPriority(.required, for: .horizontal)
         // Search lives at the RIGHT end (Calendar.app's placement): a magnifier that expands into a field
         // in place — the toggle hides while the field is up, so the field's own magnifier isn't doubled.
-        let bar = NSStackView(views: [scopePicker, refreshBtn, NSView(), searchField, searchToggle])
+        let bar = NSStackView(views: [viewModePicker, scopePicker, refreshBtn, NSView(), searchField, searchToggle])
         bar.orientation = .horizontal
         bar.spacing = 8
         // Left inset clears the traffic lights (fullSizeContentView); top inset leaves a drag strip.
@@ -484,6 +499,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         playerBar.setContentHuggingPriority(.required, for: .vertical)
 
         let split = NSSplitView()
+        libSplit = split
         split.isVertical = true
         split.dividerStyle = .thin
         split.translatesAutoresizingMaskIntoConstraints = false
@@ -504,8 +520,19 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         emptyLabel.textColor = .secondaryLabelColor
         emptyLabel.isHidden = true
 
+        // The month grid fills the same area as the split; only one is visible at a time (updateModeVisibility).
+        monthView.isHidden = true
+        monthView.onPickEntry = { [weak self] entry, from in
+            // Audio has no transcript to render in a popover — drop to the list and select it so the
+            // player bar surfaces; a transcript/digest reads in place.
+            guard let self else { return }
+            if entry.kind == .audio { openEntryInList(entry) } else { showEntryPopover(entry, from: from) }
+        }
+        monthView.onPickDay = { [weak self] day in self?.dropToDayList(day) }
+
         content.addSubview(bar)
         content.addSubview(split)
+        content.addSubview(monthView)
         content.addSubview(emptyLabel)
         NSLayoutConstraint.activate([
             bar.topAnchor.constraint(equalTo: content.topAnchor),
@@ -515,6 +542,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             split.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             split.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             split.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            monthView.topAnchor.constraint(equalTo: bar.bottomAnchor),
+            monthView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            monthView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            monthView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             emptyLabel.centerXAnchor.constraint(equalTo: content.centerXAnchor),
             emptyLabel.centerYAnchor.constraint(equalTo: content.centerYAnchor),
             emptyLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 420),
@@ -524,6 +555,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         split.setPosition(300, ofDividerAt: 0)   // list ≈ a third, document gets the rest
         window = w
         showEntry(nil)   // the right pane starts EMPTY — no ghost picker/player before a selection
+        monthMode = Pref.d.string(forKey: Pref.libraryViewMode) == "month"   // restore the saved presentation
+        viewModePicker.selectedSegment = monthMode ? 1 : 0
         switchSection(.library)   // paint the default nav selection now — an unhighlighted Library read as dead
     }
 
@@ -569,6 +602,97 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         if new == .live, let pending = pendingLiveMirror {
             pendingLiveMirror = nil
             liveMirror(pending)   // replay the caption that arrived while another section was up
+        }
+        updateModeVisibility()
+    }
+
+    /// One decision for List-vs-Month: the month grid only ever shows inside the Library section; the
+    /// split (which HOLDS the Live/Status panes) must reappear the moment another section is picked.
+    private func updateModeVisibility() {
+        let showMonth = section == .library && monthMode
+        monthView.isHidden = !showMonth
+        libSplit.isHidden = showMonth
+        viewModePicker.isHidden = section != .library   // the toggle only applies to the Library
+        if showMonth { emptyLabel.isHidden = true; loadMonth() }   // the grid is its own empty state
+    }
+
+    /// The one place mode is set: flips the flag, the segmented control, and the persisted pref together
+    /// so viewModeChanged and dropToList can't drift.
+    private func setMonthMode(_ on: Bool) {
+        monthMode = on
+        viewModePicker.selectedSegment = on ? 1 : 0
+        Pref.d.set(on ? "month" : "list", forKey: Pref.libraryViewMode)
+    }
+
+    @objc private func viewModeChanged() {
+        setMonthMode(viewModePicker.selectedSegment == 1)
+        entryPopover.close()
+        updateModeVisibility()
+    }
+
+    /// Feed the month grid: ALL recordings grouped by day (the grid IS the navigation, not a filtered
+    /// view), on the newest-data month unless the user has paged. A snapshot re-taken on every change.
+    private func loadMonth() {
+        let today = Self.dayString(Date())
+        let month = monthView.userNavigated ? monthView.month : String((allDays.first?.day ?? today).prefix(7))
+        monthView.load(month: month, entriesByDay: entriesByDayMap(allDays), today: today)
+    }
+
+    /// The popover's read-only document: render the summary (or transcript), then strip the interactive
+    /// checkbox/seek links (macrec-check:// / macrec-seek://) — the popover has no delegate, so a click
+    /// would be a silent dead-end, and toggling here would hit the wrong file. Glyphs/text stay. Read is
+    /// capped + lenient with a visible truncation note, matching loadDoc (a stray byte must not fail it).
+    private func popoverDoc(for e: LibraryEntry) -> NSAttributedString {
+        let src = e.summaryURL ?? e.url
+        let md: String
+        if let data = try? Data(contentsOf: src, options: .mappedIfSafe) {
+            let capped = data.prefix(2_000_000)
+            // A neutral notice — the popover has no "Open" (Month mode hides that pane), so don't promise it.
+            md = String(decoding: capped, as: UTF8.self)
+                + (data.count > capped.count ? "\n\n… (preview truncated)" : "")
+        } else {
+            md = "(could not read \(src.lastPathComponent))"
+        }
+        let rendered = NSMutableAttributedString(attributedString: MarkdownRender.render(md, baseURL: src.deletingLastPathComponent()))
+        rendered.removeAttribute(.link, range: NSRange(location: 0, length: rendered.length))
+        return rendered
+    }
+
+    /// Anchored to the chip so the user reads it without leaving the grid.
+    private func showEntryPopover(_ e: LibraryEntry, from: NSView) {
+        let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: 460, height: 420))
+        tv.isEditable = false
+        tv.textContainerInset = NSSize(width: 14, height: 14)
+        tv.textStorage?.setAttributedString(popoverDoc(for: e))
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 460, height: 420))
+        scroll.documentView = tv
+        scroll.hasVerticalScroller = true
+        let vc = NSViewController()
+        vc.view = scroll
+        entryPopover.contentViewController = vc
+        entryPopover.contentSize = NSSize(width: 460, height: 420)
+        entryPopover.behavior = .transient
+        guard window?.isVisible == true else { return }   // an off-screen (test) window has nothing to anchor to
+        entryPopover.show(relativeTo: from.bounds, of: from, preferredEdge: .maxX)
+    }
+
+    /// The "+N more" overflow chip drops to the list, filtered to that day — the full-detail path.
+    private func dropToDayList(_ day: String) { dropToList(day: day, select: nil) }
+
+    /// An audio chip has no transcript for a popover — drop to the list on its day and select it so the
+    /// player bar appears (the list path already special-cases audio playback).
+    private func openEntryInList(_ e: LibraryEntry) { dropToList(day: e.day, select: e) }
+
+    private func dropToList(day: String, select: LibraryEntry?) {
+        entryPopover.close()
+        setMonthMode(false)
+        selectedDay = day
+        calendarView.syncSelection(day)
+        updateModeVisibility()
+        applyFilter()
+        if let e = select, let fresh = shownDays.lazy.flatMap(\.entries).first(where: { $0.url == e.url && $0.kind == e.kind }) {
+            showEntry(fresh)
+            reselect(url: fresh.url, kind: fresh.kind)
         }
     }
 
@@ -732,7 +856,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         rebuildRowSnippetCache()   // one scan feeds both heightOfRowByItem and viewFor for this reload
         outline.reloadData()
         outline.expandItem(nil, expandChildren: true)
-        emptyLabel.isHidden = !shownDays.isEmpty
+        emptyLabel.isHidden = !shownDays.isEmpty || (monthMode && section == .library)   // never over the grid
         // The daily-specific copy only when the SCOPE, not an active text filter, emptied the list —
         // a digest has no searchable title, so any real query hides them and "no digests yet" would
         // lie (review finding).
@@ -1533,6 +1657,17 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     }
     /// Click the REAL nav button (target-action → navTapped → switchSection), not switchSection direct.
     func clickNavForTest(_ s: MainSection) { navButtons.first { $0.tag == s.rawValue }?.performClick(nil) }
+    /// Flip the REAL view-mode segmented control (List ⇄ Month) and fire its WIRED target-action — so a
+    /// broken viewModePicker target/action fails the test, not just a helper call.
+    func setMonthModeForTest(_ on: Bool) {
+        viewModePicker.selectedSegment = on ? 1 : 0
+        _ = viewModePicker.target?.perform(viewModePicker.action, with: viewModePicker)
+    }
+    func popoverDocForTest(_ e: LibraryEntry) -> NSAttributedString { popoverDoc(for: e) }
+    var monthModeVisibleForTest: Bool { !monthView.isHidden }
+    var splitVisibleForTest: Bool { !libSplit.isHidden }
+    var monthChipCountForTest: Int { monthView.chipCountForTest() }
+    @discardableResult func clickMonthChipForTest(onDay day: String) -> LibraryEntry? { monthView.clickFirstChipForTest(onDay: day) }
     /// Expand the search field (as the toggle does) and run a query, building the index SYNCHRONOUSLY so
     /// the assertion is deterministic (the shipped path builds it off-thread). Drives the real full-text path.
     func expandSearchForTest(_ term: String) {

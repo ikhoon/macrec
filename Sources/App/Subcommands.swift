@@ -237,8 +237,12 @@ func runLibrarySnapshotSubcommand(_ args: [String]) -> Never {
         LibraryWindow.shared.collapseSearchForTest()
         LibraryWindow.shared.loadFixtureForTest(sortedFixture)   // restore full list + selection for the next mode
         LibraryWindow.shared.pickDocForTest(1)
-        if main.isEmpty || daily.isEmpty || live.isEmpty || status.isEmpty || search.isEmpty { missing = true }
-        files += main + daily + live + status + search
+        // Month mode: the big Calendar.app-style grid with each day's recordings as chips.
+        LibraryWindow.shared.setMonthModeForTest(true)
+        let month = LibraryWindow.shared.snapshot(to: dir.appendingPathComponent(mode).appendingPathComponent("month"))
+        LibraryWindow.shared.setMonthModeForTest(false)
+        if main.isEmpty || daily.isEmpty || live.isEmpty || status.isEmpty || search.isEmpty || month.isEmpty { missing = true }
+        files += main + daily + live + status + search + month
     }
     if missing { print("library-snapshot: FAILED (a mode's shot is missing)"); exit(1) }
     for f in files { print(f.path) }
