@@ -122,6 +122,14 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     private var playerTimer: Timer?
 
     private var allDays: [LibraryDay] = []
+    // Full-text search index, keyed by entry URL. Refreshed OFF the main thread (a big library would
+    // otherwise beach-ball on the first keystroke), incrementally by file mtime so a focus-gain or an
+    // unchanged rescan costs nothing. `orig` feeds the result snippet from memory (no per-row disk read).
+    private struct IndexedBody { let sig: String; let lower: String; let orig: String }
+    private var contentIndex: [URL: IndexedBody] = [:]
+    private var contentLower: [URL: String] = [:] // derived lower-only map handed to the pure filter
+    private var contentIndexRefreshing = false
+    private var rowSnippetCache: [URL: String] = [:] // per-reload snippets — heightOfRowByItem + viewFor share one scan
     private var shownDays: [LibraryDay] = []
     private var fixtureDays: [LibraryDay]? // test/snapshot data — nil means scan the real folders
     private var selected: LibraryEntry?
@@ -196,6 +204,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// index is a snapshot, and these are the events that invalidate it.
     func refresh() {
         allDays = fixtureDays ?? scanReal()
+        // The content index is NOT wiped here: refreshContentIndexAsync reconciles it by mtime, so an
+        // unchanged rescan or a focus-gain re-reads nothing (only changed/new files, dropping vanished).
         // Prune re-run state for files the scan no longer sees (deleted/renamed) — in-flight runs
         // keep their entry so a completion can still land its failure reason.
         let urls = Set(allDays.flatMap(\.entries).map(\.url))
@@ -263,7 +273,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         searchToggle.target = self
         searchToggle.action = #selector(toggleSearch)
         searchField.translatesAutoresizingMaskIntoConstraints = false
-        searchField.placeholderString = "Filter by title or date"
+        searchField.placeholderString = "Search titles & contents"
         searchField.sendsSearchStringImmediately = true
         searchField.isHidden = true
         searchField.delegate = self
@@ -283,15 +293,18 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
         let refreshBtn = NSButton(title: "Refresh", target: self, action: #selector(refreshClicked))
         refreshBtn.bezelStyle = .rounded
-        let bar = NSStackView(views: [searchToggle, searchField, NSView(), scopePicker, refreshBtn])
+        // Search lives at the RIGHT end (Calendar.app's placement): a magnifier that expands into a field
+        // in place — the toggle hides while the field is up, so the field's own magnifier isn't doubled.
+        let bar = NSStackView(views: [scopePicker, refreshBtn, NSView(), searchField, searchToggle])
         bar.orientation = .horizontal
         bar.spacing = 8
         // Left inset clears the traffic lights (fullSizeContentView); top inset leaves a drag strip.
         bar.edgeInsets = NSEdgeInsets(top: 8, left: 78, bottom: 6, right: 12)
         bar.translatesAutoresizingMaskIntoConstraints = false
         searchToggle.setContentHuggingPriority(.required, for: .horizontal)
-        searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
+        // The field holds a compact right-anchored width; the flexible spacer before it takes the slack.
+        searchField.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
 
         // Left: the day/entry outline.
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("entry"))
@@ -627,6 +640,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     @objc private func toggleSearch() {
         if searchField.isHidden {
             searchField.isHidden = false
+            searchToggle.isHidden = true   // the field carries its own magnifier — don't double it
             window?.makeFirstResponder(searchField)
         } else {
             collapseSearchIfEmpty(force: true)
@@ -637,6 +651,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         guard force || searchField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         searchField.stringValue = ""
         searchField.isHidden = true
+        searchToggle.isHidden = false   // restore the collapsed magnifier at the right end
         applyFilter()
         if window?.firstResponder === searchField.currentEditor() { window?.makeFirstResponder(nil) }
     }
@@ -646,10 +661,75 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         collapseSearchIfEmpty(force: false)   // left empty → tidy back to the icon
     }
 
+    /// Static so the background closure can't race on window state; reuses an unchanged body by mtime.
+    private static func buildIndex(_ entries: [LibraryEntry], from cached: [URL: IndexedBody]) -> [URL: IndexedBody] {
+        let fm = FileManager.default
+        let cap = 512 * 1024   // BYTES, not characters — Korean transcripts are ~3 B/char, so a Character
+        func mtime(_ url: URL) -> Date? { (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date }
+        var index: [URL: IndexedBody] = [:]
+        for e in entries {
+            let sources = [e.url, e.summaryURL].compactMap { $0 }
+            let sig = sources.map { mtime($0).map { "\($0.timeIntervalSince1970)" } ?? "-" }.joined(separator: "|")
+            if let hit = cached[e.url], hit.sig == sig { index[e.url] = hit; continue } // unchanged → reuse
+            var orig = ""
+            for url in sources where fm.fileExists(atPath: url.path) {
+                if let s = try? String(contentsOf: url, encoding: .utf8) { orig += (orig.isEmpty ? "" : "\n") + s }
+            }
+            // cap bounds resident memory (orig + its lowercased copy); decode tolerates a mid-char cut.
+            let clipped = orig.utf8.count <= cap ? orig : String(decoding: Array(orig.utf8.prefix(cap)), as: UTF8.self)
+            if !clipped.isEmpty { index[e.url] = IndexedBody(sig: sig, lower: clipped.lowercased(), orig: clipped) }
+        }
+        return index
+    }
+
+    private func publishIndex(_ index: [URL: IndexedBody]) {
+        contentIndex = index
+        contentLower = index.mapValues(\.lower)
+    }
+
+    /// Off the main thread: a big library would beach-ball the first keystroke. Re-run the filter (not a
+    /// fresh kick — that loops) once the fuller index lands.
+    private func refreshContentIndexAsync() {
+        guard !contentIndexRefreshing else { return }
+        contentIndexRefreshing = true
+        let entries = allDays.flatMap(\.entries)
+        let cached = contentIndex
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let index = Self.buildIndex(entries, from: cached)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.contentIndexRefreshing = false
+                self.publishIndex(index)
+                if !self.searchField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty { self.applyFilterCore() }
+            }
+        }
+    }
+
+    /// Cached so heightOfRowByItem and viewFor don't each re-scan the body for the same row.
+    private func rowSnippet(_ e: LibraryEntry) -> String? { rowSnippetCache[e.url] }
+
+    /// Rebuild the row-snippet cache for the currently visible rows (once per applyFilterCore reload).
+    private func rebuildRowSnippetCache() {
+        rowSnippetCache = [:]
+        let q = searchField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return }
+        for e in shownDays.flatMap(\.entries) where !libraryMetadataMatches(e, filter: q) {
+            if let body = contentIndex[e.url]?.orig, let snip = searchSnippet(body, term: q) { rowSnippetCache[e.url] = snip }
+        }
+    }
+
     private func applyFilter() {
+        // Kick a background (incremental) index refresh when searching; the CORE filter runs immediately
+        // with whatever content is cached, so the list stays responsive and body matches fill in after.
+        if !searchField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty { refreshContentIndexAsync() }
+        applyFilterCore()
+    }
+
+    private func applyFilterCore() {
         let onlyKind: LibraryEntry.Kind? = scopePicker.selectedSegment == 1 ? .digest : nil
         shownDays = libraryFiltered(allDays, filter: searchField.stringValue, onlyKind: onlyKind,
-                                    day: selectedDay)
+                                    day: selectedDay, content: contentLower)
+        rebuildRowSnippetCache()   // one scan feeds both heightOfRowByItem and viewFor for this reload
         outline.reloadData()
         outline.expandItem(nil, expandChildren: true)
         emptyLabel.isHidden = !shownDays.isEmpty
@@ -1187,6 +1267,12 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         return (item as? LibraryDay)?.entries.count ?? 0
     }
 
+    func outlineView(_ v: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
+        // A row with a content snippet gets a second line; everyone else keeps the medium single-line height.
+        if let e = item as? LibraryEntry, rowSnippet(e) != nil { return 40 }
+        return 24
+    }
+
     func outlineView(_ v: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
         if item == nil { return shownDays[index] }
         guard let day = item as? LibraryDay else { return shownDays[index] }
@@ -1341,6 +1427,17 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
                 text.append(NSAttributedString(string: "  "))
                 text.append(NSAttributedString(attachment: att))
             }
+            // Full-text hit: show WHY this row matched on a SECOND line — a dim snippet of the matching
+            // line (only for a body-only hit; a title hit is self-evident). The row grows to fit it
+            // (heightOfRowByItem), so the snippet is never squeezed off the end of the title.
+            let snip = rowSnippet(e)
+            if let snip {
+                text.append(NSAttributedString(string: "\n" + snip, attributes: [
+                    .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor,
+                    .paragraphStyle: oneLine,
+                ]))
+            }
+            cell.textField?.maximumNumberOfLines = snip == nil ? 1 : 2
             cell.textField?.attributedStringValue = text
             // Re-bind on EVERY reuse: a recycled cell must delete ITS current entry, never the one it
             // showed before scrolling. The confirm→Trash flow is the same one the detail Delete runs.
@@ -1436,6 +1533,18 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     }
     /// Click the REAL nav button (target-action → navTapped → switchSection), not switchSection direct.
     func clickNavForTest(_ s: MainSection) { navButtons.first { $0.tag == s.rawValue }?.performClick(nil) }
+    /// Expand the search field (as the toggle does) and run a query, building the index SYNCHRONOUSLY so
+    /// the assertion is deterministic (the shipped path builds it off-thread). Drives the real full-text path.
+    func expandSearchForTest(_ term: String) {
+        if searchField.isHidden { toggleSearch() }
+        searchField.stringValue = term
+        publishIndex(Self.buildIndex(allDays.flatMap(\.entries), from: contentIndex))
+        applyFilterCore()
+    }
+    var rowSnippetForTest: (LibraryEntry) -> String? { { [weak self] in self?.rowSnippet($0) } }
+    func collapseSearchForTest() { collapseSearchIfEmpty(force: true) }
+    var searchFieldVisibleForTest: Bool { !searchField.isHidden }
+    var searchToggleVisibleForTest: Bool { !searchToggle.isHidden }
     /// The active nav row must LOOK selected (fill + bold) and inactive rows must not — the fix for the
     /// "dead"/무반응 nav. Force the framework's layout first so the values read are the shipped ones.
     var navHighlightForTest: (activeFilled: Bool, activeBold: Bool, othersClear: Bool) {
