@@ -661,10 +661,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         collapseSearchIfEmpty(force: false)   // left empty → tidy back to the icon
     }
 
-    /// Reconcile the index against `entries` by mtime: reuse an unchanged cached body, read a changed or
-    /// new one (capped), drop the rest. Does disk I/O — the async path runs it off the main thread. Static
-    /// so the background closure can't touch mutable window state. A unit fixture's nonexistent /tmp URLs
-    /// simply contribute nothing.
+    /// Static so the background closure can't race on window state; reuses an unchanged body by mtime.
     private static func buildIndex(_ entries: [LibraryEntry], from cached: [URL: IndexedBody]) -> [URL: IndexedBody] {
         let fm = FileManager.default
         let cap = 512 * 1024   // BYTES, not characters — Korean transcripts are ~3 B/char, so a Character
@@ -690,9 +687,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         contentLower = index.mapValues(\.lower)
     }
 
-    /// Refresh the index OFF the main thread (a big library would beach-ball the first keystroke), then
-    /// publish on the main thread and re-run the FILTER — not a fresh kick, which would loop — so body
-    /// matches fill in behind the instant metadata matches.
+    /// Off the main thread: a big library would beach-ball the first keystroke. Re-run the filter (not a
+    /// fresh kick — that loops) once the fuller index lands.
     private func refreshContentIndexAsync() {
         guard !contentIndexRefreshing else { return }
         contentIndexRefreshing = true
@@ -709,8 +705,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         }
     }
 
-    /// The snippet for a row during an active search — a body-only hit's matching line (a title hit is
-    /// self-evident). Served from a per-reload cache so heightOfRowByItem and viewFor share one body scan.
+    /// Cached so heightOfRowByItem and viewFor don't each re-scan the body for the same row.
     private func rowSnippet(_ e: LibraryEntry) -> String? { rowSnippetCache[e.url] }
 
     /// Rebuild the row-snippet cache for the currently visible rows (once per applyFilterCore reload).
