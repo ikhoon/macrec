@@ -163,7 +163,7 @@ func librarySortedEntries(_ entries: [LibraryEntry]) -> [LibraryEntry] {
 /// on title/day/time (blank = every row). All apply; days with no surviving entry disappear.
 /// Pure + selftested (the window's list is just this).
 func libraryFiltered(_ days: [LibraryDay], filter: String, onlyKind: LibraryEntry.Kind? = nil,
-                     day onlyDay: String? = nil) -> [LibraryDay] {
+                     day onlyDay: String? = nil, content: [URL: String] = [:]) -> [LibraryDay] {
     let f = filter.trimmingCharacters(in: .whitespaces).lowercased()
     guard !f.isEmpty || onlyKind != nil || onlyDay != nil else { return days }
     return days.compactMap { day in
@@ -171,9 +171,43 @@ func libraryFiltered(_ days: [LibraryDay], filter: String, onlyKind: LibraryEntr
         let kept = day.entries.filter { e in
             guard onlyKind == nil || e.kind == onlyKind else { return false }
             guard !f.isEmpty else { return true }
+            // Metadata match (fast) OR a full-text match in the transcript/summary body (the `content`
+            // map, lowercased, is built and injected by the window so this stays pure/testable).
             return (e.title ?? "").lowercased().contains(f) || e.day.contains(f)
                 || (e.time ?? "").contains(f) || e.kind.rawValue.contains(f)
+                || (content[e.url]?.contains(f) ?? false)
         }
         return kept.isEmpty ? nil : LibraryDay(day: day.day, entries: kept)
     }
+}
+
+/// Whether `filter` matches an entry's metadata alone (title/day/time/kind) — i.e. NOT a body-only hit.
+/// The window uses this to decide when to show a content snippet (a title hit needs none). Pure.
+func libraryMetadataMatches(_ e: LibraryEntry, filter: String) -> Bool {
+    let f = filter.trimmingCharacters(in: .whitespaces).lowercased()
+    guard !f.isEmpty else { return true }
+    return (e.title ?? "").lowercased().contains(f) || e.day.contains(f)
+        || (e.time ?? "").contains(f) || e.kind.rawValue.contains(f)
+}
+
+/// A one-line preview of where `term` occurs in `body`: the matching line, whitespace-collapsed, and
+/// clipped to a window of ~`context` chars on each side of the hit with … where text was trimmed.
+/// Returns nil when the term isn't present. Case-insensitive. Pure + selftested (the results snippet).
+func searchSnippet(_ body: String, term: String, context: Int = 40) -> String? {
+    let needle = term.trimmingCharacters(in: .whitespaces)
+    guard !needle.isEmpty else { return nil }
+    // The matching line (collapsed whitespace so a wrapped transcript line reads as one). All index math
+    // is done on `line` itself via a case-insensitive search — mixing indices from a separately-lowercased
+    // copy is unsound (a case-fold can change UTF-8 length and shift or crash the slice).
+    let hitLine = body.split(whereSeparator: \.isNewline)
+        .first { $0.range(of: needle, options: .caseInsensitive) != nil }
+    guard let hitLine else { return nil }
+    let line = hitLine.split(whereSeparator: { $0 == " " || $0 == "\t" }).joined(separator: " ")
+    guard let r = line.range(of: needle, options: .caseInsensitive) else { return line }
+    let start = line.index(r.lowerBound, offsetBy: -context, limitedBy: line.startIndex) ?? line.startIndex
+    let end = line.index(r.upperBound, offsetBy: context, limitedBy: line.endIndex) ?? line.endIndex
+    var snip = String(line[start..<end])
+    if start > line.startIndex { snip = "… " + snip }
+    if end < line.endIndex { snip += " …" }
+    return snip
 }

@@ -552,6 +552,38 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
               && libraryFiltered(fix, filter: "").count == 2
               && libraryFiltered(fix, filter: "digest").first?.entries.first?.kind == .digest
               && libraryFiltered(fix, filter: "zzz").isEmpty)
+    // Content (full-text) search: a term that appears ONLY in the body still surfaces the row, via the
+    // injected content map — so "저 검색으로 뭘 할 수 있지?" now finds words inside transcripts/summaries.
+    // Distinct URLs per entry (the real library has one file each; the shared-URL fixture cannot key content).
+    let ctA = URL(fileURLWithPath: "/tmp/ct-standup.md"), ctB = URL(fileURLWithPath: "/tmp/ct-kickoff.md")
+    let ctDays = [LibraryDay(day: "2026-03-02", entries: [
+        LibraryEntry(day: "2026-03-02", time: "10:00", title: "standup", kind: .transcript, url: ctA, summaryURL: nil, audioURL: nil),
+        LibraryEntry(day: "2026-03-02", time: "14:00", title: "kickoff", kind: .transcript, url: ctB, summaryURL: nil, audioURL: nil),
+    ])]
+    let contentMap = [ctB: "the migration plan and the budget were both approved"]   // "migration" only in kickoff's body
+    let ctHit = libraryFiltered(ctDays, filter: "migration", content: contentMap)
+    check("library: full-text search finds a term that appears only in the body, not the title",
+          libraryFiltered(ctDays, filter: "migration").isEmpty                       // title-only search misses it
+              && ctHit.count == 1 && ctHit.first?.entries.count == 1                  // exactly the kickoff row
+              && ctHit.first?.entries.first?.title == "kickoff"
+              && !libraryMetadataMatches(ctDays[0].entries[1], filter: "migration")   // it's a body-only hit
+              && libraryMetadataMatches(ctDays[0].entries[1], filter: "kickoff"))     // title hit is metadata
+    // No FALSE phrase match across the transcript↔summary boundary: the window joins the two bodies with a
+    // newline (not a space), so a query spanning the seam must not match (review finding).
+    check("library: a phrase does not match across the body-join newline",
+          libraryFiltered(ctDays, filter: "plan budget", content: [ctB: "the plan\nbudget notes"]).isEmpty
+              && libraryFiltered(ctDays, filter: "plan", content: [ctB: "the plan\nbudget notes"]).count == 1)
+    // Snippet: the matching line, whitespace-collapsed and clipped with … around the hit — and index math
+    // stays sound under a case-fold that changes byte length (was computed on a separate lowercased copy).
+    check("library: a content snippet clips around the matched term (case-fold safe)",
+          searchSnippet("intro line\nwe discussed the migration plan today\noutro", term: "migration")
+              == "we discussed the migration plan today"
+              && searchSnippet(String(repeating: "x ", count: 60) + "MIGRATION " + String(repeating: "y ", count: 60),
+                               term: "migration")?.hasPrefix("… ") == true
+              && searchSnippet("visit the CAFÉ downtown today", term: "café") == "visit the CAFÉ downtown today"
+              && searchSnippet("Die STRASSE war voll", term: "strasse") == "Die STRASSE war voll"
+              && searchSnippet("nothing here", term: "absent") == nil
+              && searchSnippet("body", term: "  ") == nil)
     // Daily-only scope: keeps ONLY digest rows, drops days without one, and still composes with text.
     let txScoped = libraryFiltered(fix, filter: "", onlyKind: .transcript)
     check("library: onlyKind scope keeps digests, composes with the text filter",
@@ -674,6 +706,22 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         lw.refreshForTest()
         check("library: a summary landing on the selected row rebinds it (not clears) across a rescan",
               pickerHiddenNoSummary && lw.selectedURLForTest == tURL && !lw.docPickerHiddenForTest)
+        // Full-text search THROUGH the window: the index reads a real file's body, so a term that lives
+        // only in the body surfaces its row; and the search toggle collapses cleanly. (The pure matcher is
+        // tested above; this guards the wiring — the on-disk index + the expand/collapse controls.)
+        let ctURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mr-ct-\(UUID().uuidString).md")
+        try? "quarterly OKR review and the migration timeline".write(to: ctURL, atomically: true, encoding: .utf8)
+        lw.loadFixtureForTest([LibraryDay(day: "2026-03-02", entries: [
+            LibraryEntry(day: "2026-03-02", time: "10:00", title: "sync", kind: .transcript, url: ctURL, summaryURL: nil, audioURL: nil)])])
+        lw.expandSearchForTest("migration")   // only in the body, not the "sync" title
+        let bodyHit = lw.shownDayCountForTest == 1 && lw.searchFieldVisibleForTest && !lw.searchToggleVisibleForTest
+        lw.expandSearchForTest("zzz-absent-term")
+        let missWhenAbsent = lw.shownDayCountForTest == 0
+        lw.collapseSearchForTest()
+        let collapsedClean = !lw.searchFieldVisibleForTest && lw.searchToggleVisibleForTest && lw.shownDayCountForTest == 1
+        try? FileManager.default.removeItem(at: ctURL)
+        check("library: window full-text search reads the body index and the search field collapses cleanly",
+              bodyHit && missWhenAbsent && collapsedClean)
         LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore the rich default
     }
     // Transcript stamps: parsing, the clock→offset decision, and the seek-link scheme.

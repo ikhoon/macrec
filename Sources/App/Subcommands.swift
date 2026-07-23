@@ -186,6 +186,19 @@ func runLibrarySnapshotSubcommand(_ args: [String]) -> Never {
     LibraryWindow.shared.pickDocForTest(1)
     // BOTH appearances (dark and light must each be looked at); a missing mode FAILS — partial
     // output would read as "covered both" when it didn't. Daily-scope shots ride the same loop.
+    // A DISTINCT-file fixture for the content-search shot: "rollout" appears in only ONE body, so
+    // exactly that row surfaces with its snippet (the shared-URL main fixture would over-match every
+    // row and pick the wrong identity). Mock content only — no real names.
+    let sA = "/tmp/mr-search-budget.md", sB = "/tmp/mr-search-planning.md"
+    try? "# budget review\n\nWe went over the quarterly numbers and the hiring plan.".write(toFile: sA, atomically: true, encoding: .utf8)
+    try? "# planning\n\nDecision: the rollout plan was approved and scheduled for next month.".write(toFile: sB, atomically: true, encoding: .utf8)
+    let searchDays = [LibraryDay(day: "2026-03-02", entries: [
+        LibraryEntry(day: "2026-03-02", time: "10:00", title: "budget review", kind: .transcript,
+                     url: URL(fileURLWithPath: sA), summaryURL: nil, audioURL: nil),
+        LibraryEntry(day: "2026-03-02", time: "14:00", title: "planning", kind: .transcript,
+                     url: URL(fileURLWithPath: sB), summaryURL: nil, audioURL: nil),
+    ])]
+
     var files: [URL] = []
     var missing = false
     for (mode, name) in [("dark", NSAppearance.Name.darkAqua), ("light", .aqua)] {
@@ -214,8 +227,18 @@ func runLibrarySnapshotSubcommand(_ args: [String]) -> Never {
         let status = LibraryWindow.shared.snapshot(to: dir.appendingPathComponent(mode).appendingPathComponent("status"))
         LibraryWindow.shared.healthSample = nil
         LibraryWindow.shared.switchSectionForTest(.library)
-        if main.isEmpty || daily.isEmpty || live.isEmpty || status.isEmpty { missing = true }
-        files += main + daily + live + status
+        // Content search: on the distinct-file fixture, expand the field and query a term that lives
+        // ONLY in the "planning" body ("rollout", not in any title) — exactly that row surfaces with its
+        // snippet, and selecting it shows its transcript. Proves full-text search + snippet + the field.
+        LibraryWindow.shared.loadFixtureForTest(searchDays)
+        LibraryWindow.shared.expandSearchForTest("rollout")
+        LibraryWindow.shared.selectForTest(searchDays[0].entries[1])   // the "planning" row (the sole match)
+        let search = LibraryWindow.shared.snapshot(to: dir.appendingPathComponent(mode).appendingPathComponent("search"))
+        LibraryWindow.shared.collapseSearchForTest()
+        LibraryWindow.shared.loadFixtureForTest(sortedFixture)   // restore full list + selection for the next mode
+        LibraryWindow.shared.pickDocForTest(1)
+        if main.isEmpty || daily.isEmpty || live.isEmpty || status.isEmpty || search.isEmpty { missing = true }
+        files += main + daily + live + status + search
     }
     if missing { print("library-snapshot: FAILED (a mode's shot is missing)"); exit(1) }
     for f in files { print(f.path) }
