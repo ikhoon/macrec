@@ -647,8 +647,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         let md: String
         if let data = try? Data(contentsOf: src, options: .mappedIfSafe) {
             let capped = data.prefix(2_000_000)
+            // A neutral notice — the popover has no "Open" (Month mode hides that pane), so don't promise it.
             md = String(decoding: capped, as: UTF8.self)
-                + (data.count > capped.count ? "\n\n… (truncated view — Open shows the full file)" : "")
+                + (data.count > capped.count ? "\n\n… (preview truncated)" : "")
         } else {
             md = "(could not read \(src.lastPathComponent))"
         }
@@ -657,8 +658,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         return rendered
     }
 
-    /// A chip clicked: show the recording's document in a popover anchored to the chip — the user reads it
-    /// in place without leaving the month grid. Summary if it has one, else the transcript.
+    /// Anchored to the chip so the user reads it without leaving the grid.
     private func showEntryPopover(_ e: LibraryEntry, from: NSView) {
         let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: 460, height: 420))
         tv.isEditable = false
