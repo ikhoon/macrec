@@ -641,18 +641,24 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// The popover's read-only document: render the summary (or transcript), then strip the interactive
     /// checkbox/seek links (macrec-check:// / macrec-seek://) — the popover has no delegate, so a click
     /// would be a silent dead-end, and toggling here would hit the wrong file. Glyphs/text stay. Read is
-    /// byte-capped and lenient (like the search index), not strict-UTF-8-or-bust.
+    /// capped + lenient with a visible truncation note, matching loadDoc (a stray byte must not fail it).
     private func popoverDoc(for e: LibraryEntry) -> NSAttributedString {
         let src = e.summaryURL ?? e.url
-        let md: String = (try? Data(contentsOf: src, options: .mappedIfSafe))
-            .map { String(decoding: $0.prefix(512 * 1024), as: UTF8.self) } ?? "(could not read \(src.lastPathComponent))"
+        let md: String
+        if let data = try? Data(contentsOf: src, options: .mappedIfSafe) {
+            let capped = data.prefix(2_000_000)
+            md = String(decoding: capped, as: UTF8.self)
+                + (data.count > capped.count ? "\n\n… (truncated view — Open shows the full file)" : "")
+        } else {
+            md = "(could not read \(src.lastPathComponent))"
+        }
         let rendered = NSMutableAttributedString(attributedString: MarkdownRender.render(md, baseURL: src.deletingLastPathComponent()))
         rendered.removeAttribute(.link, range: NSRange(location: 0, length: rendered.length))
         return rendered
     }
 
-    /// A chip clicked: show the recording's document in a popover anchored to the chip — read it in place
-    /// without leaving the month (the user's "그 안에 transcript를 바로 보여주는"). Summary if it has one.
+    /// A chip clicked: show the recording's document in a popover anchored to the chip — the user reads it
+    /// in place without leaving the month grid. Summary if it has one, else the transcript.
     private func showEntryPopover(_ e: LibraryEntry, from: NSView) {
         let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: 460, height: 420))
         tv.isEditable = false
