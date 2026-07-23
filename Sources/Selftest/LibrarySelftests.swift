@@ -178,6 +178,23 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
               // English letters, exactly. The view builds its own gregorian/POSIX calendar the same way.
               && weekdayHeaders(calendar: cal) == ["S", "M", "T", "W", "T", "F", "S"]
               && libraryGridCalendar(from: cal).identifier == .gregorian)
+    // Month VIEW: a day cell shows the first N entries as chips, the rest fold into a "+N" overflow, and
+    // each chip's label reads by kind (digest / audio / a titled transcript). entriesByDayMap keys lookups.
+    let mvU = URL(fileURLWithPath: "/tmp/mv.md"), mvA = URL(fileURLWithPath: "/tmp/mv.wav")
+    let mvDigest = LibraryEntry(day: "2026-03-02", time: nil, title: nil, kind: .digest, url: mvU, summaryURL: nil, audioURL: nil)
+    let mvT1 = LibraryEntry(day: "2026-03-02", time: "10:30", title: "standup", kind: .transcript, url: mvU, summaryURL: nil, audioURL: nil)
+    let mvAudio = LibraryEntry(day: "2026-03-02", time: "17:52", title: nil, kind: .audio, url: mvA, summaryURL: nil, audioURL: mvA)
+    let mvUntitled = LibraryEntry(day: "d", time: "09:00", title: nil, kind: .transcript, url: mvU, summaryURL: nil, audioURL: nil)
+    let mvDays = [LibraryDay(day: "2026-03-02", entries: [mvDigest, mvT1, mvAudio])]
+    let mvCell = monthCellChips([mvDigest, mvT1, mvAudio, mvT1, mvT1], max: 3)
+    check("library month-view: cell shows N chips + overflow, and chip labels read by kind",
+          mvCell.chips.count == 3 && mvCell.overflow == 2
+              && monthChipLabel(mvDigest) == "Daily digest"
+              && monthChipLabel(mvT1) == "10:30  standup"
+              && monthChipLabel(mvAudio) == "17:52  audio"
+              && monthChipLabel(mvUntitled) == "09:00  (untitled)"
+              && monthCellChips([mvDigest], max: 3).overflow == 0
+              && entriesByDayMap(mvDays)["2026-03-02"]?.count == 3)
     // The day filter is one more pure input: only that day's group survives, it composes with the
     // kind scope, and nil means every day (the existing behavior, unchanged).
     let fixDays = libraryFixtureDays()
@@ -722,6 +739,28 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         try? FileManager.default.removeItem(at: ctURL)
         check("library: window full-text search reads the body index and the search field collapses cleanly",
               bodyHit && missWhenAbsent && collapsedClean)
+        // Month mode: the toggle swaps to the full grid (chips rendered); leaving the Library section must
+        // bring the split (which HOLDS the Live/Status panes) back; the choice persists; a chip resolves
+        // to its entry. Break any of these and it fails.
+        lw.loadFixtureForTest(libraryFixtureDays())
+        lw.clickNavForTest(.library)
+        lw.setMonthModeForTest(true)
+        // EXACTLY 6 (2 days × 3 entries) — a >= would mask chipEntries never being cleared across rebuilds.
+        let monthOn = lw.monthModeVisibleForTest && !lw.splitVisibleForTest && lw.monthChipCountForTest == 6
+        lw.clickNavForTest(.status)   // another section must restore the split (else Live/Status vanish)
+        let splitBackOnStatus = !lw.monthModeVisibleForTest && lw.splitVisibleForTest
+        lw.clickNavForTest(.library)
+        let monthBackOnLibrary = lw.monthModeVisibleForTest && !lw.splitVisibleForTest
+        let chipResolves = lw.clickMonthChipForTest(onDay: "2026-03-02") != nil
+        // An AUDIO chip has no transcript to render — it must drop to the LIST with that entry selected
+        // (the player bar path), never open a popover that decodes the .wav as UTF-8 (review P1).
+        lw.setMonthModeForTest(true)
+        let audio = lw.clickMonthChipForTest(onDay: "2026-03-01")   // 17:52 audio is first on 2026-03-01
+        let audioRouted = audio?.kind == .audio && !lw.monthModeVisibleForTest && lw.selectedURLForTest == audio?.url
+        let monthOff = !lw.monthModeVisibleForTest && lw.splitVisibleForTest
+        check("library: Month mode shows the grid, restores the split on another section, and resolves a chip",
+              monthOn && splitBackOnStatus && monthBackOnLibrary && chipResolves && audioRouted && monthOff)
+        _ = lw.calendarClickClearForTest()   // the audio chip left a day filter — clear it for later tests
         LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore the rich default
     }
     // Transcript stamps: parsing, the clock→offset decision, and the seek-link scheme.

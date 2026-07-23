@@ -410,13 +410,13 @@ s11() {
   if [[ ! -x "$bin" ]]; then skip "s11: no macrec binary (package.sh --install, or swift build)"; return; fi
   local dir="$SCRATCH/shots" out n
   out=$("$bin" library-snapshot "$dir" 2>&1)
-  # 10 shots = {dark,light} × {main, daily, live, status, search}; the subcommand FAILS a blank or
-  # missing mode (snapshotIsBlank refuses to write a reassuring empty PNG), so exit-0 + 10 files ≡ real.
+  # 12 shots = {dark,light} × {main, daily, live, status, search, month}; the subcommand FAILS a blank
+  # or missing mode (snapshotIsBlank refuses to write a reassuring empty PNG), so exit-0 + 12 ≡ real.
   n=$(find "$dir" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
-  if print -r -- "$out" | grep -q "library-snapshot: 10 shots" && [[ "$n" -eq 10 ]] \
+  if print -r -- "$out" | grep -q "library-snapshot: 12 shots" && [[ "$n" -eq 12 ]] \
      && [[ -s "$dir/dark/library.png" && -s "$dir/light/library.png" \
-        && -s "$dir/dark/search/library.png" && -s "$dir/light/search/library.png" ]]; then
-    pass "s11: 10 non-blank Library shots (incl. content-search) rendered in both appearances"
+        && -s "$dir/dark/search/library.png" && -s "$dir/light/month/library.png" ]]; then
+    pass "s11: 12 non-blank Library shots (incl. content-search + month grid) in both appearances"
   else
     fail "s11: library-snapshot — $(print -r -- "$out" | tail -2 | tr '\n' ' ') (png count=$n)"
   fi

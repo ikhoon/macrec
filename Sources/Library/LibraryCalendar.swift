@@ -45,6 +45,29 @@ func libraryGridCalendar(from current: Calendar = .current) -> Calendar {
     return c
 }
 
+// MARK: - month-VIEW (the big Calendar.app-style grid: entries shown as chips inside each day cell)
+
+/// The one-line label for a month-view chip. Pure so the cell text is selftested.
+func monthChipLabel(_ e: LibraryEntry) -> String {
+    switch e.kind {
+    case .digest: return "Daily digest"
+    case .audio: return "\(e.time ?? "--:--")  audio"
+    case .transcript: return "\(e.time ?? "--:--")  \(e.title ?? "(untitled)")"
+    }
+}
+
+/// What a day cell shows: the first `max` entries as chips, plus an overflow count for the rest (a
+/// "+N" affordance). Entries arrive already ordered (digest first, then earliest→latest). Pure.
+func monthCellChips(_ entries: [LibraryEntry], max: Int = 3) -> (chips: [LibraryEntry], overflow: Int) {
+    let shown = Array(entries.prefix(max))
+    return (shown, Swift.max(0, entries.count - shown.count))
+}
+
+/// Group day-rows into a "yyyy-MM-dd" → entries map for O(1) cell lookup while laying out the grid. Pure.
+func entriesByDayMap(_ days: [LibraryDay]) -> [String: [LibraryEntry]] {
+    Dictionary(days.map { ($0.day, $0.entries) }, uniquingKeysWith: { a, _ in a })
+}
+
 // MARK: - the calendar sidebar (dumb renderer of monthGrid)
 
 /// A compact month calendar above the Library list: recorded days read accent, empty days dim;
