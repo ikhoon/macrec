@@ -515,7 +515,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
         // A chip fills the shared RIGHT doc pane (the same path a list-row click takes) — every kind
         // renders correctly, the player surfaces for audio, and checkboxes/Copy work. No popover.
-        monthView.onPickEntry = { [weak self] entry, _ in self?.showEntry(entry) }
+        monthView.onPickEntry = { [weak self] entry in self?.showEntry(entry) }
         monthView.onPickDay = { [weak self] day in self?.dropToDayList(day) }
 
         content.addSubview(bar)
@@ -599,7 +599,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         calendarView.isHidden = showMonth
         listScroll.isHidden = showMonth
         viewModePicker.isHidden = section != .library   // the toggle only applies to the Library
-        if showMonth { loadMonth() }
+        // The centered "No match…"/"No digests…" label belongs to the LIST; the grid is its own empty
+        // state. Track it on a mode toggle (which doesn't re-run the filter) so it never floats over the grid.
+        if showMonth { emptyLabel.isHidden = true; loadMonth() } else { emptyLabel.isHidden = !shownDays.isEmpty }
     }
 
     /// Give the grid ~62% and the doc pane the rest; the list gets its usual ~third. Set on a mode CHANGE
@@ -1157,8 +1159,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         let exportOn = libraryExportEnabled(selected?.kind)
         exportBtn.isEnabled = exportOn
         exportBtn.isHidden = !exportOn   // non-transcript rows have nothing to convert — no dead chrome
-        // Copy works for whatever doc is shown (summary / transcript / digest), so it tracks the doc, not the kind.
-        let hasDoc = currentDocURL() != nil
+        // Copy works for a TEXT doc (summary / transcript / digest / standalone) — never an audio row, whose
+        // currentDocURL() is the .wav; reading that as text yields nothing, so Copy would be a dead button.
+        let hasDoc = currentDocURL() != nil && selected?.kind != .audio
         copyBtn.isHidden = !hasDoc
         copyBtn.isEnabled = hasDoc
         let slot = currentSummarySlot()
@@ -1650,14 +1653,12 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     var splitVisibleForTest: Bool { !libSplit.isHidden }
     var calendarVisibleForTest: Bool { !calendarView.isHidden }
     var listVisibleForTest: Bool { !listScroll.isHidden }
+    var emptyLabelHiddenForTest: Bool { emptyLabel.isHidden }   // the centered "No match…" — must not float over the grid
     var monthChipCountForTest: Int { monthView.chipCountForTest() }
-    /// Lay the whole window out at `size` and count month-grid chips that spill their cell — the size-
-    /// dependent breakage a single-size snapshot missed. Run in Month mode with a fixture loaded.
-    func monthLayoutIssuesForTest(at size: NSSize) -> Int {
-        window?.setContentSize(size)
-        window?.contentView?.layoutSubtreeIfNeeded()
-        return monthView.layoutIssuesForTest()
-    }
+    /// Count day cells that do NOT clip their chips — the structural guarantee (size-independent) that a
+    /// short cell can never spill onto the next row. The "3 chips FIT without clipping at a roomy size"
+    /// check is the snapshot's eyeball job; this is the deterministic guard.
+    func monthCellClipIssuesForTest() -> Int { monthView.layoutIssuesForTest() }
     @discardableResult func clickMonthChipForTest(onDay day: String) -> LibraryEntry? { monthView.clickFirstChipForTest(onDay: day) }
     /// Expand the search field (as the toggle does) and run a query, building the index SYNCHRONOUSLY so
     /// the assertion is deterministic (the shipped path builds it off-thread). Drives the real full-text path.

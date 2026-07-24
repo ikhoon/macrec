@@ -762,11 +762,20 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         // No spill at ANY size: every day cell must CLIP its chips, so a short cell can't paint onto the
         // next row (the "UI 깨짐" the user hit; a single-size snapshot missed it). Structural, so deterministic.
         lw.setMonthModeForTest(true)
-        let cellsClip = lw.monthLayoutIssuesForTest(at: NSSize(width: 1000, height: 740)) == 0
+        let cellsClip = lw.monthCellClipIssuesForTest() == 0
+        // The centered "No match…" list label must NOT float over the grid: enter an empty search in List,
+        // then toggle to Month — the label has to hide (a mode toggle doesn't re-run the filter — review P1).
+        lw.setMonthModeForTest(false)
+        lw.setSearchForTest("zzz-no-such")
+        let labelShownInList = !lw.emptyLabelHiddenForTest
+        lw.setMonthModeForTest(true)
+        let labelHiddenInMonth = lw.emptyLabelHiddenForTest
+        lw.setSearchForTest("")
         lw.setMonthModeForTest(false)
         let monthOff = !lw.monthModeVisibleForTest && lw.calendarVisibleForTest && lw.listVisibleForTest
         check("library: Month grid shows beside the doc; a chip (incl. audio) fills the doc pane, staying in Month",
-              monthOn && splitBackOnStatus && monthBackOnLibrary && chipResolves && audioResolves && monthOff && cellsClip)
+              monthOn && splitBackOnStatus && monthBackOnLibrary && chipResolves && audioResolves && monthOff
+                  && cellsClip && labelShownInList && labelHiddenInMonth)
         // Copy: the REAL Copy button puts the shown doc's raw text on the clipboard, and is hidden when
         // there's no doc to copy (never dead chrome). Drives the button + reads the pasteboard back.
         let copyURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mr-copy-\(UUID().uuidString).md")
@@ -777,12 +786,18 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         let copyHiddenNoDoc = lw.copyButtonHiddenForTest
         lw.clickNavForTest(.library)
         lw.selectForTest(LibraryEntry(day: "2026-03-02", time: "10:00", title: "m", kind: .transcript, url: copyURL, summaryURL: nil, audioURL: nil))
+        let prevClip = NSPasteboard.general.string(forType: .string)   // don't clobber the user's real clipboard
         NSPasteboard.general.clearContents()
         lw.clickCopyForTest()
         let copied = NSPasteboard.general.string(forType: .string)
+        // Copy must be HIDDEN for an audio-only row (its "doc" is a .wav — reading it as text yields nothing).
+        lw.selectForTest(LibraryEntry(day: "2026-03-02", time: "17:00", title: nil, kind: .audio, url: copyURL, summaryURL: nil, audioURL: copyURL))
+        let copyHiddenForAudio = lw.copyButtonHiddenForTest
+        NSPasteboard.general.clearContents()
+        if let prevClip { NSPasteboard.general.setString(prevClip, forType: .string) }   // restore
         try? FileManager.default.removeItem(at: copyURL)
-        check("library: Copy puts the shown doc on the clipboard and hides when there's nothing to copy",
-              copyHiddenNoDoc && !lw.copyButtonHiddenForTest && copied == "# meeting\n\ndecisions: shipped")
+        check("library: Copy copies the shown text doc, hides for no-doc AND for audio (never a dead button)",
+              copyHiddenNoDoc && copyHiddenForAudio && copied == "# meeting\n\ndecisions: shipped")
         // NO blue: the accent recurs through NSSegmentedControl's selected segment, which an offscreen
         // snapshot never draws — so assert it STRUCTURALLY (the toggles are the monochrome MonoSegmented,
         // and no default-key blue button exists). This is the detection the eyeball QA could not do.

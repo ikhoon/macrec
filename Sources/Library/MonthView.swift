@@ -2,15 +2,13 @@ import AppKit
 
 // MARK: - the big month view (Calendar.app-style: a full-size grid with each day's recordings as chips)
 
-/// A full-width month calendar. Every day cell lists that day's recordings as chips; clicking a chip
-/// asks the window to surface it (a popover, in place). Navigation + the weekday header + today's ring
-/// mirror the compact sidebar calendar; the layout math is the same pure monthGrid/monthShift/weekday
-/// helpers. Monochrome by rule — the only color is a small kind dot on each chip.
+/// The month grid for the LEFT split pane: every day cell lists that day's recordings as chips; clicking
+/// a chip asks the window to open it in the RIGHT doc pane (a side panel, not a popover). Navigation + the
+/// weekday header + today's disc mirror the compact sidebar calendar; the layout math is the same pure
+/// monthGrid/monthShift/weekday helpers. Monochrome by rule — the only color is a small kind dot per chip.
 final class MonthCalendarView: NSView {
-    /// A chip was clicked — the window shows the entry (anchored to `from` for a popover). The overflow
-    /// "+N" chip reports a nil entry with the day, so the window can drop to the day's list instead.
-    var onPickEntry: ((LibraryEntry, NSView) -> Void)?
-    var onPickDay: ((String) -> Void)?
+    var onPickEntry: ((LibraryEntry) -> Void)?   // a chip → the window shows this entry in the doc pane
+    var onPickDay: ((String) -> Void)?           // "+N more" → the window drops to that day's list
     var onMonthChanged: ((String) -> Void)?
 
     private(set) var month = "" // "yyyy-MM"
@@ -266,7 +264,7 @@ final class MonthCalendarView: NSView {
 
     @objc private func chipTapped(_ sender: NSButton) {
         guard let e = (sender as? ChipButton)?.entry else { return }
-        onPickEntry?(e, sender)
+        onPickEntry?(e)
     }
 
     @objc private func overflowTapped(_ sender: NSButton) {
