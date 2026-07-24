@@ -745,32 +745,49 @@ func librarySelftests(_ check: (String, Bool) -> Void) {
         lw.loadFixtureForTest(libraryFixtureDays())
         lw.clickNavForTest(.library)
         lw.setMonthModeForTest(true)
-        // EXACTLY 6 (2 days × 3 entries) — a >= would mask chipEntries never being cleared across rebuilds.
-        let monthOn = lw.monthModeVisibleForTest && !lw.splitVisibleForTest && lw.monthChipCountForTest == 6
-        lw.clickNavForTest(.status)   // another section must restore the split (else Live/Status vanish)
+        // Month mode swaps the calendar+list for the grid (both in the left pane); the split (doc pane on
+        // the right) stays up. EXACTLY 6 chips (2 days × 3) — a >= would mask a rebuild not clearing them.
+        let monthOn = lw.monthModeVisibleForTest && !lw.calendarVisibleForTest && !lw.listVisibleForTest
+            && lw.splitVisibleForTest && lw.monthChipCountForTest == 6
+        lw.clickNavForTest(.status)   // another section hides the grid; the split (Status pane) stays up
         let splitBackOnStatus = !lw.monthModeVisibleForTest && lw.splitVisibleForTest
         lw.clickNavForTest(.library)
-        let monthBackOnLibrary = lw.monthModeVisibleForTest && !lw.splitVisibleForTest
-        let chipResolves = lw.clickMonthChipForTest(onDay: "2026-03-02") != nil
-        // An AUDIO chip has no transcript to render — it must drop to the LIST with that entry selected
-        // (the player bar path), never open a popover that decodes the .wav as UTF-8 (review P1).
-        lw.setMonthModeForTest(true)
+        let monthBackOnLibrary = lw.monthModeVisibleForTest
+        // A chip fills the shared RIGHT doc pane (a side panel, not a popover) — it STAYS in Month mode and
+        // selects the entry. An audio chip selects too (the doc pane's player surfaces); no dead popover.
+        let chip = lw.clickMonthChipForTest(onDay: "2026-03-02")
+        let chipResolves = chip != nil && lw.monthModeVisibleForTest && lw.selectedURLForTest == chip?.url
         let audio = lw.clickMonthChipForTest(onDay: "2026-03-01")   // 17:52 audio is first on 2026-03-01
-        let audioRouted = audio?.kind == .audio && !lw.monthModeVisibleForTest && lw.selectedURLForTest == audio?.url
-        let monthOff = !lw.monthModeVisibleForTest && lw.splitVisibleForTest
-        check("library: Month mode shows the grid, restores the split on another section, and resolves a chip",
-              monthOn && splitBackOnStatus && monthBackOnLibrary && chipResolves && audioRouted && monthOff)
-        // The Month popover is a READ-ONLY preview: its checkbox/seek links are stripped so a click is
-        // never a silent dead-end (the popover has no delegate). The glyph stays; the link does not.
-        let popURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mr-pop-\(UUID().uuidString).md")
-        try? "# note\n\n- [ ] call the vendor\n\n[10:00:05] Me: hi".write(to: popURL, atomically: true, encoding: .utf8)
-        let popDoc = lw.popoverDocForTest(LibraryEntry(day: "2026-03-02", time: "10:00", title: "note", kind: .transcript, url: popURL, summaryURL: nil, audioURL: nil))
-        var anyLink = false
-        popDoc.enumerateAttribute(.link, in: NSRange(location: 0, length: popDoc.length)) { v, _, _ in if v != nil { anyLink = true } }
-        try? FileManager.default.removeItem(at: popURL)
-        check("library: the Month popover preview keeps the checkbox glyph but strips its dead link",
-              popDoc.string.contains("☐") && !anyLink)
-        _ = lw.calendarClickClearForTest()   // the audio chip left a day filter — clear it for later tests
+        let audioResolves = audio?.kind == .audio && lw.monthModeVisibleForTest && lw.selectedURLForTest == audio?.url
+        // No spill at ANY size: every day cell must CLIP its chips, so a short cell can't paint onto the
+        // next row (the "UI 깨짐" the user hit; a single-size snapshot missed it). Structural, so deterministic.
+        lw.setMonthModeForTest(true)
+        let cellsClip = lw.monthLayoutIssuesForTest(at: NSSize(width: 1000, height: 740)) == 0
+        lw.setMonthModeForTest(false)
+        let monthOff = !lw.monthModeVisibleForTest && lw.calendarVisibleForTest && lw.listVisibleForTest
+        check("library: Month grid shows beside the doc; a chip (incl. audio) fills the doc pane, staying in Month",
+              monthOn && splitBackOnStatus && monthBackOnLibrary && chipResolves && audioResolves && monthOff && cellsClip)
+        // Copy: the REAL Copy button puts the shown doc's raw text on the clipboard, and is hidden when
+        // there's no doc to copy (never dead chrome). Drives the button + reads the pasteboard back.
+        let copyURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mr-copy-\(UUID().uuidString).md")
+        try? "# meeting\n\ndecisions: shipped".write(to: copyURL, atomically: true, encoding: .utf8)
+        lw.loadFixtureForTest([LibraryDay(day: "2026-03-02", entries: [
+            LibraryEntry(day: "2026-03-02", time: "10:00", title: "m", kind: .transcript, url: copyURL, summaryURL: nil, audioURL: nil)])])
+        lw.selectForTest(nil)
+        let copyHiddenNoDoc = lw.copyButtonHiddenForTest
+        lw.clickNavForTest(.library)
+        lw.selectForTest(LibraryEntry(day: "2026-03-02", time: "10:00", title: "m", kind: .transcript, url: copyURL, summaryURL: nil, audioURL: nil))
+        NSPasteboard.general.clearContents()
+        lw.clickCopyForTest()
+        let copied = NSPasteboard.general.string(forType: .string)
+        try? FileManager.default.removeItem(at: copyURL)
+        check("library: Copy puts the shown doc on the clipboard and hides when there's nothing to copy",
+              copyHiddenNoDoc && !lw.copyButtonHiddenForTest && copied == "# meeting\n\ndecisions: shipped")
+        // NO blue: the accent recurs through NSSegmentedControl's selected segment, which an offscreen
+        // snapshot never draws — so assert it STRUCTURALLY (the toggles are the monochrome MonoSegmented,
+        // and no default-key blue button exists). This is the detection the eyeball QA could not do.
+        check("library: no accent-blue control in the window (segmented toggles are monochrome)",
+              lw.accentControlCountForTest == 0)
         LibraryWindow.shared.loadFixtureForTest(libraryFixtureDays())   // restore the rich default
     }
     // Transcript stamps: parsing, the clock→offset decision, and the seek-link scheme.

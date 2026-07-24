@@ -237,12 +237,21 @@ func runLibrarySnapshotSubcommand(_ args: [String]) -> Never {
         LibraryWindow.shared.collapseSearchForTest()
         LibraryWindow.shared.loadFixtureForTest(sortedFixture)   // restore full list + selection for the next mode
         LibraryWindow.shared.pickDocForTest(1)
-        // Month mode: the big Calendar.app-style grid with each day's recordings as chips.
+        // Month mode: the Calendar.app-style grid on the LEFT, the clicked recording's doc on the RIGHT
+        // (a side panel, not a popover). Rendered at SEVERAL window sizes — a single size hid real
+        // breakage at the user's own window dimensions.
         LibraryWindow.shared.setMonthModeForTest(true)
+        // Fill the doc pane beside the grid. Select the kickoff row (its shared-fixture file IS the kickoff
+        // note) so the header and body match in the shot; the real chip→doc wiring is covered by selftest.
+        if let kickoff = sortedFixture.flatMap(\.entries).first(where: { $0.title == "project kickoff" }) {
+            LibraryWindow.shared.selectForTest(kickoff)
+        }
         let month = LibraryWindow.shared.snapshot(to: dir.appendingPathComponent(mode).appendingPathComponent("month"))
+        let monthWide = LibraryWindow.shared.snapshot(to: dir.appendingPathComponent(mode).appendingPathComponent("month-wide"), size: NSSize(width: 1440, height: 760))
+        let monthSmall = LibraryWindow.shared.snapshot(to: dir.appendingPathComponent(mode).appendingPathComponent("month-small"), size: NSSize(width: 720, height: 520))
         LibraryWindow.shared.setMonthModeForTest(false)
-        if main.isEmpty || daily.isEmpty || live.isEmpty || status.isEmpty || search.isEmpty || month.isEmpty { missing = true }
-        files += main + daily + live + status + search + month
+        if [main, daily, live, status, search, month, monthWide, monthSmall].contains(where: \.isEmpty) { missing = true }
+        files += main + daily + live + status + search + month + monthWide + monthSmall
     }
     if missing { print("library-snapshot: FAILED (a mode's shot is missing)"); exit(1) }
     for f in files { print(f.path) }
