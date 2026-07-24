@@ -91,20 +91,20 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
     private let searchField = NSSearchField()
     private let searchToggle = NSButton()   // magnifier; expands the field on click, collapses when empty
-    private let scopePicker = NSSegmentedControl()   // All | Daily (digests only)
-    private let viewModePicker = NSSegmentedControl()   // List | Month — the two library presentations
+    private let scopePicker = MonoSegmented(labels: ["All", "Daily"])   // digests-only filter (no accent-blue)
+    private let viewModePicker = MonoSegmented(labels: ["List", "Month"])   // the two library presentations
     private let monthView = MonthCalendarView()   // the big Calendar.app-style grid (Month mode)
     private var monthMode = false   // false = the list+compact-calendar; true = the full month grid
-    private let entryPopover = NSPopover()   // a chip's transcript shown in place (Month mode)
-    private var libSplit: NSSplitView!   // the list/doc split — hidden while the month grid is up
+    private var libSplit: NSSplitView!   // the grid|list ↔ doc split
+    private var listScroll: NSScrollView!   // the day/entry outline — swapped with monthView in the left pane
     private let textView = NSTextView()
     private let headerLabel = NSTextField(labelWithString: "")
-    private let docPicker = NSSegmentedControl(labels: ["Summary", "Transcript"],
-                                               trackingMode: .selectOne, target: nil, action: nil)
+    private let docPicker = MonoSegmented(labels: ["Summary", "Transcript"])   // was default-styled → accent-blue
     private let openBtn = NSButton(title: "Open", target: nil, action: nil)
     private let revealBtn = NSButton(title: "Reveal", target: nil, action: nil)   // in Finder (tooltip); short to leave the title room
     private let deleteBtn = NSButton(title: "Delete…", target: nil, action: nil)   // confirm → Trash the entry + its files
     private let exportBtn = NSButton(title: "Export Transcript…", target: nil, action: nil)
+    private let copyBtn = NSButton(title: "Copy", target: nil, action: nil)   // copies the shown summary/transcript
     // Transcript-actions row (its own row — squeezed into the header strip they crushed the title):
     // Export + the re-run slot (button OR spinner+label), derived in applyHeaderActions (one decision).
     private var summaryBar: NSStackView!
@@ -171,7 +171,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// selftest drives this real logic rather than a mirror (test-honesty).
     private func selectIndexed(_ target: URL) -> Bool {
         guard let hit = libraryEntryToSelect(days: allDays, target: target) else { return false }
-        searchField.stringValue = ""; scopePicker.selectedSegment = 0
+        searchField.stringValue = ""; scopePicker.setSelectedSegment(0)
         selectedDay = nil   // an active calendar day-filter would hide the target's row too
         calendarView.syncSelection(nil)   // the view's highlight must follow, or it lies (review P1)
         applyFilter()   // unfiltered outline so reselect finds the row
@@ -254,7 +254,8 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     // MARK: build
 
     private func build() {
-        let w = EditKeyWindow(contentRect: NSRect(x: 0, y: 0, width: 1160, height: 720),
+        // Roomy by default — the month grid needs width to breathe (user: a calendar wants a bigger window).
+        let w = EditKeyWindow(contentRect: NSRect(x: 0, y: 0, width: 1320, height: 860),
                               styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
                               backing: .buffered, defer: false)
         w.title = "macrec library"
@@ -288,25 +289,13 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
 
         // Scope: All vs Daily digests only — the fastest way to answer "what did each day boil down
         // to?" without scrolling past every meeting. Composes with the text filter.
-        scopePicker.segmentCount = 2
-        scopePicker.setLabel("All", forSegment: 0)
-        scopePicker.setLabel("Daily", forSegment: 1)
-        scopePicker.selectedSegment = 0
-        scopePicker.segmentStyle = .texturedRounded
-        scopePicker.target = self
-        scopePicker.action = #selector(filterChanged)
+        scopePicker.onChange = { [weak self] _ in self?.filterChanged() }
         scopePicker.setContentHuggingPriority(.required, for: .horizontal)
 
         let refreshBtn = NSButton(title: "Refresh", target: self, action: #selector(refreshClicked))
         refreshBtn.bezelStyle = .rounded
         // View mode: the compact list vs the big month grid — the two presentations the user asked for.
-        viewModePicker.segmentCount = 2
-        viewModePicker.setLabel("List", forSegment: 0)
-        viewModePicker.setLabel("Month", forSegment: 1)
-        viewModePicker.segmentStyle = .texturedRounded
-        viewModePicker.selectedSegment = 0
-        viewModePicker.target = self
-        viewModePicker.action = #selector(viewModeChanged)
+        viewModePicker.onChange = { [weak self] _ in self?.viewModeChanged() }
         viewModePicker.setContentHuggingPriority(.required, for: .horizontal)
         // Search lives at the RIGHT end (Calendar.app's placement): a magnifier that expands into a field
         // in place — the toggle hides while the field is up, so the field's own magnifier isn't doubled.
@@ -334,6 +323,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         outline.target = self
         outline.action = #selector(rowSelected)
         let leftScroll = NSScrollView()
+        listScroll = leftScroll
         leftScroll.documentView = outline
         leftScroll.hasVerticalScroller = true
         // The calendar rides ABOVE the list in the left pane; its pick becomes the day filter.
@@ -372,21 +362,21 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             b.trailingAnchor.constraint(equalTo: nav.trailingAnchor, constant: -10).isActive = true
         }
 
-        let left = NSStackView(views: [nav, calendarView, leftScroll])
+        // The month grid lives in the LEFT pane too (hidden in List mode); clicking a chip fills the
+        // shared RIGHT doc pane — a side panel, not a modal popover (user request).
+        let left = NSStackView(views: [nav, calendarView, leftScroll, monthView])
         left.orientation = .vertical
         left.spacing = 0
-        nav.leadingAnchor.constraint(equalTo: left.leadingAnchor).isActive = true
-        nav.trailingAnchor.constraint(equalTo: left.trailingAnchor).isActive = true
-        calendarView.leadingAnchor.constraint(equalTo: left.leadingAnchor).isActive = true
-        calendarView.trailingAnchor.constraint(equalTo: left.trailingAnchor).isActive = true
-        leftScroll.leadingAnchor.constraint(equalTo: left.leadingAnchor).isActive = true
-        leftScroll.trailingAnchor.constraint(equalTo: left.trailingAnchor).isActive = true
+        for v in [nav, calendarView, leftScroll, monthView] {
+            v.leadingAnchor.constraint(equalTo: left.leadingAnchor).isActive = true
+            v.trailingAnchor.constraint(equalTo: left.trailingAnchor).isActive = true
+        }
+        monthView.isHidden = true
 
         // Right: header (what's selected + actions) over the document text.
         headerLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         headerLabel.lineBreakMode = .byTruncatingTail
-        docPicker.target = self
-        docPicker.action = #selector(docPicked)
+        docPicker.onChange = { [weak self] _ in self?.docPicked() }
         openBtn.target = self
         openBtn.action = #selector(openDoc)
         revealBtn.target = self
@@ -395,12 +385,15 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         exportBtn.target = self
         exportBtn.action = #selector(exportClicked)
         exportBtn.toolTip = "Save the transcript as Markdown, plain text, SRT or VTT"
+        copyBtn.target = self
+        copyBtn.action = #selector(copyClicked)
+        copyBtn.toolTip = "Copy the shown summary or transcript to the clipboard"
         rerunBtn.target = self
         rerunBtn.action = #selector(rerunClicked)
         deleteBtn.target = self
         deleteBtn.action = #selector(deleteClicked)
         deleteBtn.toolTip = "Move this recording (transcript, summary, and audio) to the Trash"
-        for b in [openBtn, revealBtn, exportBtn, rerunBtn, deleteBtn] { b.bezelStyle = .rounded }
+        for b in [openBtn, revealBtn, exportBtn, copyBtn, rerunBtn, deleteBtn] { b.bezelStyle = .rounded }
         rerunSpinner.style = .spinning
         rerunSpinner.controlSize = .small
         rerunSpinner.isDisplayedWhenStopped = false
@@ -415,7 +408,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         head.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 6, right: 10)
         headerLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         headerLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        summaryBar = NSStackView(views: [rerunBtn, exportBtn, rerunSpinner, rerunStatus, NSView()])
+        summaryBar = NSStackView(views: [copyBtn, rerunBtn, exportBtn, rerunSpinner, rerunStatus, NSView()])
         summaryBar.orientation = .horizontal
         summaryBar.spacing = 8
         summaryBar.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 6, right: 10)
@@ -520,19 +513,13 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         emptyLabel.textColor = .secondaryLabelColor
         emptyLabel.isHidden = true
 
-        // The month grid fills the same area as the split; only one is visible at a time (updateModeVisibility).
-        monthView.isHidden = true
-        monthView.onPickEntry = { [weak self] entry, from in
-            // Audio has no transcript to render in a popover — drop to the list and select it so the
-            // player bar surfaces; a transcript/digest reads in place.
-            guard let self else { return }
-            if entry.kind == .audio { openEntryInList(entry) } else { showEntryPopover(entry, from: from) }
-        }
+        // A chip fills the shared RIGHT doc pane (the same path a list-row click takes) — every kind
+        // renders correctly, the player surfaces for audio, and checkboxes/Copy work. No popover.
+        monthView.onPickEntry = { [weak self] entry in self?.showEntry(entry) }
         monthView.onPickDay = { [weak self] day in self?.dropToDayList(day) }
 
         content.addSubview(bar)
         content.addSubview(split)
-        content.addSubview(monthView)
         content.addSubview(emptyLabel)
         NSLayoutConstraint.activate([
             bar.topAnchor.constraint(equalTo: content.topAnchor),
@@ -542,10 +529,6 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
             split.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             split.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             split.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            monthView.topAnchor.constraint(equalTo: bar.bottomAnchor),
-            monthView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            monthView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            monthView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             emptyLabel.centerXAnchor.constraint(equalTo: content.centerXAnchor),
             emptyLabel.centerYAnchor.constraint(equalTo: content.centerYAnchor),
             emptyLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 420),
@@ -556,8 +539,9 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         window = w
         showEntry(nil)   // the right pane starts EMPTY — no ghost picker/player before a selection
         monthMode = Pref.d.string(forKey: Pref.libraryViewMode) == "month"   // restore the saved presentation
-        viewModePicker.selectedSegment = monthMode ? 1 : 0
+        viewModePicker.setSelectedSegment(monthMode ? 1 : 0)
         switchSection(.library)   // paint the default nav selection now — an unhighlighted Library read as dead
+        applyModeDivider()        // set the split for the restored mode (wide grid vs a list third)
     }
 
     // MARK: data → view
@@ -606,28 +590,44 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         updateModeVisibility()
     }
 
-    /// One decision for List-vs-Month: the month grid only ever shows inside the Library section; the
-    /// split (which HOLDS the Live/Status panes) must reappear the moment another section is picked.
+    /// List-vs-Month: both live in the LEFT pane (the split stays up — the right pane holds the doc, and
+    /// the Live/Status panes). Month mode swaps the calendar+list for the grid and widens the left pane
+    /// so the grid breathes; a chip click fills the right doc pane (a side panel, not a popover).
     private func updateModeVisibility() {
         let showMonth = section == .library && monthMode
         monthView.isHidden = !showMonth
-        libSplit.isHidden = showMonth
+        calendarView.isHidden = showMonth
+        listScroll.isHidden = showMonth
         viewModePicker.isHidden = section != .library   // the toggle only applies to the Library
-        if showMonth { emptyLabel.isHidden = true; loadMonth() }   // the grid is its own empty state
+        // The centered "No match…"/"No digests…" label belongs to the LIST; the grid is its own empty
+        // state. Track it on a mode toggle (which doesn't re-run the filter) so it never floats over the grid.
+        if showMonth { emptyLabel.isHidden = true; loadMonth() } else { emptyLabel.isHidden = !shownDays.isEmpty }
+    }
+
+    /// Give the grid ~62% and the doc pane the rest; the list gets its usual ~third. Set on a mode CHANGE
+    /// only (not every section switch) so a user's divider drag survives between toggles.
+    private func applyModeDivider() {
+        guard let w = window?.contentView?.bounds.width, w > 1 else { return }
+        libSplit.setPosition(monthMode ? w * 0.62 : 320, ofDividerAt: 0)
     }
 
     /// The one place mode is set: flips the flag, the segmented control, and the persisted pref together
     /// so viewModeChanged and dropToList can't drift.
     private func setMonthMode(_ on: Bool) {
         monthMode = on
-        viewModePicker.selectedSegment = on ? 1 : 0
+        viewModePicker.setSelectedSegment(on ? 1 : 0)
         Pref.d.set(on ? "month" : "list", forKey: Pref.libraryViewMode)
     }
 
     @objc private func viewModeChanged() {
         setMonthMode(viewModePicker.selectedSegment == 1)
-        entryPopover.close()
+        // A calendar wants room — grow a cramped window on entering Month (a saved size may be small);
+        // the user can resize freely after. List mode never shrinks it.
+        if monthMode, let win = window, let s = win.contentView?.bounds.size, s.width < 1120 || s.height < 720 {
+            win.setContentSize(NSSize(width: max(s.width, 1200), height: max(s.height, 780)))
+        }
         updateModeVisibility()
+        applyModeDivider()
     }
 
     /// Feed the month grid: ALL recordings grouped by day (the grid IS the navigation, not a filtered
@@ -638,62 +638,15 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         monthView.load(month: month, entriesByDay: entriesByDayMap(allDays), today: today)
     }
 
-    /// The popover's read-only document: render the summary (or transcript), then strip the interactive
-    /// checkbox/seek links (macrec-check:// / macrec-seek://) — the popover has no delegate, so a click
-    /// would be a silent dead-end, and toggling here would hit the wrong file. Glyphs/text stay. Read is
-    /// capped + lenient with a visible truncation note, matching loadDoc (a stray byte must not fail it).
-    private func popoverDoc(for e: LibraryEntry) -> NSAttributedString {
-        let src = e.summaryURL ?? e.url
-        let md: String
-        if let data = try? Data(contentsOf: src, options: .mappedIfSafe) {
-            let capped = data.prefix(2_000_000)
-            // A neutral notice — the popover has no "Open" (Month mode hides that pane), so don't promise it.
-            md = String(decoding: capped, as: UTF8.self)
-                + (data.count > capped.count ? "\n\n… (preview truncated)" : "")
-        } else {
-            md = "(could not read \(src.lastPathComponent))"
-        }
-        let rendered = NSMutableAttributedString(attributedString: MarkdownRender.render(md, baseURL: src.deletingLastPathComponent()))
-        rendered.removeAttribute(.link, range: NSRange(location: 0, length: rendered.length))
-        return rendered
-    }
-
-    /// Anchored to the chip so the user reads it without leaving the grid.
-    private func showEntryPopover(_ e: LibraryEntry, from: NSView) {
-        let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: 460, height: 420))
-        tv.isEditable = false
-        tv.textContainerInset = NSSize(width: 14, height: 14)
-        tv.textStorage?.setAttributedString(popoverDoc(for: e))
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 460, height: 420))
-        scroll.documentView = tv
-        scroll.hasVerticalScroller = true
-        let vc = NSViewController()
-        vc.view = scroll
-        entryPopover.contentViewController = vc
-        entryPopover.contentSize = NSSize(width: 460, height: 420)
-        entryPopover.behavior = .transient
-        guard window?.isVisible == true else { return }   // an off-screen (test) window has nothing to anchor to
-        entryPopover.show(relativeTo: from.bounds, of: from, preferredEdge: .maxX)
-    }
-
-    /// The "+N more" overflow chip drops to the list, filtered to that day — the full-detail path.
-    private func dropToDayList(_ day: String) { dropToList(day: day, select: nil) }
-
-    /// An audio chip has no transcript for a popover — drop to the list on its day and select it so the
-    /// player bar appears (the list path already special-cases audio playback).
-    private func openEntryInList(_ e: LibraryEntry) { dropToList(day: e.day, select: e) }
-
-    private func dropToList(day: String, select: LibraryEntry?) {
-        entryPopover.close()
+    /// The "+N more" overflow chip switches to the list, filtered to that day — the full-detail path for
+    /// a day with more entries than a cell shows.
+    private func dropToDayList(_ day: String) {
         setMonthMode(false)
         selectedDay = day
         calendarView.syncSelection(day)
         updateModeVisibility()
+        applyModeDivider()
         applyFilter()
-        if let e = select, let fresh = shownDays.lazy.flatMap(\.entries).first(where: { $0.url == e.url && $0.kind == e.kind }) {
-            showEntry(fresh)
-            reselect(url: fresh.url, kind: fresh.kind)
-        }
     }
 
     private var renderedStatusRows: [HealthRow]? // last rendered — skip the 1 Hz rebuild when nothing changed
@@ -932,7 +885,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         docPicker.isHidden = e.summaryURL == nil
         // Summary first: the distilled note is what the user reaches for; the raw transcript is
         // the appendix. The picker defaults to Summary whenever one exists (segment 0 = Summary).
-        if !docPicker.isHidden { docPicker.selectedSegment = 0 }
+        if !docPicker.isHidden { docPicker.setSelectedSegment(0) }
         // Discoverability: seek links live on the Transcript view only — say so where the switch is.
         docPicker.setToolTip(e.audioURL != nil ? "Timestamps here play the recording" : nil, forSegment: 1)
         playerBar.isHidden = e.audioURL == nil
@@ -1206,11 +1159,16 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
         let exportOn = libraryExportEnabled(selected?.kind)
         exportBtn.isEnabled = exportOn
         exportBtn.isHidden = !exportOn   // non-transcript rows have nothing to convert — no dead chrome
+        // Copy works for a TEXT doc (summary / transcript / digest / standalone) — never an audio row, whose
+        // currentDocURL() is the .wav; reading that as text yields nothing, so Copy would be a dead button.
+        let hasDoc = currentDocURL() != nil && selected?.kind != .audio
+        copyBtn.isHidden = !hasDoc
+        copyBtn.isEnabled = hasDoc
         let slot = currentSummarySlot()
         // Section gate: refresh()/windowDidBecomeKey call this regardless of section — outside
         // Library the bar must stay down or it bleeds over the Status/Live pane.
         summaryBar.isHidden = section != .library
-            || (!exportOn && slot.buttonTitle == nil && !slot.spinning && slot.status == nil)
+            || (!hasDoc && !exportOn && slot.buttonTitle == nil && !slot.spinning && slot.status == nil)
         rerunBtn.isHidden = slot.buttonTitle == nil
         if let t = slot.buttonTitle { rerunBtn.title = t }
         rerunSpinner.isHidden = !slot.spinning
@@ -1307,6 +1265,24 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
                 showEntry(e)
                 return
             }
+        }
+    }
+
+    /// The raw text of the doc currently shown (summary or transcript) — what Copy puts on the clipboard.
+    private func copyDocText() -> String? {
+        guard let url = currentDocURL() else { return nil }
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
+
+    @objc private func copyClicked() {
+        guard let text = copyDocText() else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        let prev = copyBtn.title   // brief confirmation, then restore
+        copyBtn.title = "Copied ✓"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) { [weak self] in
+            guard let self, copyBtn.title == "Copied ✓" else { return }
+            copyBtn.title = prev
         }
     }
 
@@ -1603,7 +1579,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     func primePlayerForTest() { _ = loadPlayerIfNeeded() }
 
     /// Snapshot/selftest hook: drive the scope segment (0 = All, 1 = Daily) like a click.
-    func setScopeForTest(_ segment: Int) { scopePicker.selectedSegment = segment; applyFilter() }
+    func setScopeForTest(_ segment: Int) { scopePicker.performClickForTest(segment) }   // fires the real onChange → filterChanged
     var shownDayCountForTest: Int { shownDays.count }
 
     /// Swap the fixture WITHOUT rebuilding or reselecting — lets a test change what the next
@@ -1657,16 +1633,32 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     }
     /// Click the REAL nav button (target-action → navTapped → switchSection), not switchSection direct.
     func clickNavForTest(_ s: MainSection) { navButtons.first { $0.tag == s.rawValue }?.performClick(nil) }
-    /// Flip the REAL view-mode segmented control (List ⇄ Month) and fire its WIRED target-action — so a
-    /// broken viewModePicker target/action fails the test, not just a helper call.
-    func setMonthModeForTest(_ on: Bool) {
-        viewModePicker.selectedSegment = on ? 1 : 0
-        _ = viewModePicker.target?.perform(viewModePicker.action, with: viewModePicker)
+    /// Click the REAL view-mode toggle (List ⇄ Month) — its wired onChange fires, so broken wiring fails.
+    func setMonthModeForTest(_ on: Bool) { viewModePicker.performClickForTest(on ? 1 : 0) }
+    /// Blue re-enters through system-ACCENT controls that an offscreen snapshot never renders — a real QA
+    /// blind spot. Count the accent sources structurally: any NSSegmentedControl (blue selected segment)
+    /// and any default-key push button (blue bezel). Must be 0 under the app's "no blue" rule.
+    var accentControlCountForTest: Int {
+        guard let root = window?.contentView else { return -1 }
+        func walk(_ v: NSView) -> Int {
+            var n = v is NSSegmentedControl ? 1 : 0
+            if let b = v as? NSButton, b.keyEquivalent == "\r" { n += 1 }
+            return n + v.subviews.reduce(0) { $0 + walk($1) }
+        }
+        return walk(root)
     }
-    func popoverDocForTest(_ e: LibraryEntry) -> NSAttributedString { popoverDoc(for: e) }
+    func clickCopyForTest() { copyBtn.performClick(nil) }   // drives the REAL Copy button + pasteboard write
+    var copyButtonHiddenForTest: Bool { copyBtn.isHidden }
     var monthModeVisibleForTest: Bool { !monthView.isHidden }
     var splitVisibleForTest: Bool { !libSplit.isHidden }
+    var calendarVisibleForTest: Bool { !calendarView.isHidden }
+    var listVisibleForTest: Bool { !listScroll.isHidden }
+    var emptyLabelHiddenForTest: Bool { emptyLabel.isHidden }   // the centered "No match…" — must not float over the grid
     var monthChipCountForTest: Int { monthView.chipCountForTest() }
+    /// Count day cells that do NOT clip their chips — the structural guarantee (size-independent) that a
+    /// short cell can never spill onto the next row. The "3 chips FIT without clipping at a roomy size"
+    /// check is the snapshot's eyeball job; this is the deterministic guard.
+    func monthCellClipIssuesForTest() -> Int { monthView.layoutIssuesForTest() }
     @discardableResult func clickMonthChipForTest(onDay day: String) -> LibraryEntry? { monthView.clickFirstChipForTest(onDay: day) }
     /// Expand the search field (as the toggle does) and run a query, building the index SYNCHRONOUSLY so
     /// the assertion is deterministic (the shipped path builds it off-thread). Drives the real full-text path.
@@ -1790,8 +1782,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     func clickLinkForTest(_ link: Any) -> Bool { textView(textView, clickedOnLink: link, at: 0) }
     func pickDocForTest(_ segment: Int) {
         guard !docPicker.isHidden else { return }
-        docPicker.selectedSegment = segment
-        loadDoc()
+        docPicker.performClickForTest(segment)   // fires the real onChange → docPicked → loadDoc
     }
 
     /// AUTOMATED LAYOUT GUARD (selftest): any control collapsed to ~zero or overlapping another.
@@ -1850,10 +1841,10 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     /// UI TEST KIT (see `macrec library-snapshot`): render the fixture-filled window to a PNG.
     /// Taller than the layout guard's 860×540 on purpose: the fixture document's transcript section
     /// (the seek-link stamps) sits at the bottom, and the eyeball check must actually see it.
-    func snapshot(to dir: URL) -> [URL] {
+    func snapshot(to dir: URL, size: NSSize = NSSize(width: 860, height: 960)) -> [URL] {
         guard let win = window, let content = win.contentView else { return [] }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        win.setContentSize(NSSize(width: 860, height: 960))
+        win.setContentSize(size)
         content.layoutSubtreeIfNeeded()
         RunLoop.current.run(until: Date().addingTimeInterval(0.08))
         let bounds = content.bounds

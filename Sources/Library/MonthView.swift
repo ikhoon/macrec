@@ -2,15 +2,11 @@ import AppKit
 
 // MARK: - the big month view (Calendar.app-style: a full-size grid with each day's recordings as chips)
 
-/// A full-width month calendar. Every day cell lists that day's recordings as chips; clicking a chip
-/// asks the window to surface it (a popover, in place). Navigation + the weekday header + today's ring
-/// mirror the compact sidebar calendar; the layout math is the same pure monthGrid/monthShift/weekday
-/// helpers. Monochrome by rule — the only color is a small kind dot on each chip.
+/// The month grid (LEFT split pane): each day cell lists its recordings as chips; a chip opens in the RIGHT
+/// doc pane (a side panel, not a popover). Layout uses the pure monthGrid/monthShift/weekday helpers.
 final class MonthCalendarView: NSView {
-    /// A chip was clicked — the window shows the entry (anchored to `from` for a popover). The overflow
-    /// "+N" chip reports a nil entry with the day, so the window can drop to the day's list instead.
-    var onPickEntry: ((LibraryEntry, NSView) -> Void)?
-    var onPickDay: ((String) -> Void)?
+    var onPickEntry: ((LibraryEntry) -> Void)?   // a chip → the window shows this entry in the doc pane
+    var onPickDay: ((String) -> Void)?           // "+N more" → the window drops to that day's list
     var onMonthChanged: ((String) -> Void)?
 
     private(set) var month = "" // "yyyy-MM"
@@ -78,6 +74,29 @@ final class MonthCalendarView: NSView {
 
     @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
 
+    /// Stroke the month grid as SINGLE hairlines (one line per boundary, not a doubled per-cell border) in
+    /// a fixed thin gray that reads on both light and dark — drawn here rather than via layer colors, which
+    /// froze to the wrong appearance. 7 equal columns × 6 equal rows over the grid's frame.
+    override func layout() { super.layout(); needsDisplay = true }   // re-stroke the gridlines after a resize
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let f = grid.frame
+        guard f.width > 1, f.height > 1 else { return }
+        NSColor.gray.withAlphaComponent(0.28).setStroke()
+        let path = NSBezierPath()
+        path.lineWidth = 0.5
+        for c in 0...7 {   // vertical lines
+            let x = (f.minX + f.width * CGFloat(c) / 7).rounded() + 0.25
+            path.move(to: NSPoint(x: x, y: f.minY)); path.line(to: NSPoint(x: x, y: f.maxY))
+        }
+        for r in 0...6 {   // horizontal lines
+            let y = (f.minY + f.height * CGFloat(r) / 6).rounded() + 0.25
+            path.move(to: NSPoint(x: f.minX, y: y)); path.line(to: NSPoint(x: f.maxX, y: y))
+        }
+        path.stroke()
+    }
+
     /// Captured layer cgColors (cell border, today disc, chip dots) don't auto-adapt — re-render on a
     /// live light/dark switch so they don't freeze to the old appearance.
     override func viewDidChangeEffectiveAppearance() {
@@ -142,8 +161,10 @@ final class MonthCalendarView: NSView {
     private func dayCell(_ day: String?) -> NSView {
         let cell = NSView()
         cell.wantsLayer = true
-        cell.layer?.borderWidth = 0.5
-        cell.layer?.borderColor = NSColor.separatorColor.cgColor
+        cell.layer?.masksToBounds = true   // a short cell (small window) must CLIP its chips, not spill into the next row
+        // No border/background: the SINGLE hairline gridlines are stroked once in draw(); per-cell borders
+        // doubled between neighbors (thick — user report) and an opaque dynamic-color fill froze to the
+        // wrong appearance on a layer (black cells in light mode).
         cell.translatesAutoresizingMaskIntoConstraints = false
         // High, not required: six rows × ≥64 would fight the grid's pins when the window is dragged to its
         // 360-pt minimum (AppKit would log an unsatisfiable-constraints break). It yields before it conflicts.
@@ -241,7 +262,7 @@ final class MonthCalendarView: NSView {
 
     @objc private func chipTapped(_ sender: NSButton) {
         guard let e = (sender as? ChipButton)?.entry else { return }
-        onPickEntry?(e, sender)
+        onPickEntry?(e)
     }
 
     @objc private func overflowTapped(_ sender: NSButton) {
@@ -251,6 +272,20 @@ final class MonthCalendarView: NSView {
     private func chipButtons() -> [ChipButton] {
         func walk(_ v: NSView) -> [ChipButton] { (v as? ChipButton).map { [$0] } ?? v.subviews.flatMap(walk) }
         return walk(self)
+    }
+
+    /// The "UI 깨짐" bug was chips of a short cell spilling onto the NEXT row. The structural guarantee
+    /// against that, at ANY window size, is that every day cell CLIPS its contents. Count cells that do
+    /// NOT clip — 0 means no cell can ever spill into a neighbor. (Deterministic, unlike frame probing a
+    /// headless layout; "do 3 chips fit without clipping at a roomy size" is the snapshot's eyeball job.)
+    func layoutIssuesForTest() -> Int {
+        var issues = 0
+        for row in grid.arrangedSubviews {
+            for cell in (row as? NSStackView)?.arrangedSubviews ?? [] where cell.layer?.masksToBounds != true {
+                issues += 1
+            }
+        }
+        return issues
     }
 
     // Test hooks: drive the RENDERED chips/nav (a fabricated action could pass with nothing wired).
