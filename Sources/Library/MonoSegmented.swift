@@ -1,12 +1,7 @@
 import AppKit
 
-/// A monochrome segmented toggle: a row of buttons where the selected one wears a fixed-gray pill.
-///
-/// It exists because NSSegmentedControl paints its selected segment with the SYSTEM ACCENT (blue) — the
-/// exact color the app's "no blue" rule forbids, recurring every time a segmented control is added. Worse,
-/// an offscreen snapshot doesn't render the accent, so the snapshot QA can't catch it; a selftest instead
-/// asserts the window holds NO NSSegmentedControl. Fixed grays (not dynamic catalog colors) so a layer's
-/// once-resolved cgColor can't freeze to the wrong appearance.
+/// A monochrome segmented toggle — replaces NSSegmentedControl, whose selected segment paints the system
+/// ACCENT (blue) the app's "no blue" rule forbids and an offscreen snapshot can't reveal. Fixed grays.
 final class MonoSegmented: NSView {
     var onChange: ((Int) -> Void)?
     private(set) var selectedSegment = 0 { didSet { restyle() } }

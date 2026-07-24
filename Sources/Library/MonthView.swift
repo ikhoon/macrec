@@ -2,10 +2,8 @@ import AppKit
 
 // MARK: - the big month view (Calendar.app-style: a full-size grid with each day's recordings as chips)
 
-/// The month grid for the LEFT split pane: every day cell lists that day's recordings as chips; clicking
-/// a chip asks the window to open it in the RIGHT doc pane (a side panel, not a popover). Navigation + the
-/// weekday header + today's disc mirror the compact sidebar calendar; the layout math is the same pure
-/// monthGrid/monthShift/weekday helpers. Monochrome by rule — the only color is a small kind dot per chip.
+/// The month grid (LEFT split pane): each day cell lists its recordings as chips; a chip opens in the RIGHT
+/// doc pane (a side panel, not a popover). Layout uses the pure monthGrid/monthShift/weekday helpers.
 final class MonthCalendarView: NSView {
     var onPickEntry: ((LibraryEntry) -> Void)?   // a chip → the window shows this entry in the doc pane
     var onPickDay: ((String) -> Void)?           // "+N more" → the window drops to that day's list

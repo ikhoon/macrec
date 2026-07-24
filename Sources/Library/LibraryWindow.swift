@@ -1579,7 +1579,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     func primePlayerForTest() { _ = loadPlayerIfNeeded() }
 
     /// Snapshot/selftest hook: drive the scope segment (0 = All, 1 = Daily) like a click.
-    func setScopeForTest(_ segment: Int) { scopePicker.setSelectedSegment(segment); applyFilter() }
+    func setScopeForTest(_ segment: Int) { scopePicker.performClickForTest(segment) }   // fires the real onChange → filterChanged
     var shownDayCountForTest: Int { shownDays.count }
 
     /// Swap the fixture WITHOUT rebuilding or reselecting — lets a test change what the next
@@ -1782,8 +1782,7 @@ final class LibraryWindow: NSObject, NSWindowDelegate, NSOutlineViewDataSource, 
     func clickLinkForTest(_ link: Any) -> Bool { textView(textView, clickedOnLink: link, at: 0) }
     func pickDocForTest(_ segment: Int) {
         guard !docPicker.isHidden else { return }
-        docPicker.setSelectedSegment(segment)
-        loadDoc()
+        docPicker.performClickForTest(segment)   // fires the real onChange → docPicked → loadDoc
     }
 
     /// AUTOMATED LAYOUT GUARD (selftest): any control collapsed to ~zero or overlapping another.
